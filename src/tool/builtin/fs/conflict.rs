@@ -15,9 +15,8 @@
 //! rename, so a target swapped between the check and the rename aborts
 //! instead of silently replacing a file that was never compared.
 
+use super::existing::ExistingBytes;
 use std::path::Path;
-
-use tokio::io::AsyncReadExt;
 
 use crate::tool::ToolError;
 
@@ -30,10 +29,13 @@ use super::state::content_hash;
 /// [`ToolError`].
 #[derive(Debug)]
 pub(crate) enum CheckFailure {
-    /// The target's bytes differ from the baseline.
+    /// The target's bytes differ from the baseline, or the target
+    /// cannot be the file the baseline describes.
     ///
     /// A recoverable conflict: the caller refuses the write and surfaces
-    /// [`changed_message`] as a soft error.
+    /// [`changed_message`] as a soft error. The classification arms
+    /// cover a missing target and the guarded reader's kind and size
+    /// findings — non-regular, directory, and over-cap targets.
     Changed,
 
     /// A genuine I/O fault while re-reading or statting the target.
@@ -86,7 +88,7 @@ impl TargetIdentity {
     /// fresh path lookup would resolve. Platforms without a stable file
     /// identity produce an empty identity whose
     /// [`matches`](Self::matches) always succeeds.
-    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+    pub(crate) fn from_metadata(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -209,9 +211,11 @@ pub(crate) fn resumed_baseline_message(path: &Path) -> String {
 ///
 /// # Errors
 ///
-/// Returns `Err(CheckFailure::Changed)` when the bytes differ or the
-/// file is gone, and `Err(CheckFailure::Fault)` only on a genuine I/O
-/// fault that is not "file missing".
+/// Returns `Err(CheckFailure::Changed)` when the bytes differ, the
+/// file is gone, the target is not a regular file or is a directory,
+/// or its size exceeds the family read cap, and
+/// `Err(CheckFailure::Fault)` only on a genuine I/O fault that is not
+/// "file missing".
 pub(crate) async fn check_content_unchanged(
     baseline: &str,
     path: &Path,
@@ -237,101 +241,70 @@ pub(crate) async fn check_content_unchanged(
 ///
 /// # Errors
 ///
-/// Returns `Err(CheckFailure::Changed)` when the bytes differ or the
-/// file is gone, and `Err(CheckFailure::Fault)` only on a genuine I/O
-/// fault that is not "file missing".
+/// Returns `Err(CheckFailure::Changed)` when the bytes differ, the
+/// file is gone, the target is not a regular file, or its size
+/// exceeds the family read cap — a baseline reaches this check from a
+/// read bounded by that same cap, so an over-cap or non-regular
+/// target cannot be the file the baseline describes — and
+/// `Err(CheckFailure::Fault)` only on a genuine I/O fault that is not
+/// "file missing".
 pub(crate) async fn check_content_hash_unchanged(
     baseline_hash: u64,
     path: &Path,
 ) -> Result<TargetIdentity, CheckFailure> {
-    let mut file = open_target(path).await?;
-    let identity = TargetIdentity::from_metadata(&stat_target(&file, path).await?);
-    let mut current = Vec::new();
-    file.read_to_end(&mut current)
+    let loaded = super::existing::read_existing_bytes(path)
         .await
-        .map_err(|e| read_fault(path, &e))?;
-    if content_hash(&current) == baseline_hash {
-        Ok(identity)
-    } else {
-        Err(CheckFailure::Changed)
+        .map_err(CheckFailure::Fault)?;
+    match loaded {
+        ExistingBytes::Present { identity, bytes } => {
+            if content_hash(&bytes) == baseline_hash {
+                Ok(identity)
+            } else {
+                Err(CheckFailure::Changed)
+            }
+        }
+        ExistingBytes::Absent
+        | ExistingBytes::NonRegular
+        | ExistingBytes::Directory
+        | ExistingBytes::TooLarge => Err(CheckFailure::Changed),
     }
 }
 
 /// Shared body of the byte-exact check: open, stat the handle, compare.
 ///
-/// The identity comes from the handle's own stat, so it belongs to the
-/// inode the bytes were read from even under a concurrent swap of the
-/// path's entry.
+/// The identity comes from the gated open's own handle, so it belongs
+/// to the inode the bytes were read from even under a concurrent swap
+/// of the path's entry.
 ///
 /// # Errors
 ///
-/// Returns `Err(CheckFailure::Changed)` when the bytes differ or the
-/// file is gone, and `Err(CheckFailure::Fault)` only on a genuine I/O
-/// fault that is not "file missing".
+/// Returns `Err(CheckFailure::Changed)` when the bytes differ, the
+/// file is gone, the target is not a regular file, or its size
+/// exceeds the family read cap — an expected-content baseline was
+/// itself read under that cap, so an over-cap or non-regular target
+/// cannot be the file the baseline describes — and
+/// `Err(CheckFailure::Fault)` only on a genuine I/O fault that is not
+/// "file missing".
 async fn check_bytes_unchanged(
     baseline: &[u8],
     path: &Path,
 ) -> Result<TargetIdentity, CheckFailure> {
-    let mut file = open_target(path).await?;
-    let identity = TargetIdentity::from_metadata(&stat_target(&file, path).await?);
-    let mut current = Vec::new();
-    file.read_to_end(&mut current)
+    let loaded = super::existing::read_existing_bytes(path)
         .await
-        .map_err(|e| read_fault(path, &e))?;
-    if current == baseline {
-        Ok(identity)
-    } else {
-        Err(CheckFailure::Changed)
+        .map_err(CheckFailure::Fault)?;
+    match loaded {
+        ExistingBytes::Present { identity, bytes } => {
+            if bytes == baseline {
+                Ok(identity)
+            } else {
+                Err(CheckFailure::Changed)
+            }
+        }
+        ExistingBytes::Absent
+        | ExistingBytes::NonRegular
+        | ExistingBytes::Directory
+        | ExistingBytes::TooLarge => Err(CheckFailure::Changed),
     }
-}
-
-/// Open the check target for reading.
-///
-/// The check opens the target itself rather than reading through a helper
-/// so the same handle can be stated for the returned identity — a separate
-/// path lookup afterwards could name a different file under a concurrent
-/// swap. A missing file is a change, not a fault, matching the checks'
-/// deletion-between-reads doctrine.
-///
-/// # Errors
-///
-/// Returns `Err(CheckFailure::Changed)` for a missing file and
-/// `Err(CheckFailure::Fault)` for any other open failure.
-async fn open_target(path: &Path) -> Result<tokio::fs::File, CheckFailure> {
-    match tokio::fs::File::open(path).await {
-        Ok(file) => Ok(file),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CheckFailure::Changed),
-        Err(err) => Err(read_fault(path, &err)),
-    }
-}
-
-/// Stat the open handle — the inode the bytes come from, not a path lookup.
-///
-/// The stat rides the open descriptor, so the identity reflects the file
-/// the check actually reads bytes from even if the path's directory entry
-/// is replaced while the read is in flight.
-///
-/// # Errors
-///
-/// Returns `Err(CheckFailure::Fault)` when the open handle cannot be
-/// stated.
-async fn stat_target(
-    file: &tokio::fs::File,
-    path: &Path,
-) -> Result<std::fs::Metadata, CheckFailure> {
-    file.metadata().await.map_err(|e| read_fault(path, &e))
-}
-
-/// Map a check-side I/O error to the fault variant, naming the target.
-///
-/// Every I/O failure in the check's open-stat-read sequence funnels through
-/// this one mapper, so fault messages keep a consistent shape and always
-/// say which path was being verified when the check gave up.
-fn read_fault(path: &Path, err: &std::io::Error) -> CheckFailure {
-    CheckFailure::Fault(ToolError::Execution(format!(
-        "conflict check for {}: {err}",
-        path.display()
-    )))
 }
 
 #[cfg(test)]
@@ -386,12 +359,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_check_classifies_a_directory_target_as_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            matches!(
+                check_content_unchanged("A", tmp.path()).await,
+                Err(CheckFailure::Changed)
+            ),
+            "a directory cannot be the file a baseline describes"
+        );
+    }
+
+    #[tokio::test]
     async fn content_check_maps_a_genuine_io_fault_to_a_fault() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            check_content_unchanged("A", tmp.path()).await,
-            Err(CheckFailure::Fault(ToolError::Execution(_)))
-        ));
+        let file = temp_file(tmp.path(), "a.txt", "A");
+        let under_file = file.join("child");
+        assert!(
+            matches!(
+                check_content_unchanged("A", &under_file).await,
+                Err(CheckFailure::Fault(ToolError::Execution(_)))
+            ),
+            "a path under a regular file is a stat fault, not a classification"
+        );
     }
 
     #[tokio::test]
@@ -455,5 +445,56 @@ mod tests {
         assert!(message.contains("src/a.rs"), "{message}");
         assert!(message.contains("changed"), "{message}");
         assert!(message.contains("Read"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_regular_baselined_target_reports_changed_without_hanging() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        let spelled = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `spelled` names a fresh path in a temp dir this test owns; mkfifo writes no memory.
+        let created = unsafe { libc::mkfifo(spelled.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo must succeed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let baseline = content_hash(b"baseline");
+        let verdict = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            check_content_hash_unchanged(baseline, &fifo),
+        )
+        .await
+        .expect("the gated check resolves instead of parking on the fifo");
+        assert!(
+            matches!(verdict, Err(CheckFailure::Changed)),
+            "a non-regular target cannot verify its baseline: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_target_reports_changed_without_verifying() {
+        let cap = crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.log");
+        let oversized = vec![b'x'; usize::try_from(cap).unwrap() + 1];
+        std::fs::write(&path, &oversized).unwrap();
+        let baseline = content_hash(&oversized);
+
+        assert!(
+            matches!(
+                check_content_hash_unchanged(baseline, &path).await,
+                Err(CheckFailure::Changed)
+            ),
+            "a target over the family cap never verifies as unchanged: the baselines \
+             that reach this check were recorded under the read tool's own cap, \
+             so an over-cap target has grown since"
+        );
     }
 }

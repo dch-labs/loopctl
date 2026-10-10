@@ -4501,3 +4501,104 @@ mod memory_injection {
         );
     }
 }
+
+/// The retention-classification trap's compaction-level proof: the
+/// same shell-heavy history compacts when its receipts stamp
+/// [`Requery`](loopctl::tool::Retention::Requery) and cannot compact
+/// when they stamp
+/// [`Durable`](loopctl::tool::Retention::Durable).
+///
+/// Each fixture mints one workhorse-shaped exchange per turn — the
+/// `cd /repo && grep -n needle file` compound whose classification
+/// decided the live session's fate — with a fat receipt. The Requery
+/// set evicts freely, so the truncating terminal lands under the
+/// target; the Durable set pins every receipt verbatim past any
+/// landing target, and the pass no-changes. Volume, tools, and
+/// history shape are identical between the arms — the stamp is the
+/// only variable.
+mod retention_compaction {
+    use loopctl::compact::ContextManager;
+    use loopctl::compact::EnsureContextResult;
+    use loopctl::compact::truncating::TruncatingCompactor;
+    use loopctl::message::{Message, MessagePart, Role, ToolContent};
+    use loopctl::tool::Retention;
+    use std::sync::Arc;
+
+    /// The receipt body one exchange carries — sized so forty pinned
+    /// receipts dwarf any landing target the way the live session's
+    /// shell output did, while the evictable set sheds to the floor.
+    const RECEIPT_LINE: &str = "src/main.rs:12:let value = compute(input);\n";
+
+    /// A history of `turns` compound-command exchanges whose receipts
+    /// carry `retention`.
+    #[allow(clippy::needless_pass_by_value)]
+    fn shell_history(turns: usize, retention: Retention) -> Vec<Message> {
+        let receipt = RECEIPT_LINE.repeat(50);
+        let mut messages = vec![Message::user("review the repo")];
+        for turn in 0..turns {
+            messages.push(Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    format!("c{turn}"),
+                    "Bash",
+                    serde_json::json!({"command": format!("cd /repo && grep -n needle file{turn}.rs")}),
+                )],
+            ));
+            messages.push(Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result(
+                        format!("c{turn}"),
+                        "Bash",
+                        ToolContent::Text(receipt.clone()),
+                        false,
+                    )
+                    .with_retention(retention),
+                ],
+            ));
+        }
+        messages
+    }
+
+    /// A truncating manager whose window the forty-exchange fixture
+    /// overruns at the threshold.
+    fn manager() -> ContextManager {
+        ContextManager::new(Arc::new(TruncatingCompactor::default()))
+            .with_context_window(30_000)
+            .with_threshold(70)
+    }
+
+    #[tokio::test]
+    async fn requery_receipts_compact_and_durable_receipts_cannot() {
+        let requery = shell_history(40, Retention::Requery);
+        let durable = shell_history(40, Retention::Durable);
+
+        let landed = manager()
+            .ensure_context_fits(requery, 3)
+            .await
+            .expect("the requery pass resolves");
+        match landed {
+            EnsureContextResult::Compacted(outcome) => {
+                assert!(
+                    outcome.tokens_after < 20_000,
+                    "the landing sheds the receipts ({} tokens)",
+                    outcome.tokens_after
+                );
+            }
+            other => panic!("the requery-stamped history lands: {other:?}"),
+        }
+
+        let pinned = manager()
+            .ensure_context_fits(durable, 3)
+            .await
+            .expect("the durable pass resolves");
+        match pinned {
+            EnsureContextResult::NoAction(_) => {}
+            EnsureContextResult::Compacted(outcome) => panic!(
+                "the identical volume pinned durable cannot shrink: landed at {} tokens",
+                outcome.tokens_after
+            ),
+            _ => panic!("no third shape exists"),
+        }
+    }
+}

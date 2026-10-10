@@ -162,22 +162,22 @@ e2e-ollama:
 	LOOPCTL_E2E=1 cargo test --features ollama --test structured_output -- --nocapture
 
 derive-consumer:
-	RUSTFLAGS="-D warnings" cargo build --manifest-path derive/tests/consumer/Cargo.toml --quiet
+	RUSTFLAGS="-D warnings" cargo build --manifest-path crates/derive/tests/consumer/Cargo.toml --quiet
 
 vector-check:
-	cargo fmt --all --check --manifest-path vector/Cargo.toml
-	cargo clippy --manifest-path vector/Cargo.toml --all-targets -- -D warnings
-	cargo clippy --manifest-path vector/Cargo.toml --no-default-features --all-targets -- -D warnings
-	cargo clippy --manifest-path vector/Cargo.toml --no-default-features --features qdrant --all-targets -- -D warnings
-	cargo clippy --manifest-path vector/Cargo.toml --no-default-features --features pgvector --all-targets -- -D warnings
-	cargo clippy --manifest-path vector/Cargo.toml --all-targets --all-features -- -D warnings
-	cargo check --manifest-path vector/Cargo.toml --all-features
-	RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path vector/Cargo.toml --no-deps --all-features
-	cargo test --manifest-path vector/Cargo.toml --lib --all-features
-	cargo test --manifest-path vector/Cargo.toml --doc --all-features
+	cargo fmt --all --check --manifest-path crates/vector/Cargo.toml
+	cargo clippy --manifest-path crates/vector/Cargo.toml --all-targets -- -D warnings
+	cargo clippy --manifest-path crates/vector/Cargo.toml --no-default-features --all-targets -- -D warnings
+	cargo clippy --manifest-path crates/vector/Cargo.toml --no-default-features --features qdrant --all-targets -- -D warnings
+	cargo clippy --manifest-path crates/vector/Cargo.toml --no-default-features --features pgvector --all-targets -- -D warnings
+	cargo clippy --manifest-path crates/vector/Cargo.toml --all-targets --all-features -- -D warnings
+	cargo check --manifest-path crates/vector/Cargo.toml --all-features
+	RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path crates/vector/Cargo.toml --no-deps --all-features
+	cargo test --manifest-path crates/vector/Cargo.toml --lib --all-features
+	cargo test --manifest-path crates/vector/Cargo.toml --doc --all-features
 
 vector-e2e:
-	LOOPCTL_VECTOR_E2E=1 cargo test --manifest-path vector/Cargo.toml --features qdrant,pgvector,testing --test qdrant --test pgvector
+	LOOPCTL_VECTOR_E2E=1 cargo test --manifest-path crates/vector/Cargo.toml --features qdrant,pgvector,testing --test qdrant --test pgvector
 
 client-check:
 	cargo fmt -p loopctl-client -- --check

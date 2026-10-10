@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use serde_json::json;
-use tokio::io::AsyncReadExt;
 
 use crate::tool::DisplayHint;
 use crate::tool::Retention;
@@ -50,6 +49,8 @@ use super::diff::format_file_change;
 use super::edit::FindResult;
 use super::edit::locate_unique;
 use super::edit::splice;
+use super::existing;
+use super::existing::ExistingText;
 use super::require_session;
 use super::resolve;
 use super::resolve::ResolvePolicy;
@@ -563,9 +564,11 @@ fn build_operations(
 ///
 /// # Errors
 ///
-/// Returns `ToolError::FileNotFound` when a target does not exist,
-/// `ToolError::Execution` on any other read fault (including
-/// non-UTF-8), and when a contained handle check fails.
+/// Returns `ToolError::FileNotFound` when a target does not exist and
+/// `ToolError::Execution` when a target's content is not valid UTF-8,
+/// the target is not a regular file (a directory included), its size
+/// exceeds the family read cap, a contained handle check fails, or any
+/// other read fault occurs.
 async fn read_files(
     operations: &[EditOperation],
     session: &FileSession,
@@ -577,23 +580,35 @@ async fn read_files(
         if originals.contains_key(&op.file_path) {
             continue;
         }
-        if !tokio::fs::try_exists(&op.full_path)
-            .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?
+        match existing::read_existing_text(&op.full_path, workspace, policy, Some(session.anchor()))
+            .await?
         {
-            return Err(ToolError::FileNotFound(op.file_path.clone()));
+            ExistingText::Text(content) => {
+                originals.insert(op.file_path.clone(), content);
+            }
+            ExistingText::NotUtf8 => {
+                return Err(ToolError::Execution(format!(
+                    "{} is not valid UTF-8",
+                    op.file_path
+                )));
+            }
+            ExistingText::Absent => {
+                return Err(ToolError::FileNotFound(op.file_path.clone()));
+            }
+            ExistingText::TooLarge => {
+                return Err(ToolError::Execution(format!(
+                    "{} exceeds the {}-byte size guard for reading existing content",
+                    op.file_path,
+                    existing::MAX_EXISTING_READ_BYTES
+                )));
+            }
+            ExistingText::NonRegular | ExistingText::Directory => {
+                return Err(ToolError::Execution(format!(
+                    "{} is not a regular file; refusing to read it for editing",
+                    op.file_path
+                )));
+            }
         }
-        let mut file = tokio::fs::File::open(&op.full_path)
-            .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
-        if policy == ResolvePolicy::Contained {
-            resolve::verify_handle_inside(&file, &op.full_path, workspace, Some(session.anchor()))?;
-        }
-        let mut content = String::new();
-        file.read_to_string(&mut content)
-            .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
-        originals.insert(op.file_path.clone(), content);
     }
     Ok(originals)
 }
@@ -1731,5 +1746,44 @@ mod tests {
             out.retention, None,
             "nothing was written — a read-only-shaped failure stays evictable"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_multiedit_target_refuses_without_hanging() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("pipe");
+        let spelled = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `spelled` names a fresh path in a temp dir this test owns; mkfifo writes no memory.
+        let created = unsafe { libc::mkfifo(spelled.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo must succeed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            MultiEditTool::new().call(
+                json!({"edits": [
+                    {"file_path": "pipe", "old_text": "a", "new_text": "b"}
+                ]}),
+                &ctx_in(tmp.path().to_str().unwrap()),
+            ),
+        )
+        .await
+        .expect("the gated read resolves instead of parking on the fifo")
+        .unwrap_err();
+        match err {
+            ToolError::Execution(message) => assert!(
+                message.contains("pipe is not a regular file"),
+                "the refusal names the target and its kind: {message}"
+            ),
+            other => panic!("expected a refusal naming the fifo, got {other:?}"),
+        }
     }
 }

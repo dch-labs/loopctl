@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
 
 use crate::tool::DisplayHint;
 use crate::tool::Retention;
@@ -26,6 +25,7 @@ use super::conflict;
 use super::conflict::CheckFailure;
 use super::diff::OldContent;
 use super::diff::format_file_change;
+use super::existing;
 use super::require_session;
 use super::resolve;
 use super::resolve::ResolvePolicy;
@@ -164,11 +164,11 @@ impl Tool for WriteTool {
 ///
 /// Returns [`ToolError`] for a missing `FileSession`, a missing
 /// `file_path`, a missing `content`, a URL `file_path` or a path
-/// escaping the working directory, an existing target that cannot be
-/// opened or read, a target whose only recorded baseline is
-/// resume-armed, a target that changed while the write was being
-/// prepared, or a file-system error during parent creation or the
-/// atomic write.
+/// escaping the working directory, an existing target that is a
+/// directory, an existing target that cannot be opened or read, a
+/// target whose only recorded baseline is resume-armed, a target that
+/// changed while the write was being prepared, or a file-system error
+/// during parent creation or the atomic write.
 async fn write_inner(
     tool: &WriteTool,
     input: Value,
@@ -204,28 +204,22 @@ async fn write_inner(
         }
     }
 
-    let mut old_buffer = String::new();
-    let old_content = match tokio::fs::File::open(&full_path).await {
-        Ok(mut file) => {
-            if policy == ResolvePolicy::Contained {
-                resolve::verify_handle_inside(&file, &full_path, &cwd, Some(session.anchor()))?;
-            }
-            match file.read_to_string(&mut old_buffer).await {
-                Ok(_) => OldContent::Text(&old_buffer),
-                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => OldContent::NotUtf8,
-                Err(err) => {
-                    return Err(ToolError::Execution(format!(
-                        "cannot read existing file {}: {err}",
-                        full_path.display()
-                    )));
-                }
-            }
+    let old_buffer;
+    let loaded =
+        existing::read_existing_text(&full_path, &cwd, policy, Some(session.anchor())).await?;
+    let old_content = match loaded {
+        existing::ExistingText::Text(text) => {
+            old_buffer = text;
+            OldContent::Text(&old_buffer)
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => OldContent::Absent,
-        Err(err) => {
+        existing::ExistingText::NotUtf8 => OldContent::NotUtf8,
+        existing::ExistingText::Absent => OldContent::Absent,
+        existing::ExistingText::TooLarge | existing::ExistingText::NonRegular => {
+            OldContent::Unreadable
+        }
+        existing::ExistingText::Directory => {
             return Err(ToolError::Execution(format!(
-                "cannot open existing target {}: {err}",
-                full_path.display()
+                "{file_path} is a directory; refusing to write"
             )));
         }
     };
@@ -700,8 +694,8 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, ToolError::Execution(msg)
-                if msg.starts_with("cannot read existing file") && msg.contains("blocked.d")),
-            "a read fault must refuse the write naming the file: {err}"
+                if msg.contains("blocked.d is a directory")),
+            "a directory target refuses the write naming the file: {err}"
         );
         let entries: Vec<_> = std::fs::read_dir(tmp.path().join("blocked.d"))
             .unwrap()
@@ -811,6 +805,103 @@ mod tests {
             out.retention,
             Some(crate::tool::Retention::Durable),
             "a write receipt is a side-effect record — it must survive compaction verbatim"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_write_target_is_replaced_without_hanging() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("pipe");
+        let spelled = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `spelled` names a fresh path in a temp dir this test owns; mkfifo writes no memory.
+        let created = unsafe { libc::mkfifo(spelled.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo must succeed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            WriteTool::new().call(
+                json!({"file_path": "pipe", "content": "replacement"}),
+                &ctx_in(tmp.path().to_str().unwrap()),
+            ),
+        )
+        .await
+        .expect("the gated pre-read resolves instead of parking on the fifo")
+        .unwrap();
+        assert!(
+            out.text_content().contains("Changed:"),
+            "the replacement reports as a change: {}",
+            out.text_content()
+        );
+        assert!(
+            fifo.is_file(),
+            "the atomic write replaced the fifo with a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fifo).unwrap(),
+            "replacement",
+            "the written bytes are the tool's content"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_target_writes_with_the_unreadable_header_and_no_diff() {
+        let cap = crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("big.log");
+        let oversized = vec![b'x'; usize::try_from(cap).unwrap() + 1];
+        std::fs::write(&target, oversized).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            WriteTool::new().call(
+                json!({"file_path": "big.log", "content": "fresh start"}),
+                &ctx_in(cwd),
+            ),
+        )
+        .await
+        .expect("the capped pre-read resolves")
+        .unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("Changed: big.log") && text.contains("previous content not read"),
+            "the oversized target reports the unreadable header: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "fresh start",
+            "the write itself lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_at_cap_target_still_diffs_normally() {
+        let cap = crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("edge.log");
+        std::fs::write(&target, vec![b'x'; usize::try_from(cap).unwrap()]).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = WriteTool::new()
+            .call(
+                json!({"file_path": "edge.log", "content": "edge written"}),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("Changed: edge.log") && !text.contains("previous content not read"),
+            "a target at exactly the cap takes the ordinary diff path: {text}"
         );
     }
 }

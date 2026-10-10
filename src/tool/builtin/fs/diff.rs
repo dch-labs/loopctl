@@ -79,6 +79,17 @@ pub(crate) enum OldContent<'a> {
     /// body. The write itself is not a creation and must not be
     /// reported as one.
     NotUtf8,
+
+    /// The target existed, but its content was not read.
+    ///
+    /// The pre-read's guards classified the target without buffering
+    /// its bytes — the size exceeds the family read cap, or the
+    /// target is not a regular file — so nothing can be diffed
+    /// line-wise. The message renders the `Changed:` header labeled
+    /// as modified with the previous content not read, and no diff
+    /// body: the write replaced prior bytes it never buffered, which
+    /// is neither a creation nor a diffable modification.
+    Unreadable,
 }
 
 /// Format a file change for the tool's success message.
@@ -97,6 +108,10 @@ pub(crate) enum OldContent<'a> {
 ///   the `Changed:` header labeled `previous content not UTF-8` with no
 ///   diff body — there is no text to diff against, and an overwrite
 ///   must not be reported as a creation.
+/// - **Modified, unread content** ([`OldContent::Unreadable`]): prints
+///   the `Changed:` header labeled `previous content not read` with no
+///   diff body — the pre-read's guards classified the target without
+///   buffering its bytes, and the overwrite still is not a creation.
 ///
 /// The diff format is plain text (no ANSI color codes) so it renders cleanly
 /// in any consumer.
@@ -122,6 +137,9 @@ pub(crate) fn format_file_change(
         }
         OldContent::NotUtf8 => {
             format!("Changed: {file_path} (modified, previous content not UTF-8)\n")
+        }
+        OldContent::Unreadable => {
+            format!("Changed: {file_path} (modified, previous content not read)\n")
         }
         OldContent::Text(old) => {
             let old_lines: Vec<&str> = old.lines().collect();

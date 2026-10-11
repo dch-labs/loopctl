@@ -272,6 +272,75 @@ pub(crate) fn durable_pull_indices(messages: &[Message], split: usize) -> Vec<us
     indices
 }
 
+/// The durable pairs to pull verbatim, newest first, within a budget.
+///
+/// The unbounded [`durable_pull_indices`] exemption is honest only
+/// while the durable volume itself fits the landing: a session whose
+/// edit receipts alone exceed the target could never compact — every
+/// pass no-changed and the run limped on deferrals until the window
+/// closed. This variant walks the dropped region's durable pairs
+/// newest first, carries each pair's messages (result and call
+/// together, the pairing rule unchanged) while the budget allows,
+/// skips a pair too costly to fit, and leaves everything else for the
+/// summary stages to carry — a receipt the landing cannot hold is
+/// information the summary records, not a reason the run dies.
+pub(crate) fn durable_pull_indices_within_budget(
+    messages: &[Message],
+    split: usize,
+    budget: u64,
+    counter: &dyn crate::compact::TokenCounter,
+) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut remaining = budget;
+    let mut index = split;
+    while index > 0 {
+        index = index.saturating_sub(1);
+        let Some(message) = messages.get(index) else {
+            continue;
+        };
+        if !message.parts.iter().any(|part| {
+            matches!(
+                part,
+                MessagePart::ToolResult {
+                    retention: Some(Retention::Durable),
+                    ..
+                }
+            )
+        }) {
+            continue;
+        }
+        let mut pair = vec![index];
+        for part in &message.parts {
+            let MessagePart::ToolResult { call_id, .. } = part else {
+                continue;
+            };
+            let Some(mate) = messages.iter().position(|candidate| {
+                candidate.parts.iter().any(|candidate_part| {
+                    matches!(candidate_part, MessagePart::ToolCall { id, .. } if id == call_id)
+                })
+            }) else {
+                continue;
+            };
+            if mate < split && !pair.contains(&mate) {
+                pair.push(mate);
+            }
+        }
+        let cost = pair
+            .iter()
+            .filter_map(|&i| messages.get(i))
+            .map(|m| counter.count(std::slice::from_ref(m)))
+            .sum::<u64>();
+        if cost > remaining {
+            continue;
+        }
+        remaining = remaining.saturating_sub(cost);
+        indices.extend(pair);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// A simple compactor that keeps the first message and a recent tail,
 /// sized by the compaction target.
 ///
@@ -442,8 +511,23 @@ impl ContextCompactor for TruncatingCompactor {
                 preserved.push(first.clone());
             }
             preserved.extend(recent);
-            let (preserved, surviving) =
-                Self::reattach_dropped_results(&messages, &pairing, split, preserved);
+            // The durable pulls share the landing budget with the
+            // preserved tail: the newest receipts ride verbatim while
+            // the budget allows, and the rest sink with the slice —
+            // the summary stages above carry what the landing cannot.
+            let pull_budget = if effective_target == 0 {
+                u64::MAX
+            } else {
+                effective_target.saturating_sub(context.counter.count(&preserved))
+            };
+            let (preserved, surviving) = Self::reattach_dropped_results_within_budget(
+                &messages,
+                &pairing,
+                split,
+                preserved,
+                pull_budget,
+                context.counter.as_ref(),
+            );
 
             if preserved.is_empty() {
                 return Self::unchanged(&messages, &pairing, &context);
@@ -515,6 +599,9 @@ impl TruncatingCompactor {
         let first_tokens = messages.first().map_or(0, |first| {
             context.counter.count(std::slice::from_ref(first))
         });
+        let floor_tail_tokens = messages
+            .get(floor_split..)
+            .map_or(0, |tail| context.counter.count(tail));
         let mut last_seen = 0;
         for candidate in 2..=floor_split {
             let mut split = candidate;
@@ -530,12 +617,39 @@ impl TruncatingCompactor {
             }
             last_seen = split;
             let landing = first_tokens.saturating_add(Self::tail_and_pulled_tokens(
-                messages, pairing, split, context,
+                messages,
+                pairing,
+                split,
+                context,
+                target_tokens,
+                floor_tail_tokens,
             ));
             if landing > target_tokens {
                 continue;
             }
-            let kept = Self::assemble_kept(messages, pairing, split);
+            let mut kept = Self::assemble_kept(messages, pairing, split);
+            if context.counter.count(&kept) > target_tokens {
+                // The exact re-measure over the estimate means the
+                // unbounded pull set pushed past the target; rebuild
+                // the kept side through the budgeted assembly, which
+                // the landing will use, and measure that.
+                let budget = target_tokens
+                    .saturating_sub(
+                        messages
+                            .get(split..)
+                            .map_or(0, |tail| context.counter.count(tail)),
+                    )
+                    .saturating_sub(messages.first().map_or(0, |first| {
+                        context.counter.count(std::slice::from_ref(first))
+                    }));
+                kept = Self::assemble_kept_within_budget(
+                    messages,
+                    pairing,
+                    split,
+                    budget,
+                    context.counter.as_ref(),
+                );
+            }
             if context.counter.count(&kept) <= target_tokens {
                 return Some(split);
             }
@@ -549,6 +663,39 @@ impl TruncatingCompactor {
     /// undercount the single whole-slice count by a token per piece;
     /// before a candidate is accepted, the caller counts this assembled
     /// list once and holds the landing to that figure.
+    fn assemble_kept_within_budget(
+        messages: &[Message],
+        pairing: &ToolPairing,
+        split: usize,
+        budget: u64,
+        counter: &dyn crate::compact::TokenCounter,
+    ) -> Vec<Message> {
+        let mut kept: Vec<Message> =
+            Vec::with_capacity(messages.len().saturating_sub(split).saturating_add(2));
+        if let Some(first) = messages.first() {
+            kept.push(first.clone());
+        }
+        let mut pulled = pairing.first_message_dropped_result_indices(split);
+        for index in durable_pull_indices_within_budget(messages, split, budget, counter) {
+            if !pulled.contains(&index) {
+                pulled.push(index);
+            }
+        }
+        for index in pulled {
+            if let Some(message) = messages.get(index) {
+                kept.push(message.clone());
+            }
+        }
+        kept.extend(
+            messages
+                .get(split..)
+                .map_or([].as_slice(), |tail| tail)
+                .iter()
+                .cloned(),
+        );
+        kept
+    }
+
     fn assemble_kept(messages: &[Message], pairing: &ToolPairing, split: usize) -> Vec<Message> {
         let mut kept: Vec<Message> =
             Vec::with_capacity(messages.len().saturating_sub(split).saturating_add(2));
@@ -588,12 +735,34 @@ impl TruncatingCompactor {
         pairing: &ToolPairing,
         split: usize,
         context: &CompactionContext,
+        target_tokens: u64,
+        floor_tail_tokens: u64,
     ) -> u64 {
         let mut tokens = messages
             .get(split..)
             .map_or(0, |tail| context.counter.count(tail));
+        // The estimate mirrors the assembly: durable pulls share the
+        // target with the tail and the first message the landing
+        // always carries, so the pull budget here is whatever the
+        // target has left after both — the same newest-first walk the
+        // landing will perform.
+        // The pull budget is judged against the floor tail — the
+        // least the terminal ever keeps — so an early candidate
+        // cannot become acceptable by silently dropping durable
+        // receipts a later split would have carried alongside its
+        // smaller tail.
+        let pull_budget = target_tokens
+            .saturating_sub(floor_tail_tokens)
+            .saturating_sub(messages.first().map_or(0, |first| {
+                context.counter.count(std::slice::from_ref(first))
+            }));
         let mut pulled: Vec<usize> = pairing.first_message_dropped_result_indices(split);
-        for index in durable_pull_indices(messages, split) {
+        for index in durable_pull_indices_within_budget(
+            messages,
+            split,
+            pull_budget,
+            context.counter.as_ref(),
+        ) {
             if !pulled.contains(&index) {
                 pulled.push(index);
             }
@@ -657,21 +826,36 @@ impl TruncatingCompactor {
     /// indices that survived in it — the complement over `0..split`
     /// region boundaries is what [`evicted_complement`](Self::evicted_complement)
     /// turns into the outcome's evicted list.
-    fn reattach_dropped_results(
+    fn reattach_dropped_results_within_budget(
         messages: &[Message],
         pairing: &ToolPairing,
         split: usize,
         kept: Vec<Message>,
+        budget: u64,
+        counter: &dyn crate::compact::TokenCounter,
     ) -> (Vec<Message>, Vec<usize>) {
         let mut pull_indices = pairing.first_message_dropped_result_indices(split);
-        for index in durable_pull_indices(messages, split) {
+        for index in durable_pull_indices_within_budget(messages, split, budget, counter) {
             if !pull_indices.contains(&index) {
                 pull_indices.push(index);
             }
         }
         pull_indices.sort_unstable();
         pull_indices.dedup();
+        Self::assemble_pulled(messages, pairing, split, kept, &pull_indices)
+    }
 
+    /// Merge the pulled messages with the kept side and sanitize.
+    ///
+    /// The shared tail of both reattach variants: insertion order and
+    /// origin bookkeeping live here once.
+    fn assemble_pulled(
+        messages: &[Message],
+        pairing: &ToolPairing,
+        split: usize,
+        kept: Vec<Message>,
+        pull_indices: &[usize],
+    ) -> (Vec<Message>, Vec<usize>) {
         let pulled: Vec<Message> = pull_indices
             .iter()
             .filter_map(|&i| messages.get(i).cloned())
@@ -679,7 +863,7 @@ impl TruncatingCompactor {
         let mut kept_iter = kept.into_iter();
         let Some(first) = kept_iter.next() else {
             let mut out = pulled;
-            let surviving = Self::sanitize_tool_parts(&mut out, &pull_indices, pairing, 0);
+            let surviving = Self::sanitize_tool_parts(&mut out, pull_indices, pairing, 0);
             return (out, surviving);
         };
         let pulled_len = pulled.len();

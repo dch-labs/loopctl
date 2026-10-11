@@ -932,8 +932,12 @@ impl StructuredSummarizer {
         let mut split = self
             .splitter()
             .split_within_budget(messages, tail_budget, counter);
-        let mut durable =
-            crate::compact::truncating::durable_pull_indices(messages, split.split_index);
+        let mut durable = crate::compact::truncating::durable_pull_indices_within_budget(
+            messages,
+            split.split_index,
+            tail_budget,
+            counter,
+        );
         loop {
             let pulled_tokens: u64 = durable
                 .iter()
@@ -948,8 +952,12 @@ impl StructuredSummarizer {
             let next_split = self
                 .splitter()
                 .split_within_budget(messages, tail_budget, counter);
-            let next_durable =
-                crate::compact::truncating::durable_pull_indices(messages, next_split.split_index);
+            let next_durable = crate::compact::truncating::durable_pull_indices_within_budget(
+                messages,
+                next_split.split_index,
+                tail_budget,
+                counter,
+            );
             if next_split.split_index == split.split_index && next_durable == durable {
                 return (split, durable);
             }
@@ -1500,8 +1508,10 @@ fn numbered_bullet(line: &str) -> Option<&str> {
 /// below the smallest form the template can render — its own header
 /// and the `[trimmed]` marker — so no cut can close the gap, or the
 /// cut retained no substantive response content (a single over-long
-/// line whose whole text one cut removes leaves only the marker); the
-/// caller then fails the pass instead of committing a summary that
+/// line whose whole text one cut removes leaves only the marker; a
+/// cut that strips every entry beneath a heading leaves only heading
+/// lines, which name sections but preserve none of what they held);
+/// the caller then fails the pass instead of committing a summary that
 /// preserves nothing of what it evicts.
 fn trim_summary_to_budget(text: &str, budget: u64, template: &SummaryTemplate) -> Option<String> {
     let mut current = text.to_string();
@@ -1535,11 +1545,18 @@ fn trim_summary_to_budget(text: &str, budget: u64, template: &SummaryTemplate) -
 /// leaves nothing but the `[trimmed]` marker line and whitespace; a
 /// summary committed in that shape preserves nothing of the messages
 /// it evicts, so [`trim_summary_to_budget`] refuses it and the pass
-/// fails instead. Any non-whitespace text beside the marker means the
-/// trim kept real content.
+/// fails instead. Heading lines do not count as retained content
+/// either: a heading names a section but carries no record of the
+/// entries the cut removed beneath it, so a trim left holding only
+/// headings (with or without the marker) is refused the same way —
+/// at least one non-empty, non-heading line must survive for the
+/// trim to have kept real content.
 fn retains_substantive_content(trimmed: &str) -> bool {
     let without_marker = trimmed.strip_suffix("[trimmed]").unwrap_or(trimmed);
-    !without_marker.trim().is_empty()
+    without_marker.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#')
+    })
 }
 
 fn estimate_text_tokens(text: &str) -> u64 {
@@ -1557,7 +1574,9 @@ mod tests {
     use crate::compact::types::CompactReason;
     use crate::compact::{ContextManager, EnsureContextResult};
     use crate::error::recover_guard;
+    use crate::message::MessagePart;
     use crate::message::Role;
+    use crate::message::ToolContent;
     use crate::stream::{StreamEvent, StreamStopReason};
     use futures::Stream;
     use std::collections::VecDeque;
@@ -2751,6 +2770,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_edit_marathon_lands_under_the_durable_pull_budget() {
+        // The live failure shape: a history whose Edit receipts alone —
+        // legitimately Durable, every one — dwarf the landing target.
+        // The unbounded pull exempted them all and the pass could
+        // never shrink; the budgeted pull carries the newest receipts
+        // verbatim within the target and the rest ride the summary.
+        let receipt = "src/lib.rs:40:- let old = previous();\n".repeat(40);
+        let mut messages = vec![Message::user("apply the edits")];
+        for turn in 0..60u32 {
+            let call_id = format!("e{turn}");
+            messages.push(Message::new(
+                crate::message::Role::Assistant,
+                vec![MessagePart::tool_call(
+                    call_id.clone(),
+                    "Edit",
+                    serde_json::json!({"file_path": format!("src{turn}.rs")}),
+                )],
+            ));
+            messages.push(Message::new(
+                crate::message::Role::User,
+                vec![
+                    MessagePart::tool_result(
+                        call_id,
+                        "Edit",
+                        ToolContent::Text(receipt.clone()),
+                        false,
+                    )
+                    .with_retention(crate::tool::Retention::Durable),
+                ],
+            ));
+        }
+        let (client, summarizer) =
+            scripted(vec![ok("### Key facts\n- edits applied and verified")]);
+        let outcome = summarizer
+            .compact(messages.clone(), 4_000, context_for(&messages))
+            .await;
+        assert!(
+            outcome.success,
+            "the edit marathon lands: {:?}",
+            outcome.error
+        );
+        assert!(
+            outcome.tokens_after < 4_000,
+            "the landing fits the target ({} tokens)",
+            outcome.tokens_after
+        );
+        let newest_rides = outcome
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .any(|part| {
+                matches!(part,
+                    crate::message::MessagePart::ToolResult { call_id, .. }
+                        if call_id == "e59" || call_id == "e58")
+            });
+        assert!(
+            newest_rides,
+            "the newest receipts ride verbatim within the budget"
+        );
+        assert_eq!(
+            client.calls().len(),
+            1,
+            "one summarize call carries the marathon"
+        );
+    }
+
+    #[tokio::test]
     async fn an_over_budget_retry_trims_to_the_budget_and_lands() {
         // A summary past its budget on the retry is trimmed and
         // committed rather than failing the pass: a slightly lossy
@@ -2908,6 +2994,57 @@ mod tests {
             client.calls().len(),
             2,
             "the contentless trim costs no third call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trim_that_retains_only_a_heading_fails_the_pass() {
+        let prose = "No headings.";
+        let template = StructuredSummaryConfig::default().template;
+        let heading_only = "### Key facts\n[trimmed]";
+        let heading_floor = estimate_text_tokens(&render(
+            &raw_text_summary(heading_only.to_string(), &template),
+            &template,
+        ));
+        let long_bullet = format!("- {}\n", "finding ".repeat(160));
+        let retry_shape = format!("### Key facts\n{long_bullet}");
+        let at_retry = estimate_text_tokens(&render(
+            &raw_text_summary(retry_shape.clone(), &template),
+            &template,
+        ));
+        let budget = heading_floor.saturating_add(at_retry) / 2;
+        assert!(
+            budget > heading_floor && budget < at_retry,
+            "the budget ({budget}) sits between the heading-only floor ({heading_floor}) and the retry's own estimate ({at_retry}) — the regime where the cut fits yet strips every entry"
+        );
+        let (client, summarizer) = scripted_with(
+            vec![ok(prose), ok(retry_shape.trim())],
+            StructuredSummaryConfig::default().with_max_summary_tokens(budget),
+        );
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            !outcome.success,
+            "a trim left with only a heading fails the pass — a heading names a section, it preserves no entry of what the cut removed: {:?}",
+            outcome.error
+        );
+        let error = outcome.error.expect("the failure carries a reason");
+        assert!(
+            error.contains(&format!("{budget}-token budget")),
+            "the error names the budget figure: {error}"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            messages.len(),
+            "the original messages return intact"
+        );
+        assert_eq!(outcome.evicted.len(), 0, "nothing is demoted");
+        assert_eq!(
+            client.calls().len(),
+            2,
+            "the heading-only trim costs no third call"
         );
     }
 

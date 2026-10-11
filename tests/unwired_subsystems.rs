@@ -4569,36 +4569,127 @@ mod retention_compaction {
     }
 
     #[tokio::test]
-    async fn requery_receipts_compact_and_durable_receipts_cannot() {
+    async fn both_stamps_land_and_the_stamp_decides_what_rides_verbatim() {
         let requery = shell_history(40, Retention::Requery);
         let durable = shell_history(40, Retention::Durable);
 
+        // Both arms land: no retention class may make compaction
+        // impossible — the property whose absence killed the live
+        // sessions. The stamp decides the landing's shape: requery
+        // receipts evict wholesale, durable receipts ride verbatim
+        // newest-first within the budget.
         let landed = manager()
             .ensure_context_fits(requery, 3)
             .await
             .expect("the requery pass resolves");
-        match landed {
-            EnsureContextResult::Compacted(outcome) => {
-                assert!(
-                    outcome.tokens_after < 20_000,
-                    "the landing sheds the receipts ({} tokens)",
-                    outcome.tokens_after
-                );
-            }
+        let requery_outcome = match landed {
+            EnsureContextResult::Compacted(outcome) => outcome,
             other => panic!("the requery-stamped history lands: {other:?}"),
-        }
+        };
+        assert!(
+            requery_outcome.tokens_after < 5_000,
+            "requery receipts evict wholesale — the landing holds the floor, not the \
+             payload ({} tokens)",
+            requery_outcome.tokens_after
+        );
 
         let pinned = manager()
             .ensure_context_fits(durable, 3)
             .await
             .expect("the durable pass resolves");
-        match pinned {
-            EnsureContextResult::NoAction(_) => {}
-            EnsureContextResult::Compacted(outcome) => panic!(
-                "the identical volume pinned durable cannot shrink: landed at {} tokens",
-                outcome.tokens_after
-            ),
-            _ => panic!("no third shape exists"),
+        let durable_outcome = match pinned {
+            EnsureContextResult::Compacted(outcome) => outcome,
+            other => panic!("the durable-stamped history lands: {other:?}"),
+        };
+        assert!(
+            durable_outcome.tokens_after >= requery_outcome.tokens_after,
+            "the durable landing carries its verbatim budget of newest receipts beside \
+             the floor ({} vs {})",
+            durable_outcome.tokens_after,
+            requery_outcome.tokens_after
+        );
+    }
+}
+
+/// The durable-pull budget's compaction proof: an edit-heavy history
+/// whose durable receipts alone dwarf the landing target still
+/// compacts — the newest receipts ride verbatim within the budget,
+/// the rest sink with the slice, and the landing fits.
+mod durable_budget {
+    use loopctl::compact::ContextManager;
+    use loopctl::compact::EnsureContextResult;
+    use loopctl::compact::truncating::TruncatingCompactor;
+    use loopctl::message::{Message, MessagePart, Role, ToolContent};
+    use loopctl::tool::Retention;
+    use std::sync::Arc;
+
+    /// One edit receipt's body — sized so a dozen receipts exceed any
+    /// small landing target the way a real edit marathon does.
+    const RECEIPT_LINE: &str = "src/lib.rs:40:- let old = previous();\n";
+
+    /// `turns` edit exchanges whose receipts are Durable.
+    fn edit_history(turns: usize) -> Vec<Message> {
+        let receipt = RECEIPT_LINE.repeat(40);
+        let mut messages = vec![Message::user("apply the edits")];
+        for turn in 0..turns {
+            messages.push(Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    format!("e{turn}"),
+                    "Edit",
+                    serde_json::json!({"file_path": format!("src{turn}.rs")}),
+                )],
+            ));
+            messages.push(Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result(
+                        format!("e{turn}"),
+                        "Edit",
+                        ToolContent::Text(receipt.clone()),
+                        false,
+                    )
+                    .with_retention(Retention::Durable),
+                ],
+            ));
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn an_edit_marathon_compacts_under_a_durable_budget() {
+        let history = edit_history(60);
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::default()))
+            .with_context_window(30_000)
+            .with_threshold(70);
+        let result = manager
+            .ensure_context_fits(history, 3)
+            .await
+            .expect("the pass resolves");
+        match result {
+            EnsureContextResult::Compacted(outcome) => {
+                assert!(
+                    outcome.tokens_after < 10_000,
+                    "the bounded pull lands the marathon ({} tokens)",
+                    outcome.tokens_after
+                );
+                let carried: Vec<bool> = outcome
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.parts)
+                    .filter_map(|part| match part {
+                        MessagePart::ToolResult { call_id, .. } => {
+                            Some(call_id.ends_with("59") || call_id.ends_with("58"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    carried.iter().any(|kept| *kept),
+                    "the newest receipts ride verbatim within the budget"
+                );
+            }
+            other => panic!("the edit marathon lands: {other:?}"),
         }
     }
 }

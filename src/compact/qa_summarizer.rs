@@ -622,8 +622,12 @@ impl QaSummarizer {
         let mut split = self
             .splitter()
             .split_within_budget(messages, tail_budget, counter);
-        let mut durable =
-            crate::compact::truncating::durable_pull_indices(messages, split.split_index);
+        let mut durable = crate::compact::truncating::durable_pull_indices_within_budget(
+            messages,
+            split.split_index,
+            tail_budget,
+            counter,
+        );
         loop {
             let pulled_tokens: u64 = durable
                 .iter()
@@ -638,8 +642,12 @@ impl QaSummarizer {
             let next_split = self
                 .splitter()
                 .split_within_budget(messages, tail_budget, counter);
-            let next_durable =
-                crate::compact::truncating::durable_pull_indices(messages, next_split.split_index);
+            let next_durable = crate::compact::truncating::durable_pull_indices_within_budget(
+                messages,
+                next_split.split_index,
+                tail_budget,
+                counter,
+            );
             if next_split.split_index == split.split_index && next_durable == durable {
                 return (split, durable);
             }

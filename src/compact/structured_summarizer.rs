@@ -16,7 +16,9 @@
 //! earns exactly one rescue retry with a tighter prompt and fails the pass
 //! only if the retry stays blank; a response over the configured token
 //! budget fails the pass when the first call delivers it and is trimmed to
-//! the budget and committed when the retry delivers it. Provider errors
+//! the budget and committed when the retry delivers it and the trimmed
+//! form fits — a budget below the smallest form the template renders
+//! fails the pass instead. Provider errors
 //! fail the pass with the original messages intact, the seam a fallback
 //! chain catches.
 //!
@@ -804,7 +806,9 @@ impl Default for StructuredSummaryConfig {
 /// its raw text as the summary body rather than
 /// failing. A blank response earns one rescue retry (a second blank fails
 /// the pass), and an over-budget response fails on the first call or is
-/// trimmed to the budget and committed on the retry — the original
+/// trimmed to the budget and committed on the retry when the trimmed form
+/// fits — a budget below the smallest form the template renders fails
+/// the pass — the original
 /// messages stay intact on every failure, the seam a fallback chain
 /// catches. The compactor is stateless: no summary accumulates across
 /// passes, each pass summarizes the current transcript through the
@@ -873,13 +877,15 @@ enum SummarizeOutcome {
     /// instead.
     Blank,
 
-    /// The first call's token estimate exceeded the pass budget.
+    /// The first call's token estimate exceeded the pass budget, or a
+    /// retry's trim could not fit it.
     ///
     /// The ceiling is enforced, not merely instructed; a model that ignores
     /// the prompt's budget line fails the pass instead of shipping through.
     /// An over-budget response arriving on the retry is trimmed to the
-    /// rendered budget and committed instead — this variant reports only
-    /// the first-call failure.
+    /// rendered budget and committed when the trimmed form fits; a budget
+    /// below the smallest form the template can render leaves no cut that
+    /// closes the gap, and this failure reports that too.
     OverBudget {
         /// The budget the estimate exceeded, for the error message.
         ///
@@ -1004,9 +1010,10 @@ impl StructuredSummarizer {
     /// output budget thinking and hand back content-free text — and a
     /// second blank fails the pass; an over-budget response fails the
     /// pass when the first call delivers it and, on the retry, is
-    /// trimmed to the rendered budget and committed rather than
-    /// failing (the chain's landing check still guards the final
-    /// figure). Host-configured summary instructions and hook
+    /// trimmed to the rendered budget and committed when the trimmed
+    /// form fits — a budget below the smallest form the template
+    /// renders fails the pass — (the chain's landing check still
+    /// guards the final figure). Host-configured summary instructions and hook
     /// contributions from the [`CompactionContext`] ride along after the
     /// transcript — the config channel first, the per-pass hook channel
     /// beneath it — so both the first call and the retry see them.
@@ -1059,8 +1066,10 @@ impl StructuredSummarizer {
                 continue;
             }
             if estimate_text_tokens(&text) > budget {
-                if retry {
-                    let trimmed = trim_summary_to_budget(&text, budget, &self.config.template);
+                if retry
+                    && let Some(trimmed) =
+                        trim_summary_to_budget(&text, budget, &self.config.template)
+                {
                     return SummarizeOutcome::Parsed {
                         summary: raw_text_summary(trimmed, &self.config.template),
                         retried: true,
@@ -1484,14 +1493,18 @@ fn numbered_bullet(line: &str) -> Option<&str> {
 /// the first cut removes the bulk, the later ones the marker lines
 /// the cut itself adds. Every cut lands on a line boundary and is
 /// marked, so a reader can tell a trimmed summary from a whole one.
-fn trim_summary_to_budget(text: &str, budget: u64, template: &SummaryTemplate) -> String {
+/// Returns `None` when the budget sits below the smallest form the
+/// template can render — its own header and the `[trimmed]` marker —
+/// because no cut can close a gap that floor cannot; the caller then
+/// fails the pass instead of committing an over-budget summary.
+fn trim_summary_to_budget(text: &str, budget: u64, template: &SummaryTemplate) -> Option<String> {
     let mut current = text.to_string();
     for _ in 0..3 {
         let summary = raw_text_summary(current.clone(), template);
         let rendered = render(&summary, template);
         let measured = estimate_text_tokens(&rendered);
         if measured <= budget {
-            return current;
+            return Some(current);
         }
         let excess_tokens = measured.saturating_sub(budget);
         let excess_chars = usize::try_from(excess_tokens.saturating_mul(6))
@@ -1504,7 +1517,9 @@ fn trim_summary_to_budget(text: &str, budget: u64, template: &SummaryTemplate) -
             _ => format!("{prefix}\n[trimmed]"),
         };
     }
-    current
+    let summary = raw_text_summary(current.clone(), template);
+    let rendered = render(&summary, template);
+    (estimate_text_tokens(&rendered) <= budget).then_some(current)
 }
 
 fn estimate_text_tokens(text: &str) -> u64 {
@@ -2697,7 +2712,7 @@ mod tests {
             .await;
         assert!(
             !outcome.success,
-            "a blank response fails the pass regardless of which call delivers it"
+            "a blank arriving on the rescue retry fails the pass"
         );
         assert!(
             outcome
@@ -2772,6 +2787,56 @@ mod tests {
         assert!(
             summary.contains("[trimmed]"),
             "the trim is marked in the committed text"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trim_that_cannot_fit_the_budget_fails_the_pass() {
+        let prose = "No headings.";
+        let at_prose = CompactionOutcome::estimate_tokens(std::slice::from_ref(
+            &Message::assistant(prose.to_string()),
+        ));
+        let template = StructuredSummaryConfig::default().template;
+        let floor = estimate_text_tokens(&render(
+            &raw_text_summary("\n[trimmed]".to_string(), &template),
+            &template,
+        ));
+        assert!(
+            at_prose < floor,
+            "the fixture's budget ({at_prose}) sits below the smallest rendered form ({floor}) — the regime the pin exists for"
+        );
+        let bullets: Vec<String> = (0..12)
+            .map(|index| format!("- finding number {index} of the reviewed work\n"))
+            .collect();
+        let scripted_text = ["### Key facts\n", &bullets.concat()].concat();
+        let (client, summarizer) = scripted_with(
+            vec![ok(prose), ok(&scripted_text)],
+            StructuredSummaryConfig::default().with_max_summary_tokens(at_prose),
+        );
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            !outcome.success,
+            "a budget below the smallest form the template renders fails the pass, never commits a summary past it: {:?}",
+            outcome.error
+        );
+        let error = outcome.error.expect("the failure carries a reason");
+        assert!(
+            error.contains(&format!("{at_prose}-token budget")),
+            "the error names the budget figure: {error}"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            messages.len(),
+            "the original messages return intact"
+        );
+        assert_eq!(outcome.evicted.len(), 0, "nothing is demoted");
+        assert_eq!(
+            client.calls().len(),
+            2,
+            "the un-fittable trim costs no third call"
         );
     }
 

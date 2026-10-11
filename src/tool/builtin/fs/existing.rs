@@ -7,8 +7,10 @@
 //! staleness checks in [`conflict`](super::conflict) — reads the old
 //! content through one type-gated, size-capped reader: a non-regular
 //! target (a FIFO, a device, a socket) is classified without ever
-//! being opened, so a writer-less FIFO cannot park the dispatch, and
-//! a target over the family cap is classified without its bytes ever
+//! being opened, so a writer-less FIFO cannot park the dispatch; the
+//! open behind the gate is non-blocking, so a special file swapped
+//! into the gate-to-open window cannot park it either; and a target
+//! over the family cap is classified without its bytes ever
 //! being buffered, so a huge or endless file cannot balloon memory.
 //! The cap matches the read tool's whole-content guard
 //! ([`DEFAULT_MAX_SIZE_BYTES`](crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES)):
@@ -137,11 +139,11 @@ pub(crate) enum ExistingBytes {
 ///
 /// The metadata gate runs before the open — a non-regular target is
 /// never opened, which is what keeps a writer-less FIFO from parking
-/// the read — and the opened handle is re-checked for the swap window
-/// between the two; the residual of that window (a target replaced by
-/// a FIFO after the metadata check and before the open) is the same
-/// check-then-act residual the family's other pre-open gates carry.
-/// Under the contained policy the handle is verified inside the
+/// the read — and the open itself is non-blocking, so a special file
+/// swapped onto the entry between the gate and the open cannot park
+/// it either: the open returns at once and the opened handle's kind
+/// re-check reclassifies what answered. Under the contained policy the
+/// handle is verified inside the
 /// workspace exactly as the callers' own reads did.
 ///
 /// # Errors
@@ -227,6 +229,45 @@ pub(crate) async fn read_existing_bytes(full_path: &Path) -> Result<ExistingByte
     }
 }
 
+/// Open an existing target for reading without parking on special
+/// files.
+///
+/// The non-blocking flag matters only inside the swap window the
+/// metadata gate cannot close: a FIFO swapped onto the target's entry
+/// between the gate and this open would park a plain read-only open
+/// until a writer appears, while the same open with the flag set
+/// returns at once so the handle-level kind re-check can classify
+/// what actually answered. Regular files ignore the flag.
+///
+/// # Errors
+///
+/// Returns the open's own error verbatim; the caller's mapping
+/// classifies a missing entry and surfaces every other failure.
+#[cfg(unix)]
+async fn open_read_nonblocking(full_path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(full_path)
+        .await
+}
+
+/// Open an existing target for reading without parking on special
+/// files.
+///
+/// Platforms without the non-blocking flag keep the plain open; the
+/// swap window between the metadata gate and the open is carried as
+/// the documented residual there.
+///
+/// # Errors
+///
+/// Returns the open's own error verbatim; the caller's mapping
+/// classifies a missing entry and surfaces every other failure.
+#[cfg(not(unix))]
+async fn open_read_nonblocking(full_path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::File::open(full_path).await
+}
+
 /// The gated open's outcome.
 ///
 /// One answer per way the pre-read's gates can dispose of a target: a
@@ -266,7 +307,9 @@ enum GatedOpen {
 ///
 /// The pre-open metadata gate classifies absence, non-regular kinds,
 /// and over-cap sizes without ever opening — the anti-hang and
-/// anti-balloon gates — and the open maps its own absence race back to
+/// anti-balloon gates — the open itself never blocks on a special
+/// file swapped into the gate-to-open window (unix `O_NONBLOCK`), and
+/// the open maps its own absence race back to
 /// [`GatedOpen::Absent`].
 ///
 /// # Errors
@@ -282,7 +325,7 @@ async fn open_gated(full_path: &Path) -> Result<GatedOpen, ToolError> {
         ))),
         Ok(meta) if !meta.is_file() => Ok(classify_special(&meta)),
         Ok(meta) if meta.len() > MAX_EXISTING_READ_BYTES => Ok(GatedOpen::TooLarge),
-        Ok(_) => match tokio::fs::File::open(full_path).await {
+        Ok(_) => match open_read_nonblocking(full_path).await {
             Ok(file) => Ok(GatedOpen::Handle(file)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(GatedOpen::Absent),
             Err(err) => Err(ToolError::Execution(format!(
@@ -349,5 +392,49 @@ fn classify_special(meta: &std::fs::Metadata) -> GatedOpen {
         GatedOpen::Directory
     } else {
         GatedOpen::NonRegular
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+mod tests {
+    use super::open_read_nonblocking;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_swapped_in_fifo_cannot_park_the_gated_open() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        let spelled = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `spelled` names a fresh path in a temp dir this test owns; mkfifo writes no memory.
+        let created = unsafe { libc::mkfifo(spelled.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo must succeed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let handle = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            open_read_nonblocking(&fifo),
+        )
+        .await
+        .expect("the gated open resolves instead of parking on the fifo")
+        .unwrap();
+        assert!(
+            handle.metadata().await.unwrap().file_type().is_fifo(),
+            "the opened handle fstats as the swapped-in fifo, so the handle-level re-check classifies it"
+        );
     }
 }

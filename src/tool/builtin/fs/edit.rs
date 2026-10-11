@@ -13,7 +13,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
 
 use crate::tool::DisplayHint;
 use crate::tool::Retention;
@@ -30,6 +29,8 @@ use super::conflict;
 use super::conflict::CheckFailure;
 use super::diff::OldContent;
 use super::diff::format_file_change;
+use super::existing;
+use super::existing::ExistingText;
 use super::require_session;
 use super::resolve;
 use super::resolve::ResolvePolicy;
@@ -415,9 +416,11 @@ fn parse_input(input: &Value) -> Result<EditArgs<'_>, ToolError> {
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::FileNotFound`] when the file does not exist,
-/// [`ToolError::Execution`] on any other I/O error (including non-UTF-8
-/// reads), and when the contained handle check fails.
+/// Returns [`ToolError::FileNotFound`] when the file does not exist and
+/// [`ToolError::Execution`] when the content is not valid UTF-8, the
+/// target is not a regular file (a directory included), its size
+/// exceeds the family read cap, the contained handle check fails, or
+/// any other I/O error occurs.
 async fn read_existing(
     full_path: &Path,
     display_path: &str,
@@ -425,23 +428,20 @@ async fn read_existing(
     policy: ResolvePolicy,
     anchor: Option<&super::atomic::WorkspaceAnchor>,
 ) -> Result<String, ToolError> {
-    if !tokio::fs::try_exists(full_path)
-        .await
-        .map_err(|e| ToolError::Execution(e.to_string()))?
-    {
-        return Err(ToolError::FileNotFound(display_path.to_string()));
+    match existing::read_existing_text(full_path, workspace, policy, anchor).await? {
+        ExistingText::Text(content) => Ok(content),
+        ExistingText::NotUtf8 => Err(ToolError::Execution(format!(
+            "{display_path} is not valid UTF-8"
+        ))),
+        ExistingText::Absent => Err(ToolError::FileNotFound(display_path.to_string())),
+        ExistingText::TooLarge => Err(ToolError::Execution(format!(
+            "{display_path} exceeds the {}-byte size guard for reading existing content",
+            existing::MAX_EXISTING_READ_BYTES
+        ))),
+        ExistingText::NonRegular | ExistingText::Directory => Err(ToolError::Execution(format!(
+            "{display_path} is not a regular file; refusing to read it for editing"
+        ))),
     }
-    let mut file = tokio::fs::File::open(full_path)
-        .await
-        .map_err(|e| ToolError::Execution(e.to_string()))?;
-    if policy == ResolvePolicy::Contained {
-        resolve::verify_handle_inside(&file, full_path, workspace, anchor)?;
-    }
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .await
-        .map_err(|e| ToolError::Execution(e.to_string()))?;
-    Ok(content)
 }
 
 /// Locate `old_text` in `content` and splice `new_text` into its place.
@@ -887,5 +887,69 @@ mod tests {
             Some(crate::tool::Retention::Durable),
             "an edit receipt is a side-effect record — it must survive compaction verbatim"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_edit_target_refuses_without_hanging() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("pipe");
+        let spelled = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `spelled` names a fresh path in a temp dir this test owns; mkfifo writes no memory.
+        let created = unsafe { libc::mkfifo(spelled.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo must succeed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            EditTool::new().call(
+                json!({"file_path": "pipe", "old_text": "a", "new_text": "b"}),
+                &ctx_in(tmp.path().to_str().unwrap()),
+            ),
+        )
+        .await
+        .expect("the gated read resolves instead of parking on the fifo")
+        .unwrap_err();
+        match err {
+            ToolError::Execution(message) => assert!(
+                message.contains("pipe is not a regular file"),
+                "the refusal names the target and its kind: {message}"
+            ),
+            other => panic!("expected a refusal naming the fifo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_edit_target_refuses_naming_the_guard() {
+        let cap = crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("big.log");
+        let oversized = vec![b'x'; usize::try_from(cap).unwrap() + 1];
+        std::fs::write(&target, oversized).unwrap();
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            EditTool::new().call(
+                json!({"file_path": "big.log", "old_text": "a", "new_text": "b"}),
+                &ctx_in(tmp.path().to_str().unwrap()),
+            ),
+        )
+        .await
+        .expect("the capped read resolves")
+        .unwrap_err();
+        match err {
+            ToolError::Execution(message) => assert!(
+                message.contains("big.log") && message.contains("size guard"),
+                "the refusal names the target and the guard: {message}"
+            ),
+            other => panic!("expected a size-guard refusal, got {other:?}"),
+        }
     }
 }

@@ -378,15 +378,83 @@ pub(crate) fn render_outcome(
 /// produces re-derivable output: success stamps
 /// [`Requery`](Retention::Requery) so a large query's stdout stays
 /// evictable, while a failure changed nothing and stays unclassed.
-/// Every other command is a side-effect record: its receipt stamps
+/// A sequencing compound of read-only segments is re-derivable the
+/// same way a single read-only command is: the workhorse shape
+/// `cd /repo && grep -n needle file` changes nothing on disk, and
+/// pinning its receipt [`Durable`](Retention::Durable) — as the
+/// single-command check does for every compound — makes a
+/// shell-heavy session's output un-evictable wholesale, which no
+/// landing target can absorb. Piped segments qualify the same way:
+/// reading through a filter is still reading. Every other command is
+/// a side-effect record: its receipt stamps
 /// [`Durable`](Retention::Durable) whatever the exit code, because a
 /// mutating command that failed can still have changed state and its
-/// receipt records the attempt.
+/// receipt records the attempt — and any mutating segment,
+/// redirection, or control separator (a newline sequencing two
+/// statements included) keeps the whole receipt durable.
 fn retention_for(command: &str, succeeded: bool) -> Option<Retention> {
     if command_is_read_only(command) {
         return succeeded.then_some(Retention::Requery);
     }
+    if command_segments_read_only(command) {
+        return succeeded.then_some(Retention::Requery);
+    }
     Some(Retention::Durable)
+}
+
+/// Whether every segment of a sequenced or piped command is a
+/// read-only shape.
+///
+/// Splits on `&&`, `||`, `;`, and `|`, then runs the single-command
+/// read-only check per segment — the same prefix allowlist, operator
+/// and mutating-substring guards included — with `cd` admitted as a
+/// prefix (under the same operator guard) because changing directory
+/// alone touches no file. Splitting on the separator characters
+/// themselves covers the two-character spellings — `&&` and `||`
+/// yield a blank middle segment — and blank segments are neutral
+/// shell punctuation, skipped rather than judged. Or-sequencing
+/// riding along (`grep a || grep b`) stays read-only only when both
+/// arms are: an or-sequenced mutating fallback is a mutating
+/// command. The raw command is refused outright when it carries a
+/// control separator: a newline sequences whole statements in the
+/// shell that runs it, and the normalizer would erase the boundary.
+fn command_segments_read_only(command: &str) -> bool {
+    if has_control_separator(command) {
+        return false;
+    }
+    let normalized = shell_normalized(command);
+    if normalized.is_empty() {
+        return false;
+    }
+    let mut segments = normalized
+        .split([';', '|', '&'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty());
+    let mut any = false;
+    segments.all(|segment| {
+        any = true;
+        command_is_read_only(segment) || command_is_cd(segment)
+    }) && any
+}
+
+/// Whether a segment is a bare directory change.
+///
+/// `cd` with any argument list qualifies — the shell's working
+/// directory is not file state a receipt records — but the segment
+/// must genuinely start as the command, so a path or variable named
+/// `cd-something` does not, and a segment carrying a shell operator
+/// never qualifies: the expansion or substitution the operator
+/// spells executes inside the `cd`, and its receipt records whatever
+/// that execution changed.
+fn command_is_cd(segment: &str) -> bool {
+    let normalized = shell_normalized(segment);
+    if SHELL_OPERATORS.iter().any(|op| normalized.contains(op)) {
+        return false;
+    }
+    if normalized == "cd" {
+        return true;
+    }
+    normalized.starts_with("cd ")
 }
 
 /// Commands that are safe to run concurrently (read-only).
@@ -634,6 +702,83 @@ impl ShellBackend for UnsupportedShellBackend {
     clippy::too_many_lines
 )]
 mod tests {
+    use super::retention_for;
+
+    #[test]
+    fn sequenced_read_only_compounds_stamp_requery() {
+        // The workhorse shape: a directory change sequenced with a
+        // read-only query touches no file, and its receipt is
+        // re-derivable — pinning it Durable made shell-heavy sessions
+        // un-evictable wholesale.
+        for command in [
+            "cd /home/dch/repos/dch && grep -n needle file.rs",
+            "cd /repo && git log --oneline -3",
+            "cd /repo && cargo check",
+            "grep -rn pattern src | head -20",
+            "cat a.txt && cat b.txt",
+            "pwd && ls -la",
+        ] {
+            assert_eq!(
+                retention_for(command, true),
+                Some(Retention::Requery),
+                "`{command}` succeeds into the requery class"
+            );
+        }
+    }
+
+    #[test]
+    fn any_mutating_segment_keeps_the_receipt_durable() {
+        for command in [
+            "cd /repo && echo hi > out.txt",
+            "cd /repo && cargo build",
+            "cd /repo && git branch -D topic",
+            "grep -rn x src && sed -i s/a/b/ file",
+            "cat a.txt || rm -f b.txt",
+            "cd /repo ; touch marker",
+        ] {
+            assert_eq!(
+                retention_for(command, true),
+                Some(Retention::Durable),
+                "`{command}` carries a mutating segment"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_read_only_compound_stays_unclassed() {
+        assert_eq!(
+            retention_for("cd /repo && grep -n needle file.rs", false),
+            None,
+            "a failed query changed nothing and records nothing to evict"
+        );
+    }
+
+    #[test]
+    fn a_newline_sequenced_mutating_command_keeps_the_receipt_durable() {
+        for command in [
+            "pwd\ntouch marker",
+            "cargo check\ncargo build",
+            "ls\nrm -rf build/",
+        ] {
+            assert_eq!(
+                retention_for(command, true),
+                Some(Retention::Durable),
+                "`{command}` sequences a mutating statement past the compound gate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cd_segment_with_an_operator_keeps_the_receipt_durable() {
+        for command in ["cd $(rm -rf /) && pwd", "cd `touch marker` && pwd"] {
+            assert_eq!(
+                retention_for(command, true),
+                Some(Retention::Durable),
+                "`{command}` executes a substitution inside the cd segment"
+            );
+        }
+    }
+
     use super::*;
     use crate::tool::builtin::shell::jobs::JobStore;
     use crate::tool::builtin::shell::unix::UnixShellBackend;

@@ -40,6 +40,7 @@ mod atomic;
 mod conflict;
 mod diff;
 mod edit;
+mod existing;
 mod file_source;
 mod file_viewer;
 mod multi_edit;

@@ -3433,6 +3433,104 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_skipped_unfittable_pair_does_not_crowd_out_an_older_fitting_pair() {
+        let mut messages = vec![Message::user("task")];
+        for label in ["big", "small"] {
+            messages.push(Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    format!("call_{label}"),
+                    "Bash",
+                    json!({"cmd": label}),
+                )],
+            ));
+            messages.push(Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result(
+                        format!("call_{label}"),
+                        "Bash",
+                        tool_text(&"r".repeat(if label == "big" { 4000 } else { 40 })),
+                        false,
+                    )
+                    .with_retention(crate::tool::Retention::Durable),
+                ],
+            ));
+        }
+        let costs: Vec<u64> = messages
+            .iter()
+            .map(|m| HeuristicTokenCounter.count(std::slice::from_ref(m)))
+            .collect();
+        let big_pair = costs[1] + costs[2];
+        let small_pair = costs[3] + costs[4];
+        let budget = big_pair + small_pair + 1;
+        let pulled =
+            durable_pull_indices_within_budget(&messages, 5, budget, &HeuristicTokenCounter);
+        assert_eq!(
+            pulled,
+            vec![1, 2, 3, 4],
+            "with budget for both pairs, both ride: {pulled:?}"
+        );
+        let tight = big_pair.saturating_sub(1);
+        let pulled_tight =
+            durable_pull_indices_within_budget(&messages, 5, tight, &HeuristicTokenCounter);
+        assert_eq!(
+            pulled_tight,
+            vec![3, 4],
+            "the unfittable newer pair is skipped, and the older fitting pair still rides: {pulled_tight:?}"
+        );
+    }
+
+    #[test]
+    fn a_starved_budget_carries_exactly_the_newest_fitting_pair() {
+        let mut messages = vec![Message::user("task")];
+        for label in ["new", "mid", "old"] {
+            messages.push(Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    format!("call_{label}"),
+                    "Bash",
+                    json!({"cmd": label}),
+                )],
+            ));
+            messages.push(Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result(
+                        format!("call_{label}"),
+                        "Bash",
+                        tool_text(&"r".repeat(100)),
+                        false,
+                    )
+                    .with_retention(crate::tool::Retention::Durable),
+                ],
+            ));
+        }
+        let costs: Vec<u64> = messages
+            .iter()
+            .map(|m| HeuristicTokenCounter.count(std::slice::from_ref(m)))
+            .collect();
+        let mid_pair = costs[3] + costs[4];
+        let old_pair = costs[5] + costs[6];
+        let budget = mid_pair + old_pair;
+        let pulled =
+            durable_pull_indices_within_budget(&messages, 7, budget, &HeuristicTokenCounter);
+        assert_eq!(
+            pulled,
+            vec![3, 4, 5, 6],
+            "two pairs whose costs sum to the budget both ride — neither is crowded out: {pulled:?}"
+        );
+        let starved = budget.saturating_sub(1);
+        let pulled_starved =
+            durable_pull_indices_within_budget(&messages, 7, starved, &HeuristicTokenCounter);
+        assert_eq!(
+            pulled_starved,
+            vec![5, 6],
+            "under a budget that fits only one pair, exactly the newest pair rides — the highest-index exchange is the most recent: {pulled_starved:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_terminal_holds_the_landing_to_one_exact_count() {
         let mut messages = vec![Message::user("p".repeat(30)), Message::user("q".repeat(30))];

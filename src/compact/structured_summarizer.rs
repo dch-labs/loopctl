@@ -16,9 +16,10 @@
 //! earns exactly one rescue retry with a tighter prompt and fails the pass
 //! only if the retry stays blank; a response over the configured token
 //! budget fails the pass when the first call delivers it and is trimmed to
-//! the budget and committed when the retry delivers it and the trimmed
-//! form fits — a budget below the smallest form the template renders
-//! fails the pass instead. Provider errors
+//! the budget and committed when the retry delivers it, the trimmed form
+//! fits, and the trim retains content — a budget below the smallest form
+//! the template renders, or a trim that retains none, fails the pass
+//! instead. Provider errors
 //! fail the pass with the original messages intact, the seam a fallback
 //! chain catches.
 //!
@@ -807,8 +808,8 @@ impl Default for StructuredSummaryConfig {
 /// failing. A blank response earns one rescue retry (a second blank fails
 /// the pass), and an over-budget response fails on the first call or is
 /// trimmed to the budget and committed on the retry when the trimmed form
-/// fits — a budget below the smallest form the template renders fails
-/// the pass — the original
+/// fits and retains content — a budget below the smallest form the
+/// template renders, or a contentless trim, fails the pass — the original
 /// messages stay intact on every failure, the seam a fallback chain
 /// catches. The compactor is stateless: no summary accumulates across
 /// passes, each pass summarizes the current transcript through the
@@ -878,14 +879,15 @@ enum SummarizeOutcome {
     Blank,
 
     /// The first call's token estimate exceeded the pass budget, or a
-    /// retry's trim could not fit it.
+    /// retry's trim could not fit it or retained no content.
     ///
     /// The ceiling is enforced, not merely instructed; a model that ignores
     /// the prompt's budget line fails the pass instead of shipping through.
     /// An over-budget response arriving on the retry is trimmed to the
     /// rendered budget and committed when the trimmed form fits; a budget
     /// below the smallest form the template can render leaves no cut that
-    /// closes the gap, and this failure reports that too.
+    /// closes the gap, and a cut that removes the whole response leaves
+    /// only the marker — this failure reports both.
     OverBudget {
         /// The budget the estimate exceeded, for the error message.
         ///
@@ -1011,8 +1013,9 @@ impl StructuredSummarizer {
     /// second blank fails the pass; an over-budget response fails the
     /// pass when the first call delivers it and, on the retry, is
     /// trimmed to the rendered budget and committed when the trimmed
-    /// form fits — a budget below the smallest form the template
-    /// renders fails the pass — (the chain's landing check still
+    /// form fits and retains response content — a budget below the
+    /// smallest form the template renders, or a trim that retains
+    /// none, fails the pass — (the chain's landing check still
     /// guards the final figure). Host-configured summary instructions and hook
     /// contributions from the [`CompactionContext`] ride along after the
     /// transcript — the config channel first, the per-pass hook channel
@@ -1493,10 +1496,13 @@ fn numbered_bullet(line: &str) -> Option<&str> {
 /// the first cut removes the bulk, the later ones the marker lines
 /// the cut itself adds. Every cut lands on a line boundary and is
 /// marked, so a reader can tell a trimmed summary from a whole one.
-/// Returns `None` when the budget sits below the smallest form the
-/// template can render — its own header and the `[trimmed]` marker —
-/// because no cut can close a gap that floor cannot; the caller then
-/// fails the pass instead of committing an over-budget summary.
+/// Returns `None` for either of two sibling reasons: the budget sits
+/// below the smallest form the template can render — its own header
+/// and the `[trimmed]` marker — so no cut can close the gap, or the
+/// cut retained no substantive response content (a single over-long
+/// line whose whole text one cut removes leaves only the marker); the
+/// caller then fails the pass instead of committing a summary that
+/// preserves nothing of what it evicts.
 fn trim_summary_to_budget(text: &str, budget: u64, template: &SummaryTemplate) -> Option<String> {
     let mut current = text.to_string();
     for _ in 0..3 {
@@ -1504,7 +1510,7 @@ fn trim_summary_to_budget(text: &str, budget: u64, template: &SummaryTemplate) -
         let rendered = render(&summary, template);
         let measured = estimate_text_tokens(&rendered);
         if measured <= budget {
-            return Some(current);
+            return retains_substantive_content(&current).then_some(current);
         }
         let excess_tokens = measured.saturating_sub(budget);
         let excess_chars = usize::try_from(excess_tokens.saturating_mul(6))
@@ -1519,7 +1525,21 @@ fn trim_summary_to_budget(text: &str, budget: u64, template: &SummaryTemplate) -
     }
     let summary = raw_text_summary(current.clone(), template);
     let rendered = render(&summary, template);
-    (estimate_text_tokens(&rendered) <= budget).then_some(current)
+    (estimate_text_tokens(&rendered) <= budget && retains_substantive_content(&current))
+        .then_some(current)
+}
+
+/// Whether a trimmed summary still carries response content.
+///
+/// A cut that removed the whole response — a single over-long line —
+/// leaves nothing but the `[trimmed]` marker line and whitespace; a
+/// summary committed in that shape preserves nothing of the messages
+/// it evicts, so [`trim_summary_to_budget`] refuses it and the pass
+/// fails instead. Any non-whitespace text beside the marker means the
+/// trim kept real content.
+fn retains_substantive_content(trimmed: &str) -> bool {
+    let without_marker = trimmed.strip_suffix("[trimmed]").unwrap_or(trimmed);
+    !without_marker.trim().is_empty()
 }
 
 fn estimate_text_tokens(text: &str) -> u64 {
@@ -2837,6 +2857,57 @@ mod tests {
             client.calls().len(),
             2,
             "the un-fittable trim costs no third call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trim_that_retains_no_content_fails_the_pass() {
+        let prose = "No headings.";
+        let at_prose = CompactionOutcome::estimate_tokens(std::slice::from_ref(
+            &Message::assistant(prose.to_string()),
+        ));
+        let template = StructuredSummaryConfig::default().template;
+        let floor = estimate_text_tokens(&render(
+            &raw_text_summary("\n[trimmed]".to_string(), &template),
+            &template,
+        ));
+        assert!(
+            at_prose <= floor,
+            "the fixture's budget (the {floor}-token smallest rendered form) covers the {at_prose}-token first response — the regime where a full cut fits yet retains nothing"
+        );
+        let one_long_line = format!("{}\n", "finding ".repeat(80));
+        assert!(
+            !one_long_line.trim().is_empty() && one_long_line.lines().count() == 1,
+            "the retry response is one long line — the shape whose whole text a single cut can remove"
+        );
+        let (client, summarizer) = scripted_with(
+            vec![ok(prose), ok(one_long_line.trim())],
+            StructuredSummaryConfig::default().with_max_summary_tokens(floor),
+        );
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            !outcome.success,
+            "a trim left with only its marker fails the pass, never evicts the dropped messages unpreserved: {:?}",
+            outcome.error
+        );
+        let error = outcome.error.expect("the failure carries a reason");
+        assert!(
+            error.contains(&format!("{floor}-token budget")),
+            "the error names the budget figure: {error}"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            messages.len(),
+            "the original messages return intact"
+        );
+        assert_eq!(outcome.evicted.len(), 0, "nothing is demoted");
+        assert_eq!(
+            client.calls().len(),
+            2,
+            "the contentless trim costs no third call"
         );
     }
 

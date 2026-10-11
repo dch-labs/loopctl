@@ -3436,7 +3436,7 @@ mod tests {
     #[test]
     fn a_skipped_unfittable_pair_does_not_crowd_out_an_older_fitting_pair() {
         let mut messages = vec![Message::user("task")];
-        for label in ["big", "small"] {
+        for label in ["small", "big"] {
             messages.push(Message::new(
                 Role::Assistant,
                 vec![MessagePart::tool_call(
@@ -3462,8 +3462,8 @@ mod tests {
             .iter()
             .map(|m| HeuristicTokenCounter.count(std::slice::from_ref(m)))
             .collect();
-        let big_pair = costs[1] + costs[2];
-        let small_pair = costs[3] + costs[4];
+        let small_pair = costs[1] + costs[2];
+        let big_pair = costs[3] + costs[4];
         let budget = big_pair + small_pair + 1;
         let pulled =
             durable_pull_indices_within_budget(&messages, 5, budget, &HeuristicTokenCounter);
@@ -3477,8 +3477,8 @@ mod tests {
             durable_pull_indices_within_budget(&messages, 5, tight, &HeuristicTokenCounter);
         assert_eq!(
             pulled_tight,
-            vec![3, 4],
-            "the unfittable newer pair is skipped, and the older fitting pair still rides: {pulled_tight:?}"
+            vec![1, 2],
+            "the unfittable newest pair is skipped, and the older fitting pair below it still rides: {pulled_tight:?}"
         );
     }
 

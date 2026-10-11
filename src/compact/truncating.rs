@@ -280,22 +280,28 @@ pub(crate) fn durable_pull_indices(messages: &[Message], split: usize) -> Vec<us
 /// pass no-changed and the run limped on deferrals until the window
 /// closed. This variant walks the dropped region's durable pairs
 /// newest first, carries each pair's messages (result and call
-/// together, the pairing rule unchanged) while the budget allows,
-/// skips a pair too costly to fit, and leaves everything else for the
-/// summary stages to carry — a receipt the landing cannot hold is
-/// information the summary records, not a reason the run dies.
+/// together, occurrence-aware through [`ToolPairing::scan`] so a
+/// reused call id pairs with its own exchange's call, never an
+/// earlier spelling's) while the budget allows, skips a pair too
+/// costly to fit, and leaves everything else for the summary stages
+/// to carry — a receipt the landing cannot hold is information the
+/// summary records, not a reason the run dies.
 pub(crate) fn durable_pull_indices_within_budget(
     messages: &[Message],
     split: usize,
     budget: u64,
     counter: &dyn crate::compact::TokenCounter,
 ) -> Vec<usize> {
+    let pairing = ToolPairing::scan(messages);
     let mut indices = Vec::new();
     let mut remaining = budget;
     let mut index = split;
     while index > 0 {
         index = index.saturating_sub(1);
         let Some(message) = messages.get(index) else {
+            continue;
+        };
+        let Some(row) = pairing.mates.get(index) else {
             continue;
         };
         if !message.parts.iter().any(|part| {
@@ -310,19 +316,15 @@ pub(crate) fn durable_pull_indices_within_budget(
             continue;
         }
         let mut pair = vec![index];
-        for part in &message.parts {
-            let MessagePart::ToolResult { call_id, .. } = part else {
+        for (part, state) in message.parts.iter().zip(row) {
+            if !matches!(part, MessagePart::ToolResult { .. }) {
                 continue;
-            };
-            let Some(mate) = messages.iter().position(|candidate| {
-                candidate.parts.iter().any(|candidate_part| {
-                    matches!(candidate_part, MessagePart::ToolCall { id, .. } if id == call_id)
-                })
-            }) else {
-                continue;
-            };
-            if mate < split && !pair.contains(&mate) {
-                pair.push(mate);
+            }
+            if let Some(PartMate::Paired { message: mate }) = state
+                && *mate < split
+                && !pair.contains(mate)
+            {
+                pair.push(*mate);
             }
         }
         let cost = pair
@@ -3391,6 +3393,43 @@ mod tests {
             vec![1, 2, 3],
             "every durable result's call message is pulled — both mates survive \
              together: {pulled:?}"
+        );
+    }
+
+    #[test]
+    fn a_reused_call_id_pairs_the_budgeted_pull_with_its_own_exchange() {
+        let mut messages = vec![Message::user("task")];
+        messages.push(Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call("r1", "Bash", json!({"cmd": "one"}))],
+        ));
+        messages.push(Message::new(
+            Role::User,
+            vec![MessagePart::tool_result(
+                "r1",
+                "Bash",
+                tool_text("shed"),
+                false,
+            )],
+        ));
+        messages.push(Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call("r1", "Bash", json!({"cmd": "two"}))],
+        ));
+        messages.push(Message::new(
+            Role::User,
+            vec![
+                MessagePart::tool_result("r1", "Bash", tool_text("receipt two"), false)
+                    .with_retention(crate::tool::Retention::Durable),
+            ],
+        ));
+        let pulled =
+            durable_pull_indices_within_budget(&messages, 5, u64::MAX, &HeuristicTokenCounter);
+        assert_eq!(
+            pulled,
+            vec![3, 4],
+            "the budgeted pull pairs the durable result with its own exchange's \
+             call, never an earlier spelling of the reused id: {pulled:?}"
         );
     }
 

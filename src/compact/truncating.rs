@@ -1256,6 +1256,7 @@ impl TokenSplitter {
             }
         }
         let mut last_seen = 0;
+        let mut deepest_safe = None;
         for candidate in 1..=max_split {
             let (Some(prev), Some(curr)) = (
                 messages.get(candidate.wrapping_sub(1)),
@@ -1278,6 +1279,7 @@ impl TokenSplitter {
                 continue;
             }
             last_seen = split;
+            deepest_safe = Some(split);
             let estimate = suffix_estimate.get(split).copied().unwrap_or(u64::MAX);
             if estimate > tail_token_budget {
                 continue;
@@ -1293,6 +1295,22 @@ impl TokenSplitter {
                     split_index: split,
                 };
             }
+        }
+        // No pair-safe cut fits the budget: take the deepest pair-safe
+        // cut instead of preserving the whole history. A tail over the
+        // budget still shrinks the pass — the budget is a goal, and a
+        // fallback that keeps everything turns a sparse-boundary
+        // history into a permanent no-change stall. The orphan-slide
+        // default remains for histories with no pair-safe cut at all.
+        if let Some(split) = deepest_safe {
+            let (to_compact, preserved) = messages.split_at(split);
+            return SplitResult {
+                to_compact: to_compact.to_vec(),
+                preserved: preserved.to_vec(),
+                compact_tokens: CompactionOutcome::estimate_tokens(to_compact),
+                preserved_tokens: CompactionOutcome::estimate_tokens(preserved),
+                split_index: split,
+            };
         }
         self.split(messages)
     }

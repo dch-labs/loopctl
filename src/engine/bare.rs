@@ -2393,7 +2393,25 @@ impl<C: ApiClient> BareLoop<C> {
         let outcome = tokio::select! {
             biased;
             () = cancelled.notified() => return Err(LoopError::Cancelled),
-            outcome = self.run_compaction(turn, reason) => outcome?,
+            attempt = self.run_compaction(turn, reason) => match attempt {
+                Ok(outcome) => outcome,
+                Err(LoopError::CompactionFailed { used, limit, .. })
+                    if reason == crate::compact::types::CompactReason::ThresholdExceeded
+                        && used < limit =>
+                {
+                        // A threshold pass whose configured compactor errored
+                    // defers exactly like a stall: the payload still fits
+                    // the window, so the turn serves uncompacted and the
+                    // next turn retries the same compactor — the failure
+                    // is never a reason to substitute another strategy.
+                    // run_compaction already surfaced on_compaction_failed
+                    // with this pass's real cause; the deferral adds no
+                    // second event.
+                    self.machine.compaction_deferred(used);
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            },
         };
         if let Some(compacted) = outcome.compacted {
             self.machine

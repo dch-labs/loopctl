@@ -4934,7 +4934,7 @@ impl crate::observer::LoopObserver for CompactionEventRecorder {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_compaction_pass_fires_on_compaction_failed() {
+async fn a_failed_threshold_pass_defers_and_serves_the_turn() {
     let client = MockClient::new("m");
     client.add_text_response("never reached");
 
@@ -4954,22 +4954,15 @@ async fn a_failed_compaction_pass_fires_on_compaction_failed() {
         failures: Arc::clone(&failures),
     }));
 
-    let error = agent
+    // The payload crosses the 50% threshold but stays under the
+    // emergency line, so the strict contract applies: the failing pass
+    // defers, the turn serves uncompacted, and the run completes —
+    // no other compactor substitutes for the configured one.
+    let run = agent
         .run(&"t".repeat(3_000), &make_run_config())
         .await
-        .expect_err("the failing compactor ends the run");
-    match &error {
-        crate::error::LoopError::CompactionFailed { cause, .. } => assert!(
-            cause.contains("error sending request"),
-            "the run failure carries the compactor's real cause, not an \
-             over-window misdescription: {cause}"
-        ),
-        other => panic!("expected CompactionFailed, got {other:?}"),
-    }
-    assert!(
-        error.to_string().contains("error sending request"),
-        "the rendered error names the cause: {error}"
-    );
+        .expect("the deferred pass serves the turn");
+    assert_eq!(run.output.as_deref(), Some("never reached"));
     let failures = failures.lock().expect("failures lock");
     assert_eq!(failures.len(), 1, "one failed-pass event: {failures:?}");
     assert!(
@@ -4977,9 +4970,50 @@ async fn a_failed_compaction_pass_fires_on_compaction_failed() {
         "the event carries the compactor's error text: {failures:?}"
     );
     assert!(
+        failures[0].contains("ThresholdExceeded"),
+        "the event names the threshold trigger: {failures:?}"
+    );
+    assert!(
         passes.lock().expect("passes lock").is_empty(),
         "no success on_compaction follows a dead pass"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_emergency_compactor_failure_still_ends_the_run() {
+    let client = MockClient::new("m");
+    client.add_text_response("never reached");
+
+    let passes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(50);
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(FailingPassCompactor))
+            .with_context_window(1_000)
+            .with_threshold(50),
+    ));
+    agent.register_observer(Arc::new(CompactionEventRecorder {
+        passes: Arc::clone(&passes),
+        failures: Arc::clone(&failures),
+    }));
+
+    // Past the 95% emergency line a failed pass is not deferrable —
+    // there is no window left to serve the turn in, so the run ends
+    // with the compactor's real cause.
+    let error = agent
+        .run(&"t".repeat(6_000), &make_run_config())
+        .await
+        .expect_err("the emergency failure ends the run");
+    match &error {
+        crate::error::LoopError::CompactionFailed { cause, .. } => assert!(
+            cause.contains("error sending request"),
+            "the run failure carries the compactor's real cause: {cause}"
+        ),
+        other => panic!("expected CompactionFailed, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

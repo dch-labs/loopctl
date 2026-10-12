@@ -2357,6 +2357,23 @@ impl<C: ApiClient> BareLoop<C> {
         Ok(())
     }
 
+    /// Store the deferral figure for a threshold pass that errored.
+    ///
+    /// The figure rides the driver's provider-scale conversion
+    /// ([`context_figure`](Self::context_figure)) like every other
+    /// driver→machine feed; the raw manager-scale `used` the
+    /// compaction error carries is this arm's input, never its
+    /// stored output. Returns the figure so the scale composition is
+    /// pinnable — a between-runs caller cannot observe the machine
+    /// write itself, because the machine is terminal between runs and
+    /// [`compaction_deferred`](crate::engine::core::LoopMachine::compaction_deferred)
+    /// no-ops there.
+    fn defer_failed_threshold_pass(&mut self, used: u64) -> u64 {
+        let figure = self.context_figure(used);
+        self.machine.compaction_deferred(figure);
+        figure
+    }
+
     /// Handle a compaction request from the machine.
     ///
     /// Runs the configured [`ContextManager`](crate::compact::ContextManager)
@@ -2369,6 +2386,17 @@ impl<C: ApiClient> BareLoop<C> {
     /// so the pending buffer survives. The machine already sits in
     /// `AwaitingCompaction` for this reason when the step arrives; the driver
     /// only performs the I/O and feeds the result back.
+    ///
+    /// A threshold pass whose configured compactor errored defers exactly
+    /// like a stall when the payload still fits the window: the turn serves
+    /// uncompacted and the next turn retries the same compactor — the
+    /// failure is never a reason to substitute another strategy
+    /// (`run_compaction` already surfaced `on_compaction_failed` with the
+    /// pass's real cause, so the deferral adds no second event). The stored
+    /// figure rides the driver's provider-scale conversion
+    /// ([`context_figure`](Self::context_figure)) like every other
+    /// driver→machine feed, while the fit guard compares the error's own
+    /// raw pair — both manager-scale, like with like.
     ///
     /// # Errors
     ///
@@ -2399,15 +2427,7 @@ impl<C: ApiClient> BareLoop<C> {
                     if reason == crate::compact::types::CompactReason::ThresholdExceeded
                         && used < limit =>
                 {
-                        // A threshold pass whose configured compactor errored
-                    // defers exactly like a stall: the payload still fits
-                    // the window, so the turn serves uncompacted and the
-                    // next turn retries the same compactor — the failure
-                    // is never a reason to substitute another strategy.
-                    // run_compaction already surfaced on_compaction_failed
-                    // with this pass's real cause; the deferral adds no
-                    // second event.
-                    self.machine.compaction_deferred(used);
+                    self.defer_failed_threshold_pass(used);
                     return Ok(());
                 }
                 Err(err) => return Err(err),

@@ -5016,6 +5016,159 @@ async fn an_emergency_compactor_failure_still_ends_the_run() {
     }
 }
 
+/// A `MockClient` wrapper billing `multiple ×` the heuristic as each
+/// request's input tokens.
+///
+/// The usage-fed calibration seeds at exactly `multiple` on the first
+/// report, so every driver→machine figure is the raw estimate scaled
+/// by that factor — the known separation of scales the deferral pin
+/// asserts against.
+#[derive(Clone)]
+struct BilledMockClient {
+    inner: MockClient,
+    multiple: u64,
+}
+
+impl BilledMockClient {
+    fn wrap(inner: MockClient, multiple: u64) -> Self {
+        Self { inner, multiple }
+    }
+
+    fn billed_input(&self, request: &crate::api::StreamRequest) -> u32 {
+        use crate::compact::HeuristicTokenCounter;
+        use crate::compact::TokenCounter as _;
+        let mut tokens = HeuristicTokenCounter.count(&request.messages);
+        if let Some(system) = &request.system {
+            tokens = tokens.saturating_add(
+                HeuristicTokenCounter.count(&[crate::message::Message::user(system.clone())]),
+            );
+        }
+        if let Some(tools) = &request.tools {
+            let rendered = serde_json::to_string(tools).unwrap_or_default();
+            tokens = tokens.saturating_add(
+                HeuristicTokenCounter.count(&[crate::message::Message::user(rendered)]),
+            );
+        }
+        u32::try_from(tokens.saturating_mul(self.multiple)).unwrap_or(u32::MAX)
+    }
+}
+
+impl crate::api::ApiClient for BilledMockClient {
+    fn model(&self) -> String {
+        self.inner.model()
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        self.inner.set_model(model)
+    }
+
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let billed = self.billed_input(request);
+        let inner = self.inner.stream_messages(request);
+        Box::pin(futures::StreamExt::map(inner, move |event| {
+            event.map(|mut event| {
+                if let StreamEvent::MessageDelta(delta) = &mut event
+                    && delta.usage.is_some()
+                {
+                    delta.usage = Some(Usage::new(billed, 20));
+                }
+                event
+            })
+        }))
+    }
+
+    fn create_message(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        let billed = self.billed_input(request);
+        let inner = self.inner.create_message(request);
+        Box::pin(async move {
+            let mut response = inner.await?;
+            response.usage = Some(Usage::new(billed, 20));
+            Ok(response)
+        })
+    }
+
+    fn create_message_with_options(
+        &self,
+        request: &crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        let billed = self.billed_input(request);
+        let inner = self.inner.create_message_with_options(request, options);
+        Box::pin(async move {
+            let mut response = inner.await?;
+            response.usage = Some(Usage::new(billed, 20));
+            Ok(response)
+        })
+    }
+
+    fn stream_messages_with_options(
+        &self,
+        request: &crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let billed = self.billed_input(request);
+        let inner = self.inner.stream_messages_with_options(request, options);
+        Box::pin(futures::StreamExt::map(inner, move |event| {
+            event.map(|mut event| {
+                if let StreamEvent::MessageDelta(delta) = &mut event
+                    && delta.usage.is_some()
+                {
+                    delta.usage = Some(Usage::new(billed, 20));
+                }
+                event
+            })
+        }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_threshold_pass_stores_the_provider_scale_figure() {
+    // Two identical loops, one billed at 1x and one at 4x, each
+    // seeded by one real turn so the calibration settles; the same
+    // hand-picked manager-scale figure then rides the deferral's
+    // store through the engine's own conversion. The stored figure is
+    // observed at the arm's seam — the raw machine write is invisible
+    // to a between-runs caller — and must scale with the billing
+    // multiple, never echo the raw count both compactors report.
+    let mut figures = Vec::new();
+    for multiple in [1_u64, 4] {
+        let client = MockClient::new("m");
+        client.add_text_response("ok");
+        let mut agent = BareLoop::new(
+            Arc::new(BilledMockClient::wrap(client, multiple)),
+            ToolRegistry::new(),
+            make_config(),
+        );
+        agent
+            .run("hi", &make_run_config())
+            .await
+            .expect("the seeding turn completes");
+        figures.push((multiple, agent.defer_failed_threshold_pass(1_000)));
+    }
+    let (one, identity_figure) = figures[0];
+    let (four, billed_figure) = figures[1];
+    assert_eq!((one, four), (1, 4), "the arms ran in the scripted order");
+    assert_eq!(
+        identity_figure, 1_000,
+        "the identity arm's conversion is the raw figure by construction"
+    );
+    assert_eq!(
+        billed_figure,
+        identity_figure.saturating_mul(4),
+        "the deferred figure follows the engine's provider-scale conversion — \
+         four times the identity arm's figure under the 4x billing, never the \
+         raw manager-scale count both compactors reported ({billed_figure})"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pass_that_succeeds_but_does_not_fit_keeps_the_window_error() {
     let client = MockClient::new("m");

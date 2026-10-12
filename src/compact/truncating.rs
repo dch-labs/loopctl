@@ -1213,9 +1213,13 @@ impl TokenSplitter {
     /// **largest tail** (the smallest split point) wins, so the tail
     /// grows to fill the budget when boundaries allow instead of
     /// sitting at the count floor. When no boundary's tail fits, the
-    /// result degrades to [`split`](Self::split)'s count-based cut —
-    /// the landing will exceed the budget, and the caller's chain
-    /// declines the stage.
+    /// **deepest pair-safe cut** is the result: its tail is over
+    /// budget, but it is a real reduction — the budget is a goal, not
+    /// a gate, and a fallback that keeps everything turns a
+    /// sparse-boundary history into a permanent no-change stall —
+    /// with the chain's landing check declining the stage when the
+    /// overshoot cannot land. Only a history with no pair-safe cut at
+    /// all degrades to [`split`](Self::split)'s count-based cut.
     ///
     /// The `min_messages` guard and the "never compact the last user
     /// message" rule are [`split`](Self::split)'s; the
@@ -1256,6 +1260,7 @@ impl TokenSplitter {
             }
         }
         let mut last_seen = 0;
+        let mut deepest_safe = None;
         for candidate in 1..=max_split {
             let (Some(prev), Some(curr)) = (
                 messages.get(candidate.wrapping_sub(1)),
@@ -1278,6 +1283,7 @@ impl TokenSplitter {
                 continue;
             }
             last_seen = split;
+            deepest_safe = Some(split);
             let estimate = suffix_estimate.get(split).copied().unwrap_or(u64::MAX);
             if estimate > tail_token_budget {
                 continue;
@@ -1293,6 +1299,16 @@ impl TokenSplitter {
                     split_index: split,
                 };
             }
+        }
+        if let Some(split) = deepest_safe {
+            let (to_compact, preserved) = messages.split_at(split);
+            return SplitResult {
+                to_compact: to_compact.to_vec(),
+                preserved: preserved.to_vec(),
+                compact_tokens: CompactionOutcome::estimate_tokens(to_compact),
+                preserved_tokens: CompactionOutcome::estimate_tokens(preserved),
+                split_index: split,
+            };
         }
         self.split(messages)
     }
@@ -1577,20 +1593,74 @@ mod tests {
         let splitter = TokenSplitter::new()
             .with_min_messages(4)
             .with_preserve_recent(4);
-        let messages = pair_history();
+        let mut messages = vec![Message::user("task")];
+        for turn in 0..15 {
+            messages.push(Message::assistant(format!("assistant-{turn}")));
+        }
         let counter = HeuristicTokenCounter;
-        let floor_tail = counter.count(messages.get(16..).unwrap_or_default());
+        let floor_tail = counter.count(messages.get(12..).unwrap_or_default());
         let result =
             splitter.split_within_budget(&messages, floor_tail.saturating_sub(1), &counter);
         let count_based = splitter.split(&messages);
         assert_eq!(
             result.split_index, count_based.split_index,
-            "a budget the floor tail cannot fit degrades to the count-based cut"
+            "a history with no pair-safe cut at all degrades to the count-based cut"
         );
         assert_eq!(
             result.preserved.len(),
             count_based.preserved.len(),
-            "at least preserve_recent messages stay preserved"
+            "the count floor's preserved tail is what survives"
+        );
+    }
+
+    #[test]
+    fn a_budget_no_tail_fits_takes_the_deepest_pair_safe_cut() {
+        let mut messages = vec![Message::user("task")];
+        for turn in 0..3 {
+            messages.push(Message::assistant(format!("assistant-{turn}")));
+            messages.push(Message::user(format!("user-{turn}")));
+        }
+        messages.push(Message::assistant("seam"));
+        messages.push(Message::user("post-seam"));
+        messages.push(Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call("t1", "Bash", json!({"cmd": "run"}))],
+        ));
+        messages.push(Message::new(
+            Role::User,
+            vec![
+                MessagePart::text("ack"),
+                MessagePart::tool_result("t1", "Bash", tool_text("receipt"), false),
+            ],
+        ));
+        for tail in 0..5 {
+            messages.push(Message::assistant(format!("trailing-{tail}")));
+        }
+        let splitter = TokenSplitter::new()
+            .with_min_messages(4)
+            .with_preserve_recent(4);
+        let counter = HeuristicTokenCounter;
+        let count_based = splitter.split(&messages);
+        assert_eq!(
+            count_based.split_index, 8,
+            "the count-based cut takes the boundary that is pair-safe at itself"
+        );
+        let deepest_tail = counter.count(messages.get(9..).unwrap_or_default());
+        let result =
+            splitter.split_within_budget(&messages, deepest_tail.saturating_sub(1), &counter);
+        assert_ne!(
+            result.split_index, count_based.split_index,
+            "the no-fit fallback is not the count-based cut for this fixture"
+        );
+        assert_eq!(
+            result.split_index, 9,
+            "the deepest boundary's orphan slide wins — a deeper cut than any \
+             pair-safe-at-itself boundary: {result:?}"
+        );
+        assert_eq!(
+            result.preserved.len(),
+            messages.len() - 9,
+            "the preserved tail is everything from the slid cut"
         );
     }
 

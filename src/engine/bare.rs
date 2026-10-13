@@ -57,6 +57,7 @@
 use std::num::NonZeroU64;
 
 use crate::api::ApiClient;
+use crate::attachment::AttachmentStore;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -289,6 +290,17 @@ pub struct BareLoop<C: ApiClient> {
     /// registration order. Register via
     /// [`add_contributor`](BareLoop::add_contributor).
     contributors: Vec<Box<dyn ContextContributor>>,
+
+    /// Compaction-immune attachments pinned for this loop.
+    ///
+    /// Rendered into one consolidated user message that rides every
+    /// outbound request as per-turn transient context — attachments
+    /// never enter the machine-owned history, so no compactor can see
+    /// or drop them, and their token cost is measured into the payload
+    /// estimate like any transient. Pin via
+    /// [`set_attachment`](BareLoop::set_attachment) /
+    /// [`with_attachment`](BareLoop::with_attachment).
+    attachments: AttachmentStore,
 
     /// Cached components of the per-request overhead.
     ///
@@ -881,6 +893,7 @@ impl<C: ApiClient> BareLoop<C> {
             #[cfg(feature = "streaming")]
             text_streamer: None,
             contributors: Vec::new(),
+            attachments: AttachmentStore::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1369,6 +1382,7 @@ impl<C: ApiClient> BareLoop<C> {
             #[cfg(feature = "streaming")]
             text_streamer: None,
             contributors: Vec::new(),
+            attachments: AttachmentStore::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1487,6 +1501,7 @@ impl<C: ApiClient> BareLoop<C> {
             #[cfg(feature = "streaming")]
             text_streamer: None,
             contributors: Vec::new(),
+            attachments: AttachmentStore::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1821,6 +1836,23 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// The consolidated attachment message for this turn's request.
+    ///
+    /// A one-message vec holding the user message with every pinned
+    /// attachment's rendered part, ordered most durable kind first; an
+    /// empty vec when nothing is pinned, so a loop without attachments
+    /// builds requests byte-identical to one that has never heard of
+    /// them. The message rides as per-turn transient context ahead of
+    /// the contributors and the machine-owned history — attachments
+    /// never enter history, which is what makes them
+    /// compaction-immune by construction.
+    fn attachment_messages(&self) -> Vec<Message> {
+        match self.attachments.consolidated_message() {
+            Some(message) => vec![message],
+            None => Vec::new(),
+        }
+    }
+
     /// Collect transient contributor messages for the current turn.
     ///
     /// Each registered [`ContextContributor`] is consulted against the
@@ -1898,7 +1930,8 @@ impl<C: ApiClient> BareLoop<C> {
         self.turn_wall_start = Some(turn_start);
         let turn_input = self.turn_input(turn);
 
-        let mut messages = self.collect_contributor_messages(turn);
+        let mut messages = self.attachment_messages();
+        messages.extend(self.collect_contributor_messages(turn));
         self.collect_memories(&turn_input, &mut messages).await;
 
         // The transients ride this turn's request but not the history:

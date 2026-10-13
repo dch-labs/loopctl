@@ -117,6 +117,54 @@ impl<C: ApiClient> BareLoop<C> {
         self.managers.set_context_manager(Arc::new(synced));
     }
 
+    /// Pin an attachment whose rendered part rides every request.
+    ///
+    /// The attachment joins the loop's
+    /// [`AttachmentStore`](crate::attachment::AttachmentStore) and is
+    /// rendered into the consolidated user message that leads every
+    /// outbound request — it never enters the machine-owned history,
+    /// so no compaction pass can drop or distort it, and its token
+    /// cost is measured into the payload estimate like any transient.
+    /// Pinning an attachment whose
+    /// [`id`](crate::attachment::Attachment::id) matches one already
+    /// stored replaces it in place: the update path for a mutable
+    /// attachment such as the todo list, whose latest state is what
+    /// the next request renders.
+    pub fn set_attachment(&mut self, attachment: Arc<dyn crate::attachment::Attachment>) {
+        self.attachments.insert(attachment);
+    }
+
+    /// Pin an attachment, consuming `self`. Fluent mirror of
+    /// [`set_attachment`](BareLoop::set_attachment).
+    #[must_use]
+    pub fn with_attachment(mut self, attachment: Arc<dyn crate::attachment::Attachment>) -> Self {
+        self.set_attachment(attachment);
+        self
+    }
+
+    /// Unpin the attachment with this
+    /// [`id`](crate::attachment::Attachment::id).
+    ///
+    /// Returns whether an attachment was removed; an unknown `id` is a
+    /// no-op returning `false`. The next request stops carrying the
+    /// attachment's part.
+    pub fn detach_attachment(&mut self, id: &str) -> bool {
+        self.attachments.remove(id)
+    }
+
+    /// The ids of the pinned attachments in store order.
+    ///
+    /// The host-visible read of what is pinned right now — the store
+    /// itself is engine-internal, and nothing about attachments needs
+    /// an event because they never transit compaction.
+    pub fn attachment_ids(&self) -> Vec<String> {
+        self.attachments
+            .attachments()
+            .iter()
+            .map(|a| a.id())
+            .collect()
+    }
+
     /// Set the token counter for context-size estimates.
     ///
     /// The counter is used to estimate the conversation's token cost after

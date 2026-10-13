@@ -7,6 +7,8 @@
 
 use super::*;
 use crate::api::error::ApiError;
+#[cfg(feature = "streaming")]
+use crate::attachment::Attachment as _;
 use crate::capabilities::FallbackCapable;
 #[cfg(feature = "streaming")]
 use crate::compact::{HeuristicTokenCounter, TokenCounter as _};
@@ -12925,5 +12927,297 @@ async fn an_emergency_stall_still_ends_the_run() {
     assert!(
         crate::error::recover_guard(failures.lock()).is_empty(),
         "the hard emergency death fires no deferral notice — the typed run error is its surface"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn attachments_ride_every_request_ahead_of_the_history() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("first ", "first done");
+    client.push_final_turn("second ", "second done");
+    let file = std::sync::Arc::new(crate::attachment::FileAttachment::inline(
+        "src/main.rs",
+        "fn main() {}",
+    ));
+    let todo = std::sync::Arc::new(crate::attachment::TodoAttachment::new(vec![
+        crate::attachment::TodoItem::new("wire the attachments system", false),
+    ]));
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config())
+        .with_attachment(file.clone())
+        .with_attachment(todo.clone());
+    agent.run("first prompt", &make_run_config()).await.unwrap();
+    agent
+        .run("second prompt", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "the fixture issues two requests");
+    let MessagePart::Text { text: file_text } = file.as_ref().render() else {
+        panic!("the file attachment renders text")
+    };
+    let MessagePart::Text { text: todo_text } = todo.as_ref().render() else {
+        panic!("the todo attachment renders text")
+    };
+    for (index, request) in captured.iter().enumerate() {
+        let first = request
+            .messages
+            .first()
+            .expect("every request carries the consolidated attachment message");
+        assert_eq!(
+            first.role,
+            Role::User,
+            "request {index} leads with user text"
+        );
+        let leading = match first.parts.first() {
+            Some(MessagePart::Text { text }) => text.as_str(),
+            other => panic!("request {index} leads with text, not {other:?}"),
+        };
+        let file_at = leading
+            .find(&file_text)
+            .unwrap_or_else(|| panic!("request {index} carries the file part: {leading}"));
+        let todo_at = leading
+            .find(&todo_text)
+            .unwrap_or_else(|| panic!("request {index} carries the todo part: {leading}"));
+        assert!(
+            leading
+                .find("first prompt")
+                .or_else(|| leading.find("second prompt"))
+                .is_some_and(|prompt_at| file_at < todo_at && todo_at < prompt_at),
+            "request {index} orders the pinned parts ahead of the prompt"
+        );
+    }
+    for message in agent.machine().full_history() {
+        for part in &message.parts {
+            let text = match part {
+                MessagePart::Text { text } => text.as_str(),
+                _ => continue,
+            };
+            assert!(
+                !text.contains(&file_text) && !text.contains(&todo_text),
+                "attachments never enter the machine-owned history: {text}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn attachments_survive_a_compaction_pass_byte_equal() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("fat ", &"history payload ".repeat(240));
+    client.push_final_turn("lean ", "lean done");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            ShrinkingPassCompactor,
+        ))));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let file = std::sync::Arc::new(crate::attachment::FileAttachment::inline(
+        "pinned.md",
+        "the fact that must survive every pass",
+    ));
+    let mut agent =
+        BareLoop::new_with_managers(Arc::new(client), ToolRegistry::new(), config, managers)
+            .with_attachment(file.clone());
+    agent.run("first prompt", &make_run_config()).await.unwrap();
+    agent
+        .run("second prompt", &make_run_config())
+        .await
+        .unwrap();
+
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the fixture's history weight must fire a compaction pass"
+    );
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "one request per run");
+    let last = captured
+        .last()
+        .expect("the post-compaction request is the one that matters");
+    let leading = match last.messages.first().and_then(|m| m.parts.first()) {
+        Some(MessagePart::Text { text }) => text.as_str(),
+        other => {
+            panic!("the post-compaction request still leads with the pinned part, not {other:?}")
+        }
+    };
+    let MessagePart::Text { text: file_text } = file.as_ref().render() else {
+        panic!("the file attachment renders text")
+    };
+    assert!(
+        leading.contains(&file_text),
+        "the pinned part rides the post-compaction request byte-equal: {leading}"
+    );
+    for message in agent.machine().full_history() {
+        for part in &message.parts {
+            let text = match part {
+                MessagePart::Text { text } => text.as_str(),
+                _ => continue,
+            };
+            assert!(
+                !text.contains(&file_text),
+                "the pass compacted history while the attachment never entered it: {text}"
+            );
+        }
+    }
+    assert!(
+        agent.machine().full_history().len() <= 2,
+        "the shrinking pass did its job on the conversational history"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_updated_attachment_renders_its_latest_state_on_the_next_request() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("first ", "first done");
+    client.push_final_turn("second ", "second done");
+    let config = make_config();
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+    agent.set_attachment(std::sync::Arc::new(crate::attachment::TodoAttachment::new(
+        vec![crate::attachment::TodoItem::new("read compact.rs", false)],
+    )));
+    agent.run("first prompt", &make_run_config()).await.unwrap();
+    agent.set_attachment(std::sync::Arc::new(crate::attachment::TodoAttachment::new(
+        vec![crate::attachment::TodoItem::new("read compact.rs", true)],
+    )));
+    agent
+        .run("second prompt", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "one request per run");
+    let request_text = |index: usize| match captured[index]
+        .messages
+        .first()
+        .and_then(|m| m.parts.first())
+    {
+        Some(MessagePart::Text { text }) => text.clone(),
+        other => panic!("request {index} leads with the pinned part, not {other:?}"),
+    };
+    assert!(
+        request_text(0).contains("- [ ] read compact.rs"),
+        "the first request renders the pending item"
+    );
+    assert!(
+        request_text(1).contains("- [x] read compact.rs"),
+        "the second request renders the checked item — the latest state"
+    );
+    assert!(
+        !request_text(1).contains("- [ ] read compact.rs"),
+        "the stale pending form is gone from the second request"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn an_attachment_that_eats_the_window_defers_to_compaction_like_a_contributor() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "served anyway");
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let attachment = std::sync::Arc::new(crate::attachment::FileAttachment::inline(
+        "huge.log",
+        "payload ".repeat(430),
+    ));
+    let MessagePart::Text {
+        text: attachment_text,
+    } = attachment.as_ref().render()
+    else {
+        panic!("the file attachment renders text")
+    };
+    let mut agent =
+        BareLoop::new(Arc::new(client), ToolRegistry::new(), config).with_attachment(attachment);
+    agent.register_observer(Arc::new(CompactionFailureRecorder {
+        failures: Arc::clone(&failures),
+    }));
+    let result = agent
+        .run("hi", &make_run_config())
+        .await
+        .expect("the deferred turn still serves while the payload fits the window");
+    assert_eq!(result.output.as_deref(), Some("served anyway"));
+
+    let recorded = crate::error::recover_guard(failures.lock()).clone();
+    assert!(
+        recorded.iter().any(|row| row
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("could not shrink"))),
+        "the over-line payload deferred to a compaction pass first"
+    );
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 1, "the deferred turn served exactly once");
+    let leading = match captured[0].messages.first().and_then(|m| m.parts.first()) {
+        Some(MessagePart::Text { text }) => text.as_str(),
+        other => panic!("the served request leads with the pinned part, not {other:?}"),
+    };
+    assert!(
+        leading.contains(&attachment_text),
+        "the oversized attachment still rides the request it deferred: {leading}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_attachment_larger_than_the_window_dies_on_a_rejecting_provider() {
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_text_response("never reached");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            ShrinkingPassCompactor,
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let attachment = std::sync::Arc::new(crate::attachment::FileAttachment::inline(
+        "huge.log",
+        "payload ".repeat(430),
+    ));
+    let seeded = vec![
+        Message::user("earlier question ".repeat(20)),
+        Message::assistant("earlier answer ".repeat(20)),
+    ];
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(HardWindowClient {
+            inner: scripted,
+            window: 400,
+        }),
+        ToolRegistry::new(),
+        managers,
+    )
+    .with_attachment(attachment);
+    let result = agent
+        .run(
+            "a prompt the provider cannot serve with the pin riding",
+            &RunConfig::default(),
+        )
+        .await;
+    match result {
+        Err(LoopError::ContextExceeded { used, limit }) => assert!(
+            used >= limit,
+            "the refusal floors the reported usage at the window: used {used}, limit {limit}"
+        ),
+        other => {
+            panic!("the oversized pin rode the retried turn into the run's death, got {other:?}")
+        }
+    }
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the salvage forced a real pass before the death — the attachment survived it untouched"
     );
 }

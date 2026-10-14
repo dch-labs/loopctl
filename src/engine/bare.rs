@@ -302,6 +302,18 @@ pub struct BareLoop<C: ApiClient> {
     /// [`with_attachment`](BareLoop::with_attachment).
     attachments: AttachmentStore,
 
+    /// The per-turn tool-surface selector, when one is configured.
+    ///
+    /// `None` (the default) advertises every registered tool on every
+    /// request, byte-identical to a selector-unaware loop. When set,
+    /// the engine consults it once per turn and threads the chosen
+    /// schemas into both the outbound request and the window estimate
+    /// — the figure counts what the wire carries, never the whole
+    /// registry. Configure via
+    /// [`set_tool_selector`](BareLoop::set_tool_selector) /
+    /// [`with_tool_selector`](BareLoop::with_tool_selector).
+    tool_selector: Option<std::sync::Arc<dyn crate::tool::ToolSelector>>,
+
     /// Cached components of the per-request overhead.
     ///
     /// Holds the system-prompt and tool-schema costs separately — both
@@ -894,6 +906,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
+            tool_selector: None,
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1308,6 +1321,33 @@ impl<C: ApiClient> BareLoop<C> {
         parts.system.saturating_add(parts.tools)
     }
 
+    /// The token cost of the overhead as this turn's advertised
+    /// surface carries it.
+    ///
+    /// The per-turn figure under tool-surface selection: counts the
+    /// schemas the turn's request actually advertises — the same
+    /// `Vec` the engine threads into the request — so the estimate
+    /// describes the payload the provider receives, never the whole
+    /// registry. A `response_format` turn suppresses tool
+    /// advertisement on the wire and counts no schema component at
+    /// all, exactly as [`request_overhead_tokens`](Self::request_overhead_tokens)
+    /// does. The compaction reservation keeps the full-set figure: a
+    /// post-compaction turn may advertise the entire surface again.
+    fn advertised_overhead_tokens(&self, advertised: Option<&[crate::tool::ToolSchema]>) -> u64 {
+        let parts = self.overhead_parts();
+        if self.request_options.response_format.is_some() {
+            return parts.system;
+        }
+        let tools = advertised.map_or(0, |schemas| {
+            if schemas.is_empty() {
+                return 0;
+            }
+            serde_json::to_string(schemas)
+                .map_or(0, |rendered| self.count_context(&[Message::user(rendered)]))
+        });
+        parts.system.saturating_add(tools)
+    }
+
     /// Borrow the driving state machine.
     ///
     /// Returns a reference to the [`LoopMachine`] that owns the current run's
@@ -1383,6 +1423,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
+            tool_selector: None,
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1502,6 +1543,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
+            tool_selector: None,
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1930,6 +1972,7 @@ impl<C: ApiClient> BareLoop<C> {
         self.turn_wall_start = Some(turn_start);
         let turn_input = self.turn_input(turn);
 
+        let tools = self.turn_tool_schemas(turn, &turn_input);
         let mut messages = self.attachment_messages();
         messages.extend(self.collect_contributor_messages(turn));
         self.collect_memories(&turn_input, &mut messages).await;
@@ -1944,14 +1987,14 @@ impl<C: ApiClient> BareLoop<C> {
         // re-decision).
         let mut raw_payload = self
             .count_context(&self.machine.full_history())
-            .saturating_add(self.request_overhead_tokens())
+            .saturating_add(self.advertised_overhead_tokens(tools.as_deref()))
             .saturating_add(self.count_context(&messages));
         let mut payload = self.context_figure(raw_payload);
         self.machine.set_context_tokens(payload);
         if self.maybe_prune().await? {
             raw_payload = self
                 .count_context(&self.machine.full_history())
-                .saturating_add(self.request_overhead_tokens())
+                .saturating_add(self.advertised_overhead_tokens(tools.as_deref()))
                 .saturating_add(self.count_context(&messages));
             payload = self.context_figure(raw_payload);
             self.machine.set_context_tokens(payload);
@@ -1970,7 +2013,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         self.notify_turn_start(turn, &turn_input);
 
-        let turn_outcome = self.do_turn(turn, messages).await;
+        let turn_outcome = self.do_turn(turn, messages, tools.clone()).await;
         let llm_turn::TurnServing {
             message: msg,
             usage,
@@ -2048,7 +2091,7 @@ impl<C: ApiClient> BareLoop<C> {
         context_history.push(model_response.message.clone());
         let context_tokens = self.context_figure(
             self.count_context(&context_history)
-                .saturating_add(self.request_overhead_tokens())
+                .saturating_add(self.advertised_overhead_tokens(tools.as_deref()))
                 .saturating_add(transient_tokens),
         );
         self.machine.model_response(model_response, context_tokens);
@@ -2823,9 +2866,15 @@ impl<C: ApiClient> BareLoop<C> {
 /// `maximum context length`), `"too many tokens"`, `"exceeds
 /// maximum"`, `"max tokens"`, and `"prompt is too long"` (Anthropic's
 /// canonical `prompt is too long: 205225 tokens > 200000 maximum`).
+/// The self-hosted engine family writes its limits with underscores —
+/// `"context_length_exceeded"` and `"max_context"` — and its
+/// underscore spellings cannot collide with the spaced transient
+/// idioms, so they join the set verbatim.
 fn message_reports_context_overflow(message: &str) -> bool {
     let message = message.to_lowercase();
     message.contains("context length")
+        || message.contains("context_length")
+        || message.contains("max_context")
         || message.contains("too many tokens")
         || message.contains("exceeds maximum")
         || message.contains("max tokens")

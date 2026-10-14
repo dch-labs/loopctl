@@ -117,6 +117,32 @@ impl<C: ApiClient> BareLoop<C> {
         self.managers.set_context_manager(Arc::new(synced));
     }
 
+    /// Set the per-turn tool-surface selector.
+    ///
+    /// The selector narrows what the model sees each turn: the engine
+    /// consults it once per turn and threads the chosen schemas into
+    /// the outbound request and the window estimate alike, so the
+    /// figure counts the advertised subset, never the whole registry.
+    /// The compaction reservation keeps measuring the full surface —
+    /// a post-compaction turn may advertise all of it again. Without a
+    /// selector every registered tool is advertised, byte-identical to
+    /// a loop that has never heard of selection; the selector must be
+    /// deterministic for a given context.
+    pub fn set_tool_selector(&mut self, selector: std::sync::Arc<dyn crate::tool::ToolSelector>) {
+        self.tool_selector = Some(selector);
+    }
+
+    /// Set the tool-surface selector, consuming `self`. Fluent mirror
+    /// of [`set_tool_selector`](BareLoop::set_tool_selector).
+    #[must_use]
+    pub fn with_tool_selector(
+        mut self,
+        selector: std::sync::Arc<dyn crate::tool::ToolSelector>,
+    ) -> Self {
+        self.set_tool_selector(selector);
+        self
+    }
+
     /// Pin an attachment whose rendered part rides every request.
     ///
     /// The attachment joins the loop's

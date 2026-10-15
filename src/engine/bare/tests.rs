@@ -3254,6 +3254,31 @@ impl ApiClient for HardWindowClient {
 }
 
 #[cfg(feature = "streaming")]
+#[test]
+fn the_local_engine_s_oversized_phrases_arm_the_salvage() {
+    // The self-hosted engine family answers an oversized prompt with
+    // snake_case vocabulary — "context_length_exceeded" and
+    // "max_context" — that no hosted provider's spaced phrasing
+    // covers; the salvage arm must recognize the engine's own words,
+    // or a local session hard-fails where a hosted one compacts and
+    // retries.
+    assert!(
+        message_reports_context_overflow("prepared prompt exceeds Engine max_context 262144"),
+        "the engine's max_context phrasing arms the salvage"
+    );
+    assert!(
+        message_reports_context_overflow("context_length_exceeded"),
+        "the engine's error code arms the salvage"
+    );
+    // The gRPC/Go transient idioms stay outside: they name a deadline
+    // or a cancel, not an oversized prompt.
+    assert!(!message_reports_context_overflow(
+        "context deadline exceeded while proxying"
+    ));
+    assert!(!message_reports_context_overflow("rpc context canceled"));
+}
+
+#[cfg(feature = "streaming")]
 #[tokio::test]
 async fn an_oversized_prompt_rejection_compacts_and_retries_the_same_turn() {
     let scripted = MockClient::new("test-model").without_usage();
@@ -13219,5 +13244,533 @@ async fn an_attachment_larger_than_the_window_dies_on_a_rejecting_provider() {
     assert!(
         *crate::error::recover_guard(compactions.lock()) >= 1,
         "the salvage forced a real pass before the death — the attachment survived it untouched"
+    );
+}
+
+/// One named, described tool for the tool-surface pins — its call is
+/// never exercised (the fixtures script text-only turns); only its
+/// schema rides the wire.
+#[cfg(feature = "streaming")]
+macro_rules! surface_tool {
+    ($name:ident, $tool_name:literal, $description:literal) => {
+        struct $name;
+
+        impl Tool for $name {
+            fn name(&self) -> &'static str {
+                $tool_name
+            }
+
+            fn description(&self) -> &'static str {
+                $description
+            }
+
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    tool: $tool_name.into(),
+                    description: $description.into(),
+                    input_schema: json!({"type": "object"}),
+                }
+            }
+
+            fn call(
+                &self,
+                _input: Value,
+                _ctx: &ToolContext,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+                Box::pin(std::future::ready(Ok(ToolOutput::text("unused"))))
+            }
+        }
+    };
+}
+
+#[cfg(feature = "streaming")]
+surface_tool!(SurfaceRead, "read_file", "Read a file from disk");
+#[cfg(feature = "streaming")]
+surface_tool!(SurfaceWrite, "write_file", "Write a file to disk");
+#[cfg(feature = "streaming")]
+surface_tool!(SurfaceSearch, "web_search", "Search the web for pages");
+#[cfg(feature = "streaming")]
+surface_tool!(
+    SurfaceWeather,
+    "weather",
+    "Report the weather forecast for a city"
+);
+#[cfg(feature = "streaming")]
+surface_tool!(
+    SurfaceCalc,
+    "calculator",
+    "Evaluate an arithmetic expression"
+);
+
+/// Register the five distinct surface tools the pins select among.
+#[cfg(feature = "streaming")]
+fn surface_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(SurfaceRead);
+    registry.register(SurfaceWrite);
+    registry.register(SurfaceSearch);
+    registry.register(SurfaceWeather);
+    registry.register(SurfaceCalc);
+    registry
+}
+
+#[cfg(feature = "streaming")]
+fn surface_names(request: &crate::api::StreamRequest) -> Vec<String> {
+    request
+        .tools
+        .as_ref()
+        .map(|tools| tools.iter().map(|schema| schema.tool.clone()).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_keyword_selector_advertises_the_matching_subset_on_the_wire() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "searched");
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 1, "the fixture issues one request");
+    assert_eq!(
+        surface_names(&captured[0]),
+        vec!["web_search".to_string()],
+        "only the tool overlapping the prompt rides the request"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn the_window_estimate_counts_the_advertised_subset_not_the_registry() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "searched");
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    let subset = vec![SurfaceSearch.schema()];
+    let expected_tools = HeuristicTokenCounter.count(&[Message::user(
+        serde_json::to_string(&subset).unwrap_or_default(),
+    )]);
+    let history = agent.machine().full_history();
+    let expected = agent.calibration.apply(
+        HeuristicTokenCounter
+            .count(&history)
+            .saturating_add(expected_tools),
+    );
+    assert_eq!(
+        agent.context_tokens(),
+        expected,
+        "the machine's figure carries the subset's own rendered cost — \
+         the estimate describes the payload the provider receives"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_keyword_miss_fails_open_to_the_full_surface() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+    agent
+        .run("completely unrelated zebra topic", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(
+        surface_names(&captured[0]),
+        vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "web_search".to_string(),
+            "weather".to_string(),
+            "calculator".to_string(),
+        ],
+        "a miss advertises everything — today's behavior, not silence"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn no_selector_configured_advertises_every_registered_tool() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config());
+    agent
+        .run("an ordinary prompt about files", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(
+        surface_names(&captured[0]).len(),
+        5,
+        "the default surface is the whole registry — no selector, no narrowing"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn selection_composes_with_response_format_suppression() {
+    let client = MockClient::new("test-model").without_usage();
+    client.add_text_response("searched");
+    let format = crate::structured::ResponseFormat::new(
+        "surface",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "found": { "type": "boolean" } },
+            "required": ["found"],
+            "additionalProperties": false
+        }),
+    );
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+    agent
+        .set_request_options(crate::structured::RequestOptions::new().with_response_format(format));
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    let at_rest = agent.machine().full_history();
+    assert_eq!(
+        agent.context_tokens(),
+        agent
+            .count_context(&at_rest)
+            .saturating_add(agent.overhead_parts().system),
+        "a format turn's estimate counts no tool schemas — the wire body \
+         omits tools entirely, so neither the subset nor the registry reserves"
+    );
+}
+
+#[cfg(feature = "streaming")]
+surface_tool!(
+    SurfaceFatPatch,
+    "patch_region",
+    "modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated."
+);
+
+/// The registry whose full surface dwarfs any turn's selection: five
+/// ordinary tools plus one enormous schema, so a figure counting the
+/// whole registry and a figure counting the advertised subset sit far
+/// apart — the separation the premature-compaction pins need.
+#[cfg(feature = "streaming")]
+fn fat_surface_registry() -> ToolRegistry {
+    let mut registry = surface_registry();
+    registry.register(SurfaceFatPatch);
+    registry
+}
+
+/// A selector that reads the whole conversation the request carries:
+/// a tool rides when any word of its name appears as a word in any
+/// message's text.
+///
+/// The double behind the transient-visibility pin: unlike
+/// [`KeywordSelector`](crate::tool::KeywordSelector), which matches
+/// the prompt alone, this one's policy is over
+/// [`SelectionContext::conversation`](crate::tool::SelectionContext)
+/// — the surface it picks proves what the engine let it see.
+#[cfg(feature = "streaming")]
+struct ConversationKeywordSelector;
+
+#[cfg(feature = "streaming")]
+impl crate::tool::ToolSelector for ConversationKeywordSelector {
+    fn select(
+        &self,
+        ctx: &crate::tool::SelectionContext<'_>,
+        all: &[ToolSchema],
+    ) -> Vec<ToolSchema> {
+        let corpus = ctx
+            .conversation
+            .iter()
+            .map(Message::text_content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let corpus_words = corpus
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|word| word.len() >= 3)
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        all.iter()
+            .filter(|schema| {
+                schema
+                    .tool
+                    .split(|ch: char| !ch.is_ascii_alphanumeric())
+                    .filter(|word| word.len() >= 3)
+                    .any(|word| corpus_words.iter().any(|seen| seen == word))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// One recorded selection consultation: the turn and the query text
+/// the engine handed the selector.
+#[cfg(feature = "streaming")]
+type SelectionQuery = (usize, Option<String>);
+
+/// A selector that records the prompt and turn it was consulted with,
+/// advertising everything.
+///
+/// The double behind the run-prompt pin: its record is the assertion
+/// surface — what the engine passed as
+/// [`latest_user_message`](crate::tool::SelectionContext::latest_user_message)
+/// on each turn.
+#[cfg(feature = "streaming")]
+struct PromptRecordingSelector {
+    seen: Arc<Mutex<Vec<SelectionQuery>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::tool::ToolSelector for PromptRecordingSelector {
+    fn select(
+        &self,
+        ctx: &crate::tool::SelectionContext<'_>,
+        all: &[ToolSchema],
+    ) -> Vec<ToolSchema> {
+        crate::error::recover_guard(self.seen.lock())
+            .push((ctx.turn, ctx.latest_user_message.map(str::to_string)));
+        all.to_vec()
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn selection_reads_the_run_prompt_on_every_turn() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_tool_turn("thinking ", "call_1", &json!({"query": "x"}));
+    client.push_final_turn("thinking ", "done");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(PromptRecordingSelector {
+            seen: Arc::clone(&seen),
+        }));
+    agent
+        .run("read the configuration", &make_run_config())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(seen.lock()).clone();
+    assert_eq!(
+        recorded,
+        vec![
+            (0, Some("read the configuration".to_string())),
+            (1, Some("read the configuration".to_string())),
+        ],
+        "every turn selects on the run's opening prompt — a continuation \
+         turn's input is tool-result text, never the selection query: \
+         {recorded:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn selection_sees_the_transients_that_ride_the_request() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(ConversationKeywordSelector));
+    agent.set_attachment(std::sync::Arc::new(
+        crate::attachment::MemoryAttachment::new(
+            "research",
+            "you must use web_search for this task",
+        ),
+    ));
+    agent
+        .run(
+            "please read the configuration and summarize",
+            &make_run_config(),
+        )
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 1, "the fixture issues one request");
+    assert_eq!(
+        surface_names(&captured[0]),
+        vec!["read_file".to_string(), "web_search".to_string()],
+        "a transient naming its tool drives the selection — the selector \
+         sees the same messages the request carries"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn the_run_start_estimate_counts_the_upcoming_surface_not_the_registry() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(40);
+    let mut agent = BareLoop::new(Arc::new(client), fat_surface_registry(), config)
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+    agent.register_observer(Arc::new(CompactionFailureRecorder {
+        failures: Arc::clone(&failures),
+    }));
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(failures.lock()).clone();
+    assert!(
+        recorded.is_empty(),
+        "a turn whose advertised subset fits must not manufacture a compaction \
+         from the unadvertised registry's overhead: {} deferral notice(s) fired",
+        recorded.len()
+    );
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 1, "the fixture issues one request");
+    assert_eq!(
+        surface_names(&captured[0]),
+        vec!["web_search".to_string()],
+        "the served request carries the subset, proving the run started"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn the_post_dispatch_estimate_counts_the_next_surface_not_the_registry() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_tool_turn("thinking ", "call_1", &json!({"query": "x"}));
+    client.push_final_turn("thinking ", "done");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_observer(Arc::new(CompactionFailureRecorder {
+            failures: Arc::clone(&failures),
+        }));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(40);
+    let mut agent =
+        BareLoop::new_with_managers(Arc::new(client), fat_surface_registry(), config, managers)
+            .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "no pass and no deferral fire between tool dispatch and the next \
+         model call when the upcoming request's subset fits"
+    );
+    assert!(
+        crate::error::recover_guard(failures.lock()).is_empty(),
+        "the post-dispatch re-feed counts the next request's surface, never \
+         the registry the wire will not carry"
+    );
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "one request per turn");
+    assert_eq!(
+        surface_names(&captured[1]),
+        vec!["web_search".to_string()],
+        "the continuation request still carries the subset selected on the \
+         run's prompt"
+    );
+    assert!(
+        agent.machine().full_history().len() >= 4,
+        "the tool round trip survives untouched — no pass had anything to do"
+    );
+}
+
+/// A selector advertising a scripted surface per turn, so one run's
+/// requests carry different toolsets.
+///
+/// The double behind the anchor pin: the surface must narrow between
+/// two requests of one run — before the next usage report refreshes
+/// the anchor — which no prompt-matching selector produces with a
+/// constant run prompt.
+#[cfg(feature = "streaming")]
+struct ScriptedSurfaceSelector {
+    surfaces: Vec<Vec<String>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::tool::ToolSelector for ScriptedSurfaceSelector {
+    fn select(
+        &self,
+        ctx: &crate::tool::SelectionContext<'_>,
+        all: &[ToolSchema],
+    ) -> Vec<ToolSchema> {
+        let names = self
+            .surfaces
+            .get(ctx.turn)
+            .map_or(&[] as &[String], Vec::as_slice);
+        all.iter()
+            .filter(|schema| names.contains(&schema.tool))
+            .cloned()
+            .collect()
+    }
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn a_narrowed_surface_invalidates_the_usage_anchor_so_the_figure_can_fall() {
+    let client = MockClient::new("m");
+    add_tool_then_text_with_usage(
+        &client,
+        "call_1",
+        "web_search",
+        &json!({"query": "x"}),
+        10,
+        10,
+    );
+    let compactions = Arc::new(Mutex::new(0usize));
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_observer(Arc::new(CompactionFailureRecorder {
+            failures: Arc::clone(&failures),
+        }));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(SurfaceFatPatch);
+    registry.register(SurfaceSearch);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(BilledMockClient::wrap(client, 4)),
+        registry,
+        config,
+        managers,
+    )
+    .with_tool_selector(Arc::new(ScriptedSurfaceSelector {
+        surfaces: vec![
+            vec!["patch_region".to_string(), "web_search".to_string()],
+            vec!["web_search".to_string()],
+        ],
+    }));
+    agent
+        .run("inspect the patch region", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured_failures = crate::error::recover_guard(failures.lock()).clone();
+    assert!(
+        captured_failures.is_empty() && *crate::error::recover_guard(compactions.lock()) == 0,
+        "a turn whose narrowed surface fits must not inherit the widened \
+         turn's reported figure — the anchor dies with the wire prefix \
+         it was built on: {} pass(es), {} deferral notice(s)",
+        *crate::error::recover_guard(compactions.lock()),
+        captured_failures.len()
     );
 }

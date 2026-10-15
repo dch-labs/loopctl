@@ -81,6 +81,7 @@ use crate::message::ToolContent as MessageToolContent;
 pub mod grant;
 pub mod permission;
 pub mod registry;
+pub mod selector;
 
 pub use grant::{Grant, GrantScope, GrantStore, GrantVerdict};
 pub use permission::GateDecision;
@@ -88,6 +89,7 @@ pub use permission::GateRuleSource;
 pub use permission::GateVerdict;
 pub use permission::PermissionCheck;
 pub use registry::{FnTool, ToolRegistry};
+pub use selector::{KeywordSelector, SelectionContext, StaticSelector, ToolSelector};
 
 /// Schema descriptor for a tool, used for LLM API tool definitions.
 ///

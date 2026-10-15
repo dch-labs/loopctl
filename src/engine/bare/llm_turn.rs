@@ -67,17 +67,48 @@ pub(super) struct TurnServing {
 }
 
 impl<C: ApiClient> BareLoop<C> {
-    /// Build tool schemas for the API request.
+    /// Select the tool schemas this turn's request advertises.
     ///
-    /// Collects all tool schemas from the [`ToolRegistry`] and returns
-    /// them as `Some(Vec<ToolSchema>)`, or `None` if the registry is empty.
-    pub(super) fn build_tool_schemas(&self) -> Option<Vec<crate::tool::ToolSchema>> {
-        let schemas = self.tools.all_schemas();
-        if schemas.is_empty() {
-            None
-        } else {
-            Some(schemas)
+    /// The registry's full surface when no selector is configured —
+    /// byte-identical to a selector-unaware loop — and the configured
+    /// selector's choice otherwise, consulted with the run's opening
+    /// prompt and the conversation the request carries: the transient
+    /// messages leading the machine-owned history, the same ordered
+    /// view [`build_turn_request`](Self::build_turn_request) sends
+    /// pre-coalesce. The engine threads the result into both the
+    /// outbound request and the window estimate, so the figure counts
+    /// what the wire carries and a stateful selector cannot diverge
+    /// between what was counted and what was sent. An empty selection
+    /// or empty registry advertises nothing (the request omits the
+    /// tools field).
+    pub(super) fn turn_tool_schemas(
+        &self,
+        turn: usize,
+        transients: &[Message],
+    ) -> Option<Vec<crate::tool::ToolSchema>> {
+        let all = self.tools.all_schemas();
+        if all.is_empty() {
+            return None;
         }
+        let advertised = match &self.tool_selector {
+            None => all,
+            Some(selector) => {
+                let mut conversation = transients.to_vec();
+                conversation.extend(self.machine.full_history());
+                let prompt = self
+                    .session
+                    .current_run()
+                    .map(|run| run.input.clone())
+                    .filter(|input| !input.is_empty());
+                let context = crate::tool::SelectionContext {
+                    turn,
+                    latest_user_message: prompt.as_deref(),
+                    conversation: &conversation,
+                };
+                selector.select(&context, &all)
+            }
+        };
+        (!advertised.is_empty()).then_some(advertised)
     }
 
     /// Build the per-turn [`StreamRequest`] shared by both turn paths.
@@ -88,13 +119,17 @@ impl<C: ApiClient> BareLoop<C> {
     /// `coalesce_adjacent_user_text` pass) so the request never carries
     /// consecutive user turns. Defined once here so the streaming and
     /// non-streaming paths cannot drift on request shape.
-    pub(super) fn build_turn_request(&self, messages: Vec<Message>) -> StreamRequest {
+    pub(super) fn build_turn_request(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<crate::tool::ToolSchema>>,
+    ) -> StreamRequest {
         let mut messages = messages;
         messages.extend(self.machine.full_history());
         let messages = coalesce_adjacent_user_text(messages);
         StreamRequest::new(messages)
             .with_system(self.session.config.system_prompt.clone())
-            .with_tools(self.build_tool_schemas())
+            .with_tools(tools)
     }
 
     /// The single model the fallback manager resolves this turn's
@@ -182,6 +217,7 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         messages: Vec<Message>,
+        tools: Option<Vec<crate::tool::ToolSchema>>,
     ) -> Result<TurnServing, LoopError> {
         if self.cancelled.is_cancelled() {
             return Err(LoopError::Cancelled);
@@ -189,8 +225,8 @@ impl<C: ApiClient> BareLoop<C> {
         self.check_budget_before_request(turn)?;
         match self.turn_mode {
             #[cfg(feature = "streaming")]
-            super::TurnMode::Streaming => self.do_stream(turn, messages).await,
-            super::TurnMode::NonStreaming => self.do_create_message(turn, messages).await,
+            super::TurnMode::Streaming => self.do_stream(turn, messages, tools).await,
+            super::TurnMode::NonStreaming => self.do_create_message(turn, messages, tools).await,
         }
     }
 
@@ -269,8 +305,9 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         messages: Vec<Message>,
+        tools: Option<Vec<crate::tool::ToolSchema>>,
     ) -> Result<TurnServing, LoopError> {
-        let request = self.build_turn_request(messages);
+        let request = self.build_turn_request(messages, tools);
         let cancel = std::sync::Arc::clone(&self.cancelled);
         let client = &self.client;
         let options = self.turn_request_options()?;
@@ -317,8 +354,9 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         messages: Vec<Message>,
+        tools: Option<Vec<crate::tool::ToolSchema>>,
     ) -> Result<TurnServing, LoopError> {
-        match self.stream_turn(messages).await {
+        match self.stream_turn(messages, tools).await {
             Ok(serving) => {
                 if serving.transport_fallback {
                     self.notify_transport_fallback(turn, serving.stop_reason);
@@ -344,9 +382,10 @@ impl<C: ApiClient> BareLoop<C> {
     pub(super) async fn stream_turn(
         &self,
         messages: Vec<Message>,
+        tools: Option<Vec<crate::tool::ToolSchema>>,
     ) -> Result<TurnServing, LoopError> {
         let handler = self.managers.stream_handler();
-        let request = self.build_turn_request(messages);
+        let request = self.build_turn_request(messages, tools);
         let mut stream = handler.stream_turn(
             &*self.client,
             &request,

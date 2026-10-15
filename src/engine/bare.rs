@@ -302,6 +302,42 @@ pub struct BareLoop<C: ApiClient> {
     /// [`with_attachment`](BareLoop::with_attachment).
     attachments: AttachmentStore,
 
+    /// The per-turn tool-surface selector, when one is configured.
+    ///
+    /// `None` (the default) advertises every registered tool on every
+    /// request, byte-identical to a selector-unaware loop. When set,
+    /// the engine consults it at each request build and threads the
+    /// chosen schemas into both the outbound request and the window
+    /// estimate — the figure counts what the wire carries, never the
+    /// whole registry. Configure via
+    /// [`set_tool_selector`](BareLoop::set_tool_selector) /
+    /// [`with_tool_selector`](BareLoop::with_tool_selector).
+    tool_selector: Option<std::sync::Arc<dyn crate::tool::ToolSelector>>,
+
+    /// The prepared request context for the next model call, when it
+    /// was collected ahead of the call.
+    ///
+    /// Populated wherever the engine must estimate the upcoming
+    /// request's payload before the call itself — the run's opening
+    /// estimate and the post-dispatch re-feed — and consumed by
+    /// [`handle_call_llm`](Self::handle_call_llm), so the figure the
+    /// decision sites computed and the request the wire carries are
+    /// the same selection by construction. Cleared whenever the
+    /// machine rewrites the conversation underneath it (a compaction
+    /// pass), which makes the stashed view stale; the next call then
+    /// prepares fresh against the rewritten history.
+    prepared_turn: Option<PreparedTurn>,
+
+    /// The rendered tool surface the last outbound request advertised.
+    ///
+    /// The wire-prefix identity of the outgoing request's schema set:
+    /// a change between consecutive requests is a wholesale wire
+    /// change, so the usage anchor built on the old prefix dies with
+    /// it — the same invalidation compaction and model switches
+    /// already apply. `None` marks a request that advertised no tools
+    /// at all, a distinct prefix from any advertised set.
+    last_advertised_surface: Option<String>,
+
     /// Cached components of the per-request overhead.
     ///
     /// Holds the system-prompt and tool-schema costs separately — both
@@ -551,7 +587,9 @@ struct TurnAccounting {
 /// own number carries the figure and only the tail is estimated. Built
 /// by the usage observation path whenever a report arrives with a
 /// usable input figure and an armed prediction; cleared by the
-/// invalidation events that make the pairing stale.
+/// invalidation events that make the pairing stale — a compaction
+/// pass, a model switch, and a change in the advertised tool surface,
+/// each a wholesale wire-prefix change the report never described.
 #[derive(Debug)]
 struct UsageAnchor {
     /// The report's input figure, in the provider's window scale.
@@ -894,6 +932,9 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
+            tool_selector: None,
+            prepared_turn: None,
+            last_advertised_surface: None,
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1308,6 +1349,33 @@ impl<C: ApiClient> BareLoop<C> {
         parts.system.saturating_add(parts.tools)
     }
 
+    /// The token cost of the overhead as this turn's advertised
+    /// surface carries it.
+    ///
+    /// The per-turn figure under tool-surface selection: counts the
+    /// schemas the turn's request actually advertises — the same
+    /// `Vec` the engine threads into the request — so the estimate
+    /// describes the payload the provider receives, never the whole
+    /// registry. A `response_format` turn suppresses tool
+    /// advertisement on the wire and counts no schema component at
+    /// all, exactly as [`request_overhead_tokens`](Self::request_overhead_tokens)
+    /// does. The compaction reservation keeps the full-set figure: a
+    /// post-compaction turn may advertise the entire surface again.
+    fn advertised_overhead_tokens(&self, advertised: Option<&[crate::tool::ToolSchema]>) -> u64 {
+        let parts = self.overhead_parts();
+        if self.request_options.response_format.is_some() {
+            return parts.system;
+        }
+        let tools = advertised.map_or(0, |schemas| {
+            if schemas.is_empty() {
+                return 0;
+            }
+            serde_json::to_string(schemas)
+                .map_or(0, |rendered| self.count_context(&[Message::user(rendered)]))
+        });
+        parts.system.saturating_add(tools)
+    }
+
     /// Borrow the driving state machine.
     ///
     /// Returns a reference to the [`LoopMachine`] that owns the current run's
@@ -1383,6 +1451,9 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
+            tool_selector: None,
+            prepared_turn: None,
+            last_advertised_surface: None,
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1502,6 +1573,9 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
+            tool_selector: None,
+            prepared_turn: None,
+            last_advertised_surface: None,
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
@@ -1853,6 +1927,65 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// Collect one turn's request context: its transients and the
+    /// tool surface selected over them.
+    ///
+    /// The single seam every estimate of the upcoming request
+    /// descends from: attachments, contributor messages, and
+    /// retrieved memories are gathered first, then the selector
+    /// consults the very conversation the request will carry —
+    /// transients leading the machine-owned history — so a transient
+    /// that introduces a tool is visible to the selection that needs
+    /// it, and the run's opening prompt (not a continuation turn's
+    /// tool-result text) is the query. The moment the advertised
+    /// surface differs from the previous request's, the usage anchor
+    /// dies with the wire prefix it was built on — a narrowed surface
+    /// must let the figure fall below the prior report, never floor
+    /// at it.
+    async fn prepare_turn(&mut self, turn: usize) -> PreparedTurn {
+        let turn_input = self.turn_input(turn);
+        let mut messages = self.attachment_messages();
+        messages.extend(self.collect_contributor_messages(turn));
+        self.collect_memories(&turn_input, &mut messages).await;
+        let tools = self.turn_tool_schemas(turn, &messages);
+        let surface = tools
+            .as_ref()
+            .map(|schemas| serde_json::to_string(schemas).unwrap_or_default());
+        if self.last_advertised_surface != surface {
+            self.anchor = None;
+        }
+        self.last_advertised_surface = surface;
+        PreparedTurn {
+            turn,
+            messages,
+            tools,
+        }
+    }
+
+    /// Take the prepared context for `turn`, preparing it fresh when
+    /// the stashed entry describes another turn.
+    ///
+    /// The consumption side of the preparation seam: an entry left
+    /// over from an interrupted flow (a compacted turn, a salvaged
+    /// retry) is never served for a turn it does not describe — the
+    /// turn number in the stash is the guard.
+    async fn take_prepared_turn(
+        &mut self,
+        turn: usize,
+    ) -> (Vec<Message>, Option<Vec<crate::tool::ToolSchema>>) {
+        match self.prepared_turn.take() {
+            Some(PreparedTurn {
+                turn: prepared,
+                messages,
+                tools,
+            }) if prepared == turn => (messages, tools),
+            _ => {
+                let prepared = self.prepare_turn(turn).await;
+                (prepared.messages, prepared.tools)
+            }
+        }
+    }
+
     /// Collect transient contributor messages for the current turn.
     ///
     /// Each registered [`ContextContributor`] is consulted against the
@@ -1930,9 +2063,7 @@ impl<C: ApiClient> BareLoop<C> {
         self.turn_wall_start = Some(turn_start);
         let turn_input = self.turn_input(turn);
 
-        let mut messages = self.attachment_messages();
-        messages.extend(self.collect_contributor_messages(turn));
-        self.collect_memories(&turn_input, &mut messages).await;
+        let (messages, tools) = self.take_prepared_turn(turn).await;
 
         // The transients ride this turn's request but not the history:
         // feed their size (plus the per-request overhead) before the
@@ -1944,14 +2075,14 @@ impl<C: ApiClient> BareLoop<C> {
         // re-decision).
         let mut raw_payload = self
             .count_context(&self.machine.full_history())
-            .saturating_add(self.request_overhead_tokens())
+            .saturating_add(self.advertised_overhead_tokens(tools.as_deref()))
             .saturating_add(self.count_context(&messages));
         let mut payload = self.context_figure(raw_payload);
         self.machine.set_context_tokens(payload);
         if self.maybe_prune().await? {
             raw_payload = self
                 .count_context(&self.machine.full_history())
-                .saturating_add(self.request_overhead_tokens())
+                .saturating_add(self.advertised_overhead_tokens(tools.as_deref()))
                 .saturating_add(self.count_context(&messages));
             payload = self.context_figure(raw_payload);
             self.machine.set_context_tokens(payload);
@@ -1970,7 +2101,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         self.notify_turn_start(turn, &turn_input);
 
-        let turn_outcome = self.do_turn(turn, messages).await;
+        let turn_outcome = self.do_turn(turn, messages, tools.clone()).await;
         let llm_turn::TurnServing {
             message: msg,
             usage,
@@ -2048,7 +2179,7 @@ impl<C: ApiClient> BareLoop<C> {
         context_history.push(model_response.message.clone());
         let context_tokens = self.context_figure(
             self.count_context(&context_history)
-                .saturating_add(self.request_overhead_tokens())
+                .saturating_add(self.advertised_overhead_tokens(tools.as_deref()))
                 .saturating_add(transient_tokens),
         );
         self.machine.model_response(model_response, context_tokens);
@@ -2370,11 +2501,14 @@ impl<C: ApiClient> BareLoop<C> {
             Role::User,
             slots.into_iter().flatten().collect(),
         )]);
+        let prepared = self.prepare_turn(turn.saturating_add(1)).await;
         let estimate = self.context_figure(
             self.count_context(&self.machine.full_history())
-                .saturating_add(self.request_overhead_tokens()),
+                .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
+                .saturating_add(self.count_context(&prepared.messages)),
         );
         self.machine.set_context_tokens(estimate);
+        self.prepared_turn = Some(prepared);
         self.notify_turn_end(&TurnEnd {
             turn,
             success: true,
@@ -2559,11 +2693,14 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 self.finalize(Some(&e)).await?;
                 return Err(e);
             }
+            let prepared = self.prepare_turn(0).await;
             let estimate = self.context_figure(
                 self.count_context(&self.machine.full_history())
-                    .saturating_add(self.request_overhead_tokens()),
+                    .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
+                    .saturating_add(self.count_context(&prepared.messages)),
             );
             self.machine.set_context_tokens(estimate);
+            self.prepared_turn = Some(prepared);
 
             loop {
                 let policy = self.machine_policy();
@@ -2583,6 +2720,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                         }
                     }
                     MachineStep::Compact { reason } => {
+                        self.prepared_turn = None;
                         if let Err(e) = self.handle_compact(reason).await {
                             self.set_error_state(&e);
                             self.finalize(Some(&e)).await?;
@@ -2706,6 +2844,38 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
     }
 }
 
+/// The per-turn request context, prepared once ahead of the model
+/// call it describes.
+///
+/// Holding the transients and the selected tool surface together is
+/// what makes the seam honest: every site that estimates the upcoming
+/// payload — the run's opening figure, the post-dispatch re-feed, and
+/// the pre-request feed itself — counts the same `messages` and
+/// `tools` the request carries, and a transient is visible to the
+/// selector because selection runs after collection, against the very
+/// conversation the request sends.
+struct PreparedTurn {
+    /// The turn this context was prepared for.
+    ///
+    /// A stale entry (wrong turn number) is re-prepared rather than
+    /// consumed, so an interrupted run can never serve a prior turn's
+    /// transients.
+    turn: usize,
+
+    /// The transient messages riding the turn's request.
+    ///
+    /// Attachments, contributor messages, and retrieved memories in
+    /// request order — everything the request carries that the
+    /// machine-owned history does not.
+    messages: Vec<Message>,
+
+    /// The tool schemas the turn's request advertises.
+    ///
+    /// The selector's choice over the full registry, `None` when
+    /// nothing is advertised (the request omits the tools field).
+    tools: Option<Vec<crate::tool::ToolSchema>>,
+}
+
 /// Decide whether a failed run's conversation cannot fit the window.
 ///
 /// The signals that the request as built will keep being refused take
@@ -2823,9 +2993,15 @@ impl<C: ApiClient> BareLoop<C> {
 /// `maximum context length`), `"too many tokens"`, `"exceeds
 /// maximum"`, `"max tokens"`, and `"prompt is too long"` (Anthropic's
 /// canonical `prompt is too long: 205225 tokens > 200000 maximum`).
+/// The self-hosted engine family writes its limits with underscores —
+/// `"context_length_exceeded"` and `"max_context"` — and its
+/// underscore spellings cannot collide with the spaced transient
+/// idioms, so they join the set verbatim.
 fn message_reports_context_overflow(message: &str) -> bool {
     let message = message.to_lowercase();
     message.contains("context length")
+        || message.contains("context_length")
+        || message.contains("max_context")
         || message.contains("too many tokens")
         || message.contains("exceeds maximum")
         || message.contains("max tokens")

@@ -13452,3 +13452,325 @@ async fn selection_composes_with_response_format_suppression() {
          omits tools entirely, so neither the subset nor the registry reserves"
     );
 }
+
+#[cfg(feature = "streaming")]
+surface_tool!(
+    SurfaceFatPatch,
+    "patch_region",
+    "modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated. modify the patch region and replace the buffer span and adjust the column offsets and reflow the modified lines inside the marked region before committing the edit batch, keeping every hunk anchored and every offset recalculated."
+);
+
+/// The registry whose full surface dwarfs any turn's selection: five
+/// ordinary tools plus one enormous schema, so a figure counting the
+/// whole registry and a figure counting the advertised subset sit far
+/// apart — the separation the premature-compaction pins need.
+#[cfg(feature = "streaming")]
+fn fat_surface_registry() -> ToolRegistry {
+    let mut registry = surface_registry();
+    registry.register(SurfaceFatPatch);
+    registry
+}
+
+/// A selector that reads the whole conversation the request carries:
+/// a tool rides when any word of its name appears as a word in any
+/// message's text.
+///
+/// The double behind the transient-visibility pin: unlike
+/// [`KeywordSelector`](crate::tool::KeywordSelector), which matches
+/// the prompt alone, this one's policy is over
+/// [`SelectionContext::conversation`](crate::tool::SelectionContext)
+/// — the surface it picks proves what the engine let it see.
+#[cfg(feature = "streaming")]
+struct ConversationKeywordSelector;
+
+#[cfg(feature = "streaming")]
+impl crate::tool::ToolSelector for ConversationKeywordSelector {
+    fn select(
+        &self,
+        ctx: &crate::tool::SelectionContext<'_>,
+        all: &[ToolSchema],
+    ) -> Vec<ToolSchema> {
+        let corpus = ctx
+            .conversation
+            .iter()
+            .map(Message::text_content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let corpus_words = corpus
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|word| word.len() >= 3)
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        all.iter()
+            .filter(|schema| {
+                schema
+                    .tool
+                    .split(|ch: char| !ch.is_ascii_alphanumeric())
+                    .filter(|word| word.len() >= 3)
+                    .any(|word| corpus_words.iter().any(|seen| seen == word))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// One recorded selection consultation: the turn and the query text
+/// the engine handed the selector.
+#[cfg(feature = "streaming")]
+type SelectionQuery = (usize, Option<String>);
+
+/// A selector that records the prompt and turn it was consulted with,
+/// advertising everything.
+///
+/// The double behind the run-prompt pin: its record is the assertion
+/// surface — what the engine passed as
+/// [`latest_user_message`](crate::tool::SelectionContext::latest_user_message)
+/// on each turn.
+#[cfg(feature = "streaming")]
+struct PromptRecordingSelector {
+    seen: Arc<Mutex<Vec<SelectionQuery>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::tool::ToolSelector for PromptRecordingSelector {
+    fn select(
+        &self,
+        ctx: &crate::tool::SelectionContext<'_>,
+        all: &[ToolSchema],
+    ) -> Vec<ToolSchema> {
+        crate::error::recover_guard(self.seen.lock())
+            .push((ctx.turn, ctx.latest_user_message.map(str::to_string)));
+        all.to_vec()
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn selection_reads_the_run_prompt_on_every_turn() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_tool_turn("thinking ", "call_1", &json!({"query": "x"}));
+    client.push_final_turn("thinking ", "done");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(PromptRecordingSelector {
+            seen: Arc::clone(&seen),
+        }));
+    agent
+        .run("read the configuration", &make_run_config())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(seen.lock()).clone();
+    assert_eq!(
+        recorded,
+        vec![
+            (0, Some("read the configuration".to_string())),
+            (1, Some("read the configuration".to_string())),
+        ],
+        "every turn selects on the run's opening prompt — a continuation \
+         turn's input is tool-result text, never the selection query: \
+         {recorded:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn selection_sees_the_transients_that_ride_the_request() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(ConversationKeywordSelector));
+    agent.set_attachment(std::sync::Arc::new(
+        crate::attachment::MemoryAttachment::new(
+            "research",
+            "you must use web_search for this task",
+        ),
+    ));
+    agent
+        .run(
+            "please read the configuration and summarize",
+            &make_run_config(),
+        )
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 1, "the fixture issues one request");
+    assert_eq!(
+        surface_names(&captured[0]),
+        vec!["read_file".to_string(), "web_search".to_string()],
+        "a transient naming its tool drives the selection — the selector \
+         sees the same messages the request carries"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn the_run_start_estimate_counts_the_upcoming_surface_not_the_registry() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(40);
+    let mut agent = BareLoop::new(Arc::new(client), fat_surface_registry(), config)
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+    agent.register_observer(Arc::new(CompactionFailureRecorder {
+        failures: Arc::clone(&failures),
+    }));
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(failures.lock()).clone();
+    assert!(
+        recorded.is_empty(),
+        "a turn whose advertised subset fits must not manufacture a compaction \
+         from the unadvertised registry's overhead: {} deferral notice(s) fired",
+        recorded.len()
+    );
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 1, "the fixture issues one request");
+    assert_eq!(
+        surface_names(&captured[0]),
+        vec!["web_search".to_string()],
+        "the served request carries the subset, proving the run started"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn the_post_dispatch_estimate_counts_the_next_surface_not_the_registry() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_tool_turn("thinking ", "call_1", &json!({"query": "x"}));
+    client.push_final_turn("thinking ", "done");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_observer(Arc::new(CompactionFailureRecorder {
+            failures: Arc::clone(&failures),
+        }));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(40);
+    let mut agent =
+        BareLoop::new_with_managers(Arc::new(client), fat_surface_registry(), config, managers)
+            .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "no pass and no deferral fire between tool dispatch and the next \
+         model call when the upcoming request's subset fits"
+    );
+    assert!(
+        crate::error::recover_guard(failures.lock()).is_empty(),
+        "the post-dispatch re-feed counts the next request's surface, never \
+         the registry the wire will not carry"
+    );
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "one request per turn");
+    assert_eq!(
+        surface_names(&captured[1]),
+        vec!["web_search".to_string()],
+        "the continuation request still carries the subset selected on the \
+         run's prompt"
+    );
+    assert!(
+        agent.machine().full_history().len() >= 4,
+        "the tool round trip survives untouched — no pass had anything to do"
+    );
+}
+
+/// A selector advertising a scripted surface per turn, so one run's
+/// requests carry different toolsets.
+///
+/// The double behind the anchor pin: the surface must narrow between
+/// two requests of one run — before the next usage report refreshes
+/// the anchor — which no prompt-matching selector produces with a
+/// constant run prompt.
+#[cfg(feature = "streaming")]
+struct ScriptedSurfaceSelector {
+    surfaces: Vec<Vec<String>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::tool::ToolSelector for ScriptedSurfaceSelector {
+    fn select(
+        &self,
+        ctx: &crate::tool::SelectionContext<'_>,
+        all: &[ToolSchema],
+    ) -> Vec<ToolSchema> {
+        let names = self
+            .surfaces
+            .get(ctx.turn)
+            .map_or(&[] as &[String], Vec::as_slice);
+        all.iter()
+            .filter(|schema| names.contains(&schema.tool))
+            .cloned()
+            .collect()
+    }
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn a_narrowed_surface_invalidates_the_usage_anchor_so_the_figure_can_fall() {
+    let client = MockClient::new("m");
+    add_tool_then_text_with_usage(
+        &client,
+        "call_1",
+        "web_search",
+        &json!({"query": "x"}),
+        10,
+        10,
+    );
+    let compactions = Arc::new(Mutex::new(0usize));
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_observer(Arc::new(CompactionFailureRecorder {
+            failures: Arc::clone(&failures),
+        }));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(SurfaceFatPatch);
+    registry.register(SurfaceSearch);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(BilledMockClient::wrap(client, 4)),
+        registry,
+        config,
+        managers,
+    )
+    .with_tool_selector(Arc::new(ScriptedSurfaceSelector {
+        surfaces: vec![
+            vec!["patch_region".to_string(), "web_search".to_string()],
+            vec!["web_search".to_string()],
+        ],
+    }));
+    agent
+        .run("inspect the patch region", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured_failures = crate::error::recover_guard(failures.lock()).clone();
+    assert!(
+        captured_failures.is_empty() && *crate::error::recover_guard(compactions.lock()) == 0,
+        "a turn whose narrowed surface fits must not inherit the widened \
+         turn's reported figure — the anchor dies with the wire prefix \
+         it was built on: {} pass(es), {} deferral notice(s)",
+        *crate::error::recover_guard(compactions.lock()),
+        captured_failures.len()
+    );
+}

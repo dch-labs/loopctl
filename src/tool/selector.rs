@@ -9,10 +9,12 @@
 //! [`ToolSelector`] narrows what the model sees each turn (P8: the
 //! cheap alternative to a bigger model is less confusion).
 //!
-//! The engine consults the configured selector once per turn and
-//! threads the chosen schemas into both the request and the window
-//! estimate — the figure counts what the wire carries, never the
-//! whole registry. The default is no selector: every registered tool
+//! The engine consults the configured selector at each request build
+//! and threads the chosen schemas into both the request and the
+//! window estimate — the figure counts what the wire carries, never
+//! the whole registry. A turn whose request is rebuilt after a
+//! compaction pass re-selects against the compacted conversation, so
+//! the choice always describes the request it rides. The default is no selector: every registered tool
 //! is advertised, byte-identical to a loop that has never heard of
 //! selection. [`ToolConstraint::Strict`](crate::structured::ToolConstraint)
 //! composes automatically — it constrains the model's calls to
@@ -54,10 +56,10 @@ pub struct SelectionContext<'a> {
 /// Chooses which registered tools to advertise to the model this turn.
 ///
 /// Implementations must be deterministic for a given context — the
-/// engine selects once per turn and threads the result into both the
-/// request and its window estimate, but a selector whose output varies
-/// between equal contexts would make the estimate unexplainable. The
-/// trait is object-safe for use as `Arc<dyn ToolSelector>`.
+/// engine threads the result into both the request and its window
+/// estimate, so a selector whose output varies between equal contexts
+/// would make the estimate unexplainable. The trait is object-safe
+/// for use as `Arc<dyn ToolSelector>`.
 ///
 /// # Contract
 ///

@@ -71,18 +71,20 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// The registry's full surface when no selector is configured —
     /// byte-identical to a selector-unaware loop — and the configured
-    /// selector's choice otherwise, consulted exactly once per turn
-    /// with the turn's prompt and the conversation the request
-    /// carries. The engine threads the result into both the outbound
-    /// request and the window estimate, so the figure counts what the
-    /// wire carries and a stateful selector cannot diverge between
-    /// what was counted and what was sent. An empty selection or empty
-    /// registry advertises nothing (the request omits the tools
-    /// field).
+    /// selector's choice otherwise, consulted with the run's opening
+    /// prompt and the conversation the request carries: the transient
+    /// messages leading the machine-owned history, the same ordered
+    /// view [`build_turn_request`](Self::build_turn_request) sends
+    /// pre-coalesce. The engine threads the result into both the
+    /// outbound request and the window estimate, so the figure counts
+    /// what the wire carries and a stateful selector cannot diverge
+    /// between what was counted and what was sent. An empty selection
+    /// or empty registry advertises nothing (the request omits the
+    /// tools field).
     pub(super) fn turn_tool_schemas(
         &self,
         turn: usize,
-        turn_input: &str,
+        transients: &[Message],
     ) -> Option<Vec<crate::tool::ToolSchema>> {
         let all = self.tools.all_schemas();
         if all.is_empty() {
@@ -91,11 +93,17 @@ impl<C: ApiClient> BareLoop<C> {
         let advertised = match &self.tool_selector {
             None => all,
             Some(selector) => {
-                let history = self.machine.full_history();
+                let mut conversation = transients.to_vec();
+                conversation.extend(self.machine.full_history());
+                let prompt = self
+                    .session
+                    .current_run()
+                    .map(|run| run.input.clone())
+                    .filter(|input| !input.is_empty());
                 let context = crate::tool::SelectionContext {
                     turn,
-                    latest_user_message: Some(turn_input),
-                    conversation: &history,
+                    latest_user_message: prompt.as_deref(),
+                    conversation: &conversation,
                 };
                 selector.select(&context, &all)
             }

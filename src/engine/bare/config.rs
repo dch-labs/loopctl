@@ -120,11 +120,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// Set the per-turn tool-surface selector.
     ///
     /// The selector narrows what the model sees each turn: the engine
-    /// consults it once per turn and threads the chosen schemas into
-    /// the outbound request and the window estimate alike, so the
-    /// figure counts the advertised subset, never the whole registry.
-    /// The compaction reservation keeps measuring the full surface —
-    /// a post-compaction turn may advertise all of it again. Without a
+    /// consults it at each request build and threads the chosen
+    /// schemas into the outbound request and every estimate of the
+    /// upcoming payload alike — the run's opening figure, the
+    /// post-dispatch re-feed, and the pre-request feed — so the figure
+    /// counts the advertised subset, never the whole registry. The
+    /// overflow-salvage reservation keeps measuring the full
+    /// registered surface: a salvaged turn re-selects against the
+    /// compacted conversation and may fail open to all of it, so its
+    /// forced target must reserve for that worst case. Without a
     /// selector every registered tool is advertised, byte-identical to
     /// a loop that has never heard of selection; the selector must be
     /// deterministic for a given context.

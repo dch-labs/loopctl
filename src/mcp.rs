@@ -649,8 +649,8 @@ pub struct McpToolProvider {
     /// already-discovered tools and applies to later refreshes.
     call_timeout: Duration,
 
-    /// Every exposed name this provider has registered into a target
-    /// registry, regardless of what a later
+    /// Every tool this provider has registered into a target
+    /// registry, keyed by exposed name, regardless of what a later
     /// [`refresh`](Self::refresh) did to the discovery snapshot.
     ///
     /// The reconciliation baseline behind
@@ -658,10 +658,17 @@ pub struct McpToolProvider {
     /// name that was registered at setup and then dropped by the
     /// server before any sync — after a refresh the snapshot mirrors
     /// the server, and the orphan lives on only in the registry and
-    /// here. Interior-mutable because
+    /// here. Holding the registered *tool*, not just its name, is
+    /// what keeps survivor comparisons honest: the registry's handle
+    /// is what a discovered tool must match, so a server-side change a
+    /// refresh already observed still re-registers instead of
+    /// comparing the refreshed snapshot against itself. The baseline
+    /// and the registry move in lockstep — every registration path
+    /// records here, every sync re-baselines from what it landed.
+    /// Interior-mutable because
     /// [`register_into`](Self::register_into) records while holding
     /// only `&self`.
-    registered: std::sync::Mutex<std::collections::HashSet<String>>,
+    registered: std::sync::Mutex<std::collections::HashMap<String, McpTool>>,
 }
 
 impl McpToolProvider {
@@ -702,7 +709,7 @@ impl McpToolProvider {
             tools,
             prefix: name_prefix,
             call_timeout: DEFAULT_MCP_CALL_TIMEOUT,
-            registered: std::sync::Mutex::new(std::collections::HashSet::new()),
+            registered: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -791,7 +798,7 @@ impl McpToolProvider {
         let mut registered = crate::error::recover_guard(self.registered.lock());
         for tool in &self.tools {
             registry.register(tool.clone());
-            registered.insert(tool.exposed_name.clone());
+            registered.insert(tool.exposed_name.clone(), tool.clone());
         }
     }
 
@@ -805,11 +812,15 @@ impl McpToolProvider {
     /// [`remove`](ToolRegistry::remove)d, and names present in both
     /// snapshots keep their registration position and everything the
     /// registry keys on their name (health history included); a
-    /// survivor whose schema the server changed is re-registered in
-    /// place so the new description reads on the next request, while
-    /// a survivor whose schema is identical is not touched at all —
-    /// not even re-registered — so its handle identity survives the
-    /// sync too. The provider's
+    /// survivor whose advertised contract the server changed is
+    /// re-registered in place so the new description or annotations
+    /// read on the next request, while a survivor whose contract is
+    /// identical is not touched at all — not even re-registered — so
+    /// its handle identity survives the sync too. Survivors compare
+    /// against what the registry actually holds, so a change a
+    /// [`refresh`](Self::refresh) already pulled into the discovery
+    /// snapshot still re-registers here — the snapshot comparing
+    /// against itself can never strand a stale handle. The provider's
     /// own snapshot is replaced by the same discovery, matching
     /// [`refresh`](Self::refresh)'s error discipline: a failed re-list
     /// leaves both the provider and the registry untouched.
@@ -843,7 +854,7 @@ impl McpToolProvider {
 
         let mut report = McpSyncReport::default();
         let mut registered = crate::error::recover_guard(self.registered.lock());
-        for name in &*registered {
+        for name in registered.keys() {
             if new_names.contains(name) {
                 report.untouched.push(name.clone());
             } else {
@@ -853,11 +864,9 @@ impl McpToolProvider {
         }
         let mut fresh = Vec::new();
         for tool in discovered {
-            let survived_unchanged = self
-                .tools
-                .iter()
-                .any(|current| current.exposed_name == tool.exposed_name && current.matches(&tool));
-            if registered.contains(&tool.exposed_name) {
+            let held = registered.get(&tool.exposed_name);
+            let survived_unchanged = held.is_some_and(|held| held.matches(&tool));
+            if held.is_some() {
                 if !survived_unchanged {
                     registry.register(tool.clone());
                 }
@@ -868,7 +877,10 @@ impl McpToolProvider {
             fresh.push(tool);
         }
         self.tools = fresh;
-        *registered = new_names;
+        registered.retain(|name, _| new_names.contains(name));
+        for tool in &self.tools {
+            registered.insert(tool.exposed_name.clone(), tool.clone());
+        }
         report.added.sort();
         report.removed.sort();
         report.untouched.sort();

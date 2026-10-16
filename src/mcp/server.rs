@@ -657,6 +657,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refresh_after_a_server_side_change_still_refreshes_the_handle() {
+        let server_registry = ToolRegistry::new();
+        server_registry.register(EchoTool);
+        server_registry.register(PeekTool);
+        let adapter = McpServerAdapter::new(
+            server_registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let live = ToolRegistry::new();
+        provider.register_into(&live);
+        let before = live.version();
+
+        let served = adapter.registry();
+        served.register(ReDescribedPeek);
+        provider.refresh().await.expect("refresh");
+        let report = provider.sync_into(&live).await.expect("sync");
+
+        assert!(
+            report.added.is_empty() && report.removed.is_empty(),
+            "a changed survivor is neither added nor removed: {report:?}"
+        );
+        assert!(
+            live.version() > before,
+            "the change the refresh observed still re-registers the handle — \
+             the registry cannot keep serving the stale contract"
+        );
+        let described: Vec<String> = live
+            .all_schemas()
+            .into_iter()
+            .filter(|schema| schema.tool == "peek")
+            .map(|schema| schema.description)
+            .collect();
+        assert_eq!(
+            described,
+            ["peek at the session with a fresher description"],
+            "the registry reflects the server's changed description, not the \
+             one captured at setup"
+        );
+    }
+
+    #[tokio::test]
     async fn a_refresh_between_setup_and_sync_still_sheds_dropped_tools() {
         let server_registry = ToolRegistry::new();
         server_registry.register(EchoTool);

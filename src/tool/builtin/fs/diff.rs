@@ -511,8 +511,8 @@ fn format_diff_with_context(line_diff: &[LineDiff], context: usize) -> String {
     let mut result = String::new();
     for (start, end) in regions {
         let slice = numbered.get(start..end).unwrap_or_default();
-        let old_start = slice.iter().find_map(|entry| entry.old_no).unwrap_or(1);
-        let new_start = slice.iter().find_map(|entry| entry.new_no).unwrap_or(1);
+        let old_start = slice.iter().find_map(|entry| entry.old_no).unwrap_or(0);
+        let new_start = slice.iter().find_map(|entry| entry.new_no).unwrap_or(0);
         let old_count = slice.iter().filter(|entry| entry.old_no.is_some()).count();
         let new_count = slice.iter().filter(|entry| entry.new_no.is_some()).count();
         writeln!(
@@ -565,6 +565,29 @@ mod tests {
         assert!(result.contains("+ NEW"));
         assert!(result.contains("  a"));
         assert!(result.contains("  b"));
+    }
+
+    #[test]
+    fn an_all_insertion_header_addresses_the_empty_side_as_zero() {
+        let result = format_file_change("test.rs", OldContent::Text(""), "first\nsecond\n");
+        let header = result.lines().find(|line| line.starts_with("@@"));
+        assert_eq!(
+            header,
+            Some("@@ -0,0 +1,2 @@"),
+            "unified-diff convention addresses the line before the change — \
+             an empty side starts at zero, never at one"
+        );
+    }
+
+    #[test]
+    fn an_all_deletion_header_addresses_the_empty_side_as_zero() {
+        let result = format_file_change("test.rs", OldContent::Text("first\nsecond\n"), "");
+        let header = result.lines().find(|line| line.starts_with("@@"));
+        assert_eq!(
+            header,
+            Some("@@ -1,2 +0,0 @@"),
+            "the emptied new side is addressed at zero, never at one"
+        );
     }
 
     #[test]

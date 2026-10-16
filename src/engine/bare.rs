@@ -1994,16 +1994,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// registrations before the first turn are the baseline, not a
     /// change; mutations between turns of a running loop are.
     fn observe_tool_surface(&mut self) {
-        let version = self.tools.version();
+        let (version, surface) = self.rendered_surface();
         let Some((seen_version, seen_surface)) = self.observed_registry.take() else {
-            self.observed_registry = Some((version, self.rendered_surface()));
+            self.observed_registry = Some((version, surface));
             return;
         };
         if seen_version == version {
             self.observed_registry = Some((seen_version, seen_surface));
             return;
         }
-        let surface = self.rendered_surface();
         let added = surface
             .iter()
             .map(|(name, _)| name)
@@ -2036,24 +2035,30 @@ impl<C: ApiClient> BareLoop<C> {
         self.observed_registry = Some((version, surface));
     }
 
-    /// The registry's advertised surface as sorted name + rendered
-    /// schema pairs.
+    /// The registry's advertised surface with its version, as sorted
+    /// name + rendered schema pairs.
     ///
     /// The observation basis behind
     /// [`on_tool_surface_changed`](crate::observer::LoopObserver::on_tool_surface_changed):
     /// pairing each name with its rendered schema makes an in-place
     /// overwrite — same name, different advertised schema — visible to
-    /// the diff, not just additions and removals. Sorted for
-    /// deterministic comparison across observations.
-    fn rendered_surface(&self) -> Vec<(String, String)> {
-        self.tools
-            .all_schemas()
+    /// the diff, not just additions and removals, and the whole pair
+    /// rides one registry read so the version and the surface it
+    /// describes can never disagree. Sorted by name so the event's
+    /// lists — derived by filtering these pairs — come out sorted,
+    /// the [`ToolSurfaceContext`](crate::observer::ToolSurfaceContext)
+    /// contract.
+    fn rendered_surface(&self) -> (u64, Vec<(String, String)>) {
+        let (version, schemas) = self.tools.versioned_surface();
+        let mut pairs = schemas
             .into_iter()
             .map(|schema| {
                 let rendered = serde_json::to_string(&schema).unwrap_or_default();
                 (schema.tool, rendered)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        (version, pairs)
     }
 
     /// Collect one turn's request context: its transients and the

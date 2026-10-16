@@ -83,10 +83,10 @@ use crate::tool::ToolRegistry;
 pub struct McpServerAdapter {
     /// The registry being served.
     ///
-    /// Shared immutably across handler clones (the agent-loop usage pattern:
-    /// built once, dispatched read-only). Every `list_tools` call reads
-    /// `all_schemas()`; every `call_tool` reads `get(name)`. No mutation after
-    /// construction.
+    /// Shared across handler clones; read live on every request —
+    /// each `list_tools` reads `all_schemas()` and each `call_tool`
+    /// reads `get(name)`, so a registry mutated at runtime is served
+    /// exactly as it stands, with no adapter rebuild.
     registry: Arc<ToolRegistry>,
 
     /// The per-session context handed to every [`Tool::call`].
@@ -240,7 +240,10 @@ impl ServerHandler for McpServerAdapter {
     /// Resources, prompts, sampling, logging, completions, and subscriptions
     /// are neither implemented nor advertised; their [`ServerHandler`]
     /// defaults (no-ops / `None`) apply. `listChanged` is not advertised —
-    /// the adapter serves the snapshot taken at construction.
+    /// the adapter serves its registry live (mutations surface on the next
+    /// request), so connected clients that want change awareness must
+    /// re-list on their own schedule rather than wait for a notification
+    /// this server never sends.
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::default();
         info.capabilities.tools = Some(ToolsCapability::default());
@@ -429,6 +432,36 @@ mod tests {
         }
         fn is_read_only(&self) -> bool {
             true
+        }
+    }
+
+    /// The `peek` tool re-registered under its name with the
+    /// read-only hint flipped and nothing else moved.
+    ///
+    /// The metadata-only survivor of the sync pins: name, description,
+    /// and schema are byte-identical to [`PeekTool`]'s — only the
+    /// policy-bearing `read_only` classification flips — so a sync
+    /// that compares schemas alone keeps the stale handle and the
+    /// registry keeps advertising a mutable tool the server just made
+    /// read-only, or vice versa.
+    struct HintFlippedPeek;
+
+    impl Tool for HintFlippedPeek {
+        fn name(&self) -> &'static str {
+            "peek"
+        }
+        fn description(&self) -> &'static str {
+            PeekTool.description()
+        }
+        fn schema(&self) -> ToolSchema {
+            PeekTool.schema()
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("state")) })
         }
     }
 
@@ -621,6 +654,85 @@ mod tests {
     fn adapter_is_clone_send_sync() {
         fn _assert_clone_send_sync<T: Clone + Send + Sync>() {}
         _assert_clone_send_sync::<McpServerAdapter>();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_between_setup_and_sync_still_sheds_dropped_tools() {
+        let server_registry = ToolRegistry::new();
+        server_registry.register(EchoTool);
+        server_registry.register(FailTool);
+        let adapter = McpServerAdapter::new(
+            server_registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let live = ToolRegistry::new();
+        provider.register_into(&live);
+
+        let served = adapter.registry();
+        served.remove("fail");
+        served.register(PeekTool);
+        provider.refresh().await.expect("refresh");
+
+        let report = provider.sync_into(&live).await.expect("sync");
+        assert!(
+            report.removed.contains(&"fail".to_string()),
+            "the tool the server dropped reaches the report's removals: {:?}",
+            report.removed
+        );
+        assert!(
+            !live.contains("fail"),
+            "the orphan leaves the registry — the sync mirrors the server, \
+             not the refreshed snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_hint_flip_refreshes_the_surviving_handle() {
+        let server_registry = ToolRegistry::new();
+        server_registry.register(EchoTool);
+        server_registry.register(PeekTool);
+        let adapter = McpServerAdapter::new(
+            server_registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let live = ToolRegistry::new();
+        provider.register_into(&live);
+        let before = live.version();
+        assert!(
+            live.get("peek").is_some_and(|tool| tool.is_read_only()),
+            "the fixture starts with the read-only classification"
+        );
+
+        let served = adapter.registry();
+        served.register(HintFlippedPeek);
+        let report = provider.sync_into(&live).await.expect("sync");
+
+        assert!(
+            report.added.is_empty() && report.removed.is_empty(),
+            "a hint flip is neither: {report:?}"
+        );
+        assert!(
+            live.version() > before,
+            "the policy-bearing contract moved — the survivor's handle is replaced"
+        );
+        assert!(
+            !live.get("peek").is_some_and(|tool| tool.is_read_only()),
+            "the registry reflects the server's flipped classification"
+        );
     }
 
     #[tokio::test]

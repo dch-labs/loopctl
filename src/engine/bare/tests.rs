@@ -14250,3 +14250,111 @@ fn the_overhead_reservation_remeasures_on_registry_mutation() {
         "shedding the addition restores the figure — the cache tracks the registry"
     );
 }
+
+/// A tool whose dispatch registers three late tools in non-sorted
+/// name order, so one event must sort its added list.
+#[cfg(feature = "streaming")]
+struct MultiGrowTool {
+    handle: Arc<std::sync::OnceLock<Arc<ToolRegistry>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl Tool for MultiGrowTool {
+    fn name(&self) -> &'static str {
+        "multi_grow"
+    }
+
+    fn description(&self) -> &'static str {
+        "Register three late tools in non-sorted order"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "multi_grow".into(),
+            description: self.description().into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        if let Some(registry) = self.handle.get() {
+            for late in ["zulu_tool", "alpha_tool", "mike_tool"] {
+                registry.register(crate::tool::FnTool::new(
+                    late.into(),
+                    "Arrives with its siblings".into(),
+                    json!({"type": "object"}),
+                    late_surface_fn,
+                ));
+            }
+        }
+        Box::pin(std::future::ready(Ok(ToolOutput::text("grown"))))
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn surface_event_lists_are_sorted_by_name() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "grow_1", "multi_grow", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let registry = ToolRegistry::new();
+    registry.register(SurfaceRead);
+    registry.register(MultiGrowTool {
+        handle: Arc::clone(&handle),
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    assert!(handle.set(agent.tool_registry()).is_ok());
+    agent.register_observer(Arc::new(SurfaceChangeRecorder {
+        events: Arc::clone(&events),
+    }));
+
+    agent
+        .run("grow three tools", &make_run_config())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(events.lock()).clone();
+    assert!(
+        recorded.iter().any(|(_, added, _, _)| !added.is_empty()),
+        "the fixture's growth lands in an event: {recorded:?}"
+    );
+    for (_, added, removed, changed) in &recorded {
+        let mut sorted_added = added.clone();
+        sorted_added.sort();
+        assert_eq!(
+            added, &sorted_added,
+            "the added list is sorted by name — the context's contract"
+        );
+        let mut sorted_removed = removed.clone();
+        sorted_removed.sort();
+        assert_eq!(
+            removed, &sorted_removed,
+            "the removed list is sorted by name — the context's contract"
+        );
+        let mut sorted_changed = changed.clone();
+        sorted_changed.sort();
+        assert_eq!(
+            changed, &sorted_changed,
+            "the changed list is sorted by name — the context's contract"
+        );
+    }
+    let growth = recorded
+        .iter()
+        .find(|(_, added, _, _)| !added.is_empty())
+        .expect("the growth event exists");
+    assert_eq!(
+        growth.1,
+        vec![
+            "alpha_tool".to_string(),
+            "mike_tool".to_string(),
+            "zulu_tool".to_string(),
+        ],
+        "a multi-add event lists its names sorted, not in registration order"
+    );
+}

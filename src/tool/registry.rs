@@ -145,7 +145,6 @@ impl ToolRegistry {
             state.order.push(name.clone());
         }
         state.tools.insert(name, Arc::new(tool));
-        drop(state);
         self.bump_version();
     }
 
@@ -165,9 +164,30 @@ impl ToolRegistry {
         let removed = state.tools.remove(name).is_some();
         if removed {
             state.order.retain(|stored| stored != name);
-            drop(state);
             self.bump_version();
         }
+    }
+
+    /// The current surface and its version, read as one unit.
+    ///
+    /// The observation seam for watchers that must never pair a
+    /// surface with a foreign version: both the schemas and the
+    /// counter are read under one acquisition of the state read lock,
+    /// and every bump happens under the write lock, so the returned
+    /// pair is always internally consistent — `(old, old)` or
+    /// `(new, new)`, never mixed. Schemas arrive in registration
+    /// order, exactly as [`all_schemas`](Self::all_schemas) yields
+    /// them.
+    #[must_use]
+    pub fn versioned_surface(&self) -> (u64, Vec<ToolSchema>) {
+        let state = crate::error::recover_guard(self.state.read());
+        let schemas = state
+            .order
+            .iter()
+            .filter_map(|name| state.tools.get(name))
+            .map(|tool| tool.schema())
+            .collect();
+        (self.version(), schemas)
     }
 
     /// The monotonic count of surface mutations so far.
@@ -192,10 +212,10 @@ impl ToolRegistry {
     /// Record one surface mutation.
     ///
     /// The private bump behind [`register`](Self::register) and
-    /// [`remove`](Self::remove), called with the state lock released
-    /// — the write lock's release ordering pairs with the load in
-    /// [`version`](Self::version), so a reader that sees the new
-    /// count also sees the new set.
+    /// [`remove`](Self::remove), called while the state write lock is
+    /// still held — the count and the set move as one unit under the
+    /// lock, so no reader can ever pair a new surface with an old
+    /// count or the reverse.
     fn bump_version(&self) {
         use std::sync::atomic::Ordering::Release;
         self.version.fetch_add(1, Release);
@@ -944,6 +964,63 @@ mod tests {
             output.text_content(),
             "ok",
             "an in-flight call drains against the handle it fetched"
+        );
+    }
+
+    #[test]
+    fn concurrent_mutations_never_pair_a_version_with_a_foreign_surface() {
+        let registry = std::sync::Arc::new(ToolRegistry::new());
+        let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mutations = 500_u64;
+
+        let writer = {
+            let registry = std::sync::Arc::clone(&registry);
+            std::thread::spawn(move || {
+                for i in 0..mutations {
+                    let name = format!("stress_{i}");
+                    registry.register(make_tool(&name));
+                    if i % 2 == 0 {
+                        registry.remove(&name);
+                    }
+                }
+            })
+        };
+        let reader = {
+            let registry = std::sync::Arc::clone(&registry);
+            let samples = std::sync::Arc::clone(&samples);
+            std::thread::spawn(move || {
+                while !registry.is_empty() || registry.version() < mutations {
+                    let (version, schemas) = registry.versioned_surface();
+                    let rendered = schemas
+                        .iter()
+                        .map(|schema| schema.tool.clone())
+                        .collect::<Vec<_>>();
+                    crate::error::recover_guard(samples.lock()).push((version, rendered));
+                    if version >= mutations {
+                        break;
+                    }
+                }
+            })
+        };
+        writer.join().expect("writer finishes");
+        reader.join().expect("reader finishes");
+
+        let samples = crate::error::recover_guard(samples.lock());
+        for (left, names_left) in samples.iter() {
+            for (right, names_right) in samples.iter() {
+                if left == right {
+                    assert_eq!(
+                        names_left, names_right,
+                        "one version, one surface: version {left} sampled as \
+                         both {names_left:?} and {names_right:?} — a mixed \
+                         read is a missed surface change"
+                    );
+                }
+            }
+        }
+        assert!(
+            samples.iter().any(|(version, _)| *version >= mutations),
+            "the reader observed the settled surface"
         );
     }
 

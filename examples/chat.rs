@@ -118,7 +118,7 @@ fn calculate_fn(input: serde_json::Value, _ctx: &ToolContext) -> ToolFuture {
 
 /// Build the tool registry for the chat example.
 fn build_tools() -> ToolRegistry {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
 
     tools.register(
         FnTool::new(

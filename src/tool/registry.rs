@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use super::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 
@@ -24,11 +25,19 @@ use super::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 ///
 /// # Thread safety
 ///
-/// `ToolRegistry` is `Send + Sync` because [`Tool`] requires `Send + Sync`.
-/// The registry is created once during session setup and then shared via
-/// `Arc<ToolRegistry>` for read-only access during dispatch, including
-/// concurrent reads in parallel tool dispatch. No wrapping in `RwLock` is
-/// needed.
+/// `ToolRegistry` is `Send + Sync` because [`Tool`] requires `Send + Sync`,
+/// and it is mutable at runtime: the tool set lives behind an interior
+/// [`RwLock`](std::sync::RwLock), so a registry shared via
+/// `Arc<ToolRegistry>` — the way the engine holds it — can grow or shed
+/// tools while the loop runs. Readers (`get`, `all_schemas`, dispatch
+/// resolution) take the read lock in parallel; mutations
+/// ([`register`](ToolRegistry::register), [`remove`](ToolRegistry::remove))
+/// take the write lock and bump [`version`](ToolRegistry::version), the
+/// monotonic counter the engine watches to re-measure its cached
+/// overhead and to report surface changes. A mutation is
+/// *advertisement*-immediate (the next request sees it) and
+/// *execution*-draining: an in-flight call keeps running against the
+/// [`Arc`] it fetched, so removal never cancels a dispatched tool.
 ///
 /// # Example
 ///
@@ -45,14 +54,39 @@ use super::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 /// let schemas = registry.all_schemas();
 /// ```
 pub struct ToolRegistry {
+    /// The tool set and its ordering, behind the interior write lock.
+    ///
+    /// One lock guards both fields so a reader can never observe the
+    /// name map and the order vector disagreeing about what is
+    /// registered; every mutation under this lock is paired with a
+    /// [`version`](Self::version) bump.
+    state: std::sync::RwLock<RegistryState>,
+
+    /// Monotonic counter of surface mutations.
+    ///
+    /// Bumped by every [`register`](Self::register) and
+    /// [`remove`](Self::remove) that changes the set; read by the
+    /// engine to detect that the advertised surface moved since its
+    /// last measurement — both the cached overhead reservation and the
+    /// surface-change report hang off it.
+    version: std::sync::atomic::AtomicU64,
+}
+
+/// The mutable interior of a [`ToolRegistry`].
+///
+/// Held under one [`RwLock`](std::sync::RwLock) so the name map and
+/// the ordering vector mutate as a unit.
+struct RegistryState {
     /// Registered tools, keyed by their [`Tool::name`].
     ///
-    /// Each value is a boxed trait object so the registry can hold
-    /// tools of different concrete types uniformly. Insertion
+    /// Each value is a shared trait object so the registry can hold
+    /// tools of different concrete types uniformly and hand callers an
+    /// owned handle that keeps an in-flight call alive even after the
+    /// name is removed. Insertion
     /// ([`register`](ToolRegistry::register)) overwrites any existing
     /// entry under the same name; lookup
     /// ([`get`](ToolRegistry::get)) resolves through this map by name.
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
 
     /// Registration order of the tool names.
     ///
@@ -72,16 +106,26 @@ impl ToolRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
-            order: Vec::new(),
+            state: std::sync::RwLock::new(RegistryState {
+                tools: HashMap::new(),
+                order: Vec::new(),
+            }),
+            version: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Register a tool, replacing any previous tool with the same name.
     ///
-    /// Called during session setup, before any turns are processed. If a
-    /// tool with the same [`Tool::name`] already exists
-    /// it is silently replaced.
+    /// Callable at any time — during session setup or mid-run through
+    /// a registry shared with a running loop (see
+    /// [`BareLoop::tool_registry`](crate::engine::BareLoop::tool_registry)).
+    /// A registration is *advertisement*-immediate: the engine reads
+    /// the registry when it builds the next turn's request, so the
+    /// tool rides that request — never a partially-visible mid-turn
+    /// state. If a tool with the same [`Tool::name`] already exists it
+    /// is replaced, keeping its original position in the registration
+    /// order; every landed registration bumps
+    /// [`version`](Self::version).
     ///
     /// # Example
     ///
@@ -89,28 +133,84 @@ impl ToolRegistry {
     /// registry.register(ReadFileTool);
     /// registry.register(WriteFileTool);
     /// ```
-    pub fn register(&mut self, tool: impl Tool + 'static) {
+    pub fn register(&self, tool: impl Tool + 'static) {
         let name = tool.name().to_string();
-        if self.tools.contains_key(&name) {
+        let mut state = crate::error::recover_guard(self.state.write());
+        if state.tools.contains_key(&name) {
             tracing::warn!(
                 tool = %name,
                 "overwriting previously registered tool with the same name"
             );
         } else {
-            self.order.push(name.clone());
+            state.order.push(name.clone());
         }
-        self.tools.insert(name, Box::new(tool));
+        state.tools.insert(name, Arc::new(tool));
+        drop(state);
+        self.bump_version();
+    }
+
+    /// Remove the tool registered under `name`.
+    ///
+    /// The runtime-mutation counterpart of
+    /// [`register`](Self::register): removal is *advertisement*
+    /// -immediate — the next request omits the schema, and a
+    /// subsequent model call to the name resolves through the typed
+    /// not-found path — while an in-flight call drains to completion
+    /// against the [`Arc`] dispatch already fetched. Removing an
+    /// unknown name is a no-op (idempotent, so a removal racing
+    /// another removal never errors) and does not bump
+    /// [`version`](Self::version); a removal that drops a tool does.
+    pub fn remove(&self, name: &str) {
+        let mut state = crate::error::recover_guard(self.state.write());
+        let removed = state.tools.remove(name).is_some();
+        if removed {
+            state.order.retain(|stored| stored != name);
+            drop(state);
+            self.bump_version();
+        }
+    }
+
+    /// The monotonic count of surface mutations so far.
+    ///
+    /// Bumped by every [`register`](Self::register) that lands a tool
+    /// and every [`remove`](Self::remove) that drops one; observers
+    /// and the engine compare it against a previously seen value to
+    /// The registry's monotonic mutation counter.
+    ///
+    /// Every registration, in-place overwrite, and dropped removal
+    /// bumps it; readers use it to detect that the surface moved since
+    /// they last looked. Ordering: the bump stores with `Release` and
+    /// this read loads with `Relaxed` — sound for the engine's
+    /// turn-seam consumers, whose reads are sequenced by the turn
+    /// itself; a future cross-thread consumer that reads the version
+    /// and then registry state should upgrade the load to `Acquire`.
+    pub fn version(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.version.load(Relaxed)
+    }
+
+    /// Record one surface mutation.
+    ///
+    /// The private bump behind [`register`](Self::register) and
+    /// [`remove`](Self::remove), called with the state lock released
+    /// — the write lock's release ordering pairs with the load in
+    /// [`version`](Self::version), so a reader that sees the new
+    /// count also sees the new set.
+    fn bump_version(&self) {
+        use std::sync::atomic::Ordering::Release;
+        self.version.fetch_add(1, Release);
     }
 
     /// Look up a tool by name.
     ///
-    /// Returns `Some(&dyn Tool)` if a tool with the given name was
-    /// previously [`register`](ToolRegistry::register)ed, or `None`
+    /// Returns `Some(Arc<dyn Tool>)` if a tool with the given name is
+    /// currently [`register`](ToolRegistry::register)ed, or `None`
     /// otherwise. Called by the agent loop when dispatching an LLM tool
     /// call.
     ///
-    /// The returned reference borrows from the registry and is valid for
-    /// as long as the registry is alive.
+    /// The returned handle is owned, so a call outlives the lookup
+    /// even when the name is removed mid-dispatch — the drain half of
+    /// removal's advertisement-immediate, execution-draining contract.
     ///
     /// # Example
     ///
@@ -120,8 +220,11 @@ impl ToolRegistry {
     /// }
     /// ```
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(std::convert::AsRef::as_ref)
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        crate::error::recover_guard(self.state.read())
+            .tools
+            .get(name)
+            .cloned()
     }
 
     /// Check whether a tool with the given name is registered.
@@ -139,7 +242,9 @@ impl ToolRegistry {
     /// ```
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        crate::error::recover_guard(self.state.read())
+            .tools
+            .contains_key(name)
     }
 
     /// Collect [`ToolSchema`] descriptors for all registered tools.
@@ -164,9 +269,11 @@ impl ToolRegistry {
     /// ```
     #[must_use]
     pub fn all_schemas(&self) -> Vec<ToolSchema> {
-        self.order
+        let state = crate::error::recover_guard(self.state.read());
+        state
+            .order
             .iter()
-            .filter_map(|name| self.tools.get(name))
+            .filter_map(|name| state.tools.get(name))
             .map(|tool| tool.schema())
             .collect()
     }
@@ -177,7 +284,11 @@ impl ToolRegistry {
     /// in [`ToolError::not_found`].
     #[must_use]
     pub fn tool_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.tools.keys().cloned().collect();
+        let mut names: Vec<_> = crate::error::recover_guard(self.state.read())
+            .tools
+            .keys()
+            .cloned()
+            .collect();
         names.sort();
         names
     }
@@ -195,7 +306,7 @@ impl ToolRegistry {
     /// ```
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tools.len()
+        crate::error::recover_guard(self.state.read()).tools.len()
     }
 
     /// Whether the registry contains no tools.
@@ -213,7 +324,9 @@ impl ToolRegistry {
     /// ```
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        crate::error::recover_guard(self.state.read())
+            .tools
+            .is_empty()
     }
 
     /// Return references to all tools that are concurrency-safe.
@@ -222,11 +335,12 @@ impl ToolRegistry {
     /// returning `true`. Used by the agent loop to decide which tools can
     /// be invoked in parallel during a single turn.
     #[must_use]
-    pub fn concurrent_safe_tools(&self) -> Vec<&dyn Tool> {
-        self.tools
+    pub fn concurrent_safe_tools(&self) -> Vec<Arc<dyn Tool>> {
+        crate::error::recover_guard(self.state.read())
+            .tools
             .values()
-            .map(std::convert::AsRef::as_ref)
-            .filter(|t| t.is_concurrency_safe())
+            .filter(|tool| tool.is_concurrency_safe())
+            .cloned()
             .collect()
     }
 
@@ -238,10 +352,12 @@ impl ToolRegistry {
     /// position; callers that need a sorted order should sort the
     /// result, as [`tool_names`](Self::tool_names) does for names.
     #[must_use]
-    pub fn all_tools(&self) -> Vec<&dyn Tool> {
-        self.order
+    pub fn all_tools(&self) -> Vec<Arc<dyn Tool>> {
+        let state = crate::error::recover_guard(self.state.read());
+        state
+            .order
             .iter()
-            .filter_map(|name| self.tools.get(name).map(std::convert::AsRef::as_ref))
+            .filter_map(|name| state.tools.get(name).cloned())
             .collect()
     }
 }
@@ -635,7 +751,7 @@ mod tests {
 
     #[test]
     fn register_duplicate_overwrites_previous() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(make_tool("my_tool"));
         assert_eq!(registry.len(), 1);
 
@@ -650,7 +766,7 @@ mod tests {
 
     #[test]
     fn register_different_names_adds_both() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(make_tool("tool_a"));
         registry.register(make_tool("tool_b"));
         assert_eq!(registry.len(), 2);
@@ -664,7 +780,7 @@ mod tests {
         let registered = [
             "kilo", "zulu", "alpha", "romeo", "mike", "xray", "bravo", "tango",
         ];
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         for name in registered {
             registry.register(make_tool(name));
         }
@@ -692,7 +808,7 @@ mod tests {
 
     #[test]
     fn all_tools_returns_one_entry_per_registered_tool() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(make_tool("tool_a"));
         registry.register(make_tool("tool_b"));
         registry.register(make_tool("tool_c"));
@@ -705,7 +821,7 @@ mod tests {
 
     #[test]
     fn all_tools_includes_concurrency_unsafe_tools() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(make_tool("unsafe_tool"));
         let all = registry.all_tools();
         let safe = registry.concurrent_safe_tools();
@@ -719,22 +835,26 @@ mod tests {
 
     #[test]
     fn all_tools_preserves_registration_order() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(make_tool("first"));
         registry.register(make_tool("second"));
         registry.register(make_tool("third"));
-        let names: Vec<&str> = registry
+        let names: Vec<String> = registry
             .all_tools()
             .iter()
-            .map(|tool| tool.name())
+            .map(|tool| tool.name().to_string())
             .collect();
-        assert_eq!(names, ["first", "second", "third"]);
+        assert_eq!(
+            names,
+            ["first", "second", "third"],
+            "registration order survives the interior lock"
+        );
 
         registry.register(make_tool("first"));
-        let names: Vec<&str> = registry
+        let names: Vec<String> = registry
             .all_tools()
             .iter()
-            .map(|tool| tool.name())
+            .map(|tool| tool.name().to_string())
             .collect();
         assert_eq!(
             names,
@@ -750,8 +870,86 @@ mod tests {
     }
 
     #[test]
+    fn version_is_monotonic_across_mutations() {
+        let registry = ToolRegistry::new();
+        let v0 = registry.version();
+        registry.register(make_tool("first"));
+        let v1 = registry.version();
+        registry.register(make_tool("second"));
+        let v2 = registry.version();
+        registry.remove("first");
+        let v3 = registry.version();
+        assert!(
+            v0 < v1 && v1 < v2 && v2 < v3,
+            "every landed mutation strictly bumps the counter: {v0} < {v1} < {v2} < {v3}"
+        );
+    }
+
+    #[test]
+    fn removing_an_unknown_name_is_an_idempotent_no_op() {
+        let registry = ToolRegistry::new();
+        registry.remove("ghost");
+        assert_eq!(
+            registry.version(),
+            0,
+            "a removal that drops nothing is not a surface change"
+        );
+        registry.register(make_tool("real"));
+        let after_register = registry.version();
+        registry.remove("ghost");
+        assert_eq!(
+            registry.version(),
+            after_register,
+            "removing an unknown name beside a real one still bumps nothing"
+        );
+        registry.remove("real");
+        registry.remove("real");
+        assert_eq!(
+            registry.version(),
+            after_register + 1,
+            "the second removal of the same name is a no-op"
+        );
+    }
+
+    #[test]
+    fn a_registration_through_a_shared_handle_reaches_every_reader() {
+        let registry = ToolRegistry::new();
+        registry.register(make_tool("seed"));
+        let shared = std::sync::Arc::new(registry);
+        shared.register(make_tool("late"));
+        let names = shared.all_schemas();
+        let listed: Vec<String> = names.into_iter().map(|schema| schema.tool).collect();
+        assert_eq!(
+            listed,
+            ["seed", "late"],
+            "a mid-life registration through the shared handle is visible to every reader"
+        );
+    }
+
+    #[test]
+    fn a_fetched_handle_outlives_removal_and_still_calls() {
+        let registry = ToolRegistry::new();
+        registry.register(make_tool("ephemeral"));
+        let tool = registry.get("ephemeral").expect("registered");
+        registry.remove("ephemeral");
+        assert!(
+            registry.get("ephemeral").is_none(),
+            "the name no longer resolves"
+        );
+        let output = futures::executor::block_on(
+            tool.call(serde_json::Value::Null, &ToolContext::default()),
+        )
+        .expect("the fetched handle still calls after its removal");
+        assert_eq!(
+            output.text_content(),
+            "ok",
+            "an in-flight call drains against the handle it fetched"
+        );
+    }
+
+    #[test]
     fn register_overwrite_uses_new_tool() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(make_tool("my_tool"));
 
         // After overwriting, the tool should still be callable.

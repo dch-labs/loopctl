@@ -45,7 +45,7 @@ fn probe_tool(
 
 /// A registry holding the one probe tool every verdict targets.
 fn probe_registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(
         FnTool::new(
             "probe".into(),
@@ -561,7 +561,7 @@ mod engine_emission {
     #[tokio::test]
     async fn every_hook_decision_emits_a_record_with_rule_provenance() {
         let collector = Arc::new(GateCollector::new());
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(
             FnTool::new(
                 "deploy".into(),
@@ -654,7 +654,7 @@ mod engine_emission {
                 stop_reason: "end_turn".into(),
             },
         ]);
-        let mut advertised = ToolRegistry::new();
+        let advertised = ToolRegistry::new();
         advertised.register(
             FnTool::new(
                 "deploy".into(),

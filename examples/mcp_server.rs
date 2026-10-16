@@ -121,7 +121,7 @@ impl Tool for FailTool {
 
 #[tokio::main]
 async fn main() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     registry.register(FailTool);
     let adapter = McpServerAdapter::new(

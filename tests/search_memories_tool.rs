@@ -347,7 +347,7 @@ async fn memoize_composition_is_free_on_repeat() {
             stop_reason: "end_turn".to_string(),
         },
     ];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::clone(&store) as Arc<dyn LoopMemory>
     ));
@@ -480,7 +480,7 @@ async fn demoted_content_is_recallable_through_the_tool() {
         tool_call: None,
         stop_reason: "end_turn".to_string(),
     });
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FactTool);
     registry.register(BigResultTool);
     let config = SessionConfig::default()
@@ -1014,7 +1014,7 @@ async fn a_search_does_not_become_the_next_search_result() {
         plain_call("p1"),
         terminal_response(),
     ];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::clone(&store) as Arc<dyn LoopMemory>
     ));
@@ -1106,7 +1106,7 @@ async fn memoize_serves_the_cached_answer_across_store_writes_until_ttl() {
         search_call("s2", "launch code"),
         terminal_response(),
     ];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::clone(&store) as Arc<dyn LoopMemory>
     ));
@@ -1170,7 +1170,7 @@ async fn repeated_retrieve_failures_open_the_breaker() {
         .map(|index| search_call(&format!("f{index}"), "anything"))
         .chain(std::iter::once(terminal_response()))
         .collect();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::new(PoisonedStore) as Arc<dyn LoopMemory>
     ));
@@ -1239,7 +1239,7 @@ async fn output_limit_caps_the_joined_body_with_its_own_marker() {
             .unwrap();
     }
     let responses = vec![search_call("s1", "fact"), terminal_response()];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::clone(&memory) as Arc<dyn LoopMemory>
     ));
@@ -1334,7 +1334,7 @@ async fn memoize_follows_the_registered_name_not_the_default() {
             search_call_under("recall", "a2", "launch code"),
             terminal_response(),
         ];
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(
             SearchMemoriesTool::new(Arc::clone(&store) as Arc<dyn LoopMemory>).with_name("recall"),
         );
@@ -1394,7 +1394,7 @@ async fn a_zero_memory_top_k_still_serves_the_model_issued_search() {
         .await
         .unwrap();
     let responses = vec![search_call("s1", "launch code"), terminal_response()];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::clone(&memory) as Arc<dyn LoopMemory>
     ));
@@ -1461,7 +1461,7 @@ async fn redaction_scrubs_secrets_from_memory_content() {
         .await
         .unwrap();
     let responses = vec![search_call("s1", "leaked header"), terminal_response()];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::clone(&memory) as Arc<dyn LoopMemory>
     ));
@@ -1542,7 +1542,7 @@ async fn the_passive_memory_key_after_a_search_is_the_tool_result() {
         queries: Mutex::new(Vec::new()),
     });
     let responses = vec![search_call("s1", "launch code"), terminal_response()];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::clone(&store) as Arc<dyn LoopMemory>
     ));
@@ -1649,7 +1649,7 @@ async fn a_redirected_search_still_opts_out_of_trajectory_recording() {
         plain_call("p1"),
         terminal_response(),
     ];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FacadeTool);
     registry.register(
         SearchMemoriesTool::new(Arc::clone(&store) as Arc<dyn LoopMemory>).with_name("recall"),

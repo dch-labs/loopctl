@@ -218,7 +218,7 @@ async fn a_zero_probe_timeout_still_converges_through_the_gate() {
 
     let run_once = |fail: bool, health: Arc<ToolHealthRegistry>| {
         let client = MockApiClient::new("m").with_responses(responses.clone());
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(FailThenSucceed {
             fail_first: Arc::new(std::sync::atomic::AtomicBool::new(fail)),
             executions: Arc::clone(&executions),

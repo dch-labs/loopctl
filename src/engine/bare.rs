@@ -338,6 +338,19 @@ pub struct BareLoop<C: ApiClient> {
     /// at all, a distinct prefix from any advertised set.
     last_advertised_surface: Option<String>,
 
+    /// The registry surface the engine last observed, as the version
+    /// and sorted `(name, rendered schema)` pairs at that observation.
+    ///
+    /// The diff baseline for
+    /// [`on_tool_surface_changed`](crate::observer::LoopObserver::on_tool_surface_changed):
+    /// each turn preparation compares the registry's current version,
+    /// names, and rendered schemas against this snapshot, reports the
+    /// partitioned difference to observers when the version moved, and
+    /// re-baselines. The first observation of a session establishes
+    /// the baseline without an event — the initial registration burst
+    /// is setup, not change.
+    observed_registry: Option<(u64, Vec<(String, String)>)>,
+
     /// Cached components of the per-request overhead.
     ///
     /// Holds the system-prompt and tool-schema costs separately — both
@@ -345,7 +358,19 @@ pub struct BareLoop<C: ApiClient> {
     /// for the measurement to see them — because a request running
     /// under a `response_format` suppresses tool advertisement and its
     /// estimate must drop the schema component without re-measuring.
-    overhead: std::sync::OnceLock<OverheadParts>,
+    system_overhead: std::sync::OnceLock<u64>,
+
+    /// The full-registry tool-schema overhead, cached against the
+    /// registry version it was measured at.
+    ///
+    /// The reservation figure behind
+    /// [`request_overhead_tokens`](Self::request_overhead_tokens);
+    /// re-measured whenever the registry's
+    /// [`version`](crate::tool::ToolRegistry::version) moves — a
+    /// mid-session surface change moves the window budget with it, so
+    /// the salvage reservation can never over- or under-reserve
+    /// against a stale schema set.
+    tool_overhead: std::sync::Mutex<Option<(u64, u64)>>,
 
     /// Transient-message budget of the most recent deferred turn.
     ///
@@ -935,7 +960,9 @@ impl<C: ApiClient> BareLoop<C> {
             tool_selector: None,
             prepared_turn: None,
             last_advertised_surface: None,
-            overhead: std::sync::OnceLock::new(),
+            observed_registry: None,
+            system_overhead: std::sync::OnceLock::new(),
+            tool_overhead: std::sync::Mutex::new(None),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
             anchor: None,
@@ -1299,25 +1326,33 @@ impl<C: ApiClient> BareLoop<C> {
     /// use (register tools before the first run for the measurement to
     /// see them) with the same counter `count_context` uses, by
     /// counting each as a synthetic message.
-    fn overhead_parts(&self) -> &OverheadParts {
-        self.overhead.get_or_init(|| {
-            let system = self
-                .session
+    fn overhead_parts(&self) -> OverheadParts {
+        let system = *self.system_overhead.get_or_init(|| {
+            self.session
                 .config
                 .system_prompt
                 .as_ref()
                 .map_or(0, |prompt| {
                     self.count_context(&[Message::user(prompt.clone())])
-                });
-            let schemas = self.tools.all_schemas();
-            let tools = if schemas.is_empty() {
-                0
-            } else {
-                serde_json::to_string(&schemas)
-                    .map_or(0, |rendered| self.count_context(&[Message::user(rendered)]))
-            };
-            OverheadParts { system, tools }
-        })
+                })
+        });
+        let version = self.tools.version();
+        let mut cached = crate::error::recover_guard(self.tool_overhead.lock());
+        let tools = match *cached {
+            Some((seen, tokens)) if seen == version => tokens,
+            _ => {
+                let schemas = self.tools.all_schemas();
+                let tokens = if schemas.is_empty() {
+                    0
+                } else {
+                    serde_json::to_string(&schemas)
+                        .map_or(0, |rendered| self.count_context(&[Message::user(rendered)]))
+                };
+                *cached = Some((version, tokens));
+                tokens
+            }
+        };
+        OverheadParts { system, tools }
     }
 
     /// The token cost of the per-request overhead, in full.
@@ -1454,7 +1489,9 @@ impl<C: ApiClient> BareLoop<C> {
             tool_selector: None,
             prepared_turn: None,
             last_advertised_surface: None,
-            overhead: std::sync::OnceLock::new(),
+            observed_registry: None,
+            system_overhead: std::sync::OnceLock::new(),
+            tool_overhead: std::sync::Mutex::new(None),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
             anchor: None,
@@ -1576,7 +1613,9 @@ impl<C: ApiClient> BareLoop<C> {
             tool_selector: None,
             prepared_turn: None,
             last_advertised_surface: None,
-            overhead: std::sync::OnceLock::new(),
+            observed_registry: None,
+            system_overhead: std::sync::OnceLock::new(),
+            tool_overhead: std::sync::Mutex::new(None),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
             anchor: None,
@@ -1670,6 +1709,24 @@ impl<C: ApiClient> BareLoop<C> {
     /// `dispatch_tools()`.
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
+    }
+
+    /// The shared handle to the loop's tool registry.
+    ///
+    /// The runtime-mutation seam: the returned
+    /// [`Arc<ToolRegistry>`](std::sync::Arc) is the same registry the
+    /// engine reads when building each turn's request and resolving
+    /// dispatches, so a tool registered or removed through it is
+    /// advertised (or omitted) from the next turn's request — never a
+    /// partially-visible mid-turn state — and an in-flight call
+    /// drains to completion against the handle it fetched. Every
+    /// mutation bumps the registry's
+    /// [`version`](ToolRegistry::version), which the engine watches to
+    /// re-measure its overhead reservation and to report
+    /// [`on_tool_surface_changed`](crate::observer::LoopObserver::on_tool_surface_changed).
+    #[must_use]
+    pub fn tool_registry(&self) -> Arc<ToolRegistry> {
+        Arc::clone(&self.tools)
     }
 
     /// Check if the loop has been cancelled.
@@ -1927,6 +1984,78 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// Observe the registry surface, reporting a change to observers.
+    ///
+    /// The turn-seam half of runtime registry mutation: compares the
+    /// registry's version and sorted names against the last
+    /// observation and, when the version moved, dispatches
+    /// [`on_tool_surface_changed`](crate::observer::LoopObserver::on_tool_surface_changed)
+    /// with the set difference — then re-baselines. Setup
+    /// registrations before the first turn are the baseline, not a
+    /// change; mutations between turns of a running loop are.
+    fn observe_tool_surface(&mut self) {
+        let version = self.tools.version();
+        let Some((seen_version, seen_surface)) = self.observed_registry.take() else {
+            self.observed_registry = Some((version, self.rendered_surface()));
+            return;
+        };
+        if seen_version == version {
+            self.observed_registry = Some((seen_version, seen_surface));
+            return;
+        }
+        let surface = self.rendered_surface();
+        let added = surface
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| seen_surface.iter().all(|(seen, _)| seen != *name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = seen_surface
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| surface.iter().all(|(current, _)| current != *name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed = surface
+            .iter()
+            .filter(|(name, schema)| {
+                seen_surface
+                    .iter()
+                    .any(|(seen, seen_schema)| seen == name && seen_schema != schema)
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        self.managers
+            .observers()
+            .on_tool_surface_changed(&crate::observer::ToolSurfaceContext {
+                version,
+                added,
+                removed,
+                changed,
+            });
+        self.observed_registry = Some((version, surface));
+    }
+
+    /// The registry's advertised surface as sorted name + rendered
+    /// schema pairs.
+    ///
+    /// The observation basis behind
+    /// [`on_tool_surface_changed`](crate::observer::LoopObserver::on_tool_surface_changed):
+    /// pairing each name with its rendered schema makes an in-place
+    /// overwrite — same name, different advertised schema — visible to
+    /// the diff, not just additions and removals. Sorted for
+    /// deterministic comparison across observations.
+    fn rendered_surface(&self) -> Vec<(String, String)> {
+        self.tools
+            .all_schemas()
+            .into_iter()
+            .map(|schema| {
+                let rendered = serde_json::to_string(&schema).unwrap_or_default();
+                (schema.tool, rendered)
+            })
+            .collect()
+    }
+
     /// Collect one turn's request context: its transients and the
     /// tool surface selected over them.
     ///
@@ -1948,6 +2077,7 @@ impl<C: ApiClient> BareLoop<C> {
         messages.extend(self.collect_contributor_messages(turn));
         self.collect_memories(&turn_input, &mut messages).await;
         let tools = self.turn_tool_schemas(turn, &messages);
+        self.observe_tool_surface();
         let surface = tools
             .as_ref()
             .map(|schemas| serde_json::to_string(schemas).unwrap_or_default());

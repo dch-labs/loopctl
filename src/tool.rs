@@ -127,7 +127,7 @@ pub use selector::{KeywordSelector, SelectionContext, StaticSelector, ToolSelect
 /// `#[non_exhaustive]` so fields can be added in minor
 /// releases — construct through [`new`](Self::new); struct
 /// literals compile only inside the crate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct ToolSchema {
     /// The tool's unique name identifier.
@@ -2229,7 +2229,7 @@ mod tests {
 
     #[test]
     fn test_registry_register_and_get() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         assert!(registry.is_empty());
 
         registry.register(EchoTool);
@@ -2248,7 +2248,7 @@ mod tests {
 
     #[test]
     fn test_registry_all_schemas() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(EchoTool);
         let schemas = registry.all_schemas();
         assert_eq!(schemas.len(), 1);
@@ -2257,7 +2257,7 @@ mod tests {
 
     #[test]
     fn test_registry_tool_names() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(FailTool);
         registry.register(EchoTool);
         let names = registry.tool_names();
@@ -2266,7 +2266,7 @@ mod tests {
 
     #[test]
     fn test_registry_concurrent_safe_tools() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(EchoTool);
         registry.register(FailTool);
         let safe = registry.concurrent_safe_tools();
@@ -2643,7 +2643,7 @@ mod tests {
             },
         ]);
 
-        let mut registry = crate::tool::ToolRegistry::new();
+        let registry = crate::tool::ToolRegistry::new();
         registry.register(HintedTool {
             name: tool_name,
             output_text,

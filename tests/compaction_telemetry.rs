@@ -183,7 +183,7 @@ fn telemetry_loop_with_window(
     observer: Arc<dyn LoopObserver>,
     window: u64,
 ) -> BareLoop<MockApiClient> {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(GrowTool);
     let config = SessionConfig::default()
         .with_context_window(window)

@@ -78,7 +78,7 @@ fn scripted_loop(
     responses: Vec<MockResponse>,
 ) -> BareLoop<MockApiClient> {
     let client = MockApiClient::new("test-model").with_responses(responses);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     BareLoop::new(Arc::new(client), registry, SessionConfig::default()).with_observer(observer)
 }

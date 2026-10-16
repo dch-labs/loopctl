@@ -517,7 +517,7 @@ fn named_handler_dispatches() {
 /// registry.
 #[test]
 fn registry_integration() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoInput {
         message: String::new(),
     });

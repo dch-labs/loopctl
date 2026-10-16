@@ -770,11 +770,94 @@ impl McpToolProvider {
     /// -`warn` behaviour.
     ///
     /// Use [`Self::tools`] instead when you need finer control over which tools
-    /// to register.
-    pub fn register_into(&self, registry: &mut ToolRegistry) {
+    /// to register, or [`Self::sync_into`] when the registry is live and the
+    /// server's list may have changed since discovery.
+    pub fn register_into(&self, registry: &ToolRegistry) {
         for tool in &self.tools {
             registry.register(tool.clone());
         }
+    }
+
+    /// Re-run `tools/list` and mirror the result into a live registry
+    /// as a diff.
+    ///
+    /// The runtime-registry sync: re-discovers the server's tool list
+    /// (re-applying the captured `name_prefix`), then mutates only
+    /// what moved — names the server added are
+    /// [`register`](ToolRegistry::register)ed, names it dropped are
+    /// [`remove`](ToolRegistry::remove)d, and names present in both
+    /// snapshots keep their registration position and everything the
+    /// registry keys on their name (health history included); a
+    /// survivor whose schema the server changed is re-registered in
+    /// place so the new description reads on the next request, while
+    /// a survivor whose schema is identical is not touched at all —
+    /// not even re-registered — so its handle identity survives the
+    /// sync too. The provider's
+    /// own snapshot is replaced by the same discovery, matching
+    /// [`refresh`](Self::refresh)'s error discipline: a failed re-list
+    /// leaves both the provider and the registry untouched.
+    ///
+    /// Drive this when the server signals
+    /// `notifications/tools/list_changed`, on a schedule, or whenever
+    /// the host knows the server mutated. Push subscription — handing
+    /// the notification itself to the engine — requires a
+    /// handler-bearing client, which this module's clients (fixed to
+    /// the pure `()` handler) do not yet install; the deferral is
+    /// deliberate, and this pull primitive is the seam that wiring
+    /// will drive.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Protocol`] if the re-list RPC fails; on error no
+    /// registry mutation has occurred.
+    pub async fn sync_into(&mut self, registry: &ToolRegistry) -> Result<McpSyncReport, McpError> {
+        let mut discovered = Vec::new();
+        bridge_tool_list(
+            &self.client,
+            self.prefix.as_deref(),
+            self.call_timeout,
+            &mut discovered,
+        )
+        .await?;
+        let old_names: std::collections::HashSet<String> = self
+            .tools
+            .iter()
+            .map(|tool| tool.exposed_name.clone())
+            .collect();
+        let new_names: std::collections::HashSet<String> = discovered
+            .iter()
+            .map(|tool| tool.exposed_name.clone())
+            .collect();
+
+        let mut report = McpSyncReport::default();
+        for tool in &self.tools {
+            if new_names.contains(&tool.exposed_name) {
+                report.untouched.push(tool.exposed_name.clone());
+            } else {
+                registry.remove(&tool.exposed_name);
+                report.removed.push(tool.exposed_name.clone());
+            }
+        }
+        let mut fresh = Vec::new();
+        for tool in discovered {
+            let survived_unchanged = self.tools.iter().any(|current| {
+                current.exposed_name == tool.exposed_name && current.schema() == tool.schema()
+            });
+            if old_names.contains(&tool.exposed_name) {
+                if !survived_unchanged {
+                    registry.register(tool.clone());
+                }
+            } else {
+                report.added.push(tool.exposed_name.clone());
+                registry.register(tool.clone());
+            }
+            fresh.push(tool);
+        }
+        self.tools = fresh;
+        report.added.sort();
+        report.removed.sort();
+        report.untouched.sort();
+        Ok(report)
     }
 
     /// Borrow the underlying client.
@@ -786,6 +869,35 @@ impl McpToolProvider {
     pub fn client(&self) -> &McpClient {
         &self.client
     }
+}
+
+/// What one [`McpToolProvider::sync_into`] pass changed.
+///
+/// The diff of a completed sync, by exposed (prefixed) name: names
+/// the server added, names it dropped, and names that survived —
+/// survivors kept their registration position and name-keyed history;
+/// a survivor whose schema the server changed was refreshed in place,
+/// an identical one was not touched at all. Hosts log or observe
+/// through this; the registry's own
+/// [`version`](crate::tool::ToolRegistry::version) moved by one bump
+/// per added name, per removed name, and per refreshed survivor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpSyncReport {
+    /// Exposed names newly registered by this sync.
+    ///
+    /// Sorted; the server declared them and they were absent before.
+    pub added: Vec<String>,
+
+    /// Exposed names removed from the registry by this sync.
+    ///
+    /// Sorted; they were registered before and the server no longer
+    /// declares them.
+    pub removed: Vec<String>,
+
+    /// Exposed names that survived the sync in both snapshots.
+    ///
+    /// Sorted; their schemas were refreshed in place.
+    pub untouched: Vec<String>,
 }
 
 /// A single MCP server tool exposed as a loopctl [`Tool`].

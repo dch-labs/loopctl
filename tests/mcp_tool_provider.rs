@@ -144,8 +144,8 @@ async fn register_into_populates_registry() {
     let provider = McpToolProvider::connect(client, None)
         .await
         .expect("connect");
-    let mut registry = ToolRegistry::new();
-    provider.register_into(&mut registry);
+    let registry = ToolRegistry::new();
+    provider.register_into(&registry);
     assert_eq!(registry.len(), 2);
     assert!(registry.contains("echo"));
     assert!(registry.contains("status"));
@@ -463,8 +463,8 @@ async fn refresh_replaces_snapshot_in_place() {
         .expect("connect");
     let before = provider.tools().len();
 
-    let mut registry = ToolRegistry::new();
-    provider.register_into(&mut registry);
+    let registry = ToolRegistry::new();
+    provider.register_into(&registry);
     let registry_len_before = registry.len();
 
     provider.refresh().await.expect("refresh");
@@ -547,10 +547,10 @@ async fn re_register_with_overlapping_name_overwrites() {
     let provider = McpToolProvider::connect(client, None)
         .await
         .expect("connect");
-    let mut registry = ToolRegistry::new();
-    provider.register_into(&mut registry);
+    let registry = ToolRegistry::new();
+    provider.register_into(&registry);
     let len_after_first = registry.len();
-    provider.register_into(&mut registry);
+    provider.register_into(&registry);
     assert_eq!(registry.len(), len_after_first);
 }
 

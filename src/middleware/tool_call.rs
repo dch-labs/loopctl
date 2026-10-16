@@ -203,7 +203,7 @@ mod tests {
         }
 
         let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(SideEffectProbe(Arc::clone(&polled)));
 
         let middleware = ToolCallMiddleware::new(Arc::new(registry));
@@ -232,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn panicking_tool_produces_error_result_not_abort() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(PanickingTool);
 
         let middleware = ToolCallMiddleware::new(Arc::new(registry));
@@ -255,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn normal_tool_still_works() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(FnTool::new(
             "echo".into(),
             "Echoes input".into(),

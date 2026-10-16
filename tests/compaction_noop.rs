@@ -413,7 +413,7 @@ mod scenarios {
     }
 
     fn registry_with_echo() -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(EchoTool);
         registry
     }

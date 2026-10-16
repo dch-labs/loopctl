@@ -256,7 +256,7 @@ fn compacting_loop(
     sink: Option<Arc<dyn DemotionSink>>,
     observer: Option<Arc<dyn LoopObserver>>,
 ) -> BareLoop<MockApiClient> {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FactTool);
     let config = SessionConfig::default()
         .with_context_window(900)
@@ -435,7 +435,7 @@ async fn a_cancel_during_a_hanging_sink_ends_the_run_typed() {
 #[tokio::test]
 async fn with_demotion_sink_wires_the_manager() {
     let deliveries: Arc<Mutex<Vec<Delivery>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FactTool);
     let config = SessionConfig::default()
         .with_context_window(900)
@@ -685,7 +685,7 @@ async fn memory_and_sink_share_one_store_across_turns() {
         tool_call: None,
         stop_reason: "end_turn".to_string(),
     });
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(BigResultTool);
     registry.register(FactTool);
     let config = SessionConfig::default()
@@ -760,7 +760,7 @@ async fn an_emergency_pass_delivers_with_its_reason() {
         tool_call: None,
         stop_reason: "end_turn".to_string(),
     });
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SizedResultTool);
     let config = SessionConfig::default()
         .with_context_window(1_000)
@@ -836,7 +836,7 @@ async fn default_budget_recall_does_not_spiral_the_compaction_trigger() {
         tool_call: None,
         stop_reason: "end_turn".to_string(),
     });
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(BigResultTool);
     registry.register(FactTool);
     let config = SessionConfig::default()

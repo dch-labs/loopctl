@@ -25,6 +25,7 @@
 //! - [`FallbackContext`] — model fallback event
 //! - [`TransportFallbackContext`] — non-streaming transport fallback event
 //! - [`ModelSwitchedContext`] — runtime model hot-swap event
+//! - [`ToolSurfaceContext`] — runtime tool-surface change between turns
 //! - [`LoopDetectedContext`] — loop detection event
 //! - [`ConvergenceDetectedContext`] — convergence detection event
 //!
@@ -55,7 +56,7 @@ pub use context::{
     GateDecisionContext, LoopDetectedContext, ModelSwitchedContext, PreCompactionContext,
     ResponseContext, RunEndContext, RunStartContext, StreamContext, StreamFailureContext,
     TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext,
-    ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
+    ToolPreContext, ToolSurfaceContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 pub use hub::{EventHub, LoopEvent, ObservedEvent};
 
@@ -412,6 +413,17 @@ pub trait LoopObserver: Send + Sync {
     /// after the client has accepted the new model.
     fn on_model_switched(&self, _ctx: &ModelSwitchedContext) {}
 
+    /// Called when the registry's tool surface changes between turns.
+    ///
+    /// Fired at the turn seam when the engine observes that the
+    /// registry's tool set moved since its previous observation — a
+    /// tool registered, removed, or overwritten in place at runtime
+    /// through a shared registry. The context partitions the change
+    /// (added, removed, and schema-changed names) beside the
+    /// registry's mutation counter; the turn that follows advertises
+    /// the new surface.
+    fn on_tool_surface_changed(&self, _ctx: &ToolSurfaceContext) {}
+
     /// Called when a loop is detected in tool operations.
     ///
     /// Fired when the same tool operation produces the same result
@@ -725,6 +737,16 @@ impl ObserverHost {
     /// observers in registration order.
     pub fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
         self.dispatch(|obs| obs.on_model_switched(ctx));
+    }
+
+    /// Dispatch [`LoopObserver::on_tool_surface_changed`] to all
+    /// observers.
+    ///
+    /// Fired when the engine observes a registry mutation between
+    /// turns, carrying the added and removed names and the registry
+    /// version. Iterates registered observers in registration order.
+    pub fn on_tool_surface_changed(&self, ctx: &ToolSurfaceContext) {
+        self.dispatch(|obs| obs.on_tool_surface_changed(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_loop_detected`] to all observers.

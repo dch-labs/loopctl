@@ -465,6 +465,39 @@ mod tests {
         }
     }
 
+    /// An `echo` tool from a different server: same exposed name,
+    /// different description.
+    ///
+    /// The foreign registration of the cross-provider pin: when this
+    /// tool overwrites the first provider's `echo` in a shared
+    /// registry, only a schema-identity check can tell whose entry the
+    /// registry holds — and the first provider's sync must not remove
+    /// it when its own server drops the name.
+    struct ForeignEcho;
+
+    impl Tool for ForeignEcho {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn description(&self) -> &'static str {
+            "A different server's echo"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "echo".into(),
+                description: "a different server's echo".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("foreign")) })
+        }
+    }
+
     /// The `peek` tool re-registered under its name with a changed
     /// description.
     ///
@@ -654,6 +687,108 @@ mod tests {
     fn adapter_is_clone_send_sync() {
         fn _assert_clone_send_sync<T: Clone + Send + Sync>() {}
         _assert_clone_send_sync::<McpServerAdapter>();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_name_never_removes_another_provider_s_registration() {
+        let first = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(EchoTool);
+                registry.register(FailTool);
+                registry
+            },
+            ToolContext::default(),
+            "first".into(),
+            "0.0.1".into(),
+        );
+        let second = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(ForeignEcho);
+                registry
+            },
+            ToolContext::default(),
+            "second".into(),
+            "0.0.1".into(),
+        );
+        let first_client = serve_and_connect(&first).await;
+        let second_client = serve_and_connect(&second).await;
+
+        let mut first_provider = crate::mcp::McpToolProvider::connect(first_client, None)
+            .await
+            .expect("discover first");
+        let second_provider = crate::mcp::McpToolProvider::connect(second_client, None)
+            .await
+            .expect("discover second");
+        let shared = ToolRegistry::new();
+        first_provider.register_into(&shared);
+        second_provider.register_into(&shared);
+
+        first.registry().remove("echo");
+        let report = first_provider.sync_into(&shared).await.expect("sync");
+
+        assert!(
+            shared.contains("echo"),
+            "the second provider's registration survives the first provider's \
+             drop — the baseline never owned the registry's current entry"
+        );
+        assert!(
+            report.removed.is_empty(),
+            "the only dropped name is foreign-held — nothing is reported removed: \
+             {:?}",
+            report.removed
+        );
+        assert!(
+            shared.contains("fail"),
+            "this provider's own survivor stays registered"
+        );
+        assert_eq!(
+            report.untouched,
+            ["fail"],
+            "the survivor this target still holds is reported untouched: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sync_into_a_second_registry_registers_its_survivors() {
+        let adapter = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(EchoTool);
+                registry.register(PeekTool);
+                registry
+            },
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let first = ToolRegistry::new();
+        provider.register_into(&first);
+
+        let second = ToolRegistry::new();
+        let report = provider.sync_into(&second).await.expect("sync");
+
+        assert_eq!(
+            second.tool_names(),
+            ["echo", "peek"],
+            "a target that never saw the provider gains its survivors — \
+             presence is reconciled against the target, not the provider map"
+        );
+        assert_eq!(
+            report.added,
+            ["echo", "peek"],
+            "the report counts what this target gained: {report:?}"
+        );
+        assert!(
+            report.untouched.is_empty(),
+            "nothing was untouched in a target that held nothing"
+        );
     }
 
     #[tokio::test]

@@ -820,7 +820,17 @@ impl McpToolProvider {
     /// against what the registry actually holds, so a change a
     /// [`refresh`](Self::refresh) already pulled into the discovery
     /// snapshot still re-registers here — the snapshot comparing
-    /// against itself can never strand a stale handle. The provider's
+    /// against itself can never strand a stale handle. Both arms
+    /// reconcile against the target passed in, not the provider's
+    /// history alone: a dropped name is removed only while the target
+    /// still holds this provider's registration
+    /// ([`registration_matches`](ToolRegistry::registration_matches)
+    /// — a foreign tool that overwrote the name is left alone with a
+    /// warning), and a survivor counts `untouched` only when the
+    /// target currently holds the matching registration — anything
+    /// else re-registers and reports as `added`, so a target that
+    /// never saw the provider, or lost it to a removal, gains the
+    /// surface instead of silently staying empty. The provider's
     /// own snapshot is replaced by the same discovery, matching
     /// [`refresh`](Self::refresh)'s error discipline: a failed re-list
     /// leaves both the provider and the registry untouched.
@@ -854,25 +864,35 @@ impl McpToolProvider {
 
         let mut report = McpSyncReport::default();
         let mut registered = crate::error::recover_guard(self.registered.lock());
-        for name in registered.keys() {
+        for (name, held) in registered.iter() {
             if new_names.contains(name) {
-                report.untouched.push(name.clone());
-            } else {
+                continue;
+            }
+            if registry.registration_matches(name, &held.schema()) {
                 registry.remove(name);
                 report.removed.push(name.clone());
+            } else {
+                tracing::warn!(
+                    tool = %name,
+                    "skipping removal of a foreign-held name — the target                      registry's entry does not match this provider's                      registration"
+                );
             }
         }
         let mut fresh = Vec::new();
         for tool in discovered {
             let held = registered.get(&tool.exposed_name);
-            let survived_unchanged = held.is_some_and(|held| held.matches(&tool));
-            if held.is_some() {
-                if !survived_unchanged {
+            let ours_in_target = held.is_some_and(|held| {
+                registry.registration_matches(&tool.exposed_name, &held.schema())
+            });
+            let changed = held.is_some_and(|held| !held.matches(&tool));
+            if held.is_some() && ours_in_target {
+                if changed {
                     registry.register(tool.clone());
                 }
+                report.untouched.push(tool.exposed_name.clone());
             } else {
-                report.added.push(tool.exposed_name.clone());
                 registry.register(tool.clone());
+                report.added.push(tool.exposed_name.clone());
             }
             fresh.push(tool);
         }
@@ -910,9 +930,12 @@ impl McpToolProvider {
 /// per added name, per removed name, and per refreshed survivor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct McpSyncReport {
-    /// Exposed names newly registered by this sync.
+    /// Exposed names this sync registered into the target.
     ///
-    /// Sorted; the server declared them and they were absent before.
+    /// Sorted; either the server declared them fresh, or the target
+    /// did not hold this provider's matching registration for them —
+    /// a repair into a target that never saw it or lost it counts
+    /// here just as honestly.
     pub added: Vec<String>,
 
     /// Exposed names removed from the registry by this sync.
@@ -921,9 +944,11 @@ pub struct McpSyncReport {
     /// declares them.
     pub removed: Vec<String>,
 
-    /// Exposed names that survived the sync in both snapshots.
+    /// Exposed names that survived the sync with this target already
+    /// holding the provider's matching registration.
     ///
-    /// Sorted; their schemas were refreshed in place.
+    /// Sorted; a server-side contract change among them was refreshed
+    /// in place — the name never left the surface.
     pub untouched: Vec<String>,
 }
 

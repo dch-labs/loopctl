@@ -190,6 +190,27 @@ impl ToolRegistry {
         (self.version(), schemas)
     }
 
+    /// Whether the entry registered under `name` currently advertises
+    /// exactly this schema.
+    ///
+    /// The identity read shared-registry reconciliation needs: `true`
+    /// only when the name resolves and its current registration's
+    /// [`schema`](Tool::schema) equals the given one, so a mutator can
+    /// tell whether the entry it is about to remove or skip is still
+    /// the one it installed. Schema equality is the identity here —
+    /// two installations of the same advertised tool are
+    /// indistinguishable by design, while any divergence (a different
+    /// tool under the name, or the name gone) reads as not-matching.
+    /// Read under the state lock; never bumps
+    /// [`version`](Self::version).
+    #[must_use]
+    pub fn registration_matches(&self, name: &str, schema: &ToolSchema) -> bool {
+        crate::error::recover_guard(self.state.read())
+            .tools
+            .get(name)
+            .is_some_and(|tool| tool.schema() == *schema)
+    }
+
     /// The monotonic count of surface mutations so far.
     ///
     /// Bumped by every [`register`](Self::register) that lands a tool

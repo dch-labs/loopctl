@@ -828,7 +828,11 @@ impl McpToolProvider {
     /// — a foreign tool that overwrote the name is left alone with a
     /// warning), and a survivor counts `untouched` only when the
     /// target currently holds the matching registration — anything
-    /// else re-registers and reports as `added`, so a target that
+    /// else the survivor arm's three-way rule applies — ours is
+    /// updated in place, foreign-held is skipped with a warning
+    /// (never overwritten: a change on this provider's server must not
+    /// take ownership of a name another provider installed), and
+    /// missing is registered and reported as `added`, so a target that
     /// never saw the provider, or lost it to a removal, gains the
     /// surface instead of silently staying empty. The provider's
     /// own snapshot is replaced by the same discovery, matching
@@ -890,6 +894,11 @@ impl McpToolProvider {
                     registry.register(tool.clone());
                 }
                 report.untouched.push(tool.exposed_name.clone());
+            } else if held.is_some() && registry.contains(&tool.exposed_name) {
+                tracing::warn!(
+                    tool = %tool.exposed_name,
+                    "skipping refresh of a foreign-held name — the target                      registry's entry does not match this provider's                      registration"
+                );
             } else {
                 registry.register(tool.clone());
                 report.added.push(tool.exposed_name.clone());

@@ -498,6 +498,39 @@ mod tests {
         }
     }
 
+    /// The `echo` tool re-registered under its name with a changed
+    /// description.
+    ///
+    /// The changed survivor of the foreign-overwrite pin: the first
+    /// provider's server mutates its `echo` while a second provider
+    /// owns the shared registry's entry under the name — the sync must
+    /// skip the refresh rather than take ownership of a foreign
+    /// registration.
+    struct ReDescribedEcho;
+
+    impl Tool for ReDescribedEcho {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn description(&self) -> &'static str {
+            "Echo with a fresher description"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "echo".into(),
+                description: "echo with a fresher description".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("changed")) })
+        }
+    }
+
     /// The `peek` tool re-registered under its name with a changed
     /// description.
     ///
@@ -747,6 +780,67 @@ mod tests {
             report.untouched,
             ["fail"],
             "the survivor this target still holds is reported untouched: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_survivor_never_overwrites_a_foreign_registration() {
+        let first = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(EchoTool);
+                registry
+            },
+            ToolContext::default(),
+            "first".into(),
+            "0.0.1".into(),
+        );
+        let second = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(ForeignEcho);
+                registry
+            },
+            ToolContext::default(),
+            "second".into(),
+            "0.0.1".into(),
+        );
+        let first_client = serve_and_connect(&first).await;
+        let second_client = serve_and_connect(&second).await;
+
+        let mut first_provider = crate::mcp::McpToolProvider::connect(first_client, None)
+            .await
+            .expect("discover first");
+        let second_provider = crate::mcp::McpToolProvider::connect(second_client, None)
+            .await
+            .expect("discover second");
+        let shared = ToolRegistry::new();
+        first_provider.register_into(&shared);
+        second_provider.register_into(&shared);
+
+        first.registry().register(ReDescribedEcho);
+        let report = first_provider.sync_into(&shared).await.expect("sync");
+
+        let described: Vec<String> = shared
+            .all_schemas()
+            .into_iter()
+            .filter(|schema| schema.tool == "echo")
+            .map(|schema| schema.description)
+            .collect();
+        assert_eq!(
+            described,
+            ["a different server's echo"],
+            "the foreign registration survives the changed survivor's sync \
+             byte-equal — ownership never crosses by refresh"
+        );
+        assert!(
+            !report.added.contains(&"echo".to_string()),
+            "a skipped foreign-held name is not claimed as added: {report:?}"
+        );
+        assert!(
+            !report.untouched.contains(&"echo".to_string()),
+            "nor claimed as untouched — the report blames nothing for a name \
+             this provider does not own in the target: {report:?}"
         );
     }
 

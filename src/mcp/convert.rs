@@ -11,6 +11,8 @@
 //! `ContentBlock ↔ ToolContentPart`) are side by side — a change to either
 //! type touches one file.
 
+use crate::mcp::StructuredContentPolicy;
+use crate::tool::DisplayHint;
 use rmcp::ErrorData;
 use rmcp::model::CallToolResult;
 use rmcp::model::ContentBlock;
@@ -73,14 +75,82 @@ pub(crate) fn bridge_content(block: &ContentBlock) -> ToolContentPart {
 pub(crate) fn bridge_result(
     tool_name: &str,
     res: rmcp::model::CallToolResult,
+    output_schema: Option<&serde_json::Value>,
+    policy: StructuredContentPolicy,
 ) -> Result<ToolOutput, crate::mcp::McpError> {
     let is_error = res.is_error.unwrap_or(false);
     let mut parts: Vec<ToolContentPart> = res.content.iter().map(bridge_content).collect();
+    let mut json_lane = false;
     if let Some(structured) = res.structured_content {
-        let note = serde_json::to_string(&structured)
-            .unwrap_or_else(|_| "<unserializable structuredContent>".to_string());
-        parts.push(ToolContentPart::text(note));
+        let Some(schema) = output_schema else {
+            let note = serde_json::to_string(&structured)
+                .unwrap_or_else(|_| "<unserializable structuredContent>".to_string());
+            parts.push(ToolContentPart::text(note));
+            structured_metric(tool_name, "absent");
+            return assemble(tool_name, parts, is_error, false);
+        };
+        match validate_against(schema, &structured) {
+            Ok(()) => {
+                structured_metric(tool_name, "valid");
+                parts.push(json_lane_part(&structured));
+                json_lane = true;
+            }
+            Err(violation) => match policy {
+                StructuredContentPolicy::Error => {
+                    structured_metric(tool_name, "invalid");
+                    parts.push(ToolContentPart::text(format!(
+                        "structuredContent for MCP tool '{tool_name}' violates its \
+                         declared outputSchema — {violation}; payload: {payload}",
+                        violation = bound_text(&violation),
+                        payload = bound_text(
+                            &serde_json::to_string(&structured)
+                                .unwrap_or_else(|_| "<unserializable>".to_string())
+                        ),
+                    )));
+                    return assemble(tool_name, parts, true, false);
+                }
+                StructuredContentPolicy::Lenient => {
+                    structured_metric(tool_name, "invalid");
+                    tracing::warn!(
+                        tool = tool_name,
+                        violation = %violation,
+                        "lenient policy: passing invalid structuredContent through"
+                    );
+                    parts.push(json_lane_part(&structured));
+                    json_lane = true;
+                }
+            },
+        }
+    } else if output_schema.is_some() {
+        tracing::debug!(
+            tool = tool_name,
+            "server declared an outputSchema but returned no structuredContent; \
+             serving the text lane only"
+        );
     }
+    assemble(tool_name, parts, is_error, json_lane)
+}
+
+/// Assemble the bridged parts into the final [`ToolOutput`].
+///
+/// The shared tail of [`bridge_result`]: an empty part list keeps the
+/// historical empty/error split, a single part collapses out of
+/// multipart, and a carried structured lane marks the whole output
+/// with [`DisplayHint::Json`] — the hint that tells presentation
+/// layers a JSON payload rides inside (a consumer that cannot parse
+/// the joined payload falls back to text per the hint's own
+/// contract).
+///
+/// # Errors
+///
+/// [`McpError::EmptyToolError`] when the result carried an error flag
+/// but no renderable parts — the historical hard-empty split.
+fn assemble(
+    tool_name: &str,
+    mut parts: Vec<ToolContentPart>,
+    is_error: bool,
+    json_lane: bool,
+) -> Result<ToolOutput, crate::mcp::McpError> {
     if parts.is_empty() {
         return if is_error {
             Err(crate::mcp::McpError::EmptyToolError(tool_name.to_string()))
@@ -102,7 +172,91 @@ pub(crate) fn bridge_result(
     } else {
         ToolOutput::success(payload)
     };
-    Ok(output)
+    Ok(if json_lane {
+        output.with_hint(DisplayHint::Json)
+    } else {
+        output
+    })
+}
+
+/// Validate a structured payload against the tool's declared schema.
+///
+/// Compiles the schema with the module's standing refusal rules (see
+/// [`compile_schema`]) and reports the first violation's own text —
+/// which names the violated keyword and the instance location — or
+/// `Ok` when the payload satisfies the schema. Compilation happens
+/// per structured result: the broken-schema case is already omitted
+/// at discovery, so this path only pays for servers that actually
+/// use the structured lane, and the cost sits beside an RPC
+/// round-trip.
+///
+/// # Errors
+///
+/// The first violation's own text (naming the violated keyword and
+/// the instance location), or the compile failure when the schema
+/// itself is invalid.
+fn validate_against(
+    schema: &serde_json::Value,
+    instance: &serde_json::Value,
+) -> Result<(), String> {
+    let validator = jsonschema::options()
+        .with_retriever(RefusingRetriever)
+        .build(schema)
+        .map_err(|error| format!("the outputSchema itself is invalid: {error}"))?;
+    match validator.iter_errors(instance).next() {
+        None => Ok(()),
+        Some(error) => Err(error.to_string()),
+    }
+}
+
+/// Render the structured lane's part: the value as pretty-printed
+/// JSON text.
+///
+/// The lane the [`DisplayHint::Json`] hint describes — a JSON-encoded
+/// string the consumer may parse and re-format.
+fn json_lane_part(structured: &serde_json::Value) -> ToolContentPart {
+    ToolContentPart::text(
+        serde_json::to_string_pretty(structured)
+            .unwrap_or_else(|_| "<unserializable structuredContent>".to_string()),
+    )
+}
+
+/// The bound every validation-failure text passes through.
+///
+/// The model sees what came back so it can adapt, but a pathological
+/// payload cannot flood the context — through either channel: the
+/// raw payload appendix *and* the violation text itself, which embeds
+/// the failing instance (a huge array against an object schema would
+/// otherwise ride the violation in full). Both are cut at
+/// `MAX_STRUCTURED_ERROR_BYTES` on a character boundary with an
+/// explicit truncation marker.
+fn bound_text(rendered: &str) -> String {
+    const MAX_STRUCTURED_ERROR_BYTES: usize = 2048;
+    if rendered.len() <= MAX_STRUCTURED_ERROR_BYTES {
+        return rendered.to_string();
+    }
+    let cut = rendered
+        .floor_char_boundary(MAX_STRUCTURED_ERROR_BYTES)
+        .saturating_sub("…(truncated)".len());
+    format!(
+        "{}…(truncated)",
+        &rendered[..rendered.floor_char_boundary(cut)]
+    )
+}
+
+/// Emit the structured-lane quality counter.
+///
+/// The `outcome` label carries the validation verdict (or the
+/// schema-less note), so a server drifting out of its declared schema
+/// shows as `invalid` climbing in the metric stream.
+fn structured_metric(tool_name: &str, outcome: &'static str) {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.mcp.structured",
+        outcome,
+        tool = tool_name,
+        "structured content bridged"
+    );
 }
 
 /// A schema retriever that refuses every external reference.
@@ -135,7 +289,9 @@ impl jsonschema::Retrieve for RefusingRetriever {
 ///
 /// The compile error when the schema is not valid JSON Schema (including a
 /// refused external reference).
-fn compile_schema(schema: &serde_json::Value) -> Result<(), jsonschema::ValidationError<'static>> {
+pub(crate) fn compile_schema(
+    schema: &serde_json::Value,
+) -> Result<(), jsonschema::ValidationError<'static>> {
     jsonschema::options()
         .with_retriever(RefusingRetriever)
         .build(schema)
@@ -216,9 +372,41 @@ pub(crate) fn dispatch_result_to_call_tool(
 ) -> CallToolResult {
     match result {
         Ok(out) => {
-            let content = tool_content_to_mcp(out.payload);
-            let mut res = CallToolResult::success(content);
+            let mut res = CallToolResult::success(tool_content_to_mcp(out.payload.clone()));
             res.is_error = Some(out.is_error);
+            let structured_source = match &out.payload {
+                MessageToolContent::Text(text) => Some(text.clone()),
+                MessageToolContent::Multipart(parts) => {
+                    parts.iter().rev().find_map(|part| match part {
+                        ToolContentPart::Text { text } => Some(text.clone()),
+                        ToolContentPart::Image { .. } => None,
+                    })
+                }
+            };
+            if let Some(structured_source) = structured_source
+                .filter(|_| !out.is_error && matches!(out.display_hint, Some(DisplayHint::Json)))
+            {
+                match serde_json::from_str::<serde_json::Value>(&structured_source) {
+                    Ok(value @ serde_json::Value::Object(_)) => {
+                        tracing::debug!(
+                            target: "loopctl::metrics",
+                            metric = "loopctl.mcp.structured.emitted",
+                            tool = tool_name,
+                            "structuredContent emitted beside the text lane"
+                        );
+                        res.structured_content = Some(value);
+                    }
+                    Ok(_) => tracing::warn!(
+                        tool = tool_name,
+                        "JSON-hinted payload is not an object; keeping the text lane only"
+                    ),
+                    Err(error) => tracing::warn!(
+                        tool = tool_name,
+                        %error,
+                        "JSON-hinted payload does not parse; keeping the text lane only"
+                    ),
+                }
+            }
             res
         }
         Err(e) => {

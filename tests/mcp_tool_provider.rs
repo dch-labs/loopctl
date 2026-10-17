@@ -824,3 +824,364 @@ async fn refresh_preserves_the_overridden_call_timeout() {
         out.text_content()
     );
 }
+
+/// A server whose `structured` tool declares an object `outputSchema`
+/// and answers every call with a configurable `structuredContent`
+/// payload beside a fixed text lane.
+///
+/// The client-side structured-content pins' fixture: the declared
+/// schema and the returned payload are independent knobs, so one
+/// double drives the valid, invalid, and lenient scenarios.
+#[derive(Clone)]
+struct StructuredServer {
+    schema: std::sync::Arc<serde_json::Map<String, Value>>,
+    payload: std::sync::Arc<Option<Value>>,
+    router: ToolRouter<Self>,
+}
+
+#[tool_router(allow_empty)]
+impl StructuredServer {
+    fn new(schema: Value, payload: Value) -> Self {
+        let Value::Object(map) = schema else {
+            panic!("the fixture's declared schema must be an object");
+        };
+        Self {
+            schema: std::sync::Arc::new(map),
+            payload: std::sync::Arc::new(Some(payload)),
+            router: Self::tool_router(),
+        }
+    }
+
+    /// The schema-declared, text-only variant: the server never sends
+    /// a `structuredContent` lane.
+    fn text_only(schema: Value) -> Self {
+        let Value::Object(map) = schema else {
+            panic!("the fixture's declared schema must be an object");
+        };
+        Self {
+            schema: std::sync::Arc::new(map),
+            payload: std::sync::Arc::new(None),
+            router: Self::tool_router(),
+        }
+    }
+}
+
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
+#[tool_handler]
+impl ServerHandler for StructuredServer {
+    fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _ctx: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, McpErrorData>> {
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
+            next_cursor: None,
+            tools: vec![
+                RmcpTool::new("structured", "returns a shaped object", {
+                    let mut input = serde_json::Map::new();
+                    input.insert("type".to_string(), Value::String("object".to_string()));
+                    input
+                })
+                .with_raw_output_schema(std::sync::Arc::clone(&self.schema)),
+            ],
+            ..Default::default()
+        }))
+    }
+
+    fn call_tool(
+        &self,
+        _request: rmcp::model::CallToolRequestParams,
+        _ctx: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::CallToolResponse, McpErrorData>> {
+        let payload = std::sync::Arc::clone(&self.payload);
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![ContentBlock::text("shaped result follows")]);
+        if let Some(payload) = payload.as_ref() {
+            result.structured_content = Some(payload.clone());
+        }
+        std::future::ready(Ok(result.into()))
+    }
+}
+
+/// The declared schema every valid-shipment pin shares: an object
+/// with one required string field.
+fn shaped_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    })
+}
+
+#[tokio::test]
+async fn valid_structured_content_becomes_a_json_payload() {
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        shaped_output_schema(),
+        json!({"city": "Tromsø"}),
+    ))
+    .await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("structured tool");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(!out.is_error, "a valid payload is not an error");
+    assert_eq!(
+        out.display_hint,
+        Some(loopctl::tool::DisplayHint::Json),
+        "the structured lane is marked as JSON for every consumer"
+    );
+    let MessageToolContent::Multipart(parts) = &out.payload else {
+        panic!("text lane + structured lane ride together: {out:?}");
+    };
+    assert_eq!(parts.len(), 2, "the text lane and the JSON lane: {parts:?}");
+    assert!(
+        out.text_content().contains("shaped result follows"),
+        "the server's text lane survives as the fallback"
+    );
+    let ToolContentPart::Text { text: json_text } = &parts[1] else {
+        panic!("the structured lane renders as text carrying JSON");
+    };
+    let parsed: Value = serde_json::from_str(json_text).expect("the JSON lane parses");
+    assert_eq!(
+        parsed["city"], "Tromsø",
+        "the structured value rides verbatim"
+    );
+}
+
+#[tokio::test]
+async fn invalid_structured_content_is_a_soft_error_naming_the_keyword() {
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        shaped_output_schema(),
+        json!({"city": 42}),
+    ))
+    .await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("structured tool");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(
+        out.is_error,
+        "an invalid payload is a soft error the model sees"
+    );
+    let text = out.text_content();
+    assert!(
+        text.contains("outputSchema"),
+        "the error names the violated contract: {text}"
+    );
+    assert!(
+        text.contains("is not of type"),
+        "the error names the violated keyword itself — the fixture's miss is a type violation: {text}"
+    );
+    assert!(
+        text.contains("city"),
+        "the error names the violated property: {text}"
+    );
+    assert!(
+        text.contains("42"),
+        "the raw payload is preserved (bounded) so the model can adapt: {text}"
+    );
+}
+
+#[tokio::test]
+async fn lenient_policy_passes_an_invalid_payload_through() {
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        shaped_output_schema(),
+        json!({"city": 42}),
+    ))
+    .await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect")
+        .with_structured_policy(loopctl::mcp::StructuredContentPolicy::Lenient);
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("structured tool");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(
+        !out.is_error,
+        "the lenient policy trusts the server and passes the payload: {out:?}"
+    );
+    assert!(
+        out.text_content().contains("42"),
+        "the unvalidated value rides through"
+    );
+}
+
+#[tokio::test]
+async fn non_compilable_output_schema_omits_validation() {
+    let mut broken = serde_json::Map::new();
+    broken.insert(
+        "$ref".to_string(),
+        Value::String("https://schemas.example.com/remote.json#/shape".to_string()),
+    );
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        Value::Object(broken),
+        json!({"city": 42}),
+    ))
+    .await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("the tool still lists — only its broken schema is omitted");
+    assert!(
+        tool.output_schema().is_none(),
+        "an uncompilable outputSchema is dropped at discovery, not per call"
+    );
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(
+        !out.is_error,
+        "no schema, no validation — the payload rides as today's note: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn schema_without_structured_content_is_text_only() {
+    let (client, _server) =
+        connect_in_process(StructuredServer::text_only(shaped_output_schema())).await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("structured tool");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(
+        !out.is_error,
+        "a declared-but-unused schema is a server lapse, not an error"
+    );
+    assert!(
+        out.display_hint.is_none(),
+        "no structured lane, no JSON hint: {out:?}"
+    );
+    assert_eq!(
+        out.text_content(),
+        "shaped result follows",
+        "the text lane serves alone, byte-identical to a schema-less tool"
+    );
+}
+
+#[tokio::test]
+async fn invalid_content_keeps_the_server_text_lane_beside_the_verdict() {
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        shaped_output_schema(),
+        json!({"city": 42}),
+    ))
+    .await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("structured tool");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(out.is_error, "the verdict is a soft error");
+    assert!(
+        out.text_content().contains("is not of type"),
+        "the violation rides the output: {}",
+        out.text_content()
+    );
+    assert!(
+        out.text_content().contains("shaped result follows"),
+        "the server's own text lane survives beside the verdict — the fallback \
+         the spec keeps everywhere else: {}",
+        out.text_content()
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_violation_stays_under_the_bound() {
+    let flood: Vec<String> = (0..200)
+        .map(|i| format!("payload-{i:05}-xxxxxxxxxxxxxxxx"))
+        .collect();
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        json!({"type": "object"}),
+        serde_json::Value::Array(flood.into_iter().map(serde_json::Value::String).collect()),
+    ))
+    .await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("structured tool");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(out.is_error, "an array against an object schema is invalid");
+    assert!(
+        out.text_content().len() < 5 * 1024,
+        "the verdict and the bounded payload together stay under the anti-flood \
+         bound, never carrying the raw instance twice: {} bytes",
+        out.text_content().len()
+    );
+}
+
+#[tokio::test]
+async fn a_policy_change_reaches_already_registered_tools() {
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        shaped_output_schema(),
+        json!({"city": 42}),
+    ))
+    .await;
+    let mut provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let registry = ToolRegistry::new();
+    provider.register_into(&registry);
+    provider = provider.with_structured_policy(loopctl::mcp::StructuredContentPolicy::Lenient);
+    let _report = provider.sync_into(&registry).await.expect("sync");
+
+    let tool = registry
+        .get("structured")
+        .expect("the survivor stays registered");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(
+        !out.is_error,
+        "the builder's policy reaches the registry's clones — a changed policy is a \
+         changed contract the sync must land: {out:?}"
+    );
+}

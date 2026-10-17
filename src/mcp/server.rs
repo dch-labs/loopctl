@@ -564,6 +564,69 @@ mod tests {
         }
     }
 
+    /// A host tool whose result is a JSON object string marked with
+    /// the JSON display hint — the emission fixture: serving it over
+    /// the adapter must populate `structuredContent` beside the text
+    /// lane.
+    struct ShapedTool;
+
+    impl Tool for ShapedTool {
+        fn name(&self) -> &'static str {
+            "shaped"
+        }
+        fn description(&self) -> &'static str {
+            "Returns a shaped object"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "shaped".into(),
+                description: self.description().into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async {
+                Ok(ToolOutput::text(r#"{"city":"Tromsø"}"#.to_string())
+                    .with_hint(crate::tool::DisplayHint::Json))
+            })
+        }
+    }
+
+    /// A host tool whose JSON hint lies — the payload is prose, not
+    /// JSON — so the emission arm must keep the text lane and warn
+    /// instead of emitting garbage.
+    struct LyingHintTool;
+
+    impl Tool for LyingHintTool {
+        fn name(&self) -> &'static str {
+            "lying_hint"
+        }
+        fn description(&self) -> &'static str {
+            "Hints JSON but returns prose"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "lying_hint".into(),
+                description: self.description().into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async {
+                Ok(ToolOutput::text("just words".to_string())
+                    .with_hint(crate::tool::DisplayHint::Json))
+            })
+        }
+    }
+
     struct RecordingTool {
         received: Arc<Mutex<Option<serde_json::Value>>>,
     }
@@ -1009,6 +1072,71 @@ mod tests {
         assert!(
             !live.get("peek").is_some_and(|tool| tool.is_read_only()),
             "the registry reflects the server's flipped classification"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_emits_structured_content_for_json_payloads() {
+        let registry = ToolRegistry::new();
+        registry.register(ShapedTool);
+        let adapter = McpServerAdapter::new(
+            registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let result = client
+            .service
+            .call_tool(rmcp::model::CallToolRequestParams::new("shaped"))
+            .await
+            .expect("call shaped");
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("the JSON-hinted payload rides the structured lane");
+        assert_eq!(
+            structured.get("city").and_then(serde_json::Value::as_str),
+            Some("Tromsø"),
+            "the parsed object rides verbatim"
+        );
+        assert!(
+            result
+                .content
+                .iter()
+                .any(|block| matches!(block, rmcp::model::ContentBlock::Text(_))),
+            "the text lane survives for clients that ignore structure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lying_json_hint_keeps_the_text_lane_only() {
+        let registry = ToolRegistry::new();
+        registry.register(LyingHintTool);
+        let adapter = McpServerAdapter::new(
+            registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let result = client
+            .service
+            .call_tool(rmcp::model::CallToolRequestParams::new("lying_hint"))
+            .await
+            .expect("call lying_hint");
+        assert!(
+            result.structured_content.is_none(),
+            "prose that fails to parse never becomes structuredContent"
+        );
+        assert!(
+            result
+                .content
+                .iter()
+                .any(|block| matches!(block, rmcp::model::ContentBlock::Text(_))),
+            "the prose rides the text lane unchanged"
         );
     }
 

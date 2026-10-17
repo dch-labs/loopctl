@@ -21,6 +21,12 @@
 //!   [`register_into`](McpToolProvider::register_into) registers the batch into
 //!   a [`ToolRegistry`].
 //! - [`McpTool`] — one server tool as a [`Tool`].
+//! - [`StructuredContentPolicy`] — how a tool's `structuredContent`
+//!   results are treated when the server declared an `outputSchema`:
+//!   validated by default, with an invalid payload surfacing as a
+//!   soft tool error the model can adapt to (or passed through under
+//!   [`Lenient`](StructuredContentPolicy::Lenient) for hosts that
+//!   trust their servers).
 //! - [`McpError`] — client-adapter errors.
 //! - [`McpServerAdapter`] — serve a [`ToolRegistry`]
 //!   over MCP: `tools/list` maps to the registry's schemas, `tools/call`
@@ -260,6 +266,8 @@ impl McpClient {
         &self,
         server_name: &str,
         input: serde_json::Value,
+        output_schema: Option<&serde_json::Value>,
+        structured_policy: StructuredContentPolicy,
     ) -> Result<ToolOutput, ToolError> {
         let mut params = rmcp::model::CallToolRequestParams::new(server_name.to_string());
         if let serde_json::Value::Object(map) = input {
@@ -270,7 +278,8 @@ impl McpClient {
             .call_tool(params)
             .await
             .map_err(|e| ToolError::Execution(format!("MCP tools/call failed: {e}")))?;
-        convert::bridge_result(server_name, result).map_err(|e| ToolError::Execution(e.to_string()))
+        convert::bridge_result(server_name, result, output_schema, structured_policy)
+            .map_err(|e| ToolError::Execution(e.to_string()))
     }
 
     /// Connect to an MCP server running as a child process over stdio.
@@ -568,6 +577,27 @@ impl ReconnectSpec {
     }
 }
 
+/// Policy for structured-content validation failures on MCP tools.
+///
+/// The default ([`Error`](Self::Error)) makes an invalid
+/// `structuredContent` a soft tool error naming the violated schema
+/// keyword with the raw payload preserved (bounded) — the model sees
+/// what came back and can adapt, and the loop continues;
+/// [`Lenient`](Self::Lenient) downgrades to a warning and passes the
+/// value through unvalidated, for hosts that trust their servers and
+/// prefer the payload over the contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StructuredContentPolicy {
+    /// Invalid structured content becomes a soft tool error naming
+    /// the violated schema keyword; the run continues.
+    #[default]
+    Error,
+
+    /// Warn and pass the value through unvalidated — the host trusts
+    /// the server over the declared `outputSchema`.
+    Lenient,
+}
+
 /// Adapts one MCP server's tools as loopctl [`Tool`] implementations.
 ///
 /// A provider owns a connected [`McpClient`] and a snapshot of the server's
@@ -669,6 +699,14 @@ pub struct McpToolProvider {
     /// [`register_into`](Self::register_into) records while holding
     /// only `&self`.
     registered: std::sync::Mutex<std::collections::HashMap<String, McpTool>>,
+
+    /// The validation policy applied to every discovered tool's
+    /// structured results.
+    ///
+    /// Threaded into each [`McpTool`](crate::mcp::McpTool) at
+    /// discovery and refresh, and updated on already-discovered tools
+    /// by [`with_structured_policy`](Self::with_structured_policy).
+    structured_policy: StructuredContentPolicy,
 }
 
 impl McpToolProvider {
@@ -701,6 +739,7 @@ impl McpToolProvider {
             &client,
             name_prefix.as_deref(),
             DEFAULT_MCP_CALL_TIMEOUT,
+            StructuredContentPolicy::default(),
             &mut tools,
         )
         .await?;
@@ -710,6 +749,7 @@ impl McpToolProvider {
             prefix: name_prefix,
             call_timeout: DEFAULT_MCP_CALL_TIMEOUT,
             registered: std::sync::Mutex::new(std::collections::HashMap::new()),
+            structured_policy: StructuredContentPolicy::default(),
         })
     }
 
@@ -725,6 +765,23 @@ impl McpToolProvider {
         self.call_timeout = timeout;
         for tool in &mut self.tools {
             tool.call_timeout = timeout;
+        }
+        self
+    }
+
+    /// Set the structured-content validation policy for every tool.
+    ///
+    /// Updates both already-discovered tools and the value applied to
+    /// later [`refresh`](Self::refresh) and
+    /// [`sync_into`](Self::sync_into) discoveries, so the knob takes
+    /// effect immediately regardless of when it is called — the same
+    /// discipline [`with_call_timeout`](Self::with_call_timeout)
+    /// follows.
+    #[must_use]
+    pub fn with_structured_policy(mut self, policy: StructuredContentPolicy) -> Self {
+        self.structured_policy = policy;
+        for tool in &mut self.tools {
+            tool.structured_policy = policy;
         }
         self
     }
@@ -753,6 +810,7 @@ impl McpToolProvider {
             &self.client,
             self.prefix.as_deref(),
             self.call_timeout,
+            self.structured_policy,
             &mut tools,
         )
         .await?;
@@ -858,6 +916,7 @@ impl McpToolProvider {
             &self.client,
             self.prefix.as_deref(),
             self.call_timeout,
+            self.structured_policy,
             &mut discovered,
         )
         .await?;
@@ -1016,10 +1075,13 @@ pub struct McpTool {
     /// Embedded unchanged in [`ToolSchema::input_schema`].
     input_schema: serde_json::Value,
 
-    /// The server's `outputSchema`, if it declared one.
+    /// The server's `outputSchema`, if it declared a compilable one.
     ///
-    /// Carried for forward-compatibility only — the adapter does not validate
-    /// call results against it. Exposed via [`McpTool::output_schema`].
+    /// The validation contract for the tool's `structuredContent`
+    /// results (see [`StructuredContentPolicy`]); a schema that does
+    /// not compile as JSON Schema is omitted at discovery with a
+    /// warning, so the tool stays listed and its results stay
+    /// unvalidated. Exposed via [`McpTool::output_schema`].
     output_schema: Option<serde_json::Value>,
 
     /// A cheap clone of the shared client handle.
@@ -1050,6 +1112,15 @@ pub struct McpTool {
     /// exceeds it resolves to a soft error result rather than hanging the
     /// agent loop on a wedged server.
     call_timeout: Duration,
+
+    /// The validation policy for this tool's structured results.
+    ///
+    /// Copied from the provider at discovery and refresh (or updated by
+    /// [`with_structured_policy`](McpToolProvider::with_structured_policy)).
+    /// Deliberately excluded from
+    /// [`matches`](Self::matches): it is host configuration, not part
+    /// of what the server advertised.
+    structured_policy: StructuredContentPolicy,
 }
 
 impl McpTool {
@@ -1075,10 +1146,12 @@ impl McpTool {
             && self.destructive_hint == other.destructive_hint
             && self.call_timeout == other.call_timeout
     }
-    /// The server's `outputSchema`, if it declared one.
+    /// The server's `outputSchema`, if it declared a compilable one.
     ///
-    /// Carried verbatim for forward-compatibility; the adapter does not validate
-    /// call results against it. A future release may enforce it.
+    /// The declared contract this tool's `structuredContent` results
+    /// are validated against on every call — `None` when the server
+    /// declared none (or declared one that does not compile, which is
+    /// omitted at discovery with a warning).
     #[must_use]
     pub fn output_schema(&self) -> Option<&serde_json::Value> {
         self.output_schema.as_ref()
@@ -1160,9 +1233,19 @@ impl Tool for McpTool {
         let server_name = self.server_name.clone();
         let exposed_name = self.exposed_name.clone();
         let call_timeout = self.call_timeout;
+        let output_schema = self.output_schema.clone();
+        let structured_policy = self.structured_policy;
         Box::pin(async move {
-            match tokio::time::timeout(call_timeout, client.call_tool_forward(&server_name, input))
-                .await
+            match tokio::time::timeout(
+                call_timeout,
+                client.call_tool_forward(
+                    &server_name,
+                    input,
+                    output_schema.as_ref(),
+                    structured_policy,
+                ),
+            )
+            .await
             {
                 Ok(result) => result,
                 Err(_) => Ok(ToolOutput::error_text(format!(
@@ -1254,6 +1337,7 @@ async fn bridge_tool_list(
     client: &McpClient,
     prefix: Option<&str>,
     call_timeout: Duration,
+    structured_policy: StructuredContentPolicy,
     out: &mut Vec<McpTool>,
 ) -> Result<(), McpError> {
     let server_tools = client
@@ -1263,7 +1347,13 @@ async fn bridge_tool_list(
         .map_err(|e| McpError::Protocol(e.to_string()))?;
     let mut seen = std::collections::HashSet::new();
     for server_tool in server_tools {
-        let Some(adapted) = bridge_tool(&server_tool, prefix, client, call_timeout) else {
+        let Some(adapted) = bridge_tool(
+            &server_tool,
+            prefix,
+            client,
+            call_timeout,
+            structured_policy,
+        ) else {
             continue;
         };
         if !seen.insert(adapted.exposed_name.clone()) {
@@ -1319,6 +1409,7 @@ fn bridge_tool(
     prefix: Option<&str>,
     client: &McpClient,
     call_timeout: Duration,
+    structured_policy: StructuredContentPolicy,
 ) -> Option<McpTool> {
     let server_name = server_tool.name.to_string();
     if server_name.is_empty() {
@@ -1333,10 +1424,20 @@ fn bridge_tool(
         .unwrap_or_default()
         .to_string();
     let input_schema = serde_json::Value::Object(server_tool.input_schema.as_ref().clone());
-    let output_schema = server_tool
-        .output_schema
-        .as_ref()
-        .map(|schema| serde_json::Value::Object(schema.as_ref().clone()));
+    let output_schema = server_tool.output_schema.as_ref().map(|schema| {
+        let schema = serde_json::Value::Object(schema.as_ref().clone());
+        if let Err(error) = convert::compile_schema(&schema) {
+            tracing::warn!(
+                tool = %server_name,
+                error = %error,
+                "outputSchema does not compile as JSON Schema; omitting it — \
+                 the tool stays listed and its results stay unvalidated"
+            );
+            return None;
+        }
+        Some(schema)
+    });
+    let output_schema = output_schema.flatten();
     let (read_only_hint, destructive_hint) =
         server_tool
             .annotations
@@ -1359,6 +1460,7 @@ fn bridge_tool(
         read_only_hint,
         destructive_hint,
         call_timeout,
+        structured_policy,
     })
 }
 
@@ -1372,7 +1474,8 @@ mod tests {
     #[test]
     fn bridge_result_single_text_becomes_text_payload() {
         let res = CallToolResult::success(vec![ContentBlock::text("hi")]);
-        let out = convert::bridge_result("t", res).expect("success bridges");
+        let out = convert::bridge_result("t", res, None, StructuredContentPolicy::default())
+            .expect("success bridges");
         assert!(!out.is_error);
         assert!(matches!(out.payload, MessageToolContent::Text(_)));
         assert_eq!(out.text_content(), "hi");
@@ -1381,7 +1484,8 @@ mod tests {
     #[test]
     fn bridge_result_single_image_becomes_single_part_multipart() {
         let res = CallToolResult::success(vec![ContentBlock::image("Zm9v", "image/png")]);
-        let out = convert::bridge_result("t", res).expect("success bridges");
+        let out = convert::bridge_result("t", res, None, StructuredContentPolicy::default())
+            .expect("success bridges");
         assert!(!out.is_error);
         match out.payload {
             MessageToolContent::Multipart(parts) => {
@@ -1401,7 +1505,8 @@ mod tests {
             ContentBlock::image("Zg==", "image/jpeg"),
             ContentBlock::text("b"),
         ]);
-        let out = convert::bridge_result("t", res).expect("success bridges");
+        let out = convert::bridge_result("t", res, None, StructuredContentPolicy::default())
+            .expect("success bridges");
         let MessageToolContent::Multipart(parts) = out.payload else {
             panic!("expected Multipart");
         };
@@ -1414,7 +1519,8 @@ mod tests {
     #[test]
     fn bridge_result_soft_error_returns_ok_with_is_error() {
         let res = CallToolResult::error(vec![ContentBlock::text("boom")]);
-        let out = convert::bridge_result("t", res).expect("soft error is Ok");
+        let out = convert::bridge_result("t", res, None, StructuredContentPolicy::default())
+            .expect("soft error is Ok");
         assert!(out.is_error);
         assert_eq!(out.text_content(), "boom");
     }
@@ -1422,7 +1528,8 @@ mod tests {
     #[test]
     fn bridge_result_empty_error_is_hard_empty_tool_error_with_name() {
         let res = CallToolResult::error(vec![]);
-        let err = convert::bridge_result("search", res).expect_err("empty error is hard Err");
+        let err = convert::bridge_result("search", res, None, StructuredContentPolicy::default())
+            .expect_err("empty error is hard Err");
         match err {
             McpError::EmptyToolError(name) => assert_eq!(name, "search"),
             other => panic!("expected EmptyToolError, got {other:?}"),
@@ -1432,7 +1539,8 @@ mod tests {
     #[test]
     fn bridge_result_empty_success_yields_empty_text_output() {
         let res = CallToolResult::success(vec![]);
-        let out = convert::bridge_result("t", res).expect("empty success is Ok");
+        let out = convert::bridge_result("t", res, None, StructuredContentPolicy::default())
+            .expect("empty success is Ok");
         assert!(!out.is_error);
         assert_eq!(out.text_content(), "");
     }
@@ -1441,7 +1549,8 @@ mod tests {
     fn bridge_result_structured_content_appended_as_text_part() {
         let mut res = CallToolResult::success(vec![ContentBlock::text("body")]);
         res.structured_content = Some(serde_json::json!({"count": 7}));
-        let out = convert::bridge_result("t", res).expect("success bridges");
+        let out = convert::bridge_result("t", res, None, StructuredContentPolicy::default())
+            .expect("success bridges");
         let MessageToolContent::Multipart(parts) = out.payload else {
             panic!("text + structured must be multipart");
         };
@@ -1465,7 +1574,8 @@ mod tests {
     fn bridge_result_error_with_structured_content_is_soft_error() {
         let mut res = CallToolResult::error(vec![]);
         res.structured_content = Some(serde_json::json!({"reason": "denied"}));
-        let out = convert::bridge_result("search", res).expect("structured error is soft Ok");
+        let out = convert::bridge_result("search", res, None, StructuredContentPolicy::default())
+            .expect("structured error is soft Ok");
         assert!(out.is_error, "is_error flag set");
         let text = out.text_content();
         assert!(

@@ -136,7 +136,7 @@ fn tool_result_texts(loop_: &BareLoop<MockApiClient>) -> Vec<String> {
 #[tokio::test]
 async fn an_open_breaker_stops_dispatching_the_tool() {
     let executions = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool {
         executions: Arc::clone(&executions),
     });
@@ -180,7 +180,7 @@ async fn an_open_breaker_stops_dispatching_the_tool() {
 #[tokio::test]
 async fn unknown_tool_calls_do_not_create_ghost_breakers() {
     let executions = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool {
         executions: Arc::clone(&executions),
     });
@@ -348,7 +348,7 @@ mod hook_guidance {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(EchoTool);
         let config = SessionConfig::default()
             .with_context_window(400)
@@ -571,7 +571,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(tool);
         let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
         loop_
@@ -649,7 +649,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(NamedTool {
             name: "harmless",
             executions: Arc::clone(&requested_executions),
@@ -741,7 +741,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
         });
@@ -823,7 +823,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
         });
@@ -1043,7 +1043,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
         });
@@ -1125,7 +1125,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
         });
@@ -1411,7 +1411,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
         });
@@ -1515,7 +1515,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
         });
@@ -1611,7 +1611,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
         });
@@ -1677,7 +1677,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(NamedTool {
             name: "harmless",
             executions: Arc::clone(&requested_executions),
@@ -1747,7 +1747,7 @@ mod shield_enforcement {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
         });
@@ -1877,7 +1877,7 @@ mod breaker_sequences {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(tool);
         let health = Arc::new(ToolHealthRegistry::new().with_config(
             loopctl::tool::health::CircuitBreakerConfig {
@@ -1981,7 +1981,7 @@ mod breaker_sequences {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(ScriptedTool {
             executions: Arc::clone(&executions),
             script: vec![true],
@@ -2047,7 +2047,7 @@ mod breaker_sequences {
                     stop_reason: "end_turn".to_string(),
                 },
             ]);
-            let mut registry = ToolRegistry::new();
+            let registry = ToolRegistry::new();
             registry.register(ScriptedTool { executions, script });
             let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
             loop_.set_health_registry(health);
@@ -2150,7 +2150,7 @@ mod breaker_sequences {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(ScriptedTool {
             executions: Arc::new(Mutex::new(Vec::new())),
             script: Vec::new(),
@@ -2280,7 +2280,7 @@ mod breaker_sequences {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(HangingTool {
             executions: Arc::clone(&executions),
         });
@@ -2358,7 +2358,7 @@ mod breaker_sequences {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(ScriptedTool {
             executions: Arc::clone(&executions),
             script: vec![true; 8],
@@ -2477,7 +2477,7 @@ mod shield_sequences {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingBash {
             executions: Arc::clone(&executions),
         });
@@ -2755,7 +2755,7 @@ mod hook_sequences {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(LongEchoTool);
         let config = SessionConfig::default()
             .with_context_window(400)
@@ -2964,7 +2964,7 @@ mod parallel_gate {
     #[tokio::test]
     async fn concurrent_calls_share_one_recovery_probe() {
         let executions = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(SlowFailingTool {
             executions: Arc::clone(&executions),
         });
@@ -3221,7 +3221,7 @@ mod full_stack {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(FlakyTool {
             executions: Arc::clone(&flaky_executions),
         });
@@ -3499,7 +3499,7 @@ mod randomized_sweep {
                 let client = MockApiClient::new("m")
                     .without_usage()
                     .with_responses(responses);
-                let mut registry = ToolRegistry::new();
+                let registry = ToolRegistry::new();
                 registry.register(EchoTool);
                 registry.register(ScriptedTool {
                     script: Mutex::new(flaky_fails.clone()),
@@ -3749,7 +3749,7 @@ mod cancellation_recovery {
             executions: Arc::clone(&executions),
             hangs: Mutex::new(vec![false, true, false]),
         };
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(tool);
         let health = Arc::new(ToolHealthRegistry::new().with_config(
             loopctl::tool::health::CircuitBreakerConfig {
@@ -3925,7 +3925,7 @@ mod cancellation_recovery {
         let client = MockApiClient::new("m")
             .without_usage()
             .with_responses(responses);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(LongEchoTool);
         let config = SessionConfig::default()
             .with_context_window(400)
@@ -4181,7 +4181,7 @@ mod randomized_wave_sweep {
                 let client = Arc::new(WaveClient {
                     script: Mutex::new(script),
                 });
-                let mut registry = ToolRegistry::new();
+                let registry = ToolRegistry::new();
                 registry.register(EchoTool);
                 registry.register(ScriptedTool {
                     script: Mutex::new(flaky_fails.clone()),

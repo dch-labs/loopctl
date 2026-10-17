@@ -411,65 +411,123 @@ fn is_new_line_inserted(dp: &[usize], stride: usize, i: usize, j: usize) -> bool
 /// Format a diff with `context` lines of surrounding context around each
 /// change region.
 ///
-/// Walks the [`LineDiff`] sequence and renders it as plain text: unchanged
-/// context lines are prefixed with two spaces (`  `); inserted lines with
-/// `+ `; deleted lines with `- `. To keep the output readable for large
-/// changes, only `context` unchanged lines are shown before and after each
-/// run of insertions/deletions. Runs of unchanged lines longer than
-/// `context` are elided — including at end of input, where only an open
-/// change region's pending context is flushed (its trailing context), so
-/// unchanged tail lines distant from the last change never render as if
-/// contiguous with it.
+/// Walks the [`LineDiff`] sequence and renders it as plain text in the
+/// unified-diff shape: each change region opens with an `@@` header
+/// carrying the real 1-based line numbers and counts of both sides —
+/// `-old_start,old_count +new_start,new_count` — followed by the
+/// region's lines: unchanged context prefixed with two spaces (`  `),
+/// inserted lines with `+ `, deleted lines with `- `. To keep the
+/// output readable for large changes, only `context` unchanged lines
+/// are shown before and after each run of insertions/deletions, and
+/// runs of unchanged lines longer than `context` are elided into the
+/// next region's header. The numbers let a reader — model or display —
+/// address the change where it sits in the file, not only in the
+/// preview.
 fn format_diff_with_context(line_diff: &[LineDiff], context: usize) -> String {
-    let mut result = String::new();
-    let mut pending_context: Vec<String> = Vec::new();
-    let mut in_change = false;
-    let mut context_after = 0usize;
+    /// One numbered diff entry: the kind, its text, and its 1-based
+    /// line number on whichever side it occupies.
+    struct Numbered<'a> {
+        deleted: bool,
+        inserted: bool,
+        text: &'a str,
+        old_no: Option<u32>,
+        new_no: Option<u32>,
+    }
 
+    let mut numbered: Vec<Numbered> = Vec::with_capacity(line_diff.len());
+    let mut old_no = 0_u32;
+    let mut new_no = 0_u32;
     for diff in line_diff {
         match diff {
-            LineDiff::Unchanged(line) => {
-                if in_change {
-                    pending_context.push(line.clone());
-                    context_after = context_after.saturating_add(1);
-                    if context_after >= context {
-                        for ctx_line in &pending_context {
-                            writeln!(result, "  {ctx_line}").ok();
-                        }
-                        pending_context.clear();
-                        in_change = false;
-                        context_after = 0;
-                    }
-                } else {
-                    pending_context.push(line.clone());
-                    if pending_context.len() > context {
-                        pending_context.remove(0);
-                    }
-                }
+            LineDiff::Unchanged(text) => {
+                old_no = old_no.saturating_add(1);
+                new_no = new_no.saturating_add(1);
+                numbered.push(Numbered {
+                    deleted: false,
+                    inserted: false,
+                    text,
+                    old_no: Some(old_no),
+                    new_no: Some(new_no),
+                });
             }
-            LineDiff::Deleted(line) => {
-                for ctx_line in &pending_context {
-                    writeln!(result, "  {ctx_line}").ok();
-                }
-                pending_context.clear();
-                context_after = 0;
-                writeln!(result, "- {line}").ok();
-                in_change = true;
+            LineDiff::Deleted(text) => {
+                old_no = old_no.saturating_add(1);
+                numbered.push(Numbered {
+                    deleted: true,
+                    inserted: false,
+                    text,
+                    old_no: Some(old_no),
+                    new_no: None,
+                });
             }
-            LineDiff::Inserted(line) => {
-                for ctx_line in &pending_context {
-                    writeln!(result, "  {ctx_line}").ok();
-                }
-                pending_context.clear();
-                context_after = 0;
-                writeln!(result, "+ {line}").ok();
-                in_change = true;
+            LineDiff::Inserted(text) => {
+                new_no = new_no.saturating_add(1);
+                numbered.push(Numbered {
+                    deleted: false,
+                    inserted: true,
+                    text,
+                    old_no: None,
+                    new_no: Some(new_no),
+                });
             }
         }
     }
-    if in_change {
-        for ctx_line in &pending_context {
-            writeln!(result, "  {ctx_line}").ok();
+
+    // A change region per maximal run of changes, widened by `context`
+    // on both sides; regions whose windows overlap or touch merge, the
+    // same elision the headerless form produced.
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0_usize;
+    while let Some(change_at) = numbered.get(index..).and_then(|rest| {
+        rest.iter()
+            .position(|entry| entry.deleted || entry.inserted)
+    }) {
+        let change_at = index.saturating_add(change_at);
+        let region_start = change_at.saturating_sub(context);
+        let mut region_end = change_at.saturating_add(1);
+        index = region_end;
+        while let Some(next_change) = numbered.get(index..).and_then(|rest| {
+            rest.iter()
+                .position(|entry| entry.deleted || entry.inserted)
+        }) {
+            let next_change = index.saturating_add(next_change);
+            let next_start = next_change.saturating_sub(context);
+            if next_start > region_end {
+                break;
+            }
+            region_end = next_change.saturating_add(1);
+            index = region_end;
+        }
+        region_end = region_end.saturating_add(context).min(numbered.len());
+        if let Some((_, last_end)) = regions.last_mut()
+            && region_start <= *last_end
+        {
+            *last_end = (*last_end).max(region_end);
+            continue;
+        }
+        regions.push((region_start, region_end));
+    }
+
+    let mut result = String::new();
+    for (start, end) in regions {
+        let slice = numbered.get(start..end).unwrap_or_default();
+        let old_start = slice.iter().find_map(|entry| entry.old_no).unwrap_or(0);
+        let new_start = slice.iter().find_map(|entry| entry.new_no).unwrap_or(0);
+        let old_count = slice.iter().filter(|entry| entry.old_no.is_some()).count();
+        let new_count = slice.iter().filter(|entry| entry.new_no.is_some()).count();
+        writeln!(
+            result,
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+        )
+        .ok();
+        for entry in slice {
+            if entry.deleted {
+                writeln!(result, "- {}", entry.text).ok();
+            } else if entry.inserted {
+                writeln!(result, "+ {}", entry.text).ok();
+            } else {
+                writeln!(result, "  {}", entry.text).ok();
+            }
         }
     }
     result
@@ -507,6 +565,29 @@ mod tests {
         assert!(result.contains("+ NEW"));
         assert!(result.contains("  a"));
         assert!(result.contains("  b"));
+    }
+
+    #[test]
+    fn an_all_insertion_header_addresses_the_empty_side_as_zero() {
+        let result = format_file_change("test.rs", OldContent::Text(""), "first\nsecond\n");
+        let header = result.lines().find(|line| line.starts_with("@@"));
+        assert_eq!(
+            header,
+            Some("@@ -0,0 +1,2 @@"),
+            "unified-diff convention addresses the line before the change — \
+             an empty side starts at zero, never at one"
+        );
+    }
+
+    #[test]
+    fn an_all_deletion_header_addresses_the_empty_side_as_zero() {
+        let result = format_file_change("test.rs", OldContent::Text("first\nsecond\n"), "");
+        let header = result.lines().find(|line| line.starts_with("@@"));
+        assert_eq!(
+            header,
+            Some("@@ -1,2 +0,0 @@"),
+            "the emptied new side is addressed at zero, never at one"
+        );
     }
 
     #[test]
@@ -550,6 +631,31 @@ mod tests {
         assert!(
             !result.contains("tail 10"),
             "distant trailing lines after a closed region must not render: {result}"
+        );
+    }
+
+    #[test]
+    fn hunk_headers_carry_real_line_numbers() {
+        // A change at old line 6 with three context lines renders as a
+        // single region spanning old lines 3..=9 — seven old lines and
+        // seven new — and the header names those addresses exactly, so
+        // a display can show true line numbers beside the preview.
+        let old = "1\n2\n3\n4\n5\nOLD\n7\n8\n9\n10\n11\n12\n";
+        let new = "1\n2\n3\n4\n5\nNEW\n7\n8\n9\n10\n11\n12\n";
+        let result = format_file_change("test.rs", OldContent::Text(old), new);
+        assert!(
+            result.contains("@@ -3,7 +3,7 @@"),
+            "the header names the region's real old/new spans: {result}"
+        );
+
+        // A change near the top of the file clamps its leading context
+        // at line 1 — the header stays truthful about what follows.
+        let old_head = "OLD\na\nb\nc\nd\ne\nf\ng\n";
+        let new_head = "NEW\na\nb\nc\nd\ne\nf\ng\n";
+        let head = format_file_change("test.rs", OldContent::Text(old_head), new_head);
+        assert!(
+            head.contains("@@ -1,4 +1,4 @@"),
+            "a region starting at line 1 says so: {head}"
         );
     }
 

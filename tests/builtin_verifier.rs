@@ -382,7 +382,7 @@ fn shell_redirection_extraction() {
 async fn write_invalidates_cached_read() {
     let read_executions = Arc::new(std::sync::Mutex::new(0usize));
     let write_executions = Arc::new(std::sync::Mutex::new(0usize));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Read",
         executions: Arc::clone(&read_executions),
@@ -442,7 +442,7 @@ async fn write_invalidates_cached_read() {
 async fn an_outer_wrapped_redirection_evicts_the_cached_read() {
     let read_executions = Arc::new(std::sync::Mutex::new(0usize));
     let bash_executions = Arc::new(std::sync::Mutex::new(0usize));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Read",
         executions: Arc::clone(&read_executions),
@@ -489,7 +489,7 @@ async fn an_outer_wrapped_redirection_evicts_the_cached_read() {
 
 #[tokio::test]
 async fn builtin_verified_builder_fails_destructive_commands_softly() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Write",
         executions: Arc::new(std::sync::Mutex::new(0usize)),
@@ -515,7 +515,7 @@ async fn builtin_verified_builder_fails_destructive_commands_softly() {
 
     // The plain builder stays the bring-your-own-verifier recipe: the
     // same call rides through unverified.
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Write",
         executions: Arc::new(std::sync::Mutex::new(0usize)),
@@ -562,7 +562,7 @@ impl OutputText for loopctl::middleware::ToolDispatchResult {
 async fn shell_redirection_invalidates_cached_read_through_the_preset() {
     let read_executions = Arc::new(std::sync::Mutex::new(0usize));
     let bash_executions = Arc::new(std::sync::Mutex::new(0usize));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Read",
         executions: Arc::clone(&read_executions),
@@ -633,7 +633,7 @@ impl ToolMiddleware for InputRewriter {
 
 #[tokio::test]
 async fn verification_judges_the_input_as_sent_not_as_rewritten() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Bash",
         executions: Arc::new(std::sync::Mutex::new(0usize)),

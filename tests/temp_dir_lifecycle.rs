@@ -163,7 +163,7 @@ fn loop_with_dispatches(
 ) -> BareLoop<MockApiClient> {
     let responses = (0..dispatches).flat_map(|_| scripted_pair()).collect();
     let client = MockApiClient::new("test-model").with_responses(responses);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(CaptureCtxTool { seen });
     BareLoop::new(Arc::new(client), registry, SessionConfig::default())
 }
@@ -499,7 +499,7 @@ async fn random_lifecycle_sequences_never_leak_session_dirs() {
                         let machine = loop_.into_machine();
                         let client =
                             MockApiClient::new("test-model").with_responses(scripted_pair());
-                        let mut registry = ToolRegistry::new();
+                        let registry = ToolRegistry::new();
                         registry.register(CaptureCtxTool {
                             seen: Arc::clone(&seen),
                         });

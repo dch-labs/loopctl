@@ -166,7 +166,7 @@ mod engine {
 
     /// A registry holding the counting deploy tool.
     fn deploy_registry(executions: Arc<std::sync::atomic::AtomicUsize>) -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingDeploy { executions });
         registry
     }
@@ -647,7 +647,7 @@ mod engine {
         let collector = Arc::new(GateCollector::new());
         let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (resolver, mut approver) = ApprovalChannel::pair(4);
-        let mut pipeline_core = ToolRegistry::new();
+        let pipeline_core = ToolRegistry::new();
         pipeline_core.register(CountingDeploy {
             executions: Arc::clone(&executions),
         });
@@ -779,7 +779,7 @@ mod engine {
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let started = Arc::new(tokio::sync::Notify::new());
         let (resolver, mut approver) = ApprovalChannel::pair(4);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CountingHangingDeploy {
             starts: Arc::clone(&starts),
             started: Arc::clone(&started),

@@ -812,7 +812,7 @@ async fn non_streaming_turn_returns_assembled_message() {
 async fn non_streaming_turn_runs_tool_call_loop() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     agent.set_turn_mode(TurnMode::NonStreaming);
@@ -1098,7 +1098,7 @@ async fn test_bare_loop_with_tool_call() {
         "I echoed your message.",
     );
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let config = make_config();
@@ -1124,7 +1124,7 @@ async fn memory_stores_trajectory_after_tool_call() {
         "I echoed your message.",
     );
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let memory = Arc::new(InMemoryStore::new());
@@ -1682,7 +1682,7 @@ async fn observer_sequence_text_only_turn() {
 async fn observer_sequence_tool_call_turn() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "Done.");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let log = sequence_log();
     let mut agent = agent_with_sequence_observer(client, registry, log.clone());
@@ -1803,7 +1803,7 @@ impl crate::observer::LoopObserver for TurnDurationRecorder {
 async fn the_context_size_accessor_exposes_the_engine_estimate_after_a_run() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     agent.run("echo hi", &RunConfig::default()).await.unwrap();
@@ -1823,7 +1823,7 @@ async fn the_context_size_accessor_exposes_the_engine_estimate_after_a_run() {
 async fn turn_end_carries_the_engine_s_context_estimate() {
     let client = MockClient::new("test-model").without_usage();
     client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     let figures = Arc::new(Mutex::new(Vec::new()));
@@ -1895,7 +1895,7 @@ async fn session_retention_counts_prior_thinking_in_the_context_estimate() {
         &"second turn reasoning ".repeat(10),
         "all done",
     );
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     agent.run("echo hi", &RunConfig::default()).await.unwrap();
@@ -1996,7 +1996,7 @@ async fn a_compaction_pass_invalidates_the_anchor_until_the_next_report() {
         }),
         StreamEvent::MessageStop,
     ]);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let compactions = Arc::new(Mutex::new(0usize));
     let managers = crate::managers::LoopManagers::new()
@@ -2083,7 +2083,7 @@ async fn the_next_report_after_a_pass_re_arms_the_anchor() {
         }),
         StreamEvent::MessageStop,
     ]);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let compactions = Arc::new(Mutex::new(0usize));
     let managers = crate::managers::LoopManagers::new()
@@ -2554,7 +2554,7 @@ async fn pruning_clears_untagged_results_beyond_the_protected_tail() {
     let config = make_config()
         .with_context_window(1_000)
         .with_compact_threshold(80);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
     agent
@@ -2651,7 +2651,7 @@ async fn cleared_content_rides_the_demotion_sink() {
     let config = make_config()
         .with_context_window(1_000)
         .with_compact_threshold(80);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     registry.register(FailingTool);
     let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
@@ -2759,7 +2759,7 @@ async fn durable_results_survive_pruning_and_requery_clears_last() {
     let config = make_config()
         .with_context_window(1_000)
         .with_compact_threshold(80);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
     agent
@@ -2826,7 +2826,7 @@ async fn a_prune_pass_clears_a_report_armed_anchor() {
     let config = make_config()
         .with_context_window(1_000_000)
         .with_compact_threshold(80);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     let client = MockClient::new("test-model");
     add_retention_script_with_usage(&client, &turns, &usages);
@@ -2865,7 +2865,7 @@ async fn a_prune_pass_clears_a_report_armed_anchor() {
         crate::managers::LoopManagers::new().with_observer(Arc::new(CompactionCounter {
             count: Arc::clone(&bare_compactions),
         }));
-    let mut bare_registry = ToolRegistry::new();
+    let bare_registry = ToolRegistry::new();
     bare_registry.register(RetentionEcho);
     let mut unpruned = BareLoop::new_with_managers(
         Arc::new(bare_client),
@@ -2910,7 +2910,7 @@ async fn a_prune_below_the_minimum_free_gate_is_a_no_op() {
     let config = make_config()
         .with_context_window(1_000)
         .with_compact_threshold(95);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
     agent
@@ -2965,7 +2965,7 @@ async fn pruning_is_off_by_default() {
     let config = make_config()
         .with_context_window(1_000)
         .with_compact_threshold(80);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
     assert!(
@@ -3019,7 +3019,7 @@ async fn a_prune_that_frees_enough_avoids_the_compaction() {
     let config = make_config()
         .with_context_window(1_000)
         .with_compact_threshold(80);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
     agent
@@ -3086,7 +3086,7 @@ async fn a_cancel_during_a_hanging_prune_sink_ends_the_run_typed() {
     let config = make_config()
         .with_context_window(1_000)
         .with_compact_threshold(80);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
     agent
@@ -3147,7 +3147,7 @@ async fn the_minimum_free_gate_reads_the_counter_s_scale() {
     let config = make_config()
         .with_context_window(2_000)
         .with_compact_threshold(95);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionEcho);
     let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
     agent
@@ -3292,7 +3292,7 @@ async fn an_oversized_prompt_rejection_compacts_and_retries_the_same_turn() {
         .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
             ShrinkingPassCompactor,
         ))));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = make_config()
         .with_context_window(4_000)
@@ -3509,7 +3509,7 @@ async fn a_tool_turn_s_duration_covers_the_model_phase() {
     scripted.add_tool_only_response("c1", "echo", &json!({"message": "hi"}));
     scripted.add_text_response("done");
     let ends = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(
         Arc::new(SlowModelClient {
@@ -3678,7 +3678,7 @@ async fn the_context_figure_anchors_on_a_usage_report() {
         3_000,
         3_500,
     );
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     agent.run("anchor me", &RunConfig::default()).await.unwrap();
@@ -3717,7 +3717,7 @@ async fn appended_exchanges_grow_the_anchored_figure_by_their_estimate() {
         3_000,
     );
     client.add_text_response("second turn lands");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     agent.run("anchor me", &RunConfig::default()).await.unwrap();
@@ -4170,7 +4170,7 @@ async fn response_format_turns_do_not_reserve_suppressed_tool_schemas() {
     let make_agent = |format: Option<crate::structured::ResponseFormat>| {
         let client = MockClient::new("test-model").without_usage();
         client.add_text_response("structured answer");
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(EchoTool);
         let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
         if let Some(format) = format {
@@ -4291,7 +4291,7 @@ async fn a_cancelled_turn_s_turn_end_carries_the_engine_s_context_estimate() {
 async fn the_last_turn_end_figure_survives_the_max_turns_edge() {
     let client = MockClient::new("test-model");
     client.add_tool_only_response("call_1", "echo", &json!({"message": "hi"}));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     let figures = Arc::new(Mutex::new(Vec::new()));
@@ -4338,7 +4338,7 @@ async fn the_success_turn_end_duration_excludes_the_context_recount() {
         .with_token_counter(counter.clone());
     let client = MockClient::new("test-model");
     client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new_with_managers(
         Arc::new(client),
@@ -4428,7 +4428,7 @@ impl crate::determinism::Clock for StepClock {
 }
 
 fn recording_agent(client: RecordingClient, managers: LoopManagers) -> BareLoop<RecordingClient> {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     BareLoop::new_with_managers(Arc::new(client), registry, make_config(), managers)
 }
@@ -4664,7 +4664,7 @@ impl crate::observer::LoopObserver for CompactionDurationRecorder {
 async fn pipeline_tool_durations_come_from_the_clock_seam() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let durations = Arc::new(Mutex::new(Vec::new()));
     let mut agent = BareLoop::new_with_managers(
@@ -4771,7 +4771,7 @@ async fn observer_sequence_multi_tool_turn() {
         ],
         "All done.",
     );
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let log = sequence_log();
     let mut agent = agent_with_sequence_observer(client, registry, log.clone());
@@ -4867,7 +4867,7 @@ async fn a_tool_loop_run_crosses_the_compaction_boundary_instead_of_stalling() {
     let config = make_config()
         .with_context_window(20_000)
         .with_compact_threshold(55);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, config);
     agent.set_context_manager(Arc::new(
@@ -5441,7 +5441,7 @@ async fn on_compaction_carries_the_stage_trail() {
     }
     client.add_text_response("compacted-and-done");
     let trails = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = make_config()
         .with_context_window(1_000)
@@ -5496,7 +5496,7 @@ async fn observer_sequence_compaction_turn() {
     }
     client.add_text_response("compacted-and-done");
     let log = sequence_log();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = make_config()
         .with_context_window(1_000)
@@ -5636,7 +5636,7 @@ async fn on_turn_end_carries_the_committed_history_plus_the_completed_exchange()
     let client = MockClient::new("test-model");
     client.add_tool_only_response("tool_1", "echo", &json!({ "message": "hi" }));
     client.add_text_response("done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let ends = Arc::new(Mutex::new(Vec::new()));
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -5771,7 +5771,7 @@ async fn turn_end_history_reflects_a_mid_run_compaction() {
     }
     client.add_text_response("compacted-and-done");
     let ends = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = make_config()
         .with_context_window(1_000)
@@ -5823,7 +5823,7 @@ async fn observer_sequence_cancelled_turn() {
     for _ in 0..5 {
         client.add_tool_only_response("c1", "echo", &json!({"message": "x"}));
     }
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let log = sequence_log();
     let mut agent = agent_with_sequence_observer(client, registry, log.clone());
@@ -5865,7 +5865,7 @@ async fn dispatch_surfaces_tool_name_on_tool_pre() {
     // tool during `on_tool_pre`; the ToolNameCapture observer records the
     // tool name carried on the context.
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let captured = Arc::new(Mutex::new(None::<String>));
@@ -6270,7 +6270,7 @@ fn runs_serialized_before_the_field_still_deserialize() {
 async fn the_tool_phase_forwards_the_recorded_turns_stop_reason() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -6322,7 +6322,7 @@ impl crate::observer::LoopObserver for TurnEventShapeCapture {
 async fn each_turn_fires_exactly_one_turn_end_event() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -7017,7 +7017,7 @@ async fn a_tool_calling_fallback_run_counts_every_fallback_turn() {
     ];
 
     let managers = LoopManagers::new().with_stream_handler(fast_exhausting_handler(true));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new_with_managers(
         Arc::new(QueuedFallbackClient {
@@ -7070,7 +7070,7 @@ async fn test_bare_loop_max_turns_exceeded() {
         );
     }
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -7148,7 +7148,7 @@ async fn test_tool_execution_failure() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "fail", &json!({}), "The tool failed, moving on.");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool);
 
     let config = make_config();
@@ -7213,7 +7213,7 @@ async fn test_observer_tool_events() {
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "test"}), "All done!");
 
     let plugin = Arc::new(CountingObserver::new());
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let config = make_config();
@@ -7238,7 +7238,7 @@ async fn test_conversation_built_correctly() {
         "Final answer.",
     );
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let config = make_config();
@@ -7360,7 +7360,7 @@ async fn test_multiple_tool_calls_in_one_turn() {
     // Second response: end_turn
     client.add_text_response("Both tools executed.");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let config = make_config();
@@ -7415,7 +7415,7 @@ async fn test_mixed_known_unknown_tools_merge_into_one_user_message() {
     crate::error::recover_guard(client.responses.lock()).push(tool_events);
     client.add_text_response("done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -7493,7 +7493,7 @@ async fn test_mixed_known_unknown_tools_preserve_request_order() {
     crate::error::recover_guard(client.responses.lock()).push(tool_events);
     client.add_text_response("done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -7736,7 +7736,7 @@ async fn test_text_delta_turn_number_matches_surrounding_turn() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "All done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -7939,7 +7939,7 @@ async fn test_on_tool_call_received_fires_once_per_call() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "Done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -7996,7 +7996,7 @@ async fn test_on_tool_call_received_fires_per_call_for_multiple_calls() {
     crate::error::recover_guard(client.responses.lock()).push(tool_events);
     client.add_text_response("All done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -8060,7 +8060,7 @@ async fn test_on_tool_call_received_turn_matches_other_events() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "Done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -8131,7 +8131,7 @@ async fn test_on_tool_call_received_does_not_refire_on_retry() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "flaky", &json!({}), "Recovered");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FlakyTool::new(2));
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -8305,7 +8305,7 @@ async fn test_loop_detection_hard_stop_propagates_loop_error() {
     use crate::detection::{DetectionConfig, DetectionManager};
     use crate::managers::LoopManagers;
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let client = MockClient::new("test");
     for i in 0..10 {
@@ -8336,7 +8336,7 @@ async fn test_loop_detection_soft_block_before_stop_threshold() {
     use crate::detection::{DetectionConfig, DetectionManager};
     use crate::managers::LoopManagers;
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let client = MockClient::new("test");
     client.add_tool_only_response("c1", "echo", &json!({ "message": "hi" }));
@@ -8376,7 +8376,7 @@ async fn test_cancelled_before_run_returns_cancelled() {
 
 #[tokio::test]
 async fn test_default_recovery_on_tool_error_returns_soft_result() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool);
 
     let client = MockClient::new("test");
@@ -8401,7 +8401,7 @@ async fn test_recovery_on_missing_tool_returns_soft_result() {
 
 #[tokio::test]
 async fn test_recovery_noop_reflector_no_retries() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool);
 
     let client = MockClient::new("test");
@@ -8415,7 +8415,7 @@ async fn test_recovery_noop_reflector_no_retries() {
 
 #[tokio::test]
 async fn test_recovery_respects_cancellation() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool);
 
     let client = MockClient::new("test");
@@ -8471,7 +8471,7 @@ async fn test_cancel_during_dispatch_lands_in_cancelled_state() {
         }
     }
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool);
 
     let client = MockClient::new("test");
@@ -8610,7 +8610,7 @@ async fn test_stream_turn_cancelled_mid_stream() {
 async fn test_set_pipeline_injects_self_tools_registry() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("tool_1", "echo", &json!({"message": "hello"}), "done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = make_config();
     let mut agent = BareLoop::new(Arc::new(client), registry, config);
@@ -8657,7 +8657,7 @@ async fn test_turn_number_is_actual_turn_index() {
     client.add_tool_only_response("tool_1", "echo", &json!({"message": "b"}));
     client.add_text_response("done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let capture = Arc::new(Mutex::new(Vec::<usize>::new()));
@@ -8872,7 +8872,7 @@ async fn a_switch_to_a_larger_window_does_not_fail_history_between_the_windows()
     // ContextExceeded even though the conversation fit the model it now
     // runs on.
     let client = std::sync::Arc::new(MockClient::new("m"));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SizedTool);
     let config = SessionConfig::default()
         .with_context_window(800)
@@ -8934,7 +8934,7 @@ async fn a_switch_to_a_smaller_window_keeps_compacting_under_the_new_one() {
     // After shrinking the window mid-session, the next run's compaction
     // engages and completes under the new, tighter budget.
     let client = std::sync::Arc::new(MockClient::new("m").without_usage());
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SizedTool);
     let config = SessionConfig::default()
         .with_context_window(2_000)
@@ -9687,7 +9687,7 @@ async fn run_cancel_during_dispatch_fires_turn_end() {
     }
 
     let notify = Arc::new(tokio::sync::Notify::new());
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SlowTool {
         notify: notify.clone(),
     });
@@ -9762,7 +9762,7 @@ async fn a_dispatch_failed_turn_end_carries_only_committed_history() {
 
     let notify = Arc::new(tokio::sync::Notify::new());
     let started = Arc::new(AtomicBool::new(false));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SlowTool {
         notify: Arc::clone(&notify),
         started: Arc::clone(&started),
@@ -9920,7 +9920,7 @@ async fn a_cancelled_run_salvages_completed_turns_into_the_next_request() {
         .scripted
         .add_tool_only_response("call-1", "echo", &json!({"message": "hi"}));
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client.clone()), registry, make_config());
     let signal = agent.cancel_signal();
@@ -10161,7 +10161,7 @@ async fn a_cancel_mid_dispatch_drops_only_the_unfinished_turn() {
         .add_tool_only_response("call-2", "blocker", &json!({}));
 
     let entered = Arc::new(AtomicBool::new(false));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     registry.register(BlockingTool {
         entered: Arc::clone(&entered),
@@ -10265,7 +10265,7 @@ async fn run_cancel_during_recovery_backoff_returns_fast() {
     let client = MockClient::new("test");
     client.add_tool_only_response("tc-1", "fail", &json!({}));
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool);
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -10897,7 +10897,7 @@ async fn test_contributor_fires_across_two_turns() {
     client.add_tool_then_text("t1", "echo", &json!({"message": "hi"}), "all done");
     let counter = Arc::new(AtomicUsize::new(0));
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = contributor_config();
     let mut agent = BareLoop::new(Arc::new(client), registry, config);
@@ -10950,7 +10950,7 @@ async fn test_contributor_sees_turn_number() {
     client.add_tool_then_text("t1", "echo", &json!({"message": "x"}), "done");
     let seen_turns = Arc::new(Mutex::new(Vec::<usize>::new()));
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = contributor_config();
     let mut agent = BareLoop::new(Arc::new(client), registry, config);
@@ -11043,7 +11043,7 @@ async fn test_constrained_apply_wires_pipeline_and_contributor() {
     // end_turn, so reaching turn 5 needs a long tool-call chain), we add
     // a cadence-1 GoalReminder on top: it fires on turn 1, so a single
     // tool-then-text session (2 turns) is enough.
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
 
     let client = RecordingClient::new("test-model");
@@ -11290,7 +11290,7 @@ async fn failed_run_after_noop_compaction_leaves_history_clean() {
     config.compact_threshold = 50;
     config.auto_compact = true;
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, config);
 
@@ -11348,7 +11348,7 @@ async fn continuation_turn_queries_memory_with_tool_result_text() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     let queries = Arc::new(Mutex::new(Vec::new()));
@@ -11412,7 +11412,7 @@ async fn continuation_turn_joins_parallel_tool_results_with_newlines() {
     ]);
     client.add_text_response("done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
 
@@ -11464,7 +11464,7 @@ async fn continuation_turn_with_image_only_result_has_empty_input() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("call_1", "screenshot", &json!({}), "done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(ScreenshotTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
 
@@ -11520,7 +11520,7 @@ async fn continuation_turn_uses_tool_results_not_accompanying_text() {
     ]);
     client.add_text_response("done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
 
@@ -11538,7 +11538,7 @@ async fn post_tool_turn_input_carries_tool_result_text() {
     let client = MockClient::new("test-model");
     client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
 
@@ -11595,7 +11595,7 @@ async fn cancel_during_tool_invocation_drops_the_in_flight_call() {
 
     let started = Arc::new(tokio::sync::Notify::new());
     let finished = Arc::new(AtomicBool::new(false));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SlowTool {
         started: Arc::clone(&started),
         finished: finished.clone(),
@@ -11631,7 +11631,7 @@ async fn gate_refusals_reach_the_loop_detector() {
     use crate::managers::LoopManagers;
     use crate::tool::health::ToolHealthRegistry;
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let client = MockClient::new("test");
     for i in 0..10 {
@@ -11814,7 +11814,7 @@ mod budget_gate_tests {
         limits: crate::budget::BudgetLimits,
         collector: std::sync::Arc<BudgetCollector>,
     ) -> BareLoop<crate::testing::MockApiClient> {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(EchoTool);
         let mut agent = BareLoop::new(std::sync::Arc::new(client), registry, make_config());
         agent.register_observer(collector);
@@ -12027,7 +12027,7 @@ mod budget_gate_tests {
         );
         let nested_outcome: std::sync::Arc<Mutex<Option<String>>> =
             std::sync::Arc::new(Mutex::new(None));
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(RunNestedLoopTool {
             inner: tokio::sync::Mutex::new(Some(b_loop)),
             outcome: std::sync::Arc::clone(&nested_outcome),
@@ -12185,7 +12185,7 @@ async fn retention_rides_the_dispatch_path_into_the_history() {
     let client = std::sync::Arc::new(MockClient::new("m"));
     client.add_tool_only_response("c0", "stamped", &json!({}));
     client.add_text_response("done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionTool);
     let mut loop_ = BareLoop::new(Arc::clone(&client), registry, SessionConfig::default());
     loop_
@@ -12245,7 +12245,7 @@ async fn an_engine_run_keeps_durable_content_across_the_boundary() {
     let client = std::sync::Arc::new(MockClient::new("m"));
     client.add_tool_only_response("deploy", "receipt", &json!({}));
     script_sized_turns(&client, 3, 2_000);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(ReceiptTool);
     registry.register(SizedTool);
     let config = SessionConfig::default()
@@ -12328,7 +12328,7 @@ async fn retention_rides_the_dispatch_path_without_a_pipeline() {
     let client = std::sync::Arc::new(MockClient::new("m"));
     client.add_tool_only_response("c0", "stamped", &json!({}));
     client.add_text_response("done");
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(RetentionTool);
     let mut machine = crate::engine::core::LoopMachine::from_history(Vec::new());
     machine.accept_input("seed the machine past Start");
@@ -12404,8 +12404,14 @@ impl WireCaptureClient {
         (client, requests)
     }
 
-    /// Script one thinking-plus-tool-call response.
-    fn push_tool_turn(&self, thinking: &str, call_id: &str, input: &Value) {
+    /// Script one thinking-plus-tool-call response naming the called
+    /// tool.
+    ///
+    /// The mid-run mutation pins drive calls at tools other than the
+    /// parity fixture's `echo`; the plain
+    /// [`push_tool_turn`](Self::push_tool_turn) delegates here with
+    /// `"echo"`.
+    fn push_named_tool_turn(&self, thinking: &str, call_id: &str, tool: &str, input: &Value) {
         let model = crate::error::recover_guard(self.model_name.lock()).clone();
         let events = vec![
             StreamEvent::MessageStart(MessageStart {
@@ -12430,7 +12436,7 @@ impl WireCaptureClient {
             StreamEvent::PartStop { index: Some(0) },
             StreamEvent::PartStart(PartStart {
                 index: 1,
-                part: Some(MessagePart::tool_call(call_id, "echo", Value::Null)),
+                part: Some(MessagePart::tool_call(call_id, tool, Value::Null)),
             }),
             StreamEvent::IndexedDelta(IndexedDelta {
                 index: 1,
@@ -12448,6 +12454,12 @@ impl WireCaptureClient {
             StreamEvent::MessageStop,
         ];
         crate::error::recover_guard(self.responses.lock()).push(events);
+    }
+
+    /// Script one thinking-plus-tool-call response against the parity
+    /// fixture's `echo` tool.
+    fn push_tool_turn(&self, thinking: &str, call_id: &str, input: &Value) {
+        self.push_named_tool_turn(thinking, call_id, "echo", input);
     }
 
     /// Script one thinking-plus-text terminal response.
@@ -12696,7 +12708,7 @@ async fn wire_parity_under() {
     );
     client.push_final_turn("final turn reasoning ", "all done");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(ParityEcho);
     let system_prompt = "You are the parity probe.";
     let config = make_config().with_system_prompt(system_prompt);
@@ -12845,7 +12857,7 @@ async fn a_threshold_stall_that_fits_the_window_serves_the_turn() {
                 },
             ]),
     );
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = make_config()
         .with_context_window(50_000)
@@ -12925,7 +12937,7 @@ async fn an_emergency_stall_still_ends_the_run() {
             },
         ]),
     );
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = make_config().with_context_window(20_000);
     let mut agent = BareLoop::from_machine(
@@ -13305,7 +13317,7 @@ surface_tool!(
 /// Register the five distinct surface tools the pins select among.
 #[cfg(feature = "streaming")]
 fn surface_registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SurfaceRead);
     registry.register(SurfaceWrite);
     registry.register(SurfaceSearch);
@@ -13466,7 +13478,7 @@ surface_tool!(
 /// apart — the separation the premature-compaction pins need.
 #[cfg(feature = "streaming")]
 fn fat_surface_registry() -> ToolRegistry {
-    let mut registry = surface_registry();
+    let registry = surface_registry();
     registry.register(SurfaceFatPatch);
     registry
 }
@@ -13744,7 +13756,7 @@ async fn a_narrowed_surface_invalidates_the_usage_anchor_so_the_figure_can_fall(
     let config = make_config()
         .with_context_window(1_000)
         .with_compact_threshold(80);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SurfaceFatPatch);
     registry.register(SurfaceSearch);
     let mut agent = BareLoop::new_with_managers(
@@ -13772,5 +13784,577 @@ async fn a_narrowed_surface_invalidates_the_usage_anchor_so_the_figure_can_fall(
          it was built on: {} pass(es), {} deferral notice(s)",
         *crate::error::recover_guard(compactions.lock()),
         captured_failures.len()
+    );
+}
+
+/// The late tool a [`GrowTool`] registers: a plain callable whose
+/// schema arrives on the surface only after the grower ran.
+#[cfg(feature = "streaming")]
+fn late_surface_fn(
+    _input: Value,
+    _ctx: &ToolContext,
+) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'static>> {
+    Box::pin(async { Ok(ToolOutput::text("late")) })
+}
+
+/// A tool whose dispatch registers a named late tool into the live
+/// registry it shares with the engine.
+///
+/// The mid-run growth double: the engine holds the registry behind an
+/// [`Arc`], and this tool's `call` registers through the same handle
+/// a host would — the honest in-run mutation path, exercised at the
+/// exact moment a turn's dispatch is settling.
+#[cfg(feature = "streaming")]
+struct GrowTool {
+    handle: Arc<std::sync::OnceLock<Arc<ToolRegistry>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl Tool for GrowTool {
+    fn name(&self) -> &'static str {
+        "grow_surface"
+    }
+
+    fn description(&self) -> &'static str {
+        "Register the late tool into the live registry"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "grow_surface".into(),
+            description: self.description().into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        if let Some(registry) = self.handle.get() {
+            registry.register(crate::tool::FnTool::new(
+                "late_tool".into(),
+                "Arrives mid-session through the live registry".into(),
+                json!({"type": "object"}),
+                late_surface_fn,
+            ));
+        }
+        Box::pin(std::future::ready(Ok(ToolOutput::text("grown"))))
+    }
+}
+
+/// A tool whose dispatch overwrites a named tool's registration with
+/// a changed schema, keeping the name.
+///
+/// The mid-run swap double — the in-place overwrite shape the
+/// surface-change event must report as a changed name, not an empty
+/// diff: same name, different advertised schema.
+#[cfg(feature = "streaming")]
+struct SwapTool {
+    /// The live registry, set once the engine is constructed.
+    handle: Arc<std::sync::OnceLock<Arc<ToolRegistry>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl Tool for SwapTool {
+    fn name(&self) -> &'static str {
+        "swap_schema"
+    }
+
+    fn description(&self) -> &'static str {
+        "Overwrite the search tool's schema in the live registry"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "swap_schema".into(),
+            description: self.description().into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        if let Some(registry) = self.handle.get() {
+            registry.register(crate::tool::FnTool::new(
+                "web_search".into(),
+                "Search the web with the swapped schema".into(),
+                json!({"type": "object"}),
+                late_surface_fn,
+            ));
+        }
+        Box::pin(std::future::ready(Ok(ToolOutput::text("swapped"))))
+    }
+}
+
+/// A tool whose dispatch removes a named victim from the live
+/// registry it shares with the engine.
+///
+/// The mid-run shed double — the small-model flow L-95 exists for:
+/// dropping tools once the phase that needed them ends.
+#[cfg(feature = "streaming")]
+struct ShedTool {
+    handle: Arc<std::sync::OnceLock<Arc<ToolRegistry>>>,
+    victim: &'static str,
+}
+
+#[cfg(feature = "streaming")]
+impl Tool for ShedTool {
+    fn name(&self) -> &'static str {
+        "shed_surface"
+    }
+
+    fn description(&self) -> &'static str {
+        "Remove a tool from the live registry"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "shed_surface".into(),
+            description: self.description().into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        if let Some(registry) = self.handle.get() {
+            registry.remove(self.victim);
+        }
+        Box::pin(std::future::ready(Ok(ToolOutput::text("shed"))))
+    }
+}
+
+/// A tool that removes itself, then keeps working long enough that
+/// its removal lands while the call is still in flight.
+#[cfg(feature = "streaming")]
+struct SelfRemovingTool {
+    handle: Arc<std::sync::OnceLock<Arc<ToolRegistry>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl Tool for SelfRemovingTool {
+    fn name(&self) -> &'static str {
+        "self_removing"
+    }
+
+    fn description(&self) -> &'static str {
+        "Remove itself and finish slowly"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "self_removing".into(),
+            description: self.description().into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        if let Some(registry) = self.handle.get() {
+            registry.remove(self.name());
+        }
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            Ok(ToolOutput::text("drained after removal"))
+        })
+    }
+}
+
+/// Records every [`on_tool_surface_changed`] dispatch as the version
+/// and diff it carried.
+#[cfg(feature = "streaming")]
+type SurfaceEvent = (u64, Vec<String>, Vec<String>, Vec<String>);
+
+#[cfg(feature = "streaming")]
+struct SurfaceChangeRecorder {
+    events: Arc<Mutex<Vec<SurfaceEvent>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::observer::LoopObserver for SurfaceChangeRecorder {
+    fn name(&self) -> &'static str {
+        "surface-change-recorder"
+    }
+
+    fn on_tool_surface_changed(&self, ctx: &crate::observer::ToolSurfaceContext) {
+        crate::error::recover_guard(self.events.lock()).push((
+            ctx.version,
+            ctx.added.clone(),
+            ctx.removed.clone(),
+            ctx.changed.clone(),
+        ));
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_tool_registered_mid_run_is_advertised_on_the_next_turn() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "grow_1", "grow_surface", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let registry = ToolRegistry::new();
+    registry.register(SurfaceRead);
+    registry.register(SurfaceWrite);
+    registry.register(GrowTool {
+        handle: Arc::clone(&handle),
+    });
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    assert!(
+        handle.set(agent.tool_registry()).is_ok(),
+        "the handle is set exactly once"
+    );
+
+    agent
+        .run("grow the surface", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "the fixture issues two requests");
+    assert_eq!(
+        surface_names(&captured[0]),
+        vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "grow_surface".to_string()
+        ],
+        "the growing turn's request carries the surface as it stood"
+    );
+    assert_eq!(
+        surface_names(&captured[1]),
+        vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "grow_surface".to_string(),
+            "late_tool".to_string(),
+        ],
+        "the registration made during dispatch rides the very next request"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_removed_tool_fails_typed_and_leaves_the_surface() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "shed_1", "shed_surface", &json!({}));
+    client.push_named_tool_turn("thinking ", "victim_1", "web_search", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let registry = ToolRegistry::new();
+    registry.register(SurfaceRead);
+    registry.register(SurfaceSearch);
+    registry.register(ShedTool {
+        handle: Arc::clone(&handle),
+        victim: "web_search",
+    });
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    assert!(
+        handle.set(agent.tool_registry()).is_ok(),
+        "the handle is set exactly once"
+    );
+
+    agent
+        .run("shed the search tool", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 3, "shed, refused call, final text");
+    assert!(
+        surface_names(&captured[0]).contains(&"web_search".to_string()),
+        "the victim rides the request that sheds it"
+    );
+    assert!(
+        !surface_names(&captured[1]).contains(&"web_search".to_string()),
+        "the next request omits the removed schema"
+    );
+    let history = agent.machine().full_history();
+    let refusal = history
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            MessagePart::ToolResult { output, .. } => Some(output.to_string()),
+            MessagePart::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .find(|text| text.contains("web_search") && text.contains("not available"));
+    assert!(
+        refusal.is_some(),
+        "the post-removal call resolves through the typed unknown-tool path: {history:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_in_flight_call_drains_after_its_own_removal() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "drain_1", "self_removing", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let registry = ToolRegistry::new();
+    registry.register(SurfaceRead);
+    registry.register(SelfRemovingTool {
+        handle: Arc::clone(&handle),
+    });
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    assert!(
+        handle.set(agent.tool_registry()).is_ok(),
+        "the handle is set exactly once"
+    );
+
+    agent
+        .run("drain after removal", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "the drain turn and the final turn");
+    assert!(
+        !surface_names(&captured[1]).contains(&"self_removing".to_string()),
+        "the self-removal leaves the advertised surface"
+    );
+    let history = agent.machine().full_history();
+    let drained = history
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            MessagePart::ToolResult { output, .. } => Some(output.to_string()),
+            MessagePart::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .any(|text| text.contains("drained after removal"));
+    assert!(
+        drained,
+        "the in-flight call completes and its result reaches the model"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn the_surface_change_event_reports_the_diff() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "grow_1", "grow_surface", &json!({}));
+    client.push_named_tool_turn("thinking ", "shed_1", "shed_surface", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let registry = ToolRegistry::new();
+    registry.register(SurfaceSearch);
+    registry.register(GrowTool {
+        handle: Arc::clone(&handle),
+    });
+    registry.register(ShedTool {
+        handle: Arc::clone(&handle),
+        victim: "web_search",
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    assert!(
+        handle.set(agent.tool_registry()).is_ok(),
+        "the handle is set exactly once"
+    );
+    agent.register_observer(Arc::new(SurfaceChangeRecorder {
+        events: Arc::clone(&events),
+    }));
+
+    agent
+        .run("grow then shed", &make_run_config())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(events.lock()).clone();
+    assert_eq!(
+        recorded,
+        vec![
+            (4, vec!["late_tool".to_string()], Vec::new(), Vec::new()),
+            (5, Vec::new(), vec!["web_search".to_string()], Vec::new()),
+        ],
+        "one event per seam observation, each carrying the exact partitioned \
+         diff and the registry version it saw: {recorded:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_in_place_overwrite_reports_the_changed_name() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "swap_1", "swap_schema", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let registry = ToolRegistry::new();
+    registry.register(SurfaceSearch);
+    registry.register(SwapTool {
+        handle: Arc::clone(&handle),
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    assert!(
+        handle.set(agent.tool_registry()).is_ok(),
+        "the handle is set exactly once"
+    );
+    agent.register_observer(Arc::new(SurfaceChangeRecorder {
+        events: Arc::clone(&events),
+    }));
+
+    agent
+        .run("swap the schema in place", &make_run_config())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(events.lock()).clone();
+    assert_eq!(
+        recorded,
+        vec![(3, Vec::new(), Vec::new(), vec!["web_search".to_string()],)],
+        "an overwrite under the same name is a changed-name report, never an \
+         empty diff: {recorded:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[test]
+fn the_overhead_reservation_remeasures_on_registry_mutation() {
+    let (client, _requests) = WireCaptureClient::new();
+    let registry = ToolRegistry::new();
+    registry.register(SurfaceFatPatch);
+    registry.register(SurfaceSearch);
+    let agent = BareLoop::new(Arc::new(client), registry, make_config());
+
+    let before = agent.request_overhead_tokens();
+    agent.tool_registry().register(SurfaceCalc);
+    let grown = agent.request_overhead_tokens();
+    assert!(
+        grown > before,
+        "a registration between measurements moves the reservation: {before} -> {grown}"
+    );
+    let cached = agent.request_overhead_tokens();
+    assert_eq!(
+        grown, cached,
+        "an unchanged surface serves the cached figure"
+    );
+    agent.tool_registry().remove("calculator");
+    let shed = agent.request_overhead_tokens();
+    assert_eq!(
+        shed, before,
+        "shedding the addition restores the figure — the cache tracks the registry"
+    );
+}
+
+/// A tool whose dispatch registers three late tools in non-sorted
+/// name order, so one event must sort its added list.
+#[cfg(feature = "streaming")]
+struct MultiGrowTool {
+    handle: Arc<std::sync::OnceLock<Arc<ToolRegistry>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl Tool for MultiGrowTool {
+    fn name(&self) -> &'static str {
+        "multi_grow"
+    }
+
+    fn description(&self) -> &'static str {
+        "Register three late tools in non-sorted order"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "multi_grow".into(),
+            description: self.description().into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        if let Some(registry) = self.handle.get() {
+            for late in ["zulu_tool", "alpha_tool", "mike_tool"] {
+                registry.register(crate::tool::FnTool::new(
+                    late.into(),
+                    "Arrives with its siblings".into(),
+                    json!({"type": "object"}),
+                    late_surface_fn,
+                ));
+            }
+        }
+        Box::pin(std::future::ready(Ok(ToolOutput::text("grown"))))
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn surface_event_lists_are_sorted_by_name() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "grow_1", "multi_grow", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let handle = Arc::new(std::sync::OnceLock::new());
+    let registry = ToolRegistry::new();
+    registry.register(SurfaceRead);
+    registry.register(MultiGrowTool {
+        handle: Arc::clone(&handle),
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    assert!(handle.set(agent.tool_registry()).is_ok());
+    agent.register_observer(Arc::new(SurfaceChangeRecorder {
+        events: Arc::clone(&events),
+    }));
+
+    agent
+        .run("grow three tools", &make_run_config())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(events.lock()).clone();
+    assert!(
+        recorded.iter().any(|(_, added, _, _)| !added.is_empty()),
+        "the fixture's growth lands in an event: {recorded:?}"
+    );
+    for (_, added, removed, changed) in &recorded {
+        let mut sorted_added = added.clone();
+        sorted_added.sort();
+        assert_eq!(
+            added, &sorted_added,
+            "the added list is sorted by name — the context's contract"
+        );
+        let mut sorted_removed = removed.clone();
+        sorted_removed.sort();
+        assert_eq!(
+            removed, &sorted_removed,
+            "the removed list is sorted by name — the context's contract"
+        );
+        let mut sorted_changed = changed.clone();
+        sorted_changed.sort();
+        assert_eq!(
+            changed, &sorted_changed,
+            "the changed list is sorted by name — the context's contract"
+        );
+    }
+    let growth = recorded
+        .iter()
+        .find(|(_, added, _, _)| !added.is_empty())
+        .expect("the growth event exists");
+    assert_eq!(
+        growth.1,
+        vec![
+            "alpha_tool".to_string(),
+            "mike_tool".to_string(),
+            "zulu_tool".to_string(),
+        ],
+        "a multi-add event lists its names sorted, not in registration order"
     );
 }

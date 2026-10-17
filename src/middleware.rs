@@ -792,7 +792,7 @@ mod tests {
     }
 
     fn test_registry() -> Arc<ToolRegistry> {
-        let mut reg = ToolRegistry::new();
+        let reg = ToolRegistry::new();
         reg.register(EchoTool);
         reg.register(ErrorTool);
         reg.register(SlowTool { delay_ms: 5000 });
@@ -1001,7 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn test_timeout_fast_tool_succeeds() {
         let registry = {
-            let mut reg = ToolRegistry::new();
+            let reg = ToolRegistry::new();
             reg.register(EchoTool);
             Arc::new(reg)
         };
@@ -1019,7 +1019,7 @@ mod tests {
     #[tokio::test]
     async fn test_timeout_slow_tool_times_out() {
         let registry = {
-            let mut reg = ToolRegistry::new();
+            let reg = ToolRegistry::new();
             reg.register(SlowTool { delay_ms: 5000 });
             Arc::new(reg)
         };
@@ -1097,7 +1097,7 @@ mod tests {
     async fn test_middleware_ordering_permission_before_timeout() {
         // Permission denies → timeout middleware is never reached
         let registry = {
-            let mut reg = ToolRegistry::new();
+            let reg = ToolRegistry::new();
             reg.register(SlowTool { delay_ms: 5000 });
             Arc::new(reg)
         };
@@ -1135,7 +1135,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_pipeline_echo() {
         let registry = {
-            let mut reg = ToolRegistry::new();
+            let reg = ToolRegistry::new();
             reg.register(EchoTool);
             Arc::new(reg)
         };
@@ -1159,7 +1159,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_pipeline_not_found_with_suggestion() {
         let registry = {
-            let mut reg = ToolRegistry::new();
+            let reg = ToolRegistry::new();
             reg.register(EchoTool);
             reg.register(ErrorTool);
             Arc::new(reg)
@@ -1307,7 +1307,7 @@ mod tests {
     }
 
     fn long_output_registry() -> Arc<ToolRegistry> {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(LongOutputTool);
         registry.register(MultipartTool);
         Arc::new(registry)
@@ -1683,7 +1683,7 @@ mod tests {
         // max_chars = 6: part 0 (4) fits, leaving 2.
         // Part 1 (4 > 2) collapses to the bare marker (2 < marker 12).
         // Part 2 → 0 remaining, emptied.
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(ThreePartTextTool);
         let pipeline = ToolPipeline::builder()
             .with_middleware(OutputLimitMiddleware::new(6))
@@ -1729,7 +1729,7 @@ mod tests {
     #[tokio::test]
     async fn output_limit_multipart_shared_budget_all_fit() {
         // max_chars = 20: all three 4-char parts (12 total) fit.
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(ThreePartTextTool);
         let pipeline = ToolPipeline::builder()
             .with_middleware(OutputLimitMiddleware::new(20))
@@ -1763,7 +1763,7 @@ mod tests {
     async fn output_limit_multipart_shared_budget_exactly_consumed() {
         // max_chars = 8: parts 0+1 (4+4) exactly consume the budget.
         // Part 2 → 0 remaining → "[truncated]".
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(ThreePartTextTool);
         let pipeline = ToolPipeline::builder()
             .with_middleware(OutputLimitMiddleware::new(8))
@@ -1849,7 +1849,7 @@ mod tests {
         // The cap is one whole-output budget, not a per-part allowance:
         // the 80-char first part consumes 80 of the 100 chars, so the
         // 40-char second part is cut to the 20 that remain.
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(SizedPartsTool);
         let pipeline = ToolPipeline::builder()
             .with_middleware(OutputLimitMiddleware::new(100))

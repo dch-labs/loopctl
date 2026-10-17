@@ -2632,7 +2632,7 @@ mod tests {
     #[test]
     fn test_mock_tool_registry() {
         let tool = MockTool::new("echo", "Echoes input").with_concurrency_safe(true);
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(tool);
 
         assert!(registry.contains("echo"));

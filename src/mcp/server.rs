@@ -83,10 +83,10 @@ use crate::tool::ToolRegistry;
 pub struct McpServerAdapter {
     /// The registry being served.
     ///
-    /// Shared immutably across handler clones (the agent-loop usage pattern:
-    /// built once, dispatched read-only). Every `list_tools` call reads
-    /// `all_schemas()`; every `call_tool` reads `get(name)`. No mutation after
-    /// construction.
+    /// Shared across handler clones; read live on every request —
+    /// each `list_tools` reads `all_schemas()` and each `call_tool`
+    /// reads `get(name)`, so a registry mutated at runtime is served
+    /// exactly as it stands, with no adapter rebuild.
     registry: Arc<ToolRegistry>,
 
     /// The per-session context handed to every [`Tool::call`].
@@ -117,8 +117,10 @@ impl McpServerAdapter {
     /// name and version.
     ///
     /// The registry and context are moved into `Arc`s and shared by every clone
-    /// of the adapter. The registry is **not** mutated after construction —
-    /// rebuild the adapter if you need a different tool set.
+    /// of the adapter. The registry is read live on every `tools/list` and
+    /// `tools/call` — a registry mutated at runtime (see
+    /// [`ToolRegistry::register`](crate::tool::ToolRegistry::register)) is
+    /// served as it stands, with no adapter rebuild.
     ///
     /// # Example
     ///
@@ -148,6 +150,17 @@ impl McpServerAdapter {
             server_name,
             server_version,
         }
+    }
+
+    /// The shared handle to the served registry.
+    ///
+    /// The same [`Arc<ToolRegistry>`](std::sync::Arc) every `tools/list`
+    /// and `tools/call` reads — mutate through it and the next request
+    /// from any connected client serves the mutated surface, with no
+    /// adapter rebuild (the registry is read live, never snapshotted).
+    #[must_use]
+    pub fn registry(&self) -> Arc<ToolRegistry> {
+        Arc::clone(&self.registry)
     }
 
     /// Serve over stdio and return the running service handle.
@@ -227,7 +240,10 @@ impl ServerHandler for McpServerAdapter {
     /// Resources, prompts, sampling, logging, completions, and subscriptions
     /// are neither implemented nor advertised; their [`ServerHandler`]
     /// defaults (no-ops / `None`) apply. `listChanged` is not advertised —
-    /// the adapter serves the snapshot taken at construction.
+    /// the adapter serves its registry live (mutations surface on the next
+    /// request), so connected clients that want change awareness must
+    /// re-list on their own schedule rather than wait for a notification
+    /// this server never sends.
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::default();
         info.capabilities.tools = Some(ToolsCapability::default());
@@ -268,7 +284,7 @@ impl ServerHandler for McpServerAdapter {
                 let is_read_only = self
                     .registry
                     .get(&schema.tool)
-                    .is_some_and(Tool::is_read_only);
+                    .is_some_and(|tool| tool.is_read_only());
                 convert::tool_schema_to_mcp(schema, is_read_only)
             })
             .collect();
@@ -319,7 +335,7 @@ impl ServerHandler for McpServerAdapter {
         let input = request
             .arguments
             .map_or(serde_json::Value::Null, serde_json::Value::Object);
-        let result = dispatch_guarded(tool, input, &self.context, &context.ct).await;
+        let result = dispatch_guarded(tool.as_ref(), input, &self.context, &context.ct).await;
         Ok(convert::dispatch_result_to_call_tool(&name, result).into())
     }
 }
@@ -416,6 +432,135 @@ mod tests {
         }
         fn is_read_only(&self) -> bool {
             true
+        }
+    }
+
+    /// The `peek` tool re-registered under its name with the
+    /// read-only hint flipped and nothing else moved.
+    ///
+    /// The metadata-only survivor of the sync pins: name, description,
+    /// and schema are byte-identical to [`PeekTool`]'s — only the
+    /// policy-bearing `read_only` classification flips — so a sync
+    /// that compares schemas alone keeps the stale handle and the
+    /// registry keeps advertising a mutable tool the server just made
+    /// read-only, or vice versa.
+    struct HintFlippedPeek;
+
+    impl Tool for HintFlippedPeek {
+        fn name(&self) -> &'static str {
+            "peek"
+        }
+        fn description(&self) -> &'static str {
+            PeekTool.description()
+        }
+        fn schema(&self) -> ToolSchema {
+            PeekTool.schema()
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("state")) })
+        }
+    }
+
+    /// An `echo` tool from a different server: same exposed name,
+    /// different description.
+    ///
+    /// The foreign registration of the cross-provider pin: when this
+    /// tool overwrites the first provider's `echo` in a shared
+    /// registry, only a schema-identity check can tell whose entry the
+    /// registry holds — and the first provider's sync must not remove
+    /// it when its own server drops the name.
+    struct ForeignEcho;
+
+    impl Tool for ForeignEcho {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn description(&self) -> &'static str {
+            "A different server's echo"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "echo".into(),
+                description: "a different server's echo".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("foreign")) })
+        }
+    }
+
+    /// The `echo` tool re-registered under its name with a changed
+    /// description.
+    ///
+    /// The changed survivor of the foreign-overwrite pin: the first
+    /// provider's server mutates its `echo` while a second provider
+    /// owns the shared registry's entry under the name — the sync must
+    /// skip the refresh rather than take ownership of a foreign
+    /// registration.
+    struct ReDescribedEcho;
+
+    impl Tool for ReDescribedEcho {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn description(&self) -> &'static str {
+            "Echo with a fresher description"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "echo".into(),
+                description: "echo with a fresher description".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("changed")) })
+        }
+    }
+
+    /// The `peek` tool re-registered under its name with a changed
+    /// description.
+    ///
+    /// The schema-changed survivor of the sync pins: registering this
+    /// over [`PeekTool`] flips the served tool's description without
+    /// changing its name, so the sync that follows must refresh the
+    /// survivor in place — one registry bump, no addition, no removal
+    /// — while the identical `echo` survivor is not touched at all.
+    struct ReDescribedPeek;
+
+    impl Tool for ReDescribedPeek {
+        fn name(&self) -> &'static str {
+            "peek"
+        }
+        fn description(&self) -> &'static str {
+            "Peek at the session with a fresher description"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "peek".into(),
+                description: "peek at the session with a fresher description".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("state")) })
         }
     }
 
@@ -534,7 +679,7 @@ mod tests {
     }
 
     fn echo_fail_adapter() -> McpServerAdapter {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(EchoTool);
         registry.register(FailTool);
         McpServerAdapter::new(
@@ -578,6 +723,389 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_name_never_removes_another_provider_s_registration() {
+        let first = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(EchoTool);
+                registry.register(FailTool);
+                registry
+            },
+            ToolContext::default(),
+            "first".into(),
+            "0.0.1".into(),
+        );
+        let second = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(ForeignEcho);
+                registry
+            },
+            ToolContext::default(),
+            "second".into(),
+            "0.0.1".into(),
+        );
+        let first_client = serve_and_connect(&first).await;
+        let second_client = serve_and_connect(&second).await;
+
+        let mut first_provider = crate::mcp::McpToolProvider::connect(first_client, None)
+            .await
+            .expect("discover first");
+        let second_provider = crate::mcp::McpToolProvider::connect(second_client, None)
+            .await
+            .expect("discover second");
+        let shared = ToolRegistry::new();
+        first_provider.register_into(&shared);
+        second_provider.register_into(&shared);
+
+        first.registry().remove("echo");
+        let report = first_provider.sync_into(&shared).await.expect("sync");
+
+        assert!(
+            shared.contains("echo"),
+            "the second provider's registration survives the first provider's \
+             drop — the baseline never owned the registry's current entry"
+        );
+        assert!(
+            report.removed.is_empty(),
+            "the only dropped name is foreign-held — nothing is reported removed: \
+             {:?}",
+            report.removed
+        );
+        assert!(
+            shared.contains("fail"),
+            "this provider's own survivor stays registered"
+        );
+        assert_eq!(
+            report.untouched,
+            ["fail"],
+            "the survivor this target still holds is reported untouched: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_survivor_never_overwrites_a_foreign_registration() {
+        let first = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(EchoTool);
+                registry
+            },
+            ToolContext::default(),
+            "first".into(),
+            "0.0.1".into(),
+        );
+        let second = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(ForeignEcho);
+                registry
+            },
+            ToolContext::default(),
+            "second".into(),
+            "0.0.1".into(),
+        );
+        let first_client = serve_and_connect(&first).await;
+        let second_client = serve_and_connect(&second).await;
+
+        let mut first_provider = crate::mcp::McpToolProvider::connect(first_client, None)
+            .await
+            .expect("discover first");
+        let second_provider = crate::mcp::McpToolProvider::connect(second_client, None)
+            .await
+            .expect("discover second");
+        let shared = ToolRegistry::new();
+        first_provider.register_into(&shared);
+        second_provider.register_into(&shared);
+
+        first.registry().register(ReDescribedEcho);
+        let report = first_provider.sync_into(&shared).await.expect("sync");
+
+        let described: Vec<String> = shared
+            .all_schemas()
+            .into_iter()
+            .filter(|schema| schema.tool == "echo")
+            .map(|schema| schema.description)
+            .collect();
+        assert_eq!(
+            described,
+            ["a different server's echo"],
+            "the foreign registration survives the changed survivor's sync \
+             byte-equal — ownership never crosses by refresh"
+        );
+        assert!(
+            !report.added.contains(&"echo".to_string()),
+            "a skipped foreign-held name is not claimed as added: {report:?}"
+        );
+        assert!(
+            !report.untouched.contains(&"echo".to_string()),
+            "nor claimed as untouched — the report blames nothing for a name \
+             this provider does not own in the target: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sync_into_a_second_registry_registers_its_survivors() {
+        let adapter = McpServerAdapter::new(
+            {
+                let registry = ToolRegistry::new();
+                registry.register(EchoTool);
+                registry.register(PeekTool);
+                registry
+            },
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let first = ToolRegistry::new();
+        provider.register_into(&first);
+
+        let second = ToolRegistry::new();
+        let report = provider.sync_into(&second).await.expect("sync");
+
+        assert_eq!(
+            second.tool_names(),
+            ["echo", "peek"],
+            "a target that never saw the provider gains its survivors — \
+             presence is reconciled against the target, not the provider map"
+        );
+        assert_eq!(
+            report.added,
+            ["echo", "peek"],
+            "the report counts what this target gained: {report:?}"
+        );
+        assert!(
+            report.untouched.is_empty(),
+            "nothing was untouched in a target that held nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_after_a_server_side_change_still_refreshes_the_handle() {
+        let server_registry = ToolRegistry::new();
+        server_registry.register(EchoTool);
+        server_registry.register(PeekTool);
+        let adapter = McpServerAdapter::new(
+            server_registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let live = ToolRegistry::new();
+        provider.register_into(&live);
+        let before = live.version();
+
+        let served = adapter.registry();
+        served.register(ReDescribedPeek);
+        provider.refresh().await.expect("refresh");
+        let report = provider.sync_into(&live).await.expect("sync");
+
+        assert!(
+            report.added.is_empty() && report.removed.is_empty(),
+            "a changed survivor is neither added nor removed: {report:?}"
+        );
+        assert!(
+            live.version() > before,
+            "the change the refresh observed still re-registers the handle — \
+             the registry cannot keep serving the stale contract"
+        );
+        let described: Vec<String> = live
+            .all_schemas()
+            .into_iter()
+            .filter(|schema| schema.tool == "peek")
+            .map(|schema| schema.description)
+            .collect();
+        assert_eq!(
+            described,
+            ["peek at the session with a fresher description"],
+            "the registry reflects the server's changed description, not the \
+             one captured at setup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_between_setup_and_sync_still_sheds_dropped_tools() {
+        let server_registry = ToolRegistry::new();
+        server_registry.register(EchoTool);
+        server_registry.register(FailTool);
+        let adapter = McpServerAdapter::new(
+            server_registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let live = ToolRegistry::new();
+        provider.register_into(&live);
+
+        let served = adapter.registry();
+        served.remove("fail");
+        served.register(PeekTool);
+        provider.refresh().await.expect("refresh");
+
+        let report = provider.sync_into(&live).await.expect("sync");
+        assert!(
+            report.removed.contains(&"fail".to_string()),
+            "the tool the server dropped reaches the report's removals: {:?}",
+            report.removed
+        );
+        assert!(
+            !live.contains("fail"),
+            "the orphan leaves the registry — the sync mirrors the server, \
+             not the refreshed snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_hint_flip_refreshes_the_surviving_handle() {
+        let server_registry = ToolRegistry::new();
+        server_registry.register(EchoTool);
+        server_registry.register(PeekTool);
+        let adapter = McpServerAdapter::new(
+            server_registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let live = ToolRegistry::new();
+        provider.register_into(&live);
+        let before = live.version();
+        assert!(
+            live.get("peek").is_some_and(|tool| tool.is_read_only()),
+            "the fixture starts with the read-only classification"
+        );
+
+        let served = adapter.registry();
+        served.register(HintFlippedPeek);
+        let report = provider.sync_into(&live).await.expect("sync");
+
+        assert!(
+            report.added.is_empty() && report.removed.is_empty(),
+            "a hint flip is neither: {report:?}"
+        );
+        assert!(
+            live.version() > before,
+            "the policy-bearing contract moved — the survivor's handle is replaced"
+        );
+        assert!(
+            !live.get("peek").is_some_and(|tool| tool.is_read_only()),
+            "the registry reflects the server's flipped classification"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_into_diffs_the_live_registry() {
+        let server_registry = ToolRegistry::new();
+        server_registry.register(EchoTool);
+        server_registry.register(FailTool);
+        let adapter = McpServerAdapter::new(
+            server_registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let mut provider = crate::mcp::McpToolProvider::connect(client, None)
+            .await
+            .expect("discover");
+        let live = ToolRegistry::new();
+        provider.register_into(&live);
+        let baseline = live.version();
+        assert_eq!(
+            live.tool_names(),
+            ["echo", "fail"],
+            "the initial wiring registers the discovered set"
+        );
+
+        let served = adapter.registry();
+        served.remove("fail");
+        served.register(PeekTool);
+
+        let report = provider.sync_into(&live).await.expect("sync");
+        assert_eq!(
+            report.added,
+            ["peek"],
+            "the server's new tool is the sync's addition"
+        );
+        assert_eq!(
+            report.removed,
+            ["fail"],
+            "the server's dropped tool is the sync's removal"
+        );
+        assert_eq!(
+            report.untouched,
+            ["echo"],
+            "a name present in both snapshots survives"
+        );
+        assert_eq!(
+            live.version(),
+            baseline + 2,
+            "one registry bump per added and per removed name — the survivor never moved"
+        );
+        let order: Vec<String> = live
+            .all_schemas()
+            .into_iter()
+            .map(|schema| schema.tool)
+            .collect();
+        assert_eq!(
+            order,
+            ["echo", "peek"],
+            "the survivor keeps its registration position; the mirror is the server's list"
+        );
+
+        let settled = live.version();
+        served.register(ReDescribedPeek);
+        let refreshed = provider.sync_into(&live).await.expect("second sync");
+        assert_eq!(
+            refreshed.added,
+            Vec::<String>::new(),
+            "a re-described survivor is not an addition"
+        );
+        assert_eq!(refreshed.removed, Vec::<String>::new(), "nor a removal");
+        assert_eq!(
+            refreshed.untouched,
+            ["echo", "peek"],
+            "both names survived the second sync"
+        );
+        assert_eq!(
+            live.version(),
+            settled + 1,
+            "only the schema-changed survivor re-registered — the identical one did not move"
+        );
+        let described: Vec<String> = live
+            .all_schemas()
+            .into_iter()
+            .filter(|schema| schema.tool == "peek")
+            .map(|schema| schema.description)
+            .collect();
+        assert_eq!(
+            described,
+            ["peek at the session with a fresher description"],
+            "the refreshed schema reads on the registry the engine serves"
+        );
+    }
+
+    #[tokio::test]
     async fn list_tools_serves_registry_via_mcp() {
         let adapter = echo_fail_adapter();
         let client = serve_and_connect(&adapter).await;
@@ -595,7 +1123,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_tools_forwards_read_only_hint() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(EchoTool);
         registry.register(PeekTool);
         let adapter = McpServerAdapter::new(
@@ -689,7 +1217,7 @@ mod tests {
     #[tokio::test]
     async fn call_tool_without_arguments_passes_null_to_the_tool() {
         let received = Arc::new(Mutex::new(None));
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(RecordingTool {
             received: Arc::clone(&received),
         });
@@ -714,7 +1242,7 @@ mod tests {
     async fn call_tool_in_flight_call_is_cancelled_when_client_cancels() {
         let started = Arc::new(tokio::sync::Notify::new());
         let dropped = Arc::new(tokio::sync::Notify::new());
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(HangingTool {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),

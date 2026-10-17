@@ -1468,7 +1468,7 @@ impl<C: ApiClient> BareLoop<C> {
             .tools
             .get(resolved_tool)
             .or_else(|| self.tools.get(&tc.tool))
-            .map(crate::tool::Tool::schema);
+            .map(|tool| tool.schema());
         let Ok(analysis) = self
             .reflector
             .analyze(
@@ -1656,7 +1656,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_tool_catches_panic() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(PanicTool);
         let bare = make_loop(registry);
 
@@ -1684,7 +1684,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_tool_normal_tool_works() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(crate::tool::FnTool::new(
             "echo".into(),
             "echo".into(),
@@ -1747,7 +1747,7 @@ mod tests {
 
     #[test]
     fn graph_all_parallelizable_one_wave() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(safe_tool("a"));
         registry.register(safe_tool("b"));
         let calls = vec![
@@ -1762,7 +1762,7 @@ mod tests {
 
     #[test]
     fn graph_non_parallelizable_singleton_wave() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(unsafe_tool("unsafe"));
         registry.register(safe_tool("safe"));
         let calls = vec![
@@ -1784,7 +1784,7 @@ mod tests {
 
     #[test]
     fn graph_same_resource_separate_waves() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(safe_tool_with_key("file"));
         let calls = vec![
             make_call("1", "file", serde_json::json!({"path": "/a"})),
@@ -1811,7 +1811,7 @@ mod tests {
 
     #[test]
     fn graph_resource_chain() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(safe_tool_with_key("file"));
         // A("/x"), B("/x"), C("/y") → waves [A,C] then [B] (or [C,A] then [B]).
         let calls = vec![
@@ -1837,7 +1837,7 @@ mod tests {
 
     #[test]
     fn graph_unknown_tool_non_parallelizable() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(safe_tool("a"));
         // "ghost" is not in the registry.
         let calls = vec![
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[test]
     fn graph_order_preservation() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(safe_tool("a"));
         registry.register(safe_tool("b"));
         registry.register(safe_tool("c"));
@@ -1956,7 +1956,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_latency_independent_calls_overlap() {
         let spans: Arc<Mutex<Vec<(Instant, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(SpanRecordingTool {
             spans: Arc::clone(&spans),
             delay: std::time::Duration::from_millis(100),
@@ -1998,7 +1998,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_result_order_matches_input() {
         use crate::testing::MockTool;
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(
             MockTool::new("a", "tool a")
                 .with_concurrency_safe(true)
@@ -2038,7 +2038,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_soft_errors_collected() {
         use crate::testing::MockTool;
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(
             MockTool::new("ok", "succeeds")
                 .with_concurrency_safe(true)
@@ -2069,7 +2069,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_hard_error_discards_sibling_results() {
         use crate::testing::MockTool;
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(
             MockTool::new("fast", "completes immediately")
                 .with_concurrency_safe(true)
@@ -2124,7 +2124,7 @@ mod tests {
         use crate::testing::MockTool;
         let config = SessionConfig::default();
         // Default dispatch mode is Sequential — no change needed.
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(
             MockTool::new("a", "a")
                 .with_concurrency_safe(true)
@@ -2172,7 +2172,7 @@ mod tests {
             Value::Object(serde_json::Map::new()),
             |_, _| Box::pin(async { Err(ToolError::Execution("boom".to_string())) }),
         );
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(error_tool);
 
         let mut bare = make_loop(registry);
@@ -2262,7 +2262,7 @@ mod tests {
         let pre_count = Arc::new(AtomicU32::new(0));
         let post_count = Arc::new(AtomicU32::new(0));
 
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(error_tool);
         let mut bare = make_parallel_loop(registry);
         bare.set_reflector(Arc::new(AlwaysRecoverable));
@@ -2322,7 +2322,7 @@ mod tests {
             |_, _| Box::pin(async { Err(ToolError::Execution("boom".to_string())) }),
         );
 
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(error_tool);
         let mut bare = make_loop(registry);
         bare.set_reflector(Arc::new(AlwaysRecoverable));
@@ -2366,7 +2366,7 @@ mod tests {
             |_, _| Box::pin(async { Err(ToolError::Execution("boom".to_string())) }),
         );
 
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(error_tool);
         let mut bare = make_loop(registry);
         bare.set_reflector(Arc::new(AlwaysRecoverable));

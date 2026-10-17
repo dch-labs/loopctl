@@ -510,7 +510,7 @@ mod tests {
     }
 
     fn make_registry() -> Arc<ToolRegistry> {
-        let mut reg = ToolRegistry::new();
+        let reg = ToolRegistry::new();
         reg.register(ReadFileTool);
         Arc::new(reg)
     }

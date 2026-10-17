@@ -1,5 +1,6 @@
 Changed: a.rs (modified)
 │ 1 line removed, 1 line added
+@@ -1,2 +1,2 @@
   fn one() {}
 - fn two() {}
 + fn two() { todo!() }

@@ -169,7 +169,7 @@ fn loop_with_pipeline(
 #[tokio::test]
 async fn permission_denials_count_toward_the_breaker() {
     let executions = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FixedTool {
         name: "Bash",
         output: "ran",
@@ -222,7 +222,7 @@ async fn permission_denials_count_toward_the_breaker() {
 async fn preset_order_cap_verify_memoize_replays_cached_without_verify() {
     let write_execs = Arc::new(Mutex::new(Vec::new()));
     let read_execs = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FixedTool {
         name: "Write",
         output: "wrote",
@@ -285,7 +285,7 @@ async fn redaction_composes_outside_verify_and_memoize() {
     const SECRET: &str = "hunter2-supersecret";
     let write_execs = Arc::new(Mutex::new(Vec::new()));
     let read_execs = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FixedTool {
         name: "Write",
         output: "wrote",
@@ -353,7 +353,7 @@ async fn redaction_composes_outside_verify_and_memoize() {
 #[tokio::test]
 async fn memoize_hits_grow_health_with_the_original_duration() {
     let read_execs = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FixedTool {
         name: "Read",
         output: "payload",
@@ -405,7 +405,7 @@ async fn memoize_hits_grow_health_with_the_original_duration() {
 #[tokio::test]
 async fn verify_matches_write_tools_by_resolved_name() {
     let execs = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     // The called name must pass the availability gate, so the alias is
     // registered too; the inner renamer rewrites it to the canonical
     // write tool before the registry dispatch, and the executed name

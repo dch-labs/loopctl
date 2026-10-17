@@ -127,7 +127,7 @@ fn memoized_loop(tool: CountingTool) -> BareLoop<MockApiClient> {
     .flatten()
     .collect();
     let client = MockApiClient::new("test-model").with_responses(responses);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(tool);
     let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
     loop_
@@ -211,7 +211,7 @@ async fn middleware_returned_ids_are_overridden_by_the_engine() {
     .flatten()
     .collect();
     let client = MockApiClient::new("test-model").with_responses(responses);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(tool);
     let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
     loop_
@@ -349,7 +349,7 @@ async fn retries_pair_and_ids_survive_stacked_rewriters() {
     .flatten()
     .collect();
     let client = MockApiClient::new("m").with_responses(responses);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailOnceTool {
         calls: Mutex::new(0),
     });

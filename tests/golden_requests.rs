@@ -618,7 +618,7 @@ async fn system_and_tool_schemas_are_golden() {
         MockApiClient::new("golden-model").with_text_response("probed"),
         Vec::new(),
     ));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FixtureTool {
         name: "read_note",
         description: "Read a saved note by title",
@@ -671,7 +671,7 @@ async fn multi_turn_tool_results_are_golden() {
         MockApiClient::new("golden-model").with_responses(responses),
         Vec::new(),
     ));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FixtureTool {
         name: "echo",
         description: "Echo a word back",
@@ -848,7 +848,7 @@ async fn session_scoped_reasoning_request_is_golden() {
         ),
         reasoning_final_turn("both passes done; settling", "settled after two passes"),
     ]));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FixtureTool {
         name: "echo",
         description: "Echo a word back",
@@ -918,7 +918,7 @@ async fn constrained_decode_is_golden() {
         MockApiClient::new("golden-model").with_text_response("{\"greeting\": \"hello\"}"),
         Vec::new(),
     ));
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FixtureTool {
         name: "read_note",
         description: "Read a saved note by title",

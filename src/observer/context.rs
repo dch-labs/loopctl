@@ -1065,6 +1065,48 @@ pub struct ModelSwitchedContext {
     pub to: String,
 }
 
+/// Context for
+/// [`LoopObserver::on_tool_surface_changed`](crate::observer::LoopObserver::on_tool_surface_changed).
+///
+/// Emitted at the turn seam when the registry's tool set moved since
+/// the last turn the engine observed — a tool registered, removed, or
+/// overwritten in place at runtime through a shared registry. The name
+/// lists partition the change by shape: `added` and `removed` are the
+/// set difference of the advertised surface, `changed` holds names
+/// whose schema was overwritten without leaving the surface (same
+/// name, different advertised schema); `version` is the registry's
+/// monotonic mutation counter at the observation, so observers can
+/// order reports across a session.
+#[derive(Debug, Clone)]
+pub struct ToolSurfaceContext {
+    /// The registry's mutation counter at this observation.
+    ///
+    /// Monotonic across the registry's lifetime; two reports compare
+    /// by it even when turns interleave.
+    pub version: u64,
+
+    /// Names that entered the advertised surface since the last
+    /// observation.
+    ///
+    /// Sorted; empty when the change was removals or overwrites only.
+    pub added: Vec<String>,
+
+    /// Names that left the advertised surface since the last
+    /// observation.
+    ///
+    /// Sorted; empty when the change was additions or overwrites only.
+    pub removed: Vec<String>,
+
+    /// Names whose advertised schema changed in place since the last
+    /// observation.
+    ///
+    /// Sorted; an overwrite under the same name enters here — the name
+    /// never left the surface, so a consumer re-syncing from this
+    /// event re-reads exactly these tools. Empty when the change was
+    /// pure additions and removals.
+    pub changed: Vec<String>,
+}
+
 /// Context for [`LoopObserver::on_loop_detected`](crate::observer::LoopObserver::on_loop_detected).
 ///
 /// Describes the repeating tool pattern and how many times it

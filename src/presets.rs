@@ -649,7 +649,7 @@ mod tests {
             }
         }
 
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(CapSizedWriteTool);
         let pipeline = ConstrainedProfile::pipeline_builder()
             .with_core(Arc::new(registry))

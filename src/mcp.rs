@@ -648,6 +648,27 @@ pub struct McpToolProvider {
     /// [`with_call_timeout`](Self::with_call_timeout), which also updates
     /// already-discovered tools and applies to later refreshes.
     call_timeout: Duration,
+
+    /// Every tool this provider has registered into a target
+    /// registry, keyed by exposed name, regardless of what a later
+    /// [`refresh`](Self::refresh) did to the discovery snapshot.
+    ///
+    /// The reconciliation baseline behind
+    /// [`sync_into`](Self::sync_into): the snapshot alone cannot see a
+    /// name that was registered at setup and then dropped by the
+    /// server before any sync — after a refresh the snapshot mirrors
+    /// the server, and the orphan lives on only in the registry and
+    /// here. Holding the registered *tool*, not just its name, is
+    /// what keeps survivor comparisons honest: the registry's handle
+    /// is what a discovered tool must match, so a server-side change a
+    /// refresh already observed still re-registers instead of
+    /// comparing the refreshed snapshot against itself. The baseline
+    /// and the registry move in lockstep — every registration path
+    /// records here, every sync re-baselines from what it landed.
+    /// Interior-mutable because
+    /// [`register_into`](Self::register_into) records while holding
+    /// only `&self`.
+    registered: std::sync::Mutex<std::collections::HashMap<String, McpTool>>,
 }
 
 impl McpToolProvider {
@@ -688,6 +709,7 @@ impl McpToolProvider {
             tools,
             prefix: name_prefix,
             call_timeout: DEFAULT_MCP_CALL_TIMEOUT,
+            registered: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -770,11 +792,128 @@ impl McpToolProvider {
     /// -`warn` behaviour.
     ///
     /// Use [`Self::tools`] instead when you need finer control over which tools
-    /// to register.
-    pub fn register_into(&self, registry: &mut ToolRegistry) {
+    /// to register, or [`Self::sync_into`] when the registry is live and the
+    /// server's list may have changed since discovery.
+    pub fn register_into(&self, registry: &ToolRegistry) {
+        let mut registered = crate::error::recover_guard(self.registered.lock());
         for tool in &self.tools {
             registry.register(tool.clone());
+            registered.insert(tool.exposed_name.clone(), tool.clone());
         }
+    }
+
+    /// Re-run `tools/list` and mirror the result into a live registry
+    /// as a diff.
+    ///
+    /// The runtime-registry sync: re-discovers the server's tool list
+    /// (re-applying the captured `name_prefix`), then mutates only
+    /// what moved — names the server added are
+    /// [`register`](ToolRegistry::register)ed, names it dropped are
+    /// [`remove`](ToolRegistry::remove)d, and names present in both
+    /// snapshots keep their registration position and everything the
+    /// registry keys on their name (health history included); a
+    /// survivor whose advertised contract the server changed is
+    /// re-registered in place so the new description or annotations
+    /// read on the next request, while a survivor whose contract is
+    /// identical is not touched at all — not even re-registered — so
+    /// its handle identity survives the sync too. Survivors compare
+    /// against what the registry actually holds, so a change a
+    /// [`refresh`](Self::refresh) already pulled into the discovery
+    /// snapshot still re-registers here — the snapshot comparing
+    /// against itself can never strand a stale handle. Both arms
+    /// reconcile against the target passed in, not the provider's
+    /// history alone: a dropped name is removed only while the target
+    /// still holds this provider's registration
+    /// ([`registration_matches`](ToolRegistry::registration_matches)
+    /// — a foreign tool that overwrote the name is left alone with a
+    /// warning), and a survivor counts `untouched` only when the
+    /// target currently holds the matching registration — anything
+    /// else the survivor arm's three-way rule applies — ours is
+    /// updated in place, foreign-held is skipped with a warning
+    /// (never overwritten: a change on this provider's server must not
+    /// take ownership of a name another provider installed), and
+    /// missing is registered and reported as `added`, so a target that
+    /// never saw the provider, or lost it to a removal, gains the
+    /// surface instead of silently staying empty. The provider's
+    /// own snapshot is replaced by the same discovery, matching
+    /// [`refresh`](Self::refresh)'s error discipline: a failed re-list
+    /// leaves both the provider and the registry untouched.
+    ///
+    /// Drive this when the server signals
+    /// `notifications/tools/list_changed`, on a schedule, or whenever
+    /// the host knows the server mutated. Push subscription — handing
+    /// the notification itself to the engine — requires a
+    /// handler-bearing client, which this module's clients (fixed to
+    /// the pure `()` handler) do not yet install; the deferral is
+    /// deliberate, and this pull primitive is the seam that wiring
+    /// will drive.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Protocol`] if the re-list RPC fails; on error no
+    /// registry mutation has occurred.
+    pub async fn sync_into(&mut self, registry: &ToolRegistry) -> Result<McpSyncReport, McpError> {
+        let mut discovered = Vec::new();
+        bridge_tool_list(
+            &self.client,
+            self.prefix.as_deref(),
+            self.call_timeout,
+            &mut discovered,
+        )
+        .await?;
+        let new_names: std::collections::HashSet<String> = discovered
+            .iter()
+            .map(|tool| tool.exposed_name.clone())
+            .collect();
+
+        let mut report = McpSyncReport::default();
+        let mut registered = crate::error::recover_guard(self.registered.lock());
+        for (name, held) in registered.iter() {
+            if new_names.contains(name) {
+                continue;
+            }
+            if registry.registration_matches(name, &held.schema()) {
+                registry.remove(name);
+                report.removed.push(name.clone());
+            } else {
+                tracing::warn!(
+                    tool = %name,
+                    "skipping removal of a foreign-held name — the target                      registry's entry does not match this provider's                      registration"
+                );
+            }
+        }
+        let mut fresh = Vec::new();
+        for tool in discovered {
+            let held = registered.get(&tool.exposed_name);
+            let ours_in_target = held.is_some_and(|held| {
+                registry.registration_matches(&tool.exposed_name, &held.schema())
+            });
+            let changed = held.is_some_and(|held| !held.matches(&tool));
+            if held.is_some() && ours_in_target {
+                if changed {
+                    registry.register(tool.clone());
+                }
+                report.untouched.push(tool.exposed_name.clone());
+            } else if held.is_some() && registry.contains(&tool.exposed_name) {
+                tracing::warn!(
+                    tool = %tool.exposed_name,
+                    "skipping refresh of a foreign-held name — the target                      registry's entry does not match this provider's                      registration"
+                );
+            } else {
+                registry.register(tool.clone());
+                report.added.push(tool.exposed_name.clone());
+            }
+            fresh.push(tool);
+        }
+        self.tools = fresh;
+        registered.retain(|name, _| new_names.contains(name));
+        for tool in &self.tools {
+            registered.insert(tool.exposed_name.clone(), tool.clone());
+        }
+        report.added.sort();
+        report.removed.sort();
+        report.untouched.sort();
+        Ok(report)
     }
 
     /// Borrow the underlying client.
@@ -786,6 +925,40 @@ impl McpToolProvider {
     pub fn client(&self) -> &McpClient {
         &self.client
     }
+}
+
+/// What one [`McpToolProvider::sync_into`] pass changed.
+///
+/// The diff of a completed sync, by exposed (prefixed) name: names
+/// the server added, names it dropped, and names that survived —
+/// survivors kept their registration position and name-keyed history;
+/// a survivor whose schema the server changed was refreshed in place,
+/// an identical one was not touched at all. Hosts log or observe
+/// through this; the registry's own
+/// [`version`](crate::tool::ToolRegistry::version) moved by one bump
+/// per added name, per removed name, and per refreshed survivor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpSyncReport {
+    /// Exposed names this sync registered into the target.
+    ///
+    /// Sorted; either the server declared them fresh, or the target
+    /// did not hold this provider's matching registration for them —
+    /// a repair into a target that never saw it or lost it counts
+    /// here just as honestly.
+    pub added: Vec<String>,
+
+    /// Exposed names removed from the registry by this sync.
+    ///
+    /// Sorted; they were registered before and the server no longer
+    /// declares them.
+    pub removed: Vec<String>,
+
+    /// Exposed names that survived the sync with this target already
+    /// holding the provider's matching registration.
+    ///
+    /// Sorted; a server-side contract change among them was refreshed
+    /// in place — the name never left the surface.
+    pub untouched: Vec<String>,
 }
 
 /// A single MCP server tool exposed as a loopctl [`Tool`].
@@ -880,6 +1053,28 @@ pub struct McpTool {
 }
 
 impl McpTool {
+    /// Whether `other` advertises the exact contract this tool does.
+    ///
+    /// The survivor comparison behind
+    /// [`sync_into`](McpToolProvider::sync_into): every field a
+    /// consumer can observe or act on — the exposed and server-side
+    /// names, the description, both schemas, the read-only and
+    /// destructive annotations, and the call timeout — must match for
+    /// a sync to keep the registered handle; any one of them moving
+    /// replaces the handle so the registry never serves a stale
+    /// classification or budget. The client handle is deliberately
+    /// excluded: it is the provider's one shared connection, not part
+    /// of what the server advertised.
+    fn matches(&self, other: &Self) -> bool {
+        self.server_name == other.server_name
+            && self.exposed_name == other.exposed_name
+            && self.description == other.description
+            && self.input_schema == other.input_schema
+            && self.output_schema == other.output_schema
+            && self.read_only_hint == other.read_only_hint
+            && self.destructive_hint == other.destructive_hint
+            && self.call_timeout == other.call_timeout
+    }
     /// The server's `outputSchema`, if it declared one.
     ///
     /// Carried verbatim for forward-compatibility; the adapter does not validate

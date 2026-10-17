@@ -170,7 +170,7 @@ fn done_response() -> MockResponse {
 /// counters and the verifier's shell-class matching see one consistent
 /// tool surface.
 fn registry_with(read: CountingRead, grep: CountingGrep) -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(read);
     registry.register(grep);
     registry.register(OkBash);
@@ -488,11 +488,11 @@ async fn opt_out_composes_with_explicit_middleware() {
         tool_call_response("c1", "Write", serde_json::json!({"path": "/tmp/a.txt"})),
         done_response(),
     ]);
-    let mut all_tools = registry_with(read, grep);
+    let all_tools = registry_with(read, grep);
     all_tools.register(HostWrite);
     let mut agent = BareLoop::new(Arc::new(client), all_tools, Default::default());
     loopctl::presets::FrontierProfile::apply(&mut agent).expect("opt out first");
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(OkBash);
     tools.register(HostWrite);
     let pipeline = ToolPipeline::builder()
@@ -590,7 +590,7 @@ async fn a_bundle_supplied_pipeline_survives_default_construction() {
         tool_call_response("c1", "Write", serde_json::json!({"command": "rm -rf /"})),
         done_response(),
     ]);
-    let mut host_tools = ToolRegistry::new();
+    let host_tools = ToolRegistry::new();
     host_tools.register(OkBash);
     host_tools.register(HostWrite);
     let host_pipeline = ToolPipeline::builder()
@@ -602,7 +602,7 @@ async fn a_bundle_supplied_pipeline_survives_default_construction() {
         .build()
         .expect("the host pipeline builds");
     let managers = LoopManagers::new().with_pipeline(host_pipeline);
-    let mut loop_tools = registry_with(read, grep);
+    let loop_tools = registry_with(read, grep);
     loop_tools.register(HostWrite);
     let mut agent =
         BareLoop::new_with_managers(Arc::new(client), loop_tools, Default::default(), managers);
@@ -731,9 +731,9 @@ async fn explicit_apply_keeps_a_host_supplied_pipeline() {
         tool_call_response("c1", "Write", serde_json::json!({"command": "rm -rf /"})),
         done_response(),
     ]);
-    let mut host_tools = registry_with(read, grep);
+    let host_tools = registry_with(read, grep);
     host_tools.register(HostWrite);
-    let mut loop_tools = registry_with(
+    let loop_tools = registry_with(
         CountingRead {
             executions: Arc::new(Mutex::new(0usize)),
             payload: "r".repeat(32),

@@ -61,8 +61,8 @@ async fn main() {
     let provider = McpToolProvider::connect(client, None)
         .await
         .expect("connect + list_tools");
-    let mut registry = ToolRegistry::new();
-    provider.register_into(&mut registry);
+    let registry = ToolRegistry::new();
+    provider.register_into(&registry);
     println!("discovered {} tool(s):", registry.len());
     for schema in registry.all_schemas() {
         println!("  - {} : {}", schema.tool, schema.description);

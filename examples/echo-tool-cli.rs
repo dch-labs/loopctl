@@ -61,7 +61,7 @@ async fn main() {
     ]);
 
     // 2. Build the tool registry with a single `echo` tool.
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(
         FnTool::new(
             "echo".into(),

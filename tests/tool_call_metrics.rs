@@ -203,7 +203,7 @@ async fn direct_path_scenario(capture: &MetricCapture) {
         turn("b1", "broken", json!({})),
         terminal(),
     ];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(SearchMemoriesTool::new(
         Arc::clone(&store) as Arc<dyn LoopMemory>
     ));
@@ -294,7 +294,7 @@ async fn direct_path_scenario(capture: &MetricCapture) {
 /// for one call, which this scenario's exact count catches.
 async fn pipeline_path_scenario(capture: &MetricCapture) {
     let before = capture.events().len();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(PlainTool);
     let responses = vec![turn("q1", "plain", json!({})), terminal()];
     let mut loop_ = BareLoop::new(
@@ -415,7 +415,7 @@ async fn deprecated_think_coexistence_scenario(capture: &MetricCapture) {
         ),
         terminal(),
     ];
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(ThinkTool::new());
     let mut loop_ = BareLoop::new(
         Arc::new(MockApiClient::new("m").with_responses(responses)),

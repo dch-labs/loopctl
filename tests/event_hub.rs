@@ -89,7 +89,7 @@ fn call(id: &str) -> MockToolCall {
 /// A scripted two-turn run: one tool-using turn, then the final answer.
 fn scripted_loop(hub: Arc<EventHub>, responses: Vec<MockResponse>) -> BareLoop<MockApiClient> {
     let client = MockApiClient::new("test-model").with_responses(responses);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool);
     BareLoop::new(Arc::new(client), registry, SessionConfig::default()).with_observer(hub)
 }

@@ -387,7 +387,7 @@ fn make_agent(
 }
 
 fn registry_with<T: Tool + 'static>(tool: T) -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(tool);
     registry
 }

@@ -596,6 +596,46 @@ mod tests {
         }
     }
 
+    /// A host tool whose result is prose followed by a JSON object
+    /// part, marked with the JSON display hint.
+    ///
+    /// The multipart emission fixture: exactly the shape the client
+    /// bridge produces for a prose-plus-structured result — the JSON
+    /// lane rides as the *last* text part, so an emission arm that
+    /// parses the joined text instead of the last part loses it.
+    struct ProseAndJsonTool;
+
+    impl Tool for ProseAndJsonTool {
+        fn name(&self) -> &'static str {
+            "prose_and_json"
+        }
+        fn description(&self) -> &'static str {
+            "Prose then a shaped object"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "prose_and_json".into(),
+                description: self.description().into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async {
+                Ok(
+                    ToolOutput::success(crate::message::ToolContent::from_multipart(vec![
+                        crate::message::ToolContentPart::text("the shaped result follows"),
+                        crate::message::ToolContentPart::text(r#"{"city":"Tromsø"}"#),
+                    ]))
+                    .with_hint(crate::tool::DisplayHint::Json),
+                )
+            })
+        }
+    }
+
     /// A host tool whose JSON hint lies — the payload is prose, not
     /// JSON — so the emission arm must keep the text lane and warn
     /// instead of emitting garbage.
@@ -1107,6 +1147,34 @@ mod tests {
                 .iter()
                 .any(|block| matches!(block, rmcp::model::ContentBlock::Text(_))),
             "the text lane survives for clients that ignore structure"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_emits_structured_content_from_a_multipart_payload() {
+        let registry = ToolRegistry::new();
+        registry.register(ProseAndJsonTool);
+        let adapter = McpServerAdapter::new(
+            registry,
+            ToolContext::default(),
+            "test".into(),
+            "0.0.1".into(),
+        );
+        let client = serve_and_connect(&adapter).await;
+
+        let result = client
+            .service
+            .call_tool(rmcp::model::CallToolRequestParams::new("prose_and_json"))
+            .await
+            .expect("call prose_and_json");
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("the JSON lane rides the structured lane even beside prose");
+        assert_eq!(
+            structured.get("city").and_then(serde_json::Value::as_str),
+            Some("Tromsø"),
+            "the parsed object is the last text part, not the joined text"
         );
     }
 

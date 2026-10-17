@@ -98,11 +98,16 @@ pub(crate) fn bridge_result(
             Err(violation) => match policy {
                 StructuredContentPolicy::Error => {
                     structured_metric(tool_name, "invalid");
-                    let payload = bounded_payload(&structured);
-                    return Ok(ToolOutput::error_text(format!(
+                    parts.push(ToolContentPart::text(format!(
                         "structuredContent for MCP tool '{tool_name}' violates its \
-                         declared outputSchema — {violation}; payload: {payload}"
+                         declared outputSchema — {violation}; payload: {payload}",
+                        violation = bound_text(&violation),
+                        payload = bound_text(
+                            &serde_json::to_string(&structured)
+                                .unwrap_or_else(|_| "<unserializable>".to_string())
+                        ),
                     )));
+                    return assemble(tool_name, parts, true, false);
                 }
                 StructuredContentPolicy::Lenient => {
                     structured_metric(tool_name, "invalid");
@@ -216,18 +221,19 @@ fn json_lane_part(structured: &serde_json::Value) -> ToolContentPart {
     )
 }
 
-/// The bounded raw payload carried into a validation failure's text.
+/// The bound every validation-failure text passes through.
 ///
 /// The model sees what came back so it can adapt, but a pathological
-/// payload cannot flood the context: the render is cut at
+/// payload cannot flood the context — through either channel: the
+/// raw payload appendix *and* the violation text itself, which embeds
+/// the failing instance (a huge array against an object schema would
+/// otherwise ride the violation in full). Both are cut at
 /// `MAX_STRUCTURED_ERROR_BYTES` on a character boundary with an
 /// explicit truncation marker.
-fn bounded_payload(structured: &serde_json::Value) -> String {
+fn bound_text(rendered: &str) -> String {
     const MAX_STRUCTURED_ERROR_BYTES: usize = 2048;
-    let rendered = serde_json::to_string(structured)
-        .unwrap_or_else(|_| "<unserializable structuredContent>".to_string());
     if rendered.len() <= MAX_STRUCTURED_ERROR_BYTES {
-        return rendered;
+        return rendered.to_string();
     }
     let cut = rendered
         .floor_char_boundary(MAX_STRUCTURED_ERROR_BYTES)
@@ -366,12 +372,21 @@ pub(crate) fn dispatch_result_to_call_tool(
 ) -> CallToolResult {
     match result {
         Ok(out) => {
-            let text_lane = out.text_content();
-            let content = tool_content_to_mcp(out.payload);
-            let mut res = CallToolResult::success(content);
+            let mut res = CallToolResult::success(tool_content_to_mcp(out.payload.clone()));
             res.is_error = Some(out.is_error);
-            if !out.is_error && matches!(out.display_hint, Some(DisplayHint::Json)) {
-                match serde_json::from_str::<serde_json::Value>(&text_lane) {
+            let structured_source = match &out.payload {
+                MessageToolContent::Text(text) => Some(text.clone()),
+                MessageToolContent::Multipart(parts) => {
+                    parts.iter().rev().find_map(|part| match part {
+                        ToolContentPart::Text { text } => Some(text.clone()),
+                        ToolContentPart::Image { .. } => None,
+                    })
+                }
+            };
+            if let Some(structured_source) = structured_source
+                .filter(|_| !out.is_error && matches!(out.display_hint, Some(DisplayHint::Json)))
+            {
+                match serde_json::from_str::<serde_json::Value>(&structured_source) {
                     Ok(value @ serde_json::Value::Object(_)) => {
                         tracing::debug!(
                             target: "loopctl::metrics",

@@ -1092,3 +1092,96 @@ async fn schema_without_structured_content_is_text_only() {
         "the text lane serves alone, byte-identical to a schema-less tool"
     );
 }
+
+#[tokio::test]
+async fn invalid_content_keeps_the_server_text_lane_beside_the_verdict() {
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        shaped_output_schema(),
+        json!({"city": 42}),
+    ))
+    .await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("structured tool");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(out.is_error, "the verdict is a soft error");
+    assert!(
+        out.text_content().contains("is not of type"),
+        "the violation rides the output: {}",
+        out.text_content()
+    );
+    assert!(
+        out.text_content().contains("shaped result follows"),
+        "the server's own text lane survives beside the verdict — the fallback \
+         the spec keeps everywhere else: {}",
+        out.text_content()
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_violation_stays_under_the_bound() {
+    let flood: Vec<String> = (0..200)
+        .map(|i| format!("payload-{i:05}-xxxxxxxxxxxxxxxx"))
+        .collect();
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        json!({"type": "object"}),
+        serde_json::Value::Array(flood.into_iter().map(serde_json::Value::String).collect()),
+    ))
+    .await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let tool = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "structured")
+        .expect("structured tool");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(out.is_error, "an array against an object schema is invalid");
+    assert!(
+        out.text_content().len() < 5 * 1024,
+        "the verdict and the bounded payload together stay under the anti-flood \
+         bound, never carrying the raw instance twice: {} bytes",
+        out.text_content().len()
+    );
+}
+
+#[tokio::test]
+async fn a_policy_change_reaches_already_registered_tools() {
+    let (client, _server) = connect_in_process(StructuredServer::new(
+        shaped_output_schema(),
+        json!({"city": 42}),
+    ))
+    .await;
+    let mut provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let registry = ToolRegistry::new();
+    provider.register_into(&registry);
+    provider = provider.with_structured_policy(loopctl::mcp::StructuredContentPolicy::Lenient);
+    let _report = provider.sync_into(&registry).await.expect("sync");
+
+    let tool = registry
+        .get("structured")
+        .expect("the survivor stays registered");
+    let out = tool
+        .call(json!({}), &ToolContext::default())
+        .await
+        .expect("call ok");
+    assert!(
+        !out.is_error,
+        "the builder's policy reaches the registry's clones — a changed policy is a \
+         changed contract the sync must land: {out:?}"
+    );
+}

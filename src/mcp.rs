@@ -1117,9 +1117,10 @@ pub struct McpTool {
     ///
     /// Copied from the provider at discovery and refresh (or updated by
     /// [`with_structured_policy`](McpToolProvider::with_structured_policy)).
-    /// Deliberately excluded from
-    /// [`matches`](Self::matches): it is host configuration, not part
-    /// of what the server advertised.
+    /// Compared in [`matches`](Self::matches) alongside
+    /// `call_timeout`: host configuration must not go stale through a
+    /// sync, so a policy change re-registers the survivors that carry
+    /// it.
     structured_policy: StructuredContentPolicy,
 }
 
@@ -1130,10 +1131,11 @@ impl McpTool {
     /// [`sync_into`](McpToolProvider::sync_into): every field a
     /// consumer can observe or act on — the exposed and server-side
     /// names, the description, both schemas, the read-only and
-    /// destructive annotations, and the call timeout — must match for
-    /// a sync to keep the registered handle; any one of them moving
-    /// replaces the handle so the registry never serves a stale
-    /// classification or budget. The client handle is deliberately
+    /// destructive annotations, the call timeout, and the structured
+    /// -content policy — must match for a sync to keep the registered
+    /// handle; any one of them moving replaces the handle so the
+    /// registry never serves a stale classification, budget, or
+    /// validation policy. The client handle is deliberately
     /// excluded: it is the provider's one shared connection, not part
     /// of what the server advertised.
     fn matches(&self, other: &Self) -> bool {
@@ -1145,6 +1147,7 @@ impl McpTool {
             && self.read_only_hint == other.read_only_hint
             && self.destructive_hint == other.destructive_hint
             && self.call_timeout == other.call_timeout
+            && self.structured_policy == other.structured_policy
     }
     /// The server's `outputSchema`, if it declared a compilable one.
     ///

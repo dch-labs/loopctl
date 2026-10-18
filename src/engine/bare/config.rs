@@ -133,7 +133,38 @@ impl<C: ApiClient> BareLoop<C> {
     /// a loop that has never heard of selection; the selector must be
     /// deterministic for a given context.
     pub fn set_tool_selector(&mut self, selector: std::sync::Arc<dyn crate::tool::ToolSelector>) {
+        self.async_tool_selector = None;
         self.tool_selector = Some(selector);
+    }
+
+    /// Set the per-turn async tool-surface selector.
+    ///
+    /// The async companion to [`set_tool_selector`](BareLoop::set_tool_selector):
+    /// consulted once per turn at the same request-build seam, ahead
+    /// of the payload estimate, so the estimate and the wire share
+    /// one selection. Configuring this clears any sync selector — the
+    /// engine takes one selector, never both. Async selection is
+    /// opt-in by construction and its determinism contract is
+    /// deliberately relaxed (see
+    /// [`AsyncToolSelector`](crate::tool::AsyncToolSelector)).
+    pub fn set_async_tool_selector(
+        &mut self,
+        selector: std::sync::Arc<dyn crate::tool::AsyncToolSelector>,
+    ) {
+        self.tool_selector = None;
+        self.async_tool_selector = Some(selector);
+    }
+
+    /// Set the async tool-surface selector, consuming `self`. Fluent
+    /// mirror of
+    /// [`set_async_tool_selector`](BareLoop::set_async_tool_selector).
+    #[must_use]
+    pub fn with_async_tool_selector(
+        mut self,
+        selector: std::sync::Arc<dyn crate::tool::AsyncToolSelector>,
+    ) -> Self {
+        self.set_async_tool_selector(selector);
+        self
     }
 
     /// Set the tool-surface selector, consuming `self`. Fluent mirror

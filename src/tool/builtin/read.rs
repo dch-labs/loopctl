@@ -706,9 +706,10 @@ impl<S: ContentSource> Tool for ReadTool<S> {
     }
 
     fn description(&self) -> &'static str {
-        "Read content through the configured source, numbered line by line. \
-         Whole content when it fits; a cut view always says so, naming the \
-         returned lines and where reading continues."
+        "Read content through the configured source, numbered line by line — \
+         open, view, or inspect a file. Whole content when it fits; a cut \
+         view always says so, naming the returned lines and where reading \
+         continues."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -785,6 +786,22 @@ impl<S: ContentSource> Tool for ReadTool<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_description_carries_the_open_view_vocabulary() {
+        // The recall audit's content layer: users say "open the file" and
+        // "view the config" — the description must carry that vocabulary
+        // or the keyword selector has nothing to match.
+        let tool = ReadTool::new(FakeSource::with(&[]));
+        let description = Tool::description(&tool);
+        for word in ["open", "view"] {
+            assert!(
+                description.contains(word),
+                "the description keeps the open/view vocabulary ('{word}'): {description}"
+            );
+        }
+    }
+
     use std::collections::HashMap;
 
     /// A fake source: text and byte entries, optional reported sizes, an

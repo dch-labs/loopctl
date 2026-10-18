@@ -85,8 +85,9 @@ impl<S: SearchSource + 'static> Tool for GrepTool<S> {
     }
 
     fn description(&self) -> &'static str {
-        "Search for a regex pattern in file contents within a directory. \
-         Returns matching lines with file paths and line numbers."
+        "Search for a regex pattern in file contents within a directory — \
+         find where something is defined, used, or mentioned. Returns \
+         matching lines with file paths and line numbers."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -281,6 +282,22 @@ fn render(matches: &[Match], temp_dir: &Path) -> Result<ToolOutput, ToolError> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_description_carries_the_lookup_vocabulary() {
+        // The recall audit's content layer: users say "find where X is
+        // defined" — the description must carry that vocabulary or the
+        // keyword selector has nothing to match.
+        let tool = GrepTool::new(FakeSearchSource::with(&[]));
+        let description = Tool::description(&tool);
+        for word in ["find", "defined"] {
+            assert!(
+                description.contains(word),
+                "the description keeps the lookup vocabulary ('{word}'): {description}"
+            );
+        }
+    }
+
     use crate::tool::builtin::search::content::parse_input;
     use crate::tool::builtin::search::test_support::FakeFile;
     use crate::tool::builtin::search::test_support::FakeSearchSource;

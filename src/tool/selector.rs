@@ -20,6 +20,9 @@
 //! composes automatically — it constrains the model's calls to
 //! whatever is advertised this turn.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::message::Message;
 use crate::tool::ToolSchema;
 
@@ -78,6 +81,508 @@ pub trait ToolSelector: Send + Sync {
     /// Returned schemas must be members of `all` — the engine
     /// advertises the selection verbatim.
     fn select(&self, ctx: &SelectionContext<'_>, all: &[ToolSchema]) -> Vec<ToolSchema>;
+}
+
+/// The async companion to [`ToolSelector`], for selections that need
+/// a call to decide.
+///
+/// Consulted exactly once per turn at the same engine seam as the
+/// sync trait — the request-build step ahead of the payload estimate —
+/// so the estimate and the wire share one selection, whichever trait
+/// produced it. Implementations own their failure policy and must
+/// fail open: an embed error, a rewrite timeout, or unparseable
+/// output advertises the full surface (the returned `Vec` carries no
+/// error; log what happened and return `all` unchanged). Selection is
+/// **not** required to be deterministic — the sync trait's
+/// determinism contract is deliberately relaxed here — because the
+/// value of an async selector is exactly the judgment a call buys;
+/// the engine's once-per-turn discipline is what keeps the estimate
+/// explainable, not replayability.
+///
+/// The engine takes a sync selector or an async one, never both:
+/// configuring one clears the other.
+pub trait AsyncToolSelector: Send + Sync {
+    /// The subset of `all` to advertise this turn.
+    ///
+    /// Same contract as [`ToolSelector::select`]: returned schemas
+    /// must be members of `all`, an empty return advertises nothing,
+    /// and fail-open is the implementation's own responsibility.
+    fn select<'a>(
+        &'a self,
+        ctx: &'a SelectionContext<'a>,
+        all: &'a [ToolSchema],
+    ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>>;
+}
+
+/// A semantic selector: embeds each tool once per registry generation
+/// and the turn's query per turn, advertising the top-k nearest by
+/// cosine similarity.
+///
+/// For registries where keyword recall is structurally insufficient
+/// (MCP-mounted surfaces, fifty-plus tools): "look up rust news"
+/// lands near "search the web" because the embeddings say so, not the
+/// vocabulary. The tool corpus is embedded once and cached against
+/// the ordered name list — a registry mutation (L-95's runtime
+/// surface) changes the list and re-embeds on the next turn — and the
+/// query embeds fresh every turn. Any embed failure fails open to the
+/// full surface with a warning: selection must never strand the
+/// model. Deterministic for a fixed provider, but the sync trait's
+/// determinism contract is relaxed (see [`AsyncToolSelector`]).
+///
+/// # Cost
+///
+/// One embedding call per turn for the query plus one call per
+/// registry generation for the corpus — cheap relative to a rewrite
+/// call, and nothing on a miss.
+#[cfg(feature = "vector_index")]
+pub struct EmbeddingSelector<P> {
+    /// The embedding source both lanes consult.
+    ///
+    /// Corpus and query vectors come from the same provider, so one
+    /// dimensionality — and one quality profile — underpins every
+    /// ranking.
+    provider: P,
+
+    /// How many of the nearest tools a selection advertises.
+    ///
+    /// Clamped to the registry size at selection time; tuned through
+    /// [`with_top_k`](Self::with_top_k), defaulting to 8.
+    top_k: usize,
+
+    /// The per-generation corpus cache.
+    ///
+    /// Holds the embedded tool set behind an interior lock that is
+    /// released across the embed await (an await under a std lock is
+    /// forbidden by the crate's lints); see [`EmbeddingCache`] for
+    /// the invalidation rule.
+    cache: std::sync::Mutex<EmbeddingCache>,
+}
+
+#[cfg(feature = "vector_index")]
+struct EmbeddingCache {
+    /// The ordered name list the corpus embeddings describe.
+    ///
+    /// A registry generation's identity: names changing (the L-95
+    /// mutation surface) invalidates the corpus on the next
+    /// selection.
+    names: Vec<String>,
+
+    /// Each tool's embedding, aligned with `names`.
+    ///
+    /// Built by one batch embed per registry generation; indexed
+    /// beside `names` so a ranking maps straight back to its schema.
+    embeddings: Vec<crate::memory::vector::Embedding>,
+}
+
+#[cfg(feature = "vector_index")]
+impl<P: crate::memory::vector::EmbeddingProvider> EmbeddingSelector<P> {
+    /// Build over an embedding provider, advertising the top 8.
+    ///
+    /// The corpus embeds lazily on the first selection.
+    #[must_use]
+    pub fn new(provider: P) -> Self {
+        Self {
+            provider,
+            top_k: 8,
+            cache: std::sync::Mutex::new(EmbeddingCache {
+                names: Vec::new(),
+                embeddings: Vec::new(),
+            }),
+        }
+    }
+
+    /// Advertise the k nearest tools instead of 8.
+    ///
+    /// `k` is clamped to the registry size at selection time, so an
+    /// over-large k simply advertises everything.
+    #[must_use]
+    pub fn with_top_k(mut self, k: usize) -> Self {
+        self.top_k = k;
+        self
+    }
+
+    /// The corpus embeddings for `all`, re-embedding when the ordered
+    /// name list moved.
+    ///
+    /// The cache read happens under the lock; the embed call happens
+    /// with it released (an await under a std lock is forbidden by
+    /// the crate's lints). The read-side key check is the guard: a
+    /// concurrent same-generation caller either finds the cache
+    /// already populated or re-embeds and stores — last writer wins
+    /// with the same key, so the corpus stays consistent.
+    /// # Errors
+    ///
+    /// The provider's embed failure for the corpus batch — the
+    /// caller fails open.
+    async fn corpus(
+        &self,
+        all: &[ToolSchema],
+        texts: &[String],
+    ) -> Result<Vec<crate::memory::vector::Embedding>, crate::error::LoopError> {
+        {
+            let cache = crate::error::recover_guard(self.cache.lock());
+            let cached = cache.names.iter().map(String::as_str).collect::<Vec<_>>()
+                == all
+                    .iter()
+                    .map(|schema| schema.tool.as_str())
+                    .collect::<Vec<_>>();
+            if cached {
+                return Ok(cache.embeddings.clone());
+            }
+        }
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let embedded = self.provider.embed_batch(&refs).await?;
+        let mut cache = crate::error::recover_guard(self.cache.lock());
+        cache.names = all.iter().map(|schema| schema.tool.clone()).collect();
+        cache.embeddings = embedded;
+        Ok(cache.embeddings.clone())
+    }
+}
+
+#[cfg(feature = "vector_index")]
+impl<P: crate::memory::vector::EmbeddingProvider> AsyncToolSelector for EmbeddingSelector<P> {
+    fn select<'a>(
+        &'a self,
+        ctx: &'a SelectionContext<'a>,
+        all: &'a [ToolSchema],
+    ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>> {
+        Box::pin(async move {
+            if all.is_empty() {
+                return all.to_vec();
+            }
+            let Some(query) = ctx.latest_user_message else {
+                return all.to_vec();
+            };
+            let texts: Vec<String> = all
+                .iter()
+                .map(|schema| format!("{} {}", schema.tool, schema.description))
+                .collect();
+            let corpus = match self.corpus(all, &texts).await {
+                Ok(corpus) => corpus,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "embedding the tool corpus failed; advertising the full surface"
+                    );
+                    return all.to_vec();
+                }
+            };
+            let embedded_query = match self.provider.embed(query).await {
+                Ok(embedded) => embedded,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "embedding the query failed; advertising the full surface"
+                    );
+                    return all.to_vec();
+                }
+            };
+            let mut ranked: Vec<(usize, f32)> = corpus
+                .iter()
+                .zip(&texts)
+                .enumerate()
+                .filter_map(|(index, (embedding, _))| {
+                    let score = cosine(embedded_query.as_slice(), embedding.as_slice());
+                    (score.is_finite()).then_some((index, score))
+                })
+                .collect();
+            ranked.sort_by(|left, right| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let take = self.top_k.min(all.len());
+            let chosen: Vec<usize> = ranked
+                .into_iter()
+                .take(take)
+                .map(|(index, _)| index)
+                .collect();
+            all.iter()
+                .enumerate()
+                .filter(|(index, _)| chosen.contains(index))
+                .map(|(_, schema)| schema.clone())
+                .collect()
+        })
+    }
+}
+
+/// Cosine similarity between two vectors.
+///
+/// Zero-norm vectors score `None` (excluded upstream) rather than
+/// NaN; equal-length is assumed from a single provider's fixed
+/// dimensionality.
+#[cfg(feature = "vector_index")]
+fn cosine(left: &[f32], right: &[f32]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    for (l, r) in left.iter().zip(right) {
+        dot += l * r;
+        left_norm += l * l;
+        right_norm += r * r;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return f32::NAN;
+    }
+    dot / (left_norm.sqrt() * right_norm.sqrt())
+}
+
+/// A query-rewriting selector: a small-model call that sees the tool
+/// names and one-line summaries — never the schemas — plus the run
+/// prompt and recent context, and answers with this turn's tool list.
+///
+/// The strongest recall layer below "advertise everything": judgment
+/// instead of vocabulary, at the cost of one small non-streaming call
+/// per turn. Names and one-line summaries only, because a rewrite
+/// that sees full schemas spends the tokens selection exists to save.
+/// Failure fails open everywhere — a timeout, a transport error, a
+/// budget refusal, or output naming no known tool advertises the full
+/// surface with a warning; output naming *some* tools advertises
+/// exactly those, in registry order. Determinism is relaxed and
+/// documented (see [`AsyncToolSelector`]); the engine's one-selection
+/// -per-turn seam keeps estimate and wire on the same answer.
+///
+/// # Cost
+///
+/// One non-streaming model call per turn, bounded by
+/// [`with_timeout`](Self::with_timeout) (default 10 seconds) and by
+/// the optional [`with_budget`](Self::with_budget) gate, with each
+/// conversation excerpt capped at 400 bytes so the prompt grows with
+/// the tool list, never with the history's bodies — the P8 trade-off
+/// stated plainly: this selector spends tokens to save window.
+pub struct RewritingSelector<C> {
+    /// The model the rewrite calls ride on.
+    ///
+    /// Shared behind an [`Arc`](std::sync::Arc) with whatever else
+    /// uses the same handle — a small model on a cheap route is the
+    /// intended wiring.
+    client: std::sync::Arc<C>,
+
+    /// How long one rewrite call may take.
+    ///
+    /// Set through [`with_timeout`](Self::with_timeout), defaulting
+    /// to 10 seconds; a call that outlives it fails open instead of
+    /// stalling the turn's request build.
+    timeout: std::time::Duration,
+
+    /// The optional spend gate over the rewrite calls.
+    ///
+    /// Built by [`with_budget`](Self::with_budget); fed every call's
+    /// reported usage and consulted before each new call, refusing on
+    /// a hard crossing.
+    budget: Option<crate::budget::BudgetGate>,
+
+    /// Whether the gate's spend window has been latched open.
+    ///
+    /// Flipped exactly once, at the first budgeted selection, so
+    /// `begin` resets the spend state a single time for the
+    /// selector's lifetime.
+    budget_begun: std::sync::atomic::AtomicBool,
+
+    /// The instant the spend window started.
+    ///
+    /// Latched alongside `budget_begun`; the elapsed since it is what
+    /// the gate's wall-clock dimension measures — the clock the
+    /// caller-side check needs, since the gate records no start of
+    /// its own.
+    budget_started_at: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl<C: crate::api::ApiClient> RewritingSelector<C> {
+    /// Build over a client, one call per turn bounded to 10 seconds.
+    ///
+    /// The client is the same handle the loop uses — a small model on
+    /// a cheap route is the intended wiring.
+    #[must_use]
+    pub fn new(client: std::sync::Arc<C>) -> Self {
+        Self {
+            client,
+            timeout: std::time::Duration::from_secs(10),
+            budget: None,
+            budget_begun: std::sync::atomic::AtomicBool::new(false),
+            budget_started_at: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Bound each rewrite call to `timeout` instead of 10 seconds.
+    ///
+    /// A rewrite that cannot answer in time fails open rather than
+    /// stalling the turn's request build.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Gate the rewrite calls on their own budget.
+    ///
+    /// The selector owns a [`BudgetGate`](crate::budget::BudgetGate)
+    /// built from `limits`, feeds it every rewrite call's reported
+    /// usage, and measures wall-clock spend from its first selection —
+    /// the existing budget machinery, applied to selection spend. A
+    /// hard crossing (tokens or duration) refuses further rewrite
+    /// calls (each failing open to the full surface) for the
+    /// selector's lifetime.
+    #[must_use]
+    pub fn with_budget(mut self, limits: crate::budget::BudgetLimits) -> Self {
+        self.budget = Some(crate::budget::BudgetGate::new(limits));
+        self
+    }
+
+    /// The one-line summary of a tool for the rewrite prompt.
+    ///
+    /// The first sentence-ish line of the description, trimmed —
+    /// names plus summaries, never schemas.
+    fn summary(schema: &ToolSchema) -> &str {
+        schema
+            .description
+            .split('.')
+            .next()
+            .map_or(schema.description.as_str(), str::trim)
+    }
+
+    /// The bounded excerpt of a conversation message.
+    ///
+    /// Tool-name judgment needs a message's shape, not its body: each
+    /// excerpt keeps the first `MAX_EXCERPT_BYTES` on a character
+    /// boundary with an explicit marker, so a hundred-kilobyte tool
+    /// result cannot ride the rewrite prompt — or its response —
+    /// verbatim.
+    fn bound_excerpt(text: &str) -> String {
+        const MAX_EXCERPT_BYTES: usize = 400;
+        if text.len() <= MAX_EXCERPT_BYTES {
+            return text.to_string();
+        }
+        let cut = text.floor_char_boundary(MAX_EXCERPT_BYTES);
+        format!("{}…", &text[..cut])
+    }
+
+    /// Render the rewrite prompt.
+    ///
+    /// Names and one-line summaries, the recent conversation, and the
+    /// request — the shapes a small model needs to judge, and nothing
+    /// it does not.
+    fn prompt(ctx: &SelectionContext<'_>, all: &[ToolSchema]) -> String {
+        let mut prompt = String::from(
+            "You select tools. Reply with a comma-separated list of tool \
+             names from the list below, nothing else.\n\n",
+        );
+        prompt.push_str("Tools:\n");
+        for schema in all {
+            prompt.push_str(schema.tool.as_str());
+            prompt.push_str(": ");
+            prompt.push_str(Self::summary(schema));
+            prompt.push('\n');
+        }
+        prompt.push_str("\nRecent conversation:\n");
+        for message in ctx.conversation.iter().rev().take(6).rev() {
+            let text = message.text_content();
+            if !text.is_empty() {
+                prompt.push_str(&message.role.to_string().to_lowercase());
+                prompt.push_str(": ");
+                prompt.push_str(&Self::bound_excerpt(&text));
+                prompt.push('\n');
+            }
+        }
+        prompt.push_str("\nThe request: ");
+        prompt.push_str(ctx.latest_user_message.unwrap_or_default());
+        prompt.push_str("\n\nTool names to advertise this turn:");
+        prompt
+    }
+
+    /// Parse the model's answer into known tool names.
+    ///
+    /// Split on separators, trimmed, matched case-insensitively
+    /// against the advertised names; unknown words drop, order
+    /// follows the registry at the caller.
+    fn parse_answer(answer: &str, all: &[ToolSchema]) -> Vec<String> {
+        let lowered = answer.to_ascii_lowercase();
+        lowered
+            .split([',', '\n', ';'])
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .filter_map(|word| {
+                let trimmed = word.trim_start_matches("- ");
+                all.iter()
+                    .find(|schema| schema.tool.to_ascii_lowercase() == trimmed)
+                    .map(|schema| schema.tool.clone())
+            })
+            .collect()
+    }
+}
+
+impl<C: crate::api::ApiClient> AsyncToolSelector for RewritingSelector<C> {
+    fn select<'a>(
+        &'a self,
+        ctx: &'a SelectionContext<'a>,
+        all: &'a [ToolSchema],
+    ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>> {
+        Box::pin(async move {
+            if all.is_empty() {
+                return all.to_vec();
+            }
+            if let Some(gate) = &self.budget {
+                use std::sync::atomic::Ordering::Relaxed;
+                let started = *crate::error::recover_guard(self.budget_started_at.lock())
+                    .get_or_insert_with(std::time::Instant::now);
+                if !self.budget_begun.swap(true, Relaxed) {
+                    gate.begin();
+                }
+                if gate.pre_request(started.elapsed()).1.is_some() {
+                    tracing::warn!("rewrite budget exhausted; advertising the full surface");
+                    return all.to_vec();
+                }
+            }
+            let request =
+                crate::api::StreamRequest::new(vec![Message::user(Self::prompt(ctx, all))]);
+            let rewritten = tokio::time::timeout(self.timeout, async {
+                match self.client.create_message(&request).await {
+                    Ok(response) => {
+                        let usage = response.usage;
+                        Some((response.message.text_content(), usage))
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "rewrite call failed; advertising the full surface"
+                        );
+                        None
+                    }
+                }
+            })
+            .await;
+            let (answer, usage) = match rewritten {
+                Ok(Some((text, usage))) => (text, usage),
+                Ok(None) => return all.to_vec(),
+                Err(_) => {
+                    tracing::warn!(
+                        timeout = ?self.timeout,
+                        "rewrite call timed out; advertising the full surface"
+                    );
+                    return all.to_vec();
+                }
+            };
+            if let (Some(gate), Some(usage)) = (&self.budget, usage) {
+                gate.observe_usage(
+                    u64::from(usage.input_tokens),
+                    u64::from(usage.output_tokens),
+                );
+            }
+            let chosen = Self::parse_answer(&answer, all);
+            if chosen.is_empty() {
+                tracing::warn!(
+                    answer = %answer,
+                    "rewrite named no known tool; advertising the full surface"
+                );
+                return all.to_vec();
+            }
+            all.iter()
+                .filter(|schema| chosen.contains(&schema.tool))
+                .cloned()
+                .collect()
+        })
+    }
 }
 
 /// Advertise every registered tool — the loop's default behavior as an
@@ -734,5 +1239,484 @@ mod tests {
             "a prompt's glue words must not advertise every tool whose \
              description says 'the'"
         );
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+    #[cfg(feature = "testing")]
+    use std::sync::Arc;
+    #[cfg(feature = "vector_index")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn schema(name: &str, description: &str) -> ToolSchema {
+        ToolSchema::new(name, description, serde_json::json!({"type": "object"}))
+    }
+
+    /// A selection-recording async double advertising a fixed subset.
+    struct FixedAsyncSelector {
+        chosen: Vec<String>,
+        turns: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl AsyncToolSelector for FixedAsyncSelector {
+        fn select<'a>(
+            &'a self,
+            ctx: &'a SelectionContext<'a>,
+            all: &'a [ToolSchema],
+        ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>> {
+            Box::pin(async move {
+                let mut turns = self
+                    .turns
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                turns.push(ctx.turn);
+                drop(turns);
+                all.iter()
+                    .filter(|schema| self.chosen.contains(&schema.tool))
+                    .cloned()
+                    .collect()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_async_double_selects_through_the_companion_trait() {
+        let all = vec![
+            schema("web_search", "Search the web for pages"),
+            schema("weather", "Report the weather forecast for a city"),
+        ];
+        let selector = FixedAsyncSelector {
+            chosen: vec!["weather".to_string()],
+            turns: std::sync::Mutex::new(Vec::new()),
+        };
+        let selected = selector
+            .select(
+                &SelectionContext {
+                    turn: 0,
+                    latest_user_message: Some("anything"),
+                    conversation: &[],
+                },
+                &all,
+            )
+            .await;
+        assert_eq!(
+            selected.iter().map(|s| s.tool.as_str()).collect::<Vec<_>>(),
+            vec!["weather"],
+            "the companion trait carries selection through a future"
+        );
+        let turns = selector
+            .turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(*turns, vec![0], "the context the selector saw");
+    }
+
+    #[cfg(feature = "vector_index")]
+    mod embedding {
+        use super::*;
+        use crate::memory::vector::{Embedding, EmbeddingProvider};
+
+        /// A table-driven provider: exact-text vectors, a call
+        /// counter, and an optional poison word that fails any text
+        /// containing it.
+        struct TableProvider {
+            table: Vec<(String, Vec<f32>)>,
+            calls: AtomicUsize,
+            poison: Option<&'static str>,
+        }
+
+        impl EmbeddingProvider for TableProvider {
+            fn dim(&self) -> usize {
+                2
+            }
+
+            fn embed<'a>(
+                &'a self,
+                text: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<Embedding, crate::error::LoopError>> + Send + 'a>>
+            {
+                let _ = self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if self.poison.is_some_and(|word| text.contains(word)) {
+                        return Err(crate::error::LoopError::Internal("poisoned".into()));
+                    }
+                    let vector = self
+                        .table
+                        .iter()
+                        .find(|(known, _)| known == text)
+                        .map(|(_, vector)| vector.clone())
+                        .unwrap_or_default();
+                    Ok(Embedding::new(vector))
+                })
+            }
+        }
+
+        fn fixture() -> Vec<ToolSchema> {
+            vec![
+                schema("weather", "Report the weather forecast for a city"),
+                schema("web_search", "Search the web for pages"),
+            ]
+        }
+
+        fn table() -> Vec<(String, Vec<f32>)> {
+            vec![
+                (
+                    "weather Report the weather forecast for a city".to_string(),
+                    vec![1.0, 0.0],
+                ),
+                (
+                    "web_search Search the web for pages".to_string(),
+                    vec![0.0, 1.0],
+                ),
+                ("find today's forecast".to_string(), vec![0.95, 0.05]),
+            ]
+        }
+
+        async fn select_with(
+            provider: &TableProvider,
+            query: &str,
+            all: &[ToolSchema],
+        ) -> Vec<ToolSchema> {
+            EmbeddingSelector::new(TableProvider {
+                table: provider.table.clone(),
+                calls: AtomicUsize::new(0),
+                poison: provider.poison,
+            })
+            .with_top_k(1)
+            .select(
+                &SelectionContext {
+                    turn: 0,
+                    latest_user_message: Some(query),
+                    conversation: &[],
+                },
+                all,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn semantic_proximity_selects_the_nearest_tool() {
+            let provider = TableProvider {
+                table: table(),
+                calls: AtomicUsize::new(0),
+                poison: None,
+            };
+            let selected = select_with(&provider, "find today's forecast", &fixture()).await;
+            assert_eq!(
+                selected.iter().map(|s| s.tool.as_str()).collect::<Vec<_>>(),
+                vec!["weather"],
+                "the query lands near the forecast tool with no shared vocabulary"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_query_embed_failure_fails_open() {
+            let provider = TableProvider {
+                table: table(),
+                calls: AtomicUsize::new(0),
+                poison: Some("forecast"),
+            };
+            let all = fixture();
+            let selected = select_with(&provider, "find today's forecast", &all).await;
+            assert_eq!(
+                selected.len(),
+                all.len(),
+                "a failed embed advertises everything"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_corpus_embeds_once_per_registry_generation() {
+            let all = fixture();
+            let selector = EmbeddingSelector::new(TableProvider {
+                table: table(),
+                calls: AtomicUsize::new(0),
+                poison: None,
+            });
+            let ctx = SelectionContext {
+                turn: 0,
+                latest_user_message: Some("find today's forecast"),
+                conversation: &[],
+            };
+            selector.select(&ctx, &all).await;
+            selector.select(&ctx, &all).await;
+            assert_eq!(
+                selector.provider.calls.load(Ordering::SeqCst),
+                4,
+                "two corpus texts once + one query per selection — the corpus \
+                 served from cache on the second turn"
+            );
+            let mutated = vec![schema("weather", "Report the weather forecast for a city")];
+            selector.select(&ctx, &mutated).await;
+            assert_eq!(
+                selector.provider.calls.load(Ordering::SeqCst),
+                6,
+                "a membership change re-embeds the corpus"
+            );
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    mod rewriting {
+        use super::*;
+
+        /// A client that never answers: every non-streaming call
+        /// outlives any test timeout.
+        struct NeverAnsweringClient;
+
+        impl crate::api::ApiClient for NeverAnsweringClient {
+            fn model(&self) -> String {
+                "small-model".to_string()
+            }
+
+            fn set_model(&self, _model: &str) -> bool {
+                false
+            }
+
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<crate::stream::StreamEvent, crate::api::error::ApiError>,
+                        > + Send
+                        + 'static,
+                >,
+            > {
+                Box::pin(futures::stream::empty())
+            }
+
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<
+                                crate::api::NonStreamingResponse,
+                                crate::api::error::ApiError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    Err(crate::api::error::ApiError::api("the double never answers"))
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn the_rewrite_prompt_carries_names_never_schemas() {
+            let client = Arc::new(crate::testing::MockApiClient::new("small-model"));
+            drop((*client).clone().with_text_response("web_search"));
+            let all = vec![
+                schema(
+                    "web_search",
+                    "Search the web for pages. Results arrive as links.",
+                ),
+                schema("weather", "Report the weather forecast for a city"),
+            ];
+            let selector = RewritingSelector::new(Arc::clone(&client));
+            let selected = selector
+                .select(
+                    &SelectionContext {
+                        turn: 0,
+                        latest_user_message: Some("look up rust news"),
+                        conversation: &[],
+                    },
+                    &all,
+                )
+                .await;
+            assert_eq!(
+                selected.iter().map(|s| s.tool.as_str()).collect::<Vec<_>>(),
+                vec!["web_search"],
+                "the rewrite's answer names the selection"
+            );
+            let captured = client.captured_requests();
+            assert_eq!(captured.len(), 1, "exactly one rewrite call");
+            let prompt = captured
+                .first()
+                .and_then(|request| request.messages.first())
+                .and_then(|message| message.parts.first())
+                .and_then(|part| match part {
+                    crate::message::MessagePart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .expect("the prompt rides as text");
+            assert!(prompt.contains("web_search"), "names ride: {prompt}");
+            assert!(
+                prompt.contains("Search the web for pages"),
+                "one-line summaries ride: {prompt}"
+            );
+            assert!(
+                !prompt.contains("input_schema") && !prompt.contains("properties"),
+                "never the schemas — that would spend the tokens selection saves: {prompt}"
+            );
+            assert!(prompt.contains("look up rust news"), "the request rides");
+        }
+
+        #[tokio::test]
+        async fn an_answer_naming_no_known_tool_fails_open() {
+            let client = Arc::new(crate::testing::MockApiClient::new("small-model"));
+            drop((*client).clone().with_text_response("banana"));
+            let all = fixture_like();
+            let selector = RewritingSelector::new(client);
+            let selected = selector
+                .select(
+                    &SelectionContext {
+                        turn: 0,
+                        latest_user_message: Some("anything"),
+                        conversation: &[],
+                    },
+                    &all,
+                )
+                .await;
+            assert_eq!(
+                selected.len(),
+                all.len(),
+                "garbage output advertises the full surface"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_exhausted_budget_refuses_the_call() {
+            let client = Arc::new(crate::testing::MockApiClient::new("small-model"));
+            drop((*client).clone().with_text_response("web_search"));
+            let all = fixture_like();
+            let selector = RewritingSelector::new(Arc::clone(&client)).with_budget(
+                crate::budget::BudgetLimits {
+                    tokens: Some(0),
+                    turns: None,
+                    duration: None,
+                },
+            );
+            let selected = selector
+                .select(
+                    &SelectionContext {
+                        turn: 0,
+                        latest_user_message: Some("anything"),
+                        conversation: &[],
+                    },
+                    &all,
+                )
+                .await;
+            assert_eq!(selected.len(), all.len(), "a refused rewrite fails open");
+            assert_eq!(
+                client.create_message_calls(),
+                0,
+                "the budget gate refused before the call"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_duration_budget_refuses_once_the_clock_runs() {
+            let client = Arc::new(crate::testing::MockApiClient::new("small-model"));
+            drop((*client).clone().with_text_response("web_search"));
+            let all = fixture_like();
+            let selector = RewritingSelector::new(Arc::clone(&client)).with_budget(
+                crate::budget::BudgetLimits {
+                    tokens: None,
+                    turns: None,
+                    duration: Some(std::time::Duration::from_millis(1)),
+                },
+            );
+            let ctx = SelectionContext {
+                turn: 0,
+                latest_user_message: Some("anything"),
+                conversation: &[],
+            };
+            let first = selector.select(&ctx, &all).await;
+            assert_eq!(
+                first.iter().map(|s| s.tool.as_str()).collect::<Vec<_>>(),
+                vec!["web_search"],
+                "the first call sits at zero elapsed and proceeds"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let second = selector.select(&ctx, &all).await;
+            assert_eq!(
+                second.len(),
+                all.len(),
+                "the duration line refuses the second call and fails open"
+            );
+            assert_eq!(
+                client.create_message_calls(),
+                1,
+                "exactly one rewrite call — the clock refused the rest"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_rewrite_prompt_bounds_each_conversation_excerpt() {
+            let client = Arc::new(crate::testing::MockApiClient::new("small-model"));
+            drop((*client).clone().with_text_response("web_search"));
+            let flood = format!("{}\n", "enormous tool result body ".repeat(600));
+            let message = crate::message::Message::user(flood.clone());
+            let conversation = vec![message];
+            let all = fixture_like();
+            let selector = RewritingSelector::new(Arc::clone(&client));
+            selector
+                .select(
+                    &SelectionContext {
+                        turn: 0,
+                        latest_user_message: Some("look up rust news"),
+                        conversation: &conversation,
+                    },
+                    &all,
+                )
+                .await;
+            let prompt = client
+                .captured_requests()
+                .first()
+                .and_then(|request| request.messages.first())
+                .and_then(|message| message.parts.first())
+                .and_then(|part| match part {
+                    crate::message::MessagePart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .expect("the prompt rides as text");
+            assert!(
+                prompt.contains(&flood[..64]),
+                "the excerpt keeps the message's head"
+            );
+            assert!(
+                prompt.len() < 4 * 1024,
+                "a pathological message cannot flood the rewrite prompt: {} bytes",
+                prompt.len()
+            );
+        }
+
+        fn fixture_like() -> Vec<ToolSchema> {
+            vec![
+                schema("web_search", "Search the web for pages"),
+                schema("weather", "Report the weather forecast for a city"),
+            ]
+        }
+
+        #[tokio::test]
+        async fn a_timed_out_rewrite_fails_open() {
+            let all = fixture_like();
+            let selector = RewritingSelector::new(Arc::new(NeverAnsweringClient))
+                .with_timeout(std::time::Duration::from_millis(5));
+            let selected = selector
+                .select(
+                    &SelectionContext {
+                        turn: 0,
+                        latest_user_message: Some("anything"),
+                        conversation: &[],
+                    },
+                    &all,
+                )
+                .await;
+            assert_eq!(
+                selected.len(),
+                all.len(),
+                "a rewrite that cannot answer in time fails open"
+            );
+        }
     }
 }

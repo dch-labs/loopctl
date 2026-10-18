@@ -314,6 +314,16 @@ pub struct BareLoop<C: ApiClient> {
     /// [`with_tool_selector`](BareLoop::with_tool_selector).
     tool_selector: Option<std::sync::Arc<dyn crate::tool::ToolSelector>>,
 
+    /// The per-turn async tool-surface selector, when one is
+    /// configured.
+    ///
+    /// The async companion to [`tool_selector`](Self::tool_selector):
+    /// consulted once per turn at the same request-build seam, ahead
+    /// of the payload estimate, so the estimate and the wire share
+    /// one selection. The engine takes a sync selector or an async
+    /// one, never both — configuring either clears the other.
+    async_tool_selector: Option<std::sync::Arc<dyn crate::tool::AsyncToolSelector>>,
+
     /// The prepared request context for the next model call, when it
     /// was collected ahead of the call.
     ///
@@ -958,6 +968,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
             tool_selector: None,
+            async_tool_selector: None,
             prepared_turn: None,
             last_advertised_surface: None,
             observed_registry: None,
@@ -1487,6 +1498,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
             tool_selector: None,
+            async_tool_selector: None,
             prepared_turn: None,
             last_advertised_surface: None,
             observed_registry: None,
@@ -1611,6 +1623,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             attachments: AttachmentStore::new(),
             tool_selector: None,
+            async_tool_selector: None,
             prepared_turn: None,
             last_advertised_surface: None,
             observed_registry: None,
@@ -2081,7 +2094,7 @@ impl<C: ApiClient> BareLoop<C> {
         let mut messages = self.attachment_messages();
         messages.extend(self.collect_contributor_messages(turn));
         self.collect_memories(&turn_input, &mut messages).await;
-        let tools = self.turn_tool_schemas(turn, &messages);
+        let tools = self.turn_tool_schemas(turn, &messages).await;
         self.observe_tool_surface();
         let surface = tools
             .as_ref()

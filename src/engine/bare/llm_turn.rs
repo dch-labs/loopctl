@@ -81,7 +81,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// between what was counted and what was sent. An empty selection
     /// or empty registry advertises nothing (the request omits the
     /// tools field).
-    pub(super) fn turn_tool_schemas(
+    pub(super) async fn turn_tool_schemas(
         &self,
         turn: usize,
         transients: &[Message],
@@ -90,25 +90,38 @@ impl<C: ApiClient> BareLoop<C> {
         if all.is_empty() {
             return None;
         }
-        let advertised = match &self.tool_selector {
-            None => all,
-            Some(selector) => {
-                let mut conversation = transients.to_vec();
-                conversation.extend(self.machine.full_history());
-                let prompt = self
-                    .session
-                    .current_run()
-                    .map(|run| run.input.clone())
-                    .filter(|input| !input.is_empty());
-                let context = crate::tool::SelectionContext {
-                    turn,
-                    latest_user_message: prompt.as_deref(),
-                    conversation: &conversation,
-                };
-                selector.select(&context, &all)
+        let advertised = match (&self.tool_selector, &self.async_tool_selector) {
+            (None, None) => all,
+            (Some(selector), _) => {
+                let view = self.selection_view(turn, transients);
+                selector.select(&view.context(), &all)
+            }
+            (_, Some(selector)) => {
+                let view = self.selection_view(turn, transients);
+                selector.select(&view.context(), &all).await
             }
         };
         (!advertised.is_empty()).then_some(advertised)
+    }
+
+    /// The owned view a selection context borrows from.
+    ///
+    /// One constructor for both selector traits: transients leading
+    /// the machine-owned history, the run's opening prompt as the
+    /// query.
+    fn selection_view(&self, turn: usize, transients: &[Message]) -> TurnSelectionView {
+        let mut conversation = transients.to_vec();
+        conversation.extend(self.machine.full_history());
+        let prompt = self
+            .session
+            .current_run()
+            .map(|run| run.input.clone())
+            .filter(|input| !input.is_empty());
+        TurnSelectionView {
+            turn,
+            conversation,
+            prompt,
+        }
     }
 
     /// Build the per-turn [`StreamRequest`] shared by both turn paths.
@@ -577,6 +590,46 @@ impl<C: ApiClient> BareLoop<C> {
                 attempts,
                 retry_after,
             },
+        }
+    }
+}
+
+/// The owned view a turn's [`SelectionContext`](crate::tool::SelectionContext)
+/// borrows from.
+///
+/// Holds the conversation (transients leading history) and the run's
+/// opening prompt so the context handed to either selector trait
+/// borrows something with a place to live.
+struct TurnSelectionView {
+    /// The turn the selection is for.
+    ///
+    /// Passed straight into the context so depth-adapting selectors
+    /// can read it.
+    turn: usize,
+
+    /// The conversation the request carries.
+    ///
+    /// Transients leading the machine-owned history — the same
+    /// ordered view the request sends, pre-coalesce.
+    conversation: Vec<Message>,
+
+    /// The run's opening prompt, when input was given.
+    ///
+    /// The selection query on every turn; `None` on a promptless
+    /// turn, where a fail-open selector advertises everything.
+    prompt: Option<String>,
+}
+
+impl TurnSelectionView {
+    /// The selection context over this view.
+    ///
+    /// Same shape either selector trait receives: the turn, the run's
+    /// opening prompt, and the conversation the request carries.
+    fn context(&self) -> crate::tool::SelectionContext<'_> {
+        crate::tool::SelectionContext {
+            turn: self.turn,
+            latest_user_message: self.prompt.as_deref(),
+            conversation: &self.conversation,
         }
     }
 }

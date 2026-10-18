@@ -14358,3 +14358,169 @@ async fn surface_event_lists_are_sorted_by_name() {
         "a multi-add event lists its names sorted, not in registration order"
     );
 }
+
+/// An async selection double that counts consultations and advertises
+/// everything — the fail-open shape the trait contract prescribes.
+#[cfg(feature = "streaming")]
+struct CountingAsyncSelector {
+    chosen: Vec<String>,
+    turns: Mutex<Vec<usize>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::tool::AsyncToolSelector for CountingAsyncSelector {
+    fn select<'a>(
+        &'a self,
+        ctx: &'a crate::tool::SelectionContext<'a>,
+        all: &'a [ToolSchema],
+    ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>> {
+        Box::pin(async move {
+            crate::error::recover_guard(self.turns.lock()).push(ctx.turn);
+            all.iter()
+                .filter(|schema| self.chosen.contains(&schema.tool) || self.chosen.is_empty())
+                .cloned()
+                .collect()
+        })
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_async_fail_open_serves_the_full_surface_on_the_wire() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let selector = Arc::new(CountingAsyncSelector {
+        chosen: Vec::new(),
+        turns: Mutex::new(Vec::new()),
+    });
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_async_tool_selector(Arc::clone(&selector) as Arc<dyn crate::tool::AsyncToolSelector>);
+    agent
+        .run("an unfathomable prompt", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(
+        surface_names(&captured[0]).len(),
+        5,
+        "a fail-open double's full-surface answer rides the wire unchanged"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn configuring_one_selector_clears_the_other() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let selector = Arc::new(CountingAsyncSelector {
+        chosen: Vec::new(),
+        turns: Mutex::new(Vec::new()),
+    });
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector::default()));
+    agent.set_async_tool_selector(Arc::clone(&selector) as Arc<dyn crate::tool::AsyncToolSelector>);
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(
+        surface_names(&captured[0]).len(),
+        5,
+        "the async selector answers — the sync one was cleared on configure"
+    );
+    assert_eq!(
+        crate::error::recover_guard(selector.turns.lock()).len(),
+        1,
+        "and it was the async one consulted"
+    );
+
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config());
+    agent.set_async_tool_selector(Arc::new(CountingAsyncSelector {
+        chosen: Vec::new(),
+        turns: Mutex::new(Vec::new()),
+    }) as Arc<dyn crate::tool::AsyncToolSelector>);
+    agent.set_tool_selector(Arc::new(crate::tool::KeywordSelector::default()));
+    agent
+        .run("completely unrelated zebra topic", &make_run_config())
+        .await
+        .unwrap();
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(
+        surface_names(&captured[0]).len(),
+        5,
+        "the sync selector answers — the async one was cleared on configure \
+         (the keyword miss fails open, so five tools)"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn the_estimate_counts_the_async_selection_not_the_registry() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "searched");
+    let selector = Arc::new(CountingAsyncSelector {
+        chosen: vec!["web_search".to_string()],
+        turns: Mutex::new(Vec::new()),
+    });
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_async_tool_selector(Arc::clone(&selector) as Arc<dyn crate::tool::AsyncToolSelector>);
+    agent
+        .run("please search the web for rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    let subset = vec![SurfaceSearch.schema()];
+    let expected_tools = HeuristicTokenCounter.count(&[Message::user(
+        serde_json::to_string(&subset).unwrap_or_default(),
+    )]);
+    let history = agent.machine().full_history();
+    let expected = agent.calibration.apply(
+        HeuristicTokenCounter
+            .count(&history)
+            .saturating_add(expected_tools),
+    );
+    assert_eq!(
+        agent.context_tokens(),
+        expected,
+        "the machine's figure carries the async-chosen subset's own rendered \
+         cost — selection resolved before the estimate"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn a_rewriting_selector_costs_exactly_one_call_per_turn() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "call_1", "web_search", &json!({"query": "x"}));
+    client.push_final_turn("thinking ", "done");
+    let rewriting_client = Arc::new(crate::testing::MockApiClient::new("small-model"));
+    drop((*rewriting_client).clone().with_text_response("web_search"));
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_async_tool_selector(Arc::new(crate::tool::RewritingSelector::new(Arc::clone(
+            &rewriting_client,
+        ))) as Arc<dyn crate::tool::AsyncToolSelector>);
+    agent
+        .run("look up rust news", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "the fixture issues two model requests");
+    for (index, request) in captured.iter().enumerate() {
+        assert_eq!(
+            surface_names(request),
+            vec!["web_search".to_string()],
+            "request {index} carries the rewritten selection"
+        );
+    }
+    assert_eq!(
+        rewriting_client.create_message_calls(),
+        2,
+        "exactly one rewrite call per turn — the structural once-per-turn \
+         discipline, pinned where the money is spent"
+    );
+}

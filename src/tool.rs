@@ -89,6 +89,10 @@ pub use permission::GateRuleSource;
 pub use permission::GateVerdict;
 pub use permission::PermissionCheck;
 pub use registry::{FnTool, ToolRegistry};
+pub use selector::AsyncToolSelector;
+#[cfg(feature = "vector_index")]
+pub use selector::EmbeddingSelector;
+pub use selector::RewritingSelector;
 pub use selector::{KeywordSelector, SelectionContext, StaticSelector, ToolSelector};
 
 /// Schema descriptor for a tool, used for LLM API tool definitions.

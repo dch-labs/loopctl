@@ -14525,19 +14525,29 @@ async fn a_rewriting_selector_costs_exactly_one_call_per_turn() {
     );
 }
 
-/// An async selector that never resolves — the hung-provider shape
-/// the cancel race must survive.
+/// An async selector that never resolves and signals its first
+/// poll — the hung-provider shape the cancel race must survive, with
+/// a deterministic marker for where the run is.
+///
+/// The signal fires before the park, so a test that has received it
+/// knows the run is provably inside the selection await — a cancel
+/// that follows bites exactly the race under test, never an earlier
+/// cancellation path.
 #[cfg(feature = "streaming")]
-struct NeverResolvingSelector;
+struct SignallingNeverSelector {
+    parked: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
 
 #[cfg(feature = "streaming")]
-impl crate::tool::AsyncToolSelector for NeverResolvingSelector {
+impl crate::tool::AsyncToolSelector for SignallingNeverSelector {
     fn select<'a>(
         &'a self,
         _ctx: &'a crate::tool::SelectionContext<'a>,
         all: &'a [ToolSchema],
     ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>> {
+        let signal = crate::error::recover_guard(self.parked.lock()).take();
         Box::pin(async move {
+            let _park_signalled = signal.is_some_and(|signal| signal.send(()).is_ok());
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             all.to_vec()
         })
@@ -14549,18 +14559,21 @@ impl crate::tool::AsyncToolSelector for NeverResolvingSelector {
 async fn a_cancelled_run_does_not_wait_for_the_async_selection() {
     let (client, _requests) = WireCaptureClient::new();
     client.push_final_turn("thinking ", "never reached");
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
     let agent = Arc::new(tokio::sync::Mutex::new(
         BareLoop::new(Arc::new(client), surface_registry(), make_config())
-            .with_async_tool_selector(
-                Arc::new(NeverResolvingSelector) as Arc<dyn crate::tool::AsyncToolSelector>
-            ),
+            .with_async_tool_selector(Arc::new(SignallingNeverSelector {
+                parked: Mutex::new(Some(parked_tx)),
+            }) as Arc<dyn crate::tool::AsyncToolSelector>),
     ));
     let signal = agent.lock().await.cancel_signal();
     let run = tokio::spawn(async move {
         let mut agent = agent.lock().await;
         agent.run("anything", &make_run_config()).await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    parked_rx
+        .await
+        .expect("the selector parked — the run is provably inside the selection await");
     signal.cancel();
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
     let settled = outcome

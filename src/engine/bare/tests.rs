@@ -13341,7 +13341,7 @@ async fn a_keyword_selector_advertises_the_matching_subset_on_the_wire() {
     let (client, requests) = WireCaptureClient::new();
     client.push_final_turn("thinking ", "searched");
     let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
-        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector::default()));
     agent
         .run("please search the web for rust news", &make_run_config())
         .await
@@ -13362,7 +13362,7 @@ async fn the_window_estimate_counts_the_advertised_subset_not_the_registry() {
     let (client, _requests) = WireCaptureClient::new();
     client.push_final_turn("thinking ", "searched");
     let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
-        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector::default()));
     agent
         .run("please search the web for rust news", &make_run_config())
         .await
@@ -13392,7 +13392,7 @@ async fn a_keyword_miss_fails_open_to_the_full_surface() {
     let (client, requests) = WireCaptureClient::new();
     client.push_final_turn("thinking ", "done");
     let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
-        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector::default()));
     agent
         .run("completely unrelated zebra topic", &make_run_config())
         .await
@@ -13446,7 +13446,7 @@ async fn selection_composes_with_response_format_suppression() {
         }),
     );
     let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
-        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector::default()));
     agent
         .set_request_options(crate::structured::RequestOptions::new().with_response_format(format));
     agent
@@ -13626,7 +13626,7 @@ async fn the_run_start_estimate_counts_the_upcoming_surface_not_the_registry() {
         .with_context_window(1_000)
         .with_compact_threshold(40);
     let mut agent = BareLoop::new(Arc::new(client), fat_surface_registry(), config)
-        .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+        .with_tool_selector(Arc::new(crate::tool::KeywordSelector::default()));
     agent.register_observer(Arc::new(CompactionFailureRecorder {
         failures: Arc::clone(&failures),
     }));
@@ -13671,7 +13671,7 @@ async fn the_post_dispatch_estimate_counts_the_next_surface_not_the_registry() {
         .with_compact_threshold(40);
     let mut agent =
         BareLoop::new_with_managers(Arc::new(client), fat_surface_registry(), config, managers)
-            .with_tool_selector(Arc::new(crate::tool::KeywordSelector));
+            .with_tool_selector(Arc::new(crate::tool::KeywordSelector::default()));
     agent
         .run("please search the web for rust news", &make_run_config())
         .await

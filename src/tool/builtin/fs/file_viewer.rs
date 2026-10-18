@@ -493,10 +493,8 @@ struct ParsedInput<'a> {
 ///
 /// Returns [`ToolError::InvalidInput`] for a missing `file_path` or a URL.
 fn parse_input(input: &Value) -> Result<ParsedInput<'_>, ToolError> {
-    let file_path = input
-        .get("file_path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
+    let file_path = super::resolve_path_key(input)
+        .ok_or_else(|| super::missing_path_error("FileViewer", input))?;
 
     resolve::reject_path_url("FileViewer", file_path)?;
 

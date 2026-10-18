@@ -310,6 +310,12 @@ struct ReadInput {
     ///
     /// Opaque to the tool: whatever the source's addresses mean, the tool
     /// passes this through verbatim.
+    ///
+    /// Accepts the `file_path` spelling the recorded model drift
+    /// sends; when both ride, the canonical `path` wins (enforced
+    /// ahead of the parse, since a serde alias alone would leave the
+    /// winner to document order).
+    #[serde(alias = "file_path")]
     path: String,
 
     /// Starting line, 1-indexed; at least 1.
@@ -330,6 +336,21 @@ struct ReadInput {
     /// fields win.
     #[serde(default)]
     line_range: Option<String>,
+}
+
+/// Drop the alias spelling when the canonical key rides.
+///
+/// Canonical precedence ahead of the serde parse: a bare
+/// [`alias`](serde) leaves the both-present winner to document order
+/// (and serde errors on the duplicate), so the canonical `path`
+/// removes `file_path` first — the alias fills only a genuine gap.
+fn canonicalize_path_input(mut input: Value) -> Value {
+    if input.get("path").is_some()
+        && let Some(map) = input.as_object_mut()
+    {
+        map.remove("file_path");
+    }
+    input
 }
 
 /// Resolve `(offset, limit)` from the input.
@@ -758,9 +779,13 @@ impl<S: ContentSource> Tool for ReadTool<S> {
         _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         Box::pin(async move {
-            let parsed: ReadInput = serde_json::from_value(input).map_err(|error| {
-                ToolError::InvalidInput(format!("Read input must match the schema: {error}"))
-            })?;
+            let parsed: ReadInput = serde_json::from_value(canonicalize_path_input(input))
+                .map_err(|error| {
+                    ToolError::InvalidInput(format!(
+                        "Read input must match the schema: {error} (expected \
+                     key 'path'; accepted: path, or file_path)"
+                    ))
+                })?;
             let (offset, limit) =
                 resolve_range(&parsed, self.max_lines, self.default_offset_limit)?;
             if let Some(size) = self.source.size(&parsed.path).await
@@ -786,6 +811,33 @@ impl<S: ContentSource> Tool for ReadTool<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_accepts_file_path_where_path_was_expected() {
+        // The corpus drift: models send `file_path` to Read (26 of 517
+        // recorded failures). The alias accepts it; the canonical
+        // schema stays untouched.
+        let parsed: ReadInput =
+            serde_json::from_value(serde_json::json!({"file_path": "src/main.rs"}))
+                .expect("the alias spelling parses");
+        assert_eq!(parsed.path, "src/main.rs");
+    }
+
+    #[test]
+    fn read_both_present_resolves_to_the_canonical_path() {
+        // Canonical precedence, never last-one-in: `path` wins even
+        // when `file_path` appears after it in the document.
+        let parsed: ReadInput =
+            serde_json::from_value(canonicalize_path_input(serde_json::json!({
+                "file_path": "the-alias-value",
+                "path": "the-canonical-value",
+            })))
+            .expect("both spellings parse");
+        assert_eq!(
+            parsed.path, "the-canonical-value",
+            "the canonical key wins when both ride"
+        );
+    }
 
     #[test]
     fn the_description_carries_the_open_view_vocabulary() {

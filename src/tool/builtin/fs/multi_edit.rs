@@ -215,7 +215,8 @@ async fn multi_edit_inner(
     let cwd = session.cwd().to_path_buf();
 
     let parsed = parse_input(&input)?;
-    let mut operations = build_operations(parsed.edits, &cwd, policy)?;
+    let default_path = super::resolve_path_key(&input);
+    let mut operations = build_operations(parsed.edits, default_path, &input, &cwd, policy)?;
 
     if let Some(reason) = dup_path_check(&operations) {
         return Ok(reason.into_output());
@@ -515,17 +516,43 @@ struct EditOperation {
 /// Returns [`ToolError::InvalidInput`] for a missing `file_path`/
 /// `old_text`/`new_text`, an empty `old_text`, a URL `file_path`, or —
 /// under contained resolution — a path that escapes `cwd`.
+///
+/// # Errors
+///
+/// Also [`ToolError::InvalidInput`] teaching the per-edit location
+/// and the received top-level keys when an edit names no file
+/// through any accepted spelling (per-edit `file_path`/`path`, or the
+/// top-level default).
 fn build_operations(
     edits: &[Value],
+    default_path: Option<&str>,
+    full_input: &Value,
     cwd: &Path,
     policy: ResolvePolicy,
 ) -> Result<Vec<EditOperation>, ToolError> {
     let mut operations = Vec::with_capacity(edits.len());
     for edit_value in edits {
-        let file_path = edit_value
-            .get("file_path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("Missing file_path in edit".to_string()))?;
+        let file_path = match edit_value.get("file_path") {
+            Some(Value::String(path)) => Some(path.as_str()),
+            Some(_) => {
+                return Err(ToolError::InvalidInput(format!(
+                    "file_path must be a string, not {} (inside each edit; \
+                     got top-level keys: {})",
+                    super::json_type(edit_value.get("file_path")),
+                    super::received_keys(full_input)
+                )));
+            }
+            None => edit_value.get("path").and_then(Value::as_str),
+        }
+        .or(default_path)
+        .ok_or_else(|| {
+            ToolError::InvalidInput(format!(
+                "Missing file_path inside each edit (got top-level keys: \
+                     {}; file_path belongs inside each edit, or rides \
+                     top-level as the batch default)",
+                super::received_keys(full_input)
+            ))
+        })?;
         let old_text = edit_value
             .get("old_text")
             .and_then(Value::as_str)
@@ -1785,5 +1812,119 @@ mod tests {
             ),
             other => panic!("expected a refusal naming the fifo, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn multi_edit_accepts_per_edit_path() {
+        let ops = build_operations(
+            &[serde_json::json!({
+                "path": "src/lib.rs",
+                "old_text": "a",
+                "new_text": "b",
+            })],
+            None,
+            &serde_json::json!({"edits": []}),
+            std::path::Path::new("/repo"),
+            ResolvePolicy::Unrestricted,
+        )
+        .expect("the per-edit alias spelling parses");
+        assert_eq!(ops.len(), 1, "one operation");
+    }
+
+    #[test]
+    fn multi_edit_accepts_a_top_level_file_path_default() {
+        // The corpus: 9 of the 136 MultiEdit failures carried a
+        // top-level file_path that the strict parse silently ignored.
+        let ops = build_operations(
+            &[serde_json::json!({"old_text": "a", "new_text": "b"})],
+            Some("src/lib.rs"),
+            &serde_json::json!({"file_path": "src/lib.rs", "edits": []}),
+            std::path::Path::new("/repo"),
+            ResolvePolicy::Unrestricted,
+        )
+        .expect("the top-level default fills edits lacking a path");
+        assert_eq!(ops.len(), 1, "one operation on the defaulted file");
+    }
+
+    #[test]
+    fn multi_edit_missing_everything_names_the_location_and_keys() {
+        let full_input = serde_json::json!({"edits": []});
+        let error = build_operations(
+            &[serde_json::json!({"old_text": "a", "new_text": "b"})],
+            None,
+            &full_input,
+            std::path::Path::new("/repo"),
+            ResolvePolicy::Unrestricted,
+        )
+        .expect_err("nothing names a file");
+        let message = error.to_string();
+        assert!(
+            message.contains("file_path"),
+            "the expected key rides: {message}"
+        );
+        assert!(
+            message.contains("inside each edit"),
+            "the location rides: {message}"
+        );
+        assert!(
+            message.contains("edits"),
+            "the received shape echoes: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_round_tests {
+    use super::*;
+
+    #[test]
+    fn a_per_edit_path_beats_the_top_level_default() {
+        // The middle of the precedence chain: an edit carrying `path`
+        // while the top-level default names a different file resolves
+        // to the per-edit value.
+        let ops = build_operations(
+            &[serde_json::json!({
+                "path": "per-edit.txt",
+                "old_text": "a",
+                "new_text": "b",
+            })],
+            Some("top-level-default.txt"),
+            &serde_json::json!({"file_path": "top-level-default.txt", "edits": []}),
+            std::path::Path::new("/repo"),
+            ResolvePolicy::Unrestricted,
+        )
+        .expect("the chain resolves");
+        assert_eq!(ops.len(), 1, "one operation");
+        assert!(
+            ops.first()
+                .is_some_and(|op| op.file_path.contains("per-edit.txt")),
+            "the per-edit spelling won over the batch default"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_per_edit_canonical_refuses_instead_of_serving() {
+        let error = build_operations(
+            &[serde_json::json!({
+                "file_path": 123,
+                "path": "alias.txt",
+                "old_text": "a",
+                "new_text": "b",
+            })],
+            None,
+            &serde_json::json!({"edits": []}),
+            std::path::Path::new("/repo"),
+            ResolvePolicy::Unrestricted,
+        )
+        .expect_err("the mistyped canonical refuses");
+        assert!(
+            error.to_string().contains("file_path must be a string"),
+            "the type error rides: {error}"
+        );
     }
 }

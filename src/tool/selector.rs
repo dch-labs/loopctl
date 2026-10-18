@@ -97,7 +97,12 @@ pub trait ToolSelector: Send + Sync {
 /// determinism contract is deliberately relaxed here — because the
 /// value of an async selector is exactly the judgment a call buys;
 /// the engine's once-per-turn discipline is what keeps the estimate
-/// explainable, not replayability.
+/// explainable, not replayability. One distinction the engine cannot
+/// make and the implementation must: an **intentional** empty
+/// selection is a selector's right (`with_top_k(0)`-shaped choices),
+/// but an **inability to rank** — a failed call, an unrankable
+/// vector — must fail open to the full surface; the engine
+/// advertises whatever comes back, silence included.
 ///
 /// The engine takes a sync selector or an async one, never both:
 /// configuring one clears the other.
@@ -160,17 +165,20 @@ pub struct EmbeddingSelector<P> {
 
 #[cfg(feature = "vector_index")]
 struct EmbeddingCache {
-    /// The ordered name list the corpus embeddings describe.
+    /// The embedded texts the corpus embeddings describe.
     ///
-    /// A registry generation's identity: names changing (the L-95
-    /// mutation surface) invalidates the corpus on the next
-    /// selection.
-    names: Vec<String>,
+    /// A registry generation's identity: each text is the
+    /// `"{tool} {description}"` the selection built, so a membership
+    /// change **and** a same-name description overwrite (the L-95
+    /// `changed` surface) both invalidate the corpus on the next
+    /// selection — the semantic position always follows the tool's
+    /// current text.
+    texts: Vec<String>,
 
-    /// Each tool's embedding, aligned with `names`.
+    /// Each tool's embedding, aligned with `texts`.
     ///
     /// Built by one batch embed per registry generation; indexed
-    /// beside `names` so a ranking maps straight back to its schema.
+    /// beside `texts` so a ranking maps straight back to its schema.
     embeddings: Vec<crate::memory::vector::Embedding>,
 }
 
@@ -185,7 +193,7 @@ impl<P: crate::memory::vector::EmbeddingProvider> EmbeddingSelector<P> {
             provider,
             top_k: 8,
             cache: std::sync::Mutex::new(EmbeddingCache {
-                names: Vec::new(),
+                texts: Vec::new(),
                 embeddings: Vec::new(),
             }),
         }
@@ -216,24 +224,21 @@ impl<P: crate::memory::vector::EmbeddingProvider> EmbeddingSelector<P> {
     /// caller fails open.
     async fn corpus(
         &self,
-        all: &[ToolSchema],
         texts: &[String],
     ) -> Result<Vec<crate::memory::vector::Embedding>, crate::error::LoopError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         {
             let cache = crate::error::recover_guard(self.cache.lock());
-            let cached = cache.names.iter().map(String::as_str).collect::<Vec<_>>()
-                == all
-                    .iter()
-                    .map(|schema| schema.tool.as_str())
-                    .collect::<Vec<_>>();
-            if cached {
+            if *cache.texts == *texts {
                 return Ok(cache.embeddings.clone());
             }
         }
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let embedded = self.provider.embed_batch(&refs).await?;
         let mut cache = crate::error::recover_guard(self.cache.lock());
-        cache.names = all.iter().map(|schema| schema.tool.clone()).collect();
+        cache.texts = texts.to_vec();
         cache.embeddings = embedded;
         Ok(cache.embeddings.clone())
     }
@@ -257,7 +262,7 @@ impl<P: crate::memory::vector::EmbeddingProvider> AsyncToolSelector for Embeddin
                 .iter()
                 .map(|schema| format!("{} {}", schema.tool, schema.description))
                 .collect();
-            let corpus = match self.corpus(all, &texts).await {
+            let corpus = match self.corpus(&texts).await {
                 Ok(corpus) => corpus,
                 Err(error) => {
                     tracing::warn!(
@@ -286,6 +291,13 @@ impl<P: crate::memory::vector::EmbeddingProvider> AsyncToolSelector for Embeddin
                     (score.is_finite()).then_some((index, score))
                 })
                 .collect();
+            if ranked.is_empty() {
+                tracing::warn!(
+                    "no tool scored a finite similarity — an unrankable query \
+                     advertises the full surface rather than an empty selection"
+                );
+                return all.to_vec();
+            }
             ranked.sort_by(|left, right| {
                 right
                     .1
@@ -1412,6 +1424,25 @@ mod async_tests {
         }
 
         #[tokio::test]
+        async fn a_zero_vector_query_fails_open_to_the_full_surface() {
+            let mut entries = table();
+            entries.push(("empty headed query".to_string(), vec![0.0, 0.0]));
+            let provider = TableProvider {
+                table: entries,
+                calls: AtomicUsize::new(0),
+                poison: None,
+            };
+            let all = fixture();
+            let selected = select_with(&provider, "empty headed query", &all).await;
+            assert_eq!(
+                selected.len(),
+                all.len(),
+                "an unrankable query (every cosine NaN) advertises everything — \
+                 an inability to rank is not an intentional empty selection"
+            );
+        }
+
+        #[tokio::test]
         async fn a_query_embed_failure_fails_open() {
             let provider = TableProvider {
                 table: table(),
@@ -1424,6 +1455,34 @@ mod async_tests {
                 selected.len(),
                 all.len(),
                 "a failed embed advertises everything"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_overwritten_description_re_embeds_the_corpus() {
+            let all = fixture();
+            let selector = EmbeddingSelector::new(TableProvider {
+                table: table(),
+                calls: AtomicUsize::new(0),
+                poison: None,
+            });
+            let ctx = SelectionContext {
+                turn: 0,
+                latest_user_message: Some("find today's forecast"),
+                conversation: &[],
+            };
+            selector.select(&ctx, &all).await;
+            let overwritten = vec![
+                schema("weather", "Report the precipitation outlook for a city"),
+                schema("web_search", "Search the web for pages"),
+            ];
+            selector.select(&ctx, &overwritten).await;
+            assert_eq!(
+                selector.provider.calls.load(Ordering::SeqCst),
+                6,
+                "a same-name/different-description overwrite is a new generation — \
+                 the corpus re-embeds (3 + 3: two corpus batches, one query each) \
+                 so the semantic position follows the tool's current text"
             );
         }
 

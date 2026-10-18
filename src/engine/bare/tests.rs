@@ -14524,3 +14524,51 @@ async fn a_rewriting_selector_costs_exactly_one_call_per_turn() {
          discipline, pinned where the money is spent"
     );
 }
+
+/// An async selector that never resolves — the hung-provider shape
+/// the cancel race must survive.
+#[cfg(feature = "streaming")]
+struct NeverResolvingSelector;
+
+#[cfg(feature = "streaming")]
+impl crate::tool::AsyncToolSelector for NeverResolvingSelector {
+    fn select<'a>(
+        &'a self,
+        _ctx: &'a crate::tool::SelectionContext<'a>,
+        all: &'a [ToolSchema],
+    ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            all.to_vec()
+        })
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_cancelled_run_does_not_wait_for_the_async_selection() {
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "never reached");
+    let agent = Arc::new(tokio::sync::Mutex::new(
+        BareLoop::new(Arc::new(client), surface_registry(), make_config())
+            .with_async_tool_selector(
+                Arc::new(NeverResolvingSelector) as Arc<dyn crate::tool::AsyncToolSelector>
+            ),
+    ));
+    let signal = agent.lock().await.cancel_signal();
+    let run = tokio::spawn(async move {
+        let mut agent = agent.lock().await;
+        agent.run("anything", &make_run_config()).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    signal.cancel();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
+    let settled = outcome
+        .expect("the run settles — cancel reaches the selection await")
+        .expect("the task joins")
+        .expect_err("a cancelled run never completes");
+    assert!(
+        matches!(settled, crate::error::LoopError::Cancelled),
+        "cancel wins the race against a hung selector: {settled:?}"
+    );
+}

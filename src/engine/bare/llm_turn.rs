@@ -98,7 +98,14 @@ impl<C: ApiClient> BareLoop<C> {
             }
             (_, Some(selector)) => {
                 let view = self.selection_view(turn, transients);
-                selector.select(&view.context(), &all).await
+                let cancelled = std::sync::Arc::clone(&self.cancelled);
+                let context = view.context();
+                let selection = selector.select(&context, &all);
+                tokio::select! {
+                    biased;
+                    () = cancelled.notified() => all.clone(),
+                    advertised = selection => advertised,
+                }
             }
         };
         (!advertised.is_empty()).then_some(advertised)

@@ -138,10 +138,20 @@ impl KeywordSelector {
     /// Each pair is bidirectional and query-side, exactly like the
     /// curated defaults (see `DEFAULT_SYNONYM_PAIRS`): a query word
     /// matching either side of a pair also matches the other side
-    /// against the tool text. Repeated additions accumulate.
+    /// against the tool text. Sides are lowercased on store, matching
+    /// the tokenizer exactly, so capitalization never defeats a pair.
+    /// Each side must be **one ASCII-alphanumeric token of at least 3
+    /// characters that is not a stopword** — the shape the tokenizer
+    /// keeps — or the pair can never fire; multiword phrasings belong
+    /// to the phrase table, not the pair table. Repeated additions
+    /// accumulate.
     #[must_use]
     pub fn with_synonyms(mut self, pairs: impl IntoIterator<Item = (String, String)>) -> Self {
-        self.extra_synonyms.extend(pairs);
+        self.extra_synonyms.extend(
+            pairs
+                .into_iter()
+                .map(|(left, right)| (left.to_ascii_lowercase(), right.to_ascii_lowercase())),
+        );
         self
     }
 
@@ -217,7 +227,6 @@ const DEFAULT_SYNONYM_PAIRS: &[(&str, &str)] = &[
     ("open", "read"),
     ("show", "read"),
     ("view", "read"),
-    ("look", "search"),
     ("fix", "edit"),
     ("change", "edit"),
     ("modify", "edit"),
@@ -232,9 +241,14 @@ const DEFAULT_SYNONYM_PAIRS: &[(&str, &str)] = &[
 /// Two-word phrases whose short words tokenizing would drop, mapped to
 /// their tool-side single word; checked against the raw query with
 /// word boundaries, so "look upon" does not fire the "look up" pair.
+/// The phrase table is the discriminating layer for shared first
+/// words: "look at" reads, "look up" and "look for" search — which is
+/// exactly why no single-word `look` pair exists in
+/// `DEFAULT_SYNONYM_PAIRS`.
 const DEFAULT_PHRASE_SYNONYMS: &[(&str, &str)] = &[
     ("look up", "search"),
     ("look at", "read"),
+    ("look for", "search"),
     ("figure out", "plan"),
 ];
 
@@ -594,6 +608,97 @@ mod tests {
             "the keyword match and the core set union — a strong wrong-side match \
              cannot evict the tool every turn may need"
         );
+    }
+
+    #[test]
+    fn host_synonyms_match_case_insensitively() {
+        let all = vec![
+            schema("query_tool", "Query the dataset"),
+            schema("weather", "Report the weather forecast for a city"),
+        ];
+        let selector =
+            KeywordSelector::default().with_synonyms([("SQL".to_string(), "query".to_string())]);
+        let selected = selector.select(&ctx("sql time"), &all);
+        assert_eq!(
+            names(&selected),
+            vec!["query_tool"],
+            "pair sides normalize on store — a host pair spelled in caps still \
+             expands the tokenizer's lowercase query token"
+        );
+    }
+
+    #[test]
+    fn look_at_selects_read_tools_without_pulling_search() {
+        let all = vec![
+            schema("read_file", "Read a file from disk"),
+            schema("web_search", "Search the web for pages"),
+        ];
+        let selected = KeywordSelector::default().select(&ctx("look at the config"), &all);
+        assert_eq!(
+            names(&selected),
+            vec!["read_file"],
+            "the phrase table discriminates: look at is a read intent, and the \
+             word-level look pair must not drag search tools into it"
+        );
+    }
+
+    #[test]
+    fn look_for_keeps_the_search_intent() {
+        let all = vec![
+            schema("read_file", "Read a file from disk"),
+            schema("web_search", "Search the web for pages"),
+        ];
+        let selected = KeywordSelector::default().select(&ctx("look for the bug"), &all);
+        assert_eq!(
+            names(&selected),
+            vec!["web_search"],
+            "look for is a search intent, carried by the phrase table after the \
+             word pair's removal"
+        );
+    }
+
+    #[test]
+    fn every_default_pair_side_survives_tokenization() {
+        for (left, right) in DEFAULT_SYNONYM_PAIRS {
+            for side in [left, right] {
+                let tokens = tokenize(side);
+                assert_eq!(
+                    tokens,
+                    vec![side.to_string()],
+                    "every curated pair side must be a single token the tokenizer \
+                     keeps (>= 3 chars, non-stopword) or the pair can never fire: \
+                     '{side}'"
+                );
+                assert!(
+                    side.chars().all(|ch| ch.is_ascii_alphanumeric()),
+                    "pair sides stay ASCII alphanumeric: '{side}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_default_phrase_target_survives_tokenization() {
+        for (phrase, target) in DEFAULT_PHRASE_SYNONYMS {
+            assert!(
+                phrase.contains(' '),
+                "phrase keys are multi-word — a single word belongs in the pair \
+                 table: '{phrase}'"
+            );
+            assert!(
+                phrase
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch == ' '),
+                "phrase keys are lowercase, matching the lowered query: '{phrase}'"
+            );
+            let tokens = tokenize(target);
+            assert_eq!(
+                tokens,
+                vec![target.to_string()],
+                "every phrase target must survive tokenization — it joins the \
+                 expanded set: '{target}'"
+            );
+        }
     }
 
     #[test]

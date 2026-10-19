@@ -149,7 +149,10 @@ pub(crate) struct EscapeTeaching {
 /// repo's context, under the working directory's parent but not the
 /// directory itself), and system or dependency paths — each with its
 /// own remedy. Traversal spellings get the traversal class.
-pub(crate) fn classify_escape(file_path: &str, cwd: &Path) -> &'static str {
+pub(crate) fn classify_escape(file_path: &str, cwd: &Path, via_symlink: bool) -> &'static str {
+    if via_symlink {
+        return "a symlink inside the working directory points outside it";
+    }
     let path = Path::new(file_path);
     if path.is_relative() {
         return "traversal outside the working directory";
@@ -168,7 +171,7 @@ pub(crate) fn classify_escape(file_path: &str, cwd: &Path) -> &'static str {
     }
     if let Some(parent) = cwd.parent() {
         let parent_normalized = normalize_lexical(parent);
-        if normalized.starts_with(&parent_normalized) {
+        if parent_normalized != Path::new("/") && normalized.starts_with(&parent_normalized) {
             return "sibling workspace";
         }
     }
@@ -184,9 +187,10 @@ pub(crate) fn render_escape_teaching(
     file_path: &str,
     cwd: &Path,
     teaching: &EscapeTeaching,
+    via_symlink: bool,
 ) -> String {
     use std::fmt::Write as _;
-    let class = classify_escape(file_path, cwd);
+    let class = classify_escape(file_path, cwd, via_symlink);
     let mut rendered = format!(
         "The session is contained to the working directory: {}\n\
          Target class: {class}\n",
@@ -218,6 +222,11 @@ pub(crate) fn render_escape_teaching(
             "  - system and dependency paths are outside this session's \
              reach: read them through a Bash call\n",
         ),
+        "a symlink inside the working directory points outside it" => rendered.push_str(
+            "  - the spelling is inside, but the link points out: pass the \
+             real path of a target inside the working directory, or read it \
+             through a Bash call\n",
+        ),
         _ => rendered.push_str(
             "  - the spelling resolves outside the working directory: keep \
              targets inside it\n",
@@ -230,6 +239,26 @@ pub(crate) fn render_escape_teaching(
         );
     }
     rendered
+}
+
+/// Whether a candidate scratch root stays inside the working
+/// directory, lexically and through symlinks.
+///
+/// The builder-side twin of the resolver's containment: the root is
+/// normalized lexically (an escape spelling like `cwd/../outside`
+/// collapses before the check) and walked with the same
+/// symlink-aware verification the file tools use, so `create_dir_all`
+/// can never follow a link below the working directory to build
+/// outside it.
+pub(crate) fn scratch_root_is_contained(cwd: &Path, root: &Path) -> bool {
+    let base = normalize_lexical(cwd);
+    let base_canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| base.clone());
+    let normalized = normalize_lexical(root);
+    if !lexically_inside(&normalized, &base) && !lexically_inside(&normalized, &base_canonical) {
+        return false;
+    }
+    let mut visited = Vec::new();
+    verify_symlinks_inside(&normalized, &base, &base_canonical, 0, &mut visited).is_ok()
 }
 
 /// Resolve for a session that can teach at the rejection site.
@@ -252,9 +281,15 @@ pub(crate) fn resolve_path_for_session(
         if let ToolError::InvalidInput(message) = &error
             && message.contains("escapes the working directory")
         {
+            let via_symlink = message.contains("via symlink");
             let mut taught = message.clone();
             taught.push_str("\n\n");
-            taught.push_str(&render_escape_teaching(file_path, cwd, teaching));
+            taught.push_str(&render_escape_teaching(
+                file_path,
+                cwd,
+                teaching,
+                via_symlink,
+            ));
             return ToolError::InvalidInput(taught);
         }
         error
@@ -1402,7 +1437,7 @@ mod verify_tests {
     #[test]
     fn a_direct_temp_child_is_temp_scratch() {
         let cwd = Path::new("/home/dch/repos/loopctl");
-        assert_eq!(classify_escape("/tmp/probe.py", cwd), "temp scratch");
+        assert_eq!(classify_escape("/tmp/probe.py", cwd, false), "temp scratch");
     }
 
     #[test]
@@ -1411,7 +1446,7 @@ mod verify_tests {
         // nested path is a workspace sibling (or system) instead.
         let cwd = Path::new("/home/dch/repos/loopctl");
         assert_ne!(
-            classify_escape("/tmp/.tmpln/AGENTS.md", cwd),
+            classify_escape("/tmp/.tmpln/AGENTS.md", cwd, false),
             "temp scratch"
         );
     }
@@ -1420,8 +1455,21 @@ mod verify_tests {
     fn a_neighbor_repo_is_a_sibling_workspace() {
         let cwd = Path::new("/home/dch/repos/loopctl");
         assert_eq!(
-            classify_escape("/home/dch/repos/AGENTS.md", cwd),
+            classify_escape("/home/dch/repos/AGENTS.md", cwd, false),
             "sibling workspace"
+        );
+    }
+
+    #[test]
+    fn a_root_level_cwd_parent_never_makes_absolutes_siblings() {
+        // cwd /work has parent / - every absolute path starts with
+        // "/", but only a real sibling counts: system paths keep
+        // system guidance.
+        let cwd = Path::new("/work");
+        assert_eq!(
+            classify_escape("/etc/hosts", cwd, false),
+            "system or dependency path",
+            "the root parent does not turn /etc/hosts into a sibling"
         );
     }
 
@@ -1429,8 +1477,20 @@ mod verify_tests {
     fn a_dependency_source_is_a_system_path() {
         let cwd = Path::new("/home/dch/repos/loopctl");
         assert_eq!(
-            classify_escape("/home/dch/.cargo/registry/src/lib.rs", cwd),
+            classify_escape("/home/dch/.cargo/registry/src/lib.rs", cwd, false),
             "system or dependency path"
+        );
+    }
+
+    #[test]
+    fn the_symlink_arm_classifies_as_a_link_pointing_out() {
+        // A relative spelling inside the workspace whose target is a
+        // symlink out is not traversal: the class names the link.
+        let cwd = Path::new("/home/dch/repos/loopctl");
+        let class = classify_escape("inside_link.txt", cwd, true);
+        assert_eq!(
+            class,
+            "a symlink inside the working directory points outside it"
         );
     }
 
@@ -1438,7 +1498,7 @@ mod verify_tests {
     fn a_traversal_spelling_is_traversal() {
         let cwd = Path::new("/home/dch/repos/loopctl");
         assert_eq!(
-            classify_escape("../../outside.txt", cwd),
+            classify_escape("../../outside.txt", cwd, false),
             "traversal outside the working directory"
         );
     }

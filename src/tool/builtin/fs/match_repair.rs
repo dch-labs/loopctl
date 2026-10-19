@@ -154,17 +154,52 @@ fn line_table(content: &str) -> Vec<(usize, &str)> {
 /// line `fn two() { todo!() }` resembles the old text's
 /// `fn two() {}` — the stale shape — while a paraphrase shares no
 /// half of its words with anything in the file.
-fn similar_line(a: &str, b: &str) -> bool {
-    if a == b {
+/// A line prepared for window comparison: its normalized form and
+/// its token set, computed once per line instead of once per compared
+/// pair.
+struct PreparedLine<'a> {
+    /// The whitespace-normalized text of the line.
+    ///
+    /// The comparison form: line ending stripped, edges trimmed, so
+    /// indentation width and trailing whitespace never count as
+    /// content differences.
+    normalized: &'a str,
+
+    /// The whitespace-split token set of the normalized line.
+    ///
+    /// The resemblance comparison's building block — word-overlap at
+    /// the half mark between two lines' sets is the stale shape's
+    /// signal.
+    tokens: std::collections::HashSet<&'a str>,
+}
+
+/// Prepare one line for comparison.
+///
+/// Normalizes once and splits once: the window loop compares
+/// O(file x old) pairs and must never rebuild either per pair —
+/// a ten-`MiB` file against a fifty-line old text would otherwise
+/// allocate millions of token sets on the executor thread.
+fn prepare_line(line: &str) -> PreparedLine<'_> {
+    let normalized = normalized_line(line);
+    let tokens = normalized.split_whitespace().collect();
+    PreparedLine { normalized, tokens }
+}
+
+/// Whether two prepared lines resemble each other.
+///
+/// Word-overlap at the half mark (computed without floats): the file
+/// line `fn two() { todo!() }` resembles the old text's
+/// `fn two() {}` — the stale shape — while a paraphrase shares no
+/// half of its words with anything in the file.
+fn lines_resemble(a: &PreparedLine<'_>, b: &PreparedLine<'_>) -> bool {
+    if a.normalized == b.normalized {
         return true;
     }
-    let a_tokens: std::collections::HashSet<&str> = a.split_whitespace().collect();
-    let b_tokens: std::collections::HashSet<&str> = b.split_whitespace().collect();
-    if a_tokens.is_empty() && b_tokens.is_empty() {
+    if a.tokens.is_empty() && b.tokens.is_empty() {
         return true;
     }
-    let intersection = a_tokens.intersection(&b_tokens).count();
-    let union = a_tokens.union(&b_tokens).count();
+    let intersection = a.tokens.intersection(&b.tokens).count();
+    let union = a.tokens.union(&b.tokens).count();
     intersection.saturating_mul(2) >= union
 }
 
@@ -183,11 +218,17 @@ fn similar_line(a: &str, b: &str) -> bool {
 /// neighborhood; otherwise no similar passage.
 pub(crate) fn classify_miss(content: &str, old_text: &str) -> MissKind {
     let content_lines = line_table(content);
-    let old_lines: Vec<&str> = old_text.lines().map(normalized_line).collect();
+    let old_lines: Vec<&str> = old_text.lines().collect();
     let old_len = old_lines.len();
     if old_len == 0 || content_lines.len() < old_len {
         return MissKind::NoPassage;
     }
+    let content_prepared: Vec<PreparedLine<'_>> = content_lines
+        .iter()
+        .map(|(_, line)| prepare_line(line))
+        .collect();
+    let old_prepared: Vec<PreparedLine<'_>> =
+        old_lines.iter().map(|line| prepare_line(line)).collect();
 
     let mut whitespace_windows: Vec<LineWindow> = Vec::new();
     let mut best = None;
@@ -198,26 +239,29 @@ pub(crate) fn classify_miss(content: &str, old_text: &str) -> MissKind {
         let mut all_match = true;
         let mut anchored = false;
         let mut first_diff: Option<(usize, &str, &str)> = None;
-        for (index, old_line) in old_lines.iter().enumerate() {
-            let Some(&(_, file_line)) = content_lines.get(start.saturating_add(index)) else {
+        for (index, old_prepared_line) in old_prepared.iter().enumerate() {
+            let Some(file_prepared) = content_prepared.get(start.saturating_add(index)) else {
                 continue;
             };
-            let file_normalized = normalized_line(file_line);
-            let equal = file_normalized == *old_line;
+            let equal = file_prepared.normalized == old_prepared_line.normalized;
             if equal {
                 score = score.saturating_add(1);
                 if (index == 0 || index.saturating_add(1) == old_len)
-                    && old_line.chars().count() > 1
+                    && old_prepared_line.normalized.chars().count() > 1
                 {
                     anchored = true;
                 }
             } else {
                 all_match = false;
-                if similar_line(file_normalized, old_line) {
+                if lines_resemble(file_prepared, old_prepared_line) {
                     score = score.saturating_add(1);
                 }
                 if first_diff.is_none() {
-                    first_diff = Some((start.saturating_add(index), file_line, *old_line));
+                    first_diff = Some((
+                        start.saturating_add(index),
+                        file_prepared.normalized,
+                        old_prepared_line.normalized,
+                    ));
                 }
             }
         }
@@ -414,6 +458,117 @@ pub(crate) fn edge_trimmed_replacement(new_text: &str) -> &str {
     new_text.trim()
 }
 
+/// The leading-whitespace width of a line, in characters.
+///
+/// The re-indent delta's unit — simple character count, mixing tabs
+/// and spaces as they stand; the delta shifts by the same measure it
+/// was measured in.
+fn leading_width(line: &str) -> usize {
+    line.len().saturating_sub(line.trim_start().len())
+}
+
+/// Shift every replacement line's leading whitespace by `delta`.
+///
+/// The indentation delta between the matched window's file-side
+/// first line and the model's `old_text` first line: the
+/// replacement's own spelling is *relative*, the file's is absolute,
+/// so the whole block shifts uniformly — a shallower model spelling
+/// re-indents deeper (a verbatim splice would produce an
+/// `IndentationError` in indentation-sensitive languages), and an
+/// over-indented one shifts back. Pure-whitespace lines stay
+/// untouched; a negative shift strips at most the line's own leading
+/// whitespace.
+pub(crate) fn reindented_replacement(new_text: &str, delta: i64) -> String {
+    let mut rendered = String::with_capacity(new_text.len().saturating_add(16));
+    for (index, line) in new_text.lines().enumerate() {
+        if index > 0 {
+            rendered.push('\n');
+        }
+        if line.trim().is_empty() {
+            rendered.push_str(line);
+            continue;
+        }
+        if delta >= 0 {
+            let pad = usize::try_from(delta).unwrap_or(0);
+            for _ in 0..pad {
+                rendered.push(' ');
+            }
+            rendered.push_str(line);
+        } else {
+            let strip = delta
+                .checked_neg()
+                .and_then(|magnitude| usize::try_from(magnitude).ok())
+                .unwrap_or(0)
+                .min(leading_width(line));
+            let keep = line.len().saturating_sub(strip);
+            if let Some(rest) = line.get(line.len().saturating_sub(keep)..) {
+                rendered.push_str(rest);
+            }
+        }
+    }
+    rendered
+}
+
+/// Splice a whitespace-tolerant replacement into the file's own
+/// bytes, edge-symmetric and uniformly re-indented.
+///
+/// The composed tolerant apply: the window's core range (the file's
+/// edge whitespace preserved), the replacement edge-trimmed, and
+/// every replacement line shifted by the indentation delta between
+/// the file's window and the model's `old_text`.
+/// Drop only the first line's leading whitespace.
+///
+/// After the uniform re-indent, the first line carries exactly the
+/// file's own indentation width — which the core range already keeps
+/// outside the splice. Dropping it here keeps the two from stacking;
+/// interior lines keep their shifted indent.
+fn first_line_unindented(text: &str) -> String {
+    match text.find('\n') {
+        Some(cut) => format!(
+            "{}{}",
+            text.get(..cut).map_or("", str::trim_start),
+            text.get(cut..).unwrap_or_default()
+        ),
+        None => text.trim_start().to_string(),
+    }
+}
+
+/// Splice a whitespace-tolerant replacement into the file's own
+/// bytes, edge-symmetric and uniformly re-indented.
+///
+/// The composed tolerant apply, in order: the window's core range
+/// (the file's own first-line leading and last-line trailing
+/// whitespace stay outside the splice), the replacement edge-trimmed
+/// (its own edge whitespace never stacks against the file's), every
+/// replacement line shifted by the indentation delta between the
+/// matched window's file-side first line and the model's `old_text`
+/// first line — the model's spelling stays *relative*, the file's
+/// absolute indent wins — and the reindented first line's leading
+/// dropped, because the core range already supplies it.
+///
+/// The one seam both [`Edit`](super::Edit) and [`MultiEdit`](super::MultiEditTool)
+/// route their tolerant applies
+/// through; callers owe the receipt's disclosure line.
+pub(crate) fn normalized_splice(
+    content: &str,
+    window: LineWindow,
+    old_text: &str,
+    new_text: &str,
+) -> String {
+    let table = line_table(content);
+    let file_indent = table
+        .get(window.start)
+        .map_or(0, |(_, line)| leading_width(line));
+    let old_indent = old_text.lines().next().map_or(0, leading_width);
+    let file = i64::try_from(file_indent).unwrap_or(i64::MAX);
+    let old = i64::try_from(old_indent).unwrap_or(i64::MAX);
+    let delta = file.saturating_sub(old);
+    let trimmed = edge_trimmed_replacement(new_text);
+    let reindented = reindented_replacement(trimmed, delta);
+    let replacement = first_line_unindented(&reindented);
+    super::edit::splice(content, window_core_range(content, window), &replacement)
+}
+
 /// The disclosure line a whitespace-tolerant apply adds to the
 /// receipt.
 pub(crate) const NORMALIZED_MATCH_NOTE: &str = "matched with normalized indentation";
@@ -497,6 +652,25 @@ mod tests {
     fn an_old_text_longer_than_the_file_is_no_passage() {
         let kind = classify_miss("one line\n", "one line\nplus more\nand more\n");
         assert_eq!(kind, MissKind::NoPassage);
+    }
+
+    #[test]
+    fn the_replacement_re_indents_uniformly() {
+        assert_eq!(
+            reindented_replacement("def f(self):\n    return 2", 4),
+            "    def f(self):\n        return 2",
+            "every line shifts by the delta, interior included"
+        );
+        assert_eq!(
+            reindented_replacement("        fn inner() { todo!() }", -8),
+            "fn inner() { todo!() }",
+            "an over-indented spelling shifts back"
+        );
+        assert_eq!(
+            reindented_replacement("code\n   \ncode", 2),
+            "  code\n   \n  code",
+            "pure-whitespace lines stay untouched"
+        );
     }
 
     #[test]

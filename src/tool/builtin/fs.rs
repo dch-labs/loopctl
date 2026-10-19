@@ -257,7 +257,7 @@ impl FileSession {
     /// can still create itself.
     #[must_use]
     pub fn with_scratch_root(mut self, scratch_root: PathBuf) -> Self {
-        if scratch_root.starts_with(&self.cwd) {
+        if resolve::scratch_root_is_contained(&self.cwd, &scratch_root) {
             if let Err(e) = std::fs::create_dir_all(&scratch_root) {
                 tracing::warn!(error = %e, root = %scratch_root.display(), "scratch root creation failed");
             }

@@ -207,11 +207,13 @@ async fn edit_inner(
         Err(EditError::NotFound) => {
             match super::match_repair::classify_miss(&old_content, parsed.old_text) {
                 super::match_repair::MissKind::WhitespaceUnique(window) => {
-                    let range = super::match_repair::window_core_range(&old_content, window);
                     normalized_note = true;
-                    let replacement =
-                        super::match_repair::edge_trimmed_replacement(parsed.new_text);
-                    splice(&old_content, range, replacement)
+                    super::match_repair::normalized_splice(
+                        &old_content,
+                        window,
+                        parsed.old_text,
+                        parsed.new_text,
+                    )
                 }
                 kind => {
                     return Ok(ToolOutput::error_text(format!(
@@ -482,6 +484,11 @@ fn insert_normalized_note(receipt: &mut String) {
     let note = format!("│ {}\n", super::match_repair::NORMALIZED_MATCH_NOTE);
     if let Some(position) = receipt.find("\n@@") {
         receipt.insert_str(position.saturating_add(1), &note);
+    } else {
+        if !receipt.ends_with('\n') {
+            receipt.push('\n');
+        }
+        receipt.push_str(&note);
     }
 }
 
@@ -743,6 +750,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tolerant_apply_re_indents_the_whole_replacement() {
+        // The review's Python shape: the model matched with shallower
+        // indentation, and the replacement's interior lines keep that
+        // shallow spelling - applied verbatim they would produce an
+        // IndentationError. The whole block shifts by the window's
+        // indentation delta; the file's absolute indent wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.py"),
+            "def outer():\n    def f(self):\n        return 1\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "file_path": "a.py",
+            "old_text": "def f(self):\n    return 1",
+            "new_text": "def f(self):\n    return 2",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        assert!(
+            out.text_content()
+                .contains("matched with normalized indentation"),
+            "the disclosure rides: {}",
+            out.text_content()
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("a.py")).expect("read back");
+        assert!(
+            on_disk.lines().any(|line| line == "    def f(self):")
+                && on_disk.lines().any(|line| line == "        return 2"),
+            "every replacement line carries the file's indent - no IndentationError: {on_disk:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tolerant_apply_dedents_when_the_model_over_indented() {
+        // The negative-delta twin: the model's spelling is deeper
+        // than the file's; the block shifts back by the same delta.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.rs"), "mod m {\nfn inner() {}\n}\n")
+            .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "        fn inner() {}",
+            "new_text": "        fn inner() { todo!() }",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let _ = out;
+        let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).expect("read back");
+        assert!(
+            on_disk.lines().any(|line| line == "fn inner() { todo!() }"),
+            "the over-indent shifts back to the file's level: {on_disk:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_ambiguous_normalized_match_rejects_with_the_echo() {
         // Tolerant matching never applies an ambiguous match: both
         // regions match after normalization, so the miss keeps
@@ -839,6 +906,33 @@ mod tests {
         assert!(
             out.text_content().contains("no similar passage"),
             "the paraphrase shape is named: {}",
+            out.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_disclosure_survives_the_large_diff_path() {
+        // Past MAX_LCS_PRODUCT the receipt carries no @@ hunk marker;
+        // the disclosure must ride anyway - it is the only signal
+        // that the model's text was not applied as sent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let mut content = "filler line\n".repeat(1100);
+        content.push_str("unique anchor line\n");
+        content.push_str(&"filler line\n".repeat(100));
+        std::fs::write(dir.path().join("big.rs"), &content).expect("write fixture");
+        let input = json!({
+            "file_path": "big.rs",
+            "old_text": "      unique anchor line",
+            "new_text": "      replaced anchor",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        assert!(
+            out.text_content()
+                .contains("matched with normalized indentation"),
+            "the disclosure survives every receipt path: {}",
             out.text_content()
         );
     }

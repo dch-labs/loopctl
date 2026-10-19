@@ -1203,12 +1203,15 @@ fn merge_per_file(
         match locate_unique(entry, &op.old_text) {
             FindResult::NotFound => match super::match_repair::classify_miss(entry, &op.old_text) {
                 super::match_repair::MissKind::WhitespaceUnique(window) => {
-                    let range = super::match_repair::window_core_range(entry, window);
                     if !normalized_files.contains(&op.file_path) {
                         normalized_files.push(op.file_path.clone());
                     }
-                    let replacement = super::match_repair::edge_trimmed_replacement(&op.new_text);
-                    *entry = splice(entry, range, replacement);
+                    *entry = super::match_repair::normalized_splice(
+                        entry,
+                        window,
+                        &op.old_text,
+                        &op.new_text,
+                    );
                 }
                 kind => {
                     return Err(AbortReason::Locate(format!(

@@ -1167,6 +1167,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_scratch_root_escape_spelling_is_refused() {
+        // `cwd/../outside` passes a naive starts_with - the builder's
+        // contract honors only a root that stays inside after
+        // lexical normalization.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf())
+            .with_scratch_root(dir.path().join("../elsewhere"));
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/probe.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path still escapes");
+        assert!(
+            !error.to_string().contains("scratch root:"),
+            "the escape spelling is never named: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scratch_root_through_a_symlink_is_refused() {
+        // A symlink below cwd pointing out would let create_dir_all
+        // build outside the workspace - the same containment the
+        // resolver grades, checked before creating or storing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let link = dir.path().join("out-link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        let session =
+            FileSession::new(dir.path().to_path_buf()).with_scratch_root(link.join("scratch"));
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/probe.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path still escapes");
+        assert!(
+            !error.to_string().contains("scratch root:"),
+            "a root through an outbound symlink is never named: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_escape_classifies_as_a_link_pointing_out() {
+        // A spelling inside the workspace whose target is a link out
+        // is not traversal: the class names the link and the remedy
+        // names a real target inside.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "x").expect("outside file");
+        let link = dir.path().join("leak.txt");
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).expect("symlink");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({
+                "file_path": link.to_string_lossy(),
+                "content": "x"
+            }),
+            &session,
+        )
+        .await
+        .expect_err("the symlink target escapes");
+        let message = error.to_string();
+        assert!(
+            message.contains("via symlink"),
+            "the first line is the pinned symlink arm: {message}"
+        );
+        assert!(
+            message.contains("a symlink inside the working directory points outside it"),
+            "the class names the link: {message}"
+        );
+        assert!(
+            message.contains("pass the real path"),
+            "the remedy names a real target: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_scratch_root_outside_the_working_directory_is_ignored() {
         // The gate: only a root at or under the working directory is
         // honored — anything else would advertise a directory the

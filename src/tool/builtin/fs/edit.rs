@@ -372,10 +372,8 @@ impl EditError {
 /// Returns [`ToolError::InvalidInput`] for a missing field, an empty
 /// `old_text`, or a URL `file_path`.
 fn parse_input(input: &Value) -> Result<EditArgs<'_>, ToolError> {
-    let file_path = input
-        .get("file_path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
+    let file_path =
+        super::resolve_path_key(input).ok_or_else(|| super::missing_path_error("Edit", input))?;
     let old_text = input
         .get("old_text")
         .and_then(Value::as_str)
@@ -951,5 +949,41 @@ mod tests {
             ),
             other => panic!("expected a size-guard refusal, got {other:?}"),
         }
+    }
+    #[test]
+    fn edit_refuses_a_mistyped_canonical_key() {
+        let input = serde_json::json!({
+            "file_path": 123,
+            "path": "alias.txt",
+            "old_text": "a",
+            "new_text": "b",
+        });
+        let error = parse_input(&input).expect_err("the mistyped canonical refuses");
+        assert!(
+            error.to_string().contains("file_path must be a string"),
+            "the type error rides: {error}"
+        );
+    }
+    #[test]
+    fn edit_accepts_path_where_file_path_was_expected() {
+        let input = serde_json::json!({
+            "path": "src/lib.rs",
+            "old_text": "a",
+            "new_text": "b",
+        });
+        let parsed = parse_input(&input).expect("the alias spelling parses");
+        assert_eq!(parsed.file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn edit_both_present_resolves_to_the_canonical_file_path() {
+        let input = serde_json::json!({
+            "path": "alias.txt",
+            "file_path": "canonical.txt",
+            "old_text": "a",
+            "new_text": "b",
+        });
+        let parsed = parse_input(&input).expect("parses");
+        assert_eq!(parsed.file_path, "canonical.txt");
     }
 }

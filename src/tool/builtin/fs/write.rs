@@ -176,10 +176,8 @@ async fn write_inner(
 ) -> Result<ToolOutput, ToolError> {
     let policy = session.resolve_policy();
     let cwd = session.cwd().to_path_buf();
-    let file_path = input
-        .get("file_path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
+    let file_path = super::resolve_path_key(&input)
+        .ok_or_else(|| super::missing_path_error("Write", &input))?;
     resolve::reject_path_url("Write", file_path)?;
     let content = input
         .get("content")
@@ -902,6 +900,120 @@ mod tests {
         assert!(
             text.contains("Changed: edge.log") && !text.contains("previous content not read"),
             "a target at exactly the cap takes the ordinary diff path: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_accepts_path_where_file_path_was_expected() {
+        // The corpus drift: models send `path` to Write (68 of 69
+        // recorded failures exactly this shape).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let input = serde_json::json!({
+            "path": "out.txt",
+            "content": "written through the alias",
+        });
+        let output = write_inner(&WriteTool::default(), input, &session)
+            .await
+            .expect("the alias spelling writes");
+        assert!(
+            output.text_content().contains("out.txt"),
+            "the write landed: {}",
+            output.text_content()
+        );
+        let written = std::fs::read_to_string(dir.path().join("out.txt")).expect("file");
+        assert_eq!(written, "written through the alias");
+    }
+
+    #[tokio::test]
+    async fn write_both_present_resolves_to_the_canonical_file_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let input = serde_json::json!({
+            "path": "alias-target.txt",
+            "file_path": "canonical-target.txt",
+            "content": "body",
+        });
+        let _ = write_inner(&WriteTool::default(), input, &session)
+            .await
+            .expect("parses");
+        assert!(
+            dir.path().join("canonical-target.txt").exists(),
+            "the canonical file_path wins when both ride — never last-one-in"
+        );
+        assert!(
+            !dir.path().join("alias-target.txt").exists(),
+            "the alias spelling did not also write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_canonical_key_refuses_instead_of_serving_the_alias() {
+        // The canonical key was present but mistyped: teaching the
+        // type error beats silently serving the alias — Read already
+        // refuses this shape, the family follows.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let input = serde_json::json!({
+            "file_path": 123,
+            "path": "alias-would-write.txt",
+            "content": "body",
+        });
+        let error = write_inner(&WriteTool::default(), input, &session)
+            .await
+            .expect_err("a present-but-mistyped canonical refuses");
+        let message = error.to_string();
+        assert!(
+            message.contains("file_path must be a string"),
+            "the type error names the canonical key: {message}"
+        );
+        assert!(
+            !dir.path().join("alias-would-write.txt").exists(),
+            "the alias never served under the mistyped canonical"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_received_keys_echo_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let flood_key = "k".repeat(8_192);
+        let input = serde_json::json!({
+            flood_key.clone(): "v",
+            "content": "body",
+        });
+        let error = write_inner(&WriteTool::default(), input, &session)
+            .await
+            .expect_err("no path rides");
+        assert!(
+            error.to_string().len() < 2 * 1024,
+            "a pathological key cannot flood the teaching error: {} bytes",
+            error.to_string().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_path_alias_reports_its_type_not_a_miss() {
+        // The alias leg mirrors the canonical's teaching: a present
+        // non-string `path` is a type error, not "missing file_path" —
+        // the model must not be told to resend what it already sent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let input = serde_json::json!({
+            "path": 123,
+            "content": "body",
+        });
+        let error = write_inner(&WriteTool::default(), input, &session)
+            .await
+            .expect_err("a mistyped alias refuses");
+        let message = error.to_string();
+        assert!(
+            message.contains("path must be a string"),
+            "the type error names the alias key: {message}"
+        );
+        assert!(
+            message.contains("number"),
+            "the received type rides: {message}"
         );
     }
 }

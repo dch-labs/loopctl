@@ -288,7 +288,11 @@ impl<B: ShellBackend + 'static> ShellTool<B> {
     async fn call_inner(&self, input: Value, cwd: PathBuf) -> Result<ToolOutput, ToolError> {
         let command = match input.get("command") {
             None => {
-                return Err(ToolError::InvalidInput("Missing command".to_string()));
+                return Err(ToolError::InvalidInput(format!(
+                    "Missing command (got top-level keys: {}; \
+                     expected key 'command')",
+                    crate::tool::builtin::fs::received_keys(&input)
+                )));
             }
             Some(Value::String(command)) => command.clone(),
             Some(_) => {
@@ -1153,7 +1157,12 @@ mod tests {
             .expect_err("an absent command is a missing-field prompt");
         match error {
             ToolError::InvalidInput(message) => {
-                assert_eq!(message, "Missing command");
+                assert_eq!(
+                    message,
+                    "Missing command (got top-level keys: no keys; \
+                     expected key 'command')",
+                    "the teaching shape: the expected key and the absence, both named"
+                );
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
@@ -1549,5 +1558,25 @@ mod tests {
             None,
             "a failed listing changed nothing"
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_call_names_the_expected_key_and_the_absence() {
+        // The while-touching-the-surface item: the empty-object
+        // rejection teaches the expected key instead of a bare word.
+        let tool = ShellTool::new(
+            crate::tool::builtin::shell::unix::UnixShellBackend,
+            std::sync::Arc::new(crate::tool::builtin::shell::jobs::JobStore::new()),
+        );
+        let error = tool
+            .call_inner(serde_json::json!({}), std::env::temp_dir())
+            .await
+            .expect_err("an empty call never runs");
+        let message = error.to_string();
+        assert!(
+            message.contains("command"),
+            "the expected key rides: {message}"
+        );
+        assert!(message.contains("no keys"), "the absence rides: {message}");
     }
 }

@@ -67,6 +67,7 @@ use std::sync::Mutex;
 
 use crate::tool::ToolContext;
 use crate::tool::ToolError;
+use serde_json::Value;
 
 use atomic::WorkspaceAnchor;
 use resolve::ResolvePolicy as Policy;
@@ -452,6 +453,119 @@ pub fn fs_session(ctx: &ToolContext) -> Result<FileSession, ToolError> {
 ///
 /// Returns [`ToolError::Execution`] explaining that a `FileSession`
 /// must be attached to the context before family tools can run.
+/// Resolve the path field from a tool input with canonical
+/// precedence.
+///
+/// The fs family's alias tolerance: `file_path` is the canonical key
+/// every schema advertises, `path` is the spelling the recorded model
+/// drift sends — canonical wins when both ride, never last-one-in,
+/// never merged.
+pub(crate) fn resolve_path_key(input: &Value) -> Option<&str> {
+    match input.get("file_path") {
+        Some(Value::String(path)) => Some(path.as_str()),
+        // A present-but-mistyped canonical refuses rather than
+        // silently serving the alias — the family's one rule, and the
+        // one Read enforces through its own parse.
+        Some(_) => None,
+        None => input.get("path").and_then(Value::as_str),
+    }
+}
+
+/// Resolve the path field with typed refusals for mistyped spellings.
+///
+/// The teaching seam behind the whole family: an absent field is
+/// `Ok(None)` (the caller renders its plain miss), while a
+/// **present-but-non-string** key — canonical or alias — refuses
+/// with the key's own name and its received JSON type, so the model
+/// is never told to resend what it already sent. Canonical precedence
+/// unchanged: `file_path` first, `path` only when the canonical is
+/// absent.
+///
+/// # Errors
+///
+/// [`ToolError::InvalidInput`] naming the mistyped key, its received
+/// type, and the accepted spellings.
+pub(crate) fn resolve_path_key_typed(input: &Value) -> Result<Option<&str>, ToolError> {
+    for (key, value) in [
+        ("file_path", input.get("file_path")),
+        ("path", input.get("path")),
+    ] {
+        if let Some(value) = value
+            && !value.is_string()
+        {
+            return Err(ToolError::InvalidInput(format!(
+                "{key} must be a string, not {} (got top-level keys: {}; \
+                 accepted: file_path, or path)",
+                json_type(Some(value)),
+                received_keys(input)
+            )));
+        }
+        if let Some(Value::String(path)) = value {
+            return Ok(Some(path.as_str()));
+        }
+    }
+    Ok(None)
+}
+
+/// The received-keys echo for a teaching error.
+///
+/// Names the top-level keys the input actually carried, so a missed
+/// field's error shows the shape the model sent — `edits, dry_run` —
+/// instead of making it guess which key was wrong.
+pub(crate) fn received_keys(input: &Value) -> String {
+    const MAX_KEYS_ECHO_BYTES: usize = 512;
+    let mut keys: Vec<&str> = input
+        .as_object()
+        .map_or(Vec::new(), |map| map.keys().map(String::as_str).collect());
+    keys.sort_unstable();
+    if keys.is_empty() {
+        return "no keys".to_string();
+    }
+    let joined = keys.join(", ");
+    if joined.len() <= MAX_KEYS_ECHO_BYTES {
+        return joined;
+    }
+    let cut = joined.floor_char_boundary(MAX_KEYS_ECHO_BYTES);
+    format!("{}…(truncated)", &joined[..cut])
+}
+
+/// The teaching missing-path error for a top-level fs input.
+///
+/// Names the canonical key, the accepted alias, and the keys the
+/// input actually carried.
+pub(crate) fn missing_path_error(tool: &str, input: &Value) -> ToolError {
+    if let Err(error) = resolve_path_key_typed(input) {
+        return error;
+    }
+    ToolError::InvalidInput(format!(
+        "Missing file_path for {tool} (got top-level keys: {}; \
+         accepted: file_path, or path)",
+        received_keys(input)
+    ))
+}
+
+/// The JSON type name a teaching error quotes.
+///
+/// `null`/`bool`/`number`/`string`/`array`/`object` — the vocabulary
+/// a model reads back and understands. `None` reads as `null`: the
+/// caller passes a value it just probed.
+pub(crate) fn json_type(value: Option<&Value>) -> &'static str {
+    match value {
+        None | Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "bool",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+/// Pull the fs session from the tool context.
+///
+/// # Errors
+///
+/// [`ToolError::InvalidInput`] when no [`FileSession`] is wired into
+/// the context — the fs family cannot operate without its workspace.
 pub(crate) fn require_session(session: Option<FileSession>) -> Result<FileSession, ToolError> {
     session.ok_or_else(|| {
         ToolError::Execution(
@@ -545,6 +659,23 @@ fn identity_of(path: &Path) -> Option<(u64, u64)> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_over_long_keys_echo_truncates_at_the_cap() {
+        let long_key = "k".repeat(4_096);
+        let input = serde_json::json!({ long_key: true });
+        let echo = received_keys(&input);
+        assert!(
+            echo.len() <= 512 + "…(truncated)".len(),
+            "the teaching echo is bounded — a pathological key cannot flood the \
+             error the model reads: {} bytes",
+            echo.len()
+        );
+        assert!(
+            echo.ends_with("…(truncated)"),
+            "the cap says so with the marker"
+        );
+    }
 
     fn ctx_in(cwd: &Path) -> ToolContext {
         let mut ctx = ToolContext::default();

@@ -114,8 +114,11 @@ mod emission;
 mod llm_turn;
 mod model_switch;
 mod prune;
+mod steering;
 #[cfg(test)]
 mod tests;
+
+pub use steering::Steering;
 
 use emission::TurnEnd;
 pub use model_switch::ModelSwitch;
@@ -269,6 +272,15 @@ pub struct BareLoop<C: ApiClient> {
     /// also cancel-aware via `tokio::select!` — the loop will wake up
     /// mid-stream, mid-tool, or mid-compaction when cancelled.
     cancelled: Arc<CancelSignal>,
+
+    /// This loop's steering slot, shared with every handle handed out.
+    ///
+    /// Cloned from [`steering`](Self::steering) by hosts that steer a
+    /// running loop: guidance pushed here is drained by the loop at
+    /// the next turn boundary into the machine's pending set, so it
+    /// joins the committed conversation rather than riding one
+    /// request. One slot serves the loop for its whole life.
+    steering: Arc<Steering>,
 
     /// Optional callback invoked for each text delta during streaming.
     ///
@@ -963,6 +975,7 @@ impl<C: ApiClient> BareLoop<C> {
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
+            steering: Arc::new(Steering::new()),
             #[cfg(feature = "streaming")]
             text_streamer: None,
             contributors: Vec::new(),
@@ -1439,6 +1452,34 @@ impl<C: ApiClient> BareLoop<C> {
         &self.machine
     }
 
+    /// Rewind this loop's committed history; see
+    /// [`rewind_to`](LoopMachine::rewind_to).
+    ///
+    /// The host seam for correcting a committed prompt: the loop keeps
+    /// its machine, its client, its observers, and the
+    /// [`cancel_signal`](Self::cancel_signal) the host already holds —
+    /// nothing is rebuilt. Must be called between runs (a turn in
+    /// flight refuses); `cancel()` then letting the run resolve is the
+    /// supported path out of a live turn.
+    ///
+    /// A rewind that removes anything also invalidates the usage
+    /// anchor and any prepared turn, exactly as a prune adoption does —
+    /// the next run re-estimates against the history it now has, which
+    /// re-arms the compaction threshold naturally.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::InvalidInput`] when a turn is in flight, verbatim
+    /// from the machine.
+    pub fn rewind_history_to(&mut self, len: usize) -> Result<usize, LoopError> {
+        let removed = self.machine.rewind_to(len)?;
+        if removed > 0 {
+            self.anchor = None;
+            self.prepared_turn = None;
+        }
+        Ok(removed)
+    }
+
     /// Consume the loop and take ownership of its state machine.
     ///
     /// Returns the [`LoopMachine`], dropping the rest of the loop (client,
@@ -1493,6 +1534,7 @@ impl<C: ApiClient> BareLoop<C> {
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
+            steering: Arc::new(Steering::new()),
             #[cfg(feature = "streaming")]
             text_streamer: None,
             contributors: Vec::new(),
@@ -1618,6 +1660,7 @@ impl<C: ApiClient> BareLoop<C> {
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
+            steering: Arc::new(Steering::new()),
             #[cfg(feature = "streaming")]
             text_streamer: None,
             contributors: Vec::new(),
@@ -1796,6 +1839,21 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     pub fn cancel_signal(&self) -> Arc<CancelSignal> {
         Arc::clone(&self.cancelled)
+    }
+
+    /// This loop's steering handle; every clone reaches the same slot.
+    ///
+    /// The shared way to say something to the turn that is running:
+    /// [`Steering::push`] offers a message to the run in flight, and
+    /// the loop drains the slot at the next turn boundary through the
+    /// machine's inject — the guidance enters the pending set the
+    /// machine commits, so the conversation the user reads is the one
+    /// the model continues. Nothing is rebuilt: the handle reaches the
+    /// same loop holding the observers and cancel signal the host
+    /// already has.
+    #[must_use]
+    pub fn steering(&self) -> Arc<Steering> {
+        Arc::clone(&self.steering)
     }
 
     /// Assert that the loop has not started running yet.
@@ -2205,6 +2263,23 @@ impl<C: ApiClient> BareLoop<C> {
             && fallback.active_model()?.is_none()
         {
             return Err(LoopError::FallbackExhausted);
+        }
+
+        // The steering drain: guidance accepted since the last
+        // boundary joins the pending set ahead of this turn's
+        // assembly — after the tool results that opened the boundary,
+        // before the request. An assembled turn no longer matches the
+        // history it was built from, so the stash and the usage
+        // anchor go exactly as a rewind takes them; the pre-request
+        // estimate below re-measures over the machine's full history
+        // (injections included) and re-feeds the machine.
+        let steered = self.steering.drain_waiting();
+        if !steered.is_empty() {
+            for message in steered {
+                self.machine.inject(message);
+            }
+            self.prepared_turn = None;
+            self.anchor = None;
         }
 
         let turn_start = self.managers.clock().monotonic();
@@ -2825,6 +2900,8 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 gate.begin();
                 self.budget_run_started = Some(self.managers.clock().monotonic());
             }
+            self.steering.open_run();
+            let _slot_guard = steering::SteeringCloseGuard::new(Arc::clone(&self.steering));
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
             self.overflow_retry = None;
@@ -2967,6 +3044,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
 
             self.notify_run_end(&run, duration, error);
             self.cancelled.reset();
+            self.steering.close_run();
 
             Ok(run)
         })

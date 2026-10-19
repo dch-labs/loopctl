@@ -145,6 +145,57 @@ fn assert_scenario(fixture: &Fixture, name: &str, produced: &str, workspace: &Pa
     );
 }
 
+#[cfg(feature = "schema_validation")]
+#[test]
+fn the_documented_shapes_are_schema_legal_across_the_family() {
+    let cases: Vec<(&str, serde_json::Value, Vec<serde_json::Value>)> = vec![
+        (
+            "Write",
+            write_tool().schema().input_schema,
+            vec![serde_json::json!({"file_path": "a.txt", "content": "body"})],
+        ),
+        (
+            "Edit",
+            edit_tool().schema().input_schema,
+            vec![serde_json::json!(
+                {"file_path": "a.txt", "old_text": "x", "new_text": "y"}
+            )],
+        ),
+        (
+            "FileViewer",
+            FileViewerTool.schema().input_schema,
+            vec![
+                serde_json::json!({"file_path": "a.txt"}),
+                serde_json::json!({"file_path": "a.txt", "page": 2}),
+            ],
+        ),
+        (
+            "MultiEdit",
+            multi_edit_tool().schema().input_schema,
+            vec![
+                serde_json::json!({
+                    "edits": [{"file_path": "a.txt", "old_text": "x", "new_text": "y"}]
+                }),
+                serde_json::json!({
+                    "file_path": "a.txt",
+                    "edits": [
+                        {"old_text": "x", "new_text": "y"},
+                        {"file_path": "b.txt", "old_text": "p", "new_text": "q"}
+                    ]
+                }),
+            ],
+        ),
+    ];
+    for (tool, schema, shapes) in cases {
+        for shape in shapes {
+            assert!(
+                jsonschema::is_valid(&schema, &shape),
+                "{tool} schema rejects a documented runtime-accepted shape: {shape}"
+            );
+        }
+    }
+}
+
 fn schema_scenarios(fixture: &Fixture) {
     for (name, tool) in [
         ("schema_Write", Arc::new(write_tool()) as Arc<dyn Tool>),

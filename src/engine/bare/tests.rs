@@ -14585,3 +14585,812 @@ async fn a_cancelled_run_does_not_wait_for_the_async_selection() {
         "cancel wins the race against a hung selector: {settled:?}"
     );
 }
+
+// --- L-162 rewind seam -----------------------------------------------------
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn rewind_history_to_prunes_the_next_provider_request() {
+    // The host observed len 2 before the second run; rewinding there
+    // must read on the wire as though the second run never happened —
+    // the captured request, not just the vector, is the evidence.
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("ok", "first answer");
+    client.push_final_turn("ok", "second answer");
+    client.push_final_turn("ok", "third answer");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    agent.run("first", &make_run_config()).await.unwrap();
+    let before_second = agent.machine().history().len();
+    agent.run("second", &make_run_config()).await.unwrap();
+    let removed = agent
+        .rewind_history_to(before_second)
+        .expect("a between-runs rewind succeeds");
+    assert_eq!(removed, 2, "exactly the second run's messages leave");
+    agent.run("third", &make_run_config()).await.unwrap();
+
+    let log = crate::error::recover_guard(requests.lock()).clone();
+    let third = log.last().expect("the third run issued a model call");
+    assert_eq!(
+        third.messages.len(),
+        3,
+        "the next request carries [user first, assistant first, user third]: {:?}",
+        third
+            .messages
+            .iter()
+            .map(crate::message::Message::text_content)
+            .collect::<Vec<_>>()
+    );
+    let rendered = third
+        .messages
+        .iter()
+        .map(crate::message::Message::text_content)
+        .collect::<Vec<_>>();
+    assert!(
+        !rendered.iter().any(|text| text.contains("second")),
+        "the superseded prompt and its answer are gone from the wire: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn rewind_history_to_keeps_the_system_prompt() {
+    // The system prompt lives on the session config, outside the
+    // machine's history; a rewind to zero must not eat it.
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("ok", "one");
+    client.push_final_turn("ok", "two");
+    let config = SessionConfig {
+        system_prompt: Some("you are the night watch".to_string()),
+        ..make_config()
+    };
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+    agent.run("first", &make_run_config()).await.unwrap();
+    let removed = agent.rewind_history_to(0).expect("rewind to zero succeeds");
+    assert_eq!(removed, 2);
+    agent.run("second", &make_run_config()).await.unwrap();
+
+    let log = crate::error::recover_guard(requests.lock()).clone();
+    let second = log.last().expect("the second run issued a model call");
+    assert_eq!(
+        second.system.as_deref(),
+        Some("you are the night watch"),
+        "the system prompt survives a rewind to zero"
+    );
+    assert_eq!(
+        second.messages.len(),
+        1,
+        "history is empty; the request carries only the new prompt"
+    );
+}
+
+#[tokio::test]
+async fn rewind_history_to_keeps_the_cancel_signal_the_host_already_holds() {
+    // The whole point of the seam over a rebuild: the signal the host
+    // cloned stays bound to this loop.
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    client.add_text_response("two");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let signal = agent.cancel_signal();
+    agent.run("first", &make_run_config()).await.unwrap();
+    agent.rewind_history_to(0).expect("rewind succeeds");
+    assert!(
+        Arc::ptr_eq(&signal, &agent.cancel_signal()),
+        "the cancel signal the host already holds stays live"
+    );
+    agent.run("second", &make_run_config()).await.unwrap();
+}
+
+#[tokio::test]
+async fn rewind_history_to_re_arms_the_compaction_threshold_naturally() {
+    // A rewind can drop history below the last compaction floor; the
+    // rule is that the next run re-estimates against the shorter
+    // history and no compaction fires for it.
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    client.add_text_response("two");
+    let config = SessionConfig {
+        compact_threshold: 5,
+        ..make_config()
+    };
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+    agent.run("first", &make_run_config()).await.unwrap();
+    agent.rewind_history_to(0).expect("rewind succeeds");
+    let result = agent.run("second", &make_run_config()).await.unwrap();
+    assert_eq!(
+        result.turn_count(),
+        1,
+        "the run after a rewind completes without a compaction detour"
+    );
+}
+
+/// A tool that offers steering messages while its call is in flight,
+/// recording whether each was accepted, then lingering so a canceller
+/// can observe the push before the next boundary drains it.
+#[cfg(feature = "streaming")]
+struct SteeringTool {
+    steering: Arc<Steering>,
+    words: &'static [&'static str],
+    accepted: Arc<Mutex<Vec<bool>>>,
+    linger: Duration,
+}
+
+#[cfg(feature = "streaming")]
+impl Tool for SteeringTool {
+    fn name(&self) -> &'static str {
+        "steer_here"
+    }
+
+    fn description(&self) -> &'static str {
+        "Offer this run's steering messages mid-dispatch"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "steer_here".into(),
+            description: self.description().into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        let steering = Arc::clone(&self.steering);
+        let words = self.words;
+        let accepted = Arc::clone(&self.accepted);
+        let linger = self.linger;
+        Box::pin(async move {
+            for word in words {
+                let took = steering.push(Message::user(*word));
+                crate::error::recover_guard(accepted.lock()).push(took);
+            }
+            tokio::time::sleep(linger).await;
+            Ok(ToolOutput::text("steered"))
+        })
+    }
+}
+
+/// A tool that pushes one large steering message mid-dispatch.
+#[cfg(feature = "streaming")]
+struct BigSteerTool {
+    steering: Arc<Steering>,
+    text: String,
+}
+
+#[cfg(feature = "streaming")]
+impl Tool for BigSteerTool {
+    fn name(&self) -> &'static str {
+        "steer_big"
+    }
+
+    fn description(&self) -> &'static str {
+        "Offer one large steering message mid-dispatch"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "steer_big".into(),
+            description: self.description().into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        let steering = Arc::clone(&self.steering);
+        let text = self.text.clone();
+        Box::pin(async move {
+            assert!(steering.push(Message::user(text)), "the run is in flight");
+            Ok(ToolOutput::text("steered big"))
+        })
+    }
+}
+
+/// Wait until the accepted log holds `expected` entries, then cancel.
+///
+/// The deterministic spine of the leftover pins: the tool lingers
+/// after its push, so the cancel always lands between the push and
+/// the boundary that would drain it.
+#[cfg(feature = "streaming")]
+async fn cancel_once_steered(
+    accepted: Arc<Mutex<Vec<bool>>>,
+    expected: usize,
+    signal: Arc<crate::engine::bare::CancelSignal>,
+) {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
+    while crate::error::recover_guard(accepted.lock()).len() < expected {
+        assert!(
+            Instant::now() < deadline,
+            "the steering tool never pushed its guidance"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    signal.cancel();
+}
+
+/// Render a request's messages as role-tagged text, for wire-shape pins.
+#[cfg(feature = "streaming")]
+fn steered_shape(request: &crate::api::StreamRequest) -> Vec<(String, String)> {
+    request
+        .messages
+        .iter()
+        .map(|message| (format!("{:?}", message.role), message.text_content()))
+        .collect()
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_push_mid_run_reaches_the_next_request_and_commits() {
+    // The boundary law at the loop level: a push during dispatch is
+    // absent from the request whose tools are running and present in
+    // the next one — then lands in committed history, so a resume
+    // rebuilds a conversation that contains it (the property the
+    // contributor path cannot offer).
+    let (client, requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "steer_1", "steer_here", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    agent.tool_registry().register(SteeringTool {
+        steering: Arc::clone(&steering),
+        words: &["the file is generated"],
+        accepted: Arc::clone(&accepted),
+        linger: Duration::ZERO,
+    });
+
+    agent
+        .run("inspect things", &make_run_config())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *crate::error::recover_guard(accepted.lock()),
+        vec![true],
+        "the push was accepted: a run was in flight"
+    );
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 2, "the fixture issues two requests");
+    assert!(
+        !captured[0]
+            .messages
+            .iter()
+            .any(|message| message.text_content().contains("generated")),
+        "the push happens during the first turn's dispatch: it cannot appear in that stream's request"
+    );
+    let shape = steered_shape(&captured[1]);
+    let position = shape
+        .iter()
+        .position(|(role, text)| text.contains("generated") && role.contains("User"))
+        .expect("the next request carries the guidance");
+    let preceding = &captured[1].messages[position.saturating_sub(1)];
+    assert_eq!(
+        tool_result_ids(preceding),
+        vec!["steer_1".to_string()],
+        "it sits directly after the tool results that opened the boundary: {shape:?}"
+    );
+    assert!(
+        agent
+            .machine()
+            .history()
+            .iter()
+            .any(|message| message.text_content().contains("generated")),
+        "the guidance is committed history — a resume rebuilds a conversation containing it"
+    );
+    assert!(
+        agent.steering().is_empty(),
+        "a delivered push leaves nothing waiting"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn three_pushes_land_in_order_as_separate_user_messages() {
+    // Order and separation: the model must be able to tell "the user
+    // interjected" from "my own last turn" — three pushes land
+    // consecutively, in push order, each its own user message.
+    let (client, requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "steer_1", "steer_here", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    agent.tool_registry().register(SteeringTool {
+        steering: Arc::clone(&steering),
+        words: &["first word", "second word", "third word"],
+        accepted: Arc::new(Mutex::new(Vec::new())),
+        linger: Duration::ZERO,
+    });
+    agent
+        .run("inspect things", &make_run_config())
+        .await
+        .unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    // Machine level: three separate user messages, in push order,
+    // directly after the tool results that opened the boundary.
+    let history = agent.machine().history();
+    let first = history
+        .iter()
+        .position(|message| message.text_content().contains("first word"))
+        .expect("the pushes are committed history");
+    assert_eq!(
+        history[first].text_content(),
+        "first word",
+        "each push keeps its own message"
+    );
+    assert_eq!(
+        (
+            history[first + 1].text_content(),
+            history[first + 2].text_content()
+        ),
+        ("second word".to_string(), "third word".to_string()),
+        "push order is message order"
+    );
+    assert!(
+        tool_result_ids(&history[first.saturating_sub(1)]).contains(&"steer_1".to_string()),
+        "the interjections sit after the tool results, before the request"
+    );
+    // Wire level: the provider's adjacent-user coalescing joins them,
+    // in push order, still after the tool results.
+    let joined = captured[1]
+        .messages
+        .iter()
+        .find(|message| message.text_content().contains("first word"))
+        .expect("the pushes ride the next request");
+    let text = joined.text_content();
+    let (a, b, c) = (
+        text.find("first word").unwrap_or(usize::MAX),
+        text.find("second word").unwrap_or(usize::MAX),
+        text.find("third word").unwrap_or(usize::MAX),
+    );
+    assert!(
+        a != usize::MAX && b != usize::MAX && c != usize::MAX && a < b && b < c,
+        "wire order is push order: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_push_while_idle_is_refused_and_leaves_nothing_waiting() {
+    // The idle edge is the sharp one: between runs the machine is
+    // terminal and a bare inject would swallow the message — so "is
+    // a run in flight" and "hand the message over" are one atomic
+    // act. The refused message stays the caller's: nothing waits,
+    // and a later run's wire carries no trace of it.
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    client.add_text_response("two");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    assert!(
+        !steering.push(Message::user("nobody is running")),
+        "no run is in flight: the push is refused"
+    );
+    assert!(
+        steering.is_empty(),
+        "the refused push leaves the slot empty"
+    );
+    agent.run("unrelated", &make_run_config()).await.unwrap();
+    assert!(
+        !agent
+            .machine()
+            .history()
+            .iter()
+            .any(|message| message.text_content().contains("nobody is running")),
+        "a refused push never rides a later run"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_cancelled_run_leaves_the_slot_intact_and_leftovers_survive() {
+    // Cancel and terminal: cancellation ends a turn, it does not
+    // discard the user's words — an accepted push the boundary never
+    // reached stays in the slot, in order, for the host; and once
+    // the run has resolved, a further push is refused. The race
+    // between "run ends" and "push lands" resolves to
+    // accepted-and-collectable or refused-and-returned — never both,
+    // never neither.
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "steer_1", "steer_here", &json!({}));
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    agent.tool_registry().register(SteeringTool {
+        steering: Arc::clone(&steering),
+        words: &["held word", "second held"],
+        accepted: Arc::clone(&accepted),
+        linger: Duration::from_millis(50),
+    });
+    let signal = agent.cancel_signal();
+    let canceller = tokio::spawn(cancel_once_steered(
+        Arc::clone(&accepted),
+        2,
+        Arc::clone(&signal),
+    ));
+    let first = agent.run("inspect things", &make_run_config()).await;
+    canceller.await.unwrap();
+    match first {
+        Err(LoopError::Cancelled) => {}
+        other => panic!("expected Err(LoopError::Cancelled), got {other:?}"),
+    }
+    let leftovers = steering.take_all();
+    assert_eq!(
+        leftovers.len(),
+        2,
+        "both accepted pushes survive the cancelled run"
+    );
+    assert!(
+        leftovers[0].text_content().contains("held word")
+            && leftovers[1].text_content().contains("second held"),
+        "the host collects exactly what was pushed, in order"
+    );
+    assert!(steering.is_empty(), "take_all empties the slot");
+    assert!(
+        !steering.push(Message::user("too late")),
+        "after the run resolves, pushes are refused"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn take_leftovers_never_steals_the_live_run_s_guidance() {
+    // The split: `take_leftovers` is the sealed pocket alone — a host
+    // peeking mid-run must not steal guidance the next boundary would
+    // deliver. The live queue keeps its word.
+    let (client, requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "steer_1", "steer_here", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    agent.tool_registry().register(SteeringTool {
+        steering: Arc::clone(&steering),
+        words: &["live word"],
+        accepted: Arc::clone(&accepted),
+        linger: Duration::from_millis(50),
+    });
+    let stolen_log = Arc::new(Mutex::new(Vec::<Message>::new()));
+    let slot_probe = Arc::clone(&steering);
+    let push_watcher = Arc::clone(&accepted);
+    let probe_log = Arc::clone(&stolen_log);
+    let probe = tokio::spawn(async move {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
+        while crate::error::recover_guard(push_watcher.lock()).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the steering tool never pushed its guidance"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let stolen = slot_probe.take_leftovers();
+        *crate::error::recover_guard(probe_log.lock()) = stolen;
+    });
+    agent
+        .run("inspect things", &make_run_config())
+        .await
+        .unwrap();
+    probe.await.unwrap();
+    assert!(
+        crate::error::recover_guard(stolen_log.lock()).is_empty(),
+        "a mid-run take_leftovers reads the sealed pocket alone: {:?}",
+        "guidance stolen from the live queue"
+    );
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert!(
+        captured[1]
+            .messages
+            .iter()
+            .any(|message| message.text_content().contains("live word")),
+        "the live guidance still rides the next boundary"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn take_all_collects_sealed_and_waiting_at_shutdown() {
+    // The shutdown shape: after a run resolves, `take_all` gathers
+    // both the sealed pocket and the still-waiting queue, oldest
+    // first, and empties the slot.
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "steer_1", "steer_here", &json!({}));
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    agent.tool_registry().register(SteeringTool {
+        steering: Arc::clone(&steering),
+        words: &["held word", "second held"],
+        accepted: Arc::clone(&accepted),
+        linger: Duration::from_millis(50),
+    });
+    let signal = agent.cancel_signal();
+    let canceller = tokio::spawn(cancel_once_steered(
+        Arc::clone(&accepted),
+        2,
+        Arc::clone(&signal),
+    ));
+    let first = agent.run("inspect things", &make_run_config()).await;
+    canceller.await.unwrap();
+    assert!(first.is_err(), "the cancelled run fails");
+    let collected = steering.take_all();
+    assert_eq!(
+        collected.len(),
+        2,
+        "the shutdown collect gathers everything the run never reached"
+    );
+    assert!(
+        collected[0].text_content().contains("held word")
+            && collected[1].text_content().contains("second held"),
+        "in arrival order: {:?}",
+        collected
+            .iter()
+            .map(crate::message::Message::text_content)
+            .collect::<Vec<_>>()
+    );
+    assert!(steering.is_empty(), "take_all empties the slot");
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn leftovers_never_ride_turn_zero_of_the_next_run() {
+    // Guidance the run never reached must not be auto-drained as
+    // turn 0 of the next run — between runs the host may have
+    // rewound (L-162) or cancelled, and advice about a turn that no
+    // longer stands is not advice. It stays collectable instead.
+    let (client, requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "steer_1", "steer_here", &json!({}));
+    client.push_final_turn("thinking ", "done again");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    agent.tool_registry().register(SteeringTool {
+        steering: Arc::clone(&steering),
+        words: &["stale word"],
+        accepted: Arc::clone(&accepted),
+        linger: Duration::from_millis(50),
+    });
+    let signal = agent.cancel_signal();
+    let canceller = tokio::spawn(cancel_once_steered(
+        Arc::clone(&accepted),
+        1,
+        Arc::clone(&signal),
+    ));
+    let first = agent.run("inspect things", &make_run_config()).await;
+    canceller.await.unwrap();
+    assert!(first.is_err(), "the cancelled run fails");
+    // The host does NOT take the leftovers and simply runs again.
+    agent.run("a fresh task", &make_run_config()).await.unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    let later = &captured[1];
+    assert_eq!(later.messages.len(), 1, "the fresh run is a cold start");
+    assert!(
+        !later
+            .messages
+            .iter()
+            .any(|message| message.text_content().contains("stale word")),
+        "the stale guidance never rides turn 0 of the next run: {:?}",
+        steered_shape(later)
+    );
+    let leftovers = steering.take_leftovers();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "the stale guidance stays collectable instead of delivered"
+    );
+    assert!(
+        leftovers[0].text_content().contains("stale word"),
+        "the host decides what happens to it"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_aborted_run_task_closes_the_steering_slot() {
+    // R3-1: a host wrapping run() in a select!/timeout can drop the
+    // future before finalize ever runs — the slot must close with the
+    // drop, or push() would tell the host a dead run accepted its
+    // guidance. The abort is the crate-invisible exit path.
+    struct HangTool {
+        entered: Arc<AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl Tool for HangTool {
+        fn name(&self) -> &'static str {
+            "hang"
+        }
+        fn description(&self) -> &'static str {
+            "Block until released"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "hang".into(),
+                description: self.description().into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                entered.store(true, Ordering::SeqCst);
+                release.notified().await;
+                Ok(ToolOutput::text("done"))
+            })
+        }
+    }
+
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "hang_1", "hang", &json!({}));
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    agent.tool_registry().register(HangTool {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let task = tokio::spawn(async move { agent.run("inspect things", &make_run_config()).await });
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the run never reached its hanging tool"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        steering.push(Message::user("while it runs")),
+        "mid-run, the slot accepts guidance"
+    );
+    task.abort();
+    let _join = task.await;
+    assert!(
+        !steering.push(Message::user("after the drop")),
+        "a dropped run future closes the slot - no dead run accepts guidance"
+    );
+    assert!(
+        !steering.is_empty(),
+        "the accepted guidance survives the drop for the host to collect"
+    );
+    let collected = steering.take_all();
+    assert!(
+        collected
+            .iter()
+            .any(|message| message.text_content().contains("while it runs")),
+        "the mid-run push is collectable after the abort"
+    );
+}
+
+/// An async selector that gates each consult on a notify, counting
+/// how many times it was consulted.
+#[cfg(feature = "streaming")]
+struct GatedSelector {
+    gate: Arc<tokio::sync::Notify>,
+    consults: Arc<Mutex<usize>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::tool::AsyncToolSelector for GatedSelector {
+    fn select<'a>(
+        &'a self,
+        _ctx: &'a crate::tool::SelectionContext<'a>,
+        all: &'a [ToolSchema],
+    ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>> {
+        let gate = Arc::clone(&self.gate);
+        let consults = Arc::clone(&self.consults);
+        Box::pin(async move {
+            let seen = {
+                let mut count = crate::error::recover_guard(consults.lock());
+                *count = count.saturating_add(1);
+                *count
+            };
+            if seen == 1 {
+                gate.notified().await;
+            }
+            all.to_vec()
+        })
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_prepared_turn_plus_steering_sends_the_guidance() {
+    // The invalidation is load-bearing, not decorative: run() stashes
+    // turn 0's prepared turn before the loop, and a push accepted in
+    // the preparation window must drop that stash — the selector is
+    // consulted again for the turn it now faces, and the request the
+    // host can already see on screen carries the guidance.
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("thinking ", "done");
+    let steering_arc_holder: Arc<Mutex<Option<Arc<Steering>>>> = Arc::new(Mutex::new(None));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let consults = Arc::new(Mutex::new(0));
+    let mut agent = BareLoop::new(Arc::new(client), surface_registry(), make_config())
+        .with_async_tool_selector(Arc::new(GatedSelector {
+            gate: Arc::clone(&gate),
+            consults: Arc::clone(&consults),
+        }));
+    let steering = agent.steering();
+    *crate::error::recover_guard(steering_arc_holder.lock()) = Some(Arc::clone(&steering));
+    let run_steering = Arc::clone(&steering);
+    let pusher_consults = Arc::clone(&consults);
+    let pusher = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while *crate::error::recover_guard(pusher_consults.lock()) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the selector was never consulted for turn 0"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            run_steering.push(Message::user("mid-window word")),
+            "the run is in flight: the push is accepted"
+        );
+        gate.notify_one();
+    });
+    agent
+        .run("inspect things", &make_run_config())
+        .await
+        .unwrap();
+    pusher.await.unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    let first = &captured[0];
+    assert!(
+        first
+            .messages
+            .iter()
+            .any(|message| message.text_content().contains("mid-window word")),
+        "the turn-0 request carries the guidance the stash predated: {:?}",
+        steered_shape(first)
+    );
+    assert_eq!(
+        *crate::error::recover_guard(consults.lock()),
+        2,
+        "the stashed preparation is dropped and re-run with the guidance in view"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_steering_message_refreshes_the_context_estimate() {
+    // Point 5: inject deliberately does not refresh the estimate, so
+    // the drain sits ahead of the pre-request re-measure — the next
+    // turn's threshold decision runs against the payload that is
+    // about to be sent, not the pre-inject figure.
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "steer_1", "steer_big", &json!({}));
+    client.push_final_turn("thinking ", "done");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    agent.tool_registry().register(BigSteerTool {
+        steering: Arc::clone(&steering),
+        text: "context ballast ".repeat(4000),
+    });
+    agent
+        .run("inspect things", &make_run_config())
+        .await
+        .unwrap();
+    assert!(
+        agent.machine().context_tokens() > 10_000,
+        "the figure reflects the steered payload, not the pre-inject estimate: {}",
+        agent.machine().context_tokens()
+    );
+}

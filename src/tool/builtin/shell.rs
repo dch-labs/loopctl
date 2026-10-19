@@ -1559,12 +1559,7 @@ mod tests {
             "a failed listing changed nothing"
         );
     }
-}
-
-#[cfg(test)]
-mod teaching_error_tests {
-    use super::*;
-
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_empty_call_names_the_expected_key_and_the_absence() {
         // The while-touching-the-surface item: the empty-object

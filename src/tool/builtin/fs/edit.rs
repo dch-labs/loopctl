@@ -950,12 +950,20 @@ mod tests {
             other => panic!("expected a size-guard refusal, got {other:?}"),
         }
     }
-}
-
-#[cfg(test)]
-mod alias_tests {
-    use super::*;
-
+    #[test]
+    fn edit_refuses_a_mistyped_canonical_key() {
+        let input = serde_json::json!({
+            "file_path": 123,
+            "path": "alias.txt",
+            "old_text": "a",
+            "new_text": "b",
+        });
+        let error = parse_input(&input).expect_err("the mistyped canonical refuses");
+        assert!(
+            error.to_string().contains("file_path must be a string"),
+            "the type error rides: {error}"
+        );
+    }
     #[test]
     fn edit_accepts_path_where_file_path_was_expected() {
         let input = serde_json::json!({
@@ -977,25 +985,5 @@ mod alias_tests {
         });
         let parsed = parse_input(&input).expect("parses");
         assert_eq!(parsed.file_path, "canonical.txt");
-    }
-}
-
-#[cfg(test)]
-mod review_round_tests {
-    use super::*;
-
-    #[test]
-    fn edit_refuses_a_mistyped_canonical_key() {
-        let input = serde_json::json!({
-            "file_path": 123,
-            "path": "alias.txt",
-            "old_text": "a",
-            "new_text": "b",
-        });
-        let error = parse_input(&input).expect_err("the mistyped canonical refuses");
-        assert!(
-            error.to_string().contains("file_path must be a string"),
-            "the type error rides: {error}"
-        );
     }
 }

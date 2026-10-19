@@ -902,11 +902,6 @@ mod tests {
             "a target at exactly the cap takes the ordinary diff path: {text}"
         );
     }
-}
-
-#[cfg(test)]
-mod alias_tests {
-    use super::*;
 
     #[tokio::test]
     async fn write_accepts_path_where_file_path_was_expected() {
@@ -951,11 +946,6 @@ mod alias_tests {
             "the alias spelling did not also write"
         );
     }
-}
-
-#[cfg(test)]
-mod review_round_tests {
-    use super::*;
 
     #[tokio::test]
     async fn a_mistyped_canonical_key_refuses_instead_of_serving_the_alias() {
@@ -999,6 +989,31 @@ mod review_round_tests {
             error.to_string().len() < 2 * 1024,
             "a pathological key cannot flood the teaching error: {} bytes",
             error.to_string().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_path_alias_reports_its_type_not_a_miss() {
+        // The alias leg mirrors the canonical's teaching: a present
+        // non-string `path` is a type error, not "missing file_path" —
+        // the model must not be told to resend what it already sent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let input = serde_json::json!({
+            "path": 123,
+            "content": "body",
+        });
+        let error = write_inner(&WriteTool::default(), input, &session)
+            .await
+            .expect_err("a mistyped alias refuses");
+        let message = error.to_string();
+        assert!(
+            message.contains("path must be a string"),
+            "the type error names the alias key: {message}"
+        );
+        assert!(
+            message.contains("number"),
+            "the received type rides: {message}"
         );
     }
 }

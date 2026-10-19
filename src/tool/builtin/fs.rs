@@ -471,6 +471,42 @@ pub(crate) fn resolve_path_key(input: &Value) -> Option<&str> {
     }
 }
 
+/// Resolve the path field with typed refusals for mistyped spellings.
+///
+/// The teaching seam behind the whole family: an absent field is
+/// `Ok(None)` (the caller renders its plain miss), while a
+/// **present-but-non-string** key — canonical or alias — refuses
+/// with the key's own name and its received JSON type, so the model
+/// is never told to resend what it already sent. Canonical precedence
+/// unchanged: `file_path` first, `path` only when the canonical is
+/// absent.
+///
+/// # Errors
+///
+/// [`ToolError::InvalidInput`] naming the mistyped key, its received
+/// type, and the accepted spellings.
+pub(crate) fn resolve_path_key_typed(input: &Value) -> Result<Option<&str>, ToolError> {
+    for (key, value) in [
+        ("file_path", input.get("file_path")),
+        ("path", input.get("path")),
+    ] {
+        if let Some(value) = value
+            && !value.is_string()
+        {
+            return Err(ToolError::InvalidInput(format!(
+                "{key} must be a string, not {} (got top-level keys: {}; \
+                 accepted: file_path, or path)",
+                json_type(Some(value)),
+                received_keys(input)
+            )));
+        }
+        if let Some(Value::String(path)) = value {
+            return Ok(Some(path.as_str()));
+        }
+    }
+    Ok(None)
+}
+
 /// The received-keys echo for a teaching error.
 ///
 /// Names the top-level keys the input actually carried, so a missed
@@ -498,16 +534,8 @@ pub(crate) fn received_keys(input: &Value) -> String {
 /// Names the canonical key, the accepted alias, and the keys the
 /// input actually carried.
 pub(crate) fn missing_path_error(tool: &str, input: &Value) -> ToolError {
-    if input
-        .get("file_path")
-        .is_some_and(|value| !value.is_string())
-    {
-        return ToolError::InvalidInput(format!(
-            "file_path must be a string, not {} (got top-level keys: {}; \
-             accepted: file_path, or path)",
-            json_type(input.get("file_path")),
-            received_keys(input)
-        ));
+    if let Err(error) = resolve_path_key_typed(input) {
+        return error;
     }
     ToolError::InvalidInput(format!(
         "Missing file_path for {tool} (got top-level keys: {}; \

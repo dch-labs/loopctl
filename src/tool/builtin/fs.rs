@@ -43,6 +43,7 @@ mod edit;
 mod existing;
 mod file_source;
 mod file_viewer;
+mod match_repair;
 mod multi_edit;
 mod resolve;
 mod state;
@@ -193,6 +194,15 @@ pub struct FileSession {
     /// contained keys are the lexical resolution output by design.
     /// Cloning shares the same map.
     identities: Arc<Mutex<FileIdentities>>,
+
+    /// What escape errors may teach about this session's sanctioned
+    /// alternatives.
+    ///
+    /// Off unless the host opted in: no scratch root is named, no
+    /// unrestricted mode is advertised. See
+    /// [`with_scratch_root`](Self::with_scratch_root) and
+    /// [`with_unrestricted_available`](Self::with_unrestricted_available).
+    escape_teaching: resolve::EscapeTeaching,
 }
 
 impl FileSession {
@@ -218,6 +228,7 @@ impl FileSession {
             workspace_anchor,
             baselines: Arc::new(Mutex::new(FileBaselines::default())),
             identities: Arc::new(Mutex::new(FileIdentities::default())),
+            escape_teaching: resolve::EscapeTeaching::default(),
         }
     }
 
@@ -231,6 +242,65 @@ impl FileSession {
     pub fn with_resolve_policy(mut self, resolve_policy: ResolvePolicy) -> Self {
         self.resolve_policy = resolve_policy;
         self
+    }
+
+    /// Set the session's scratch root, creating it.
+    ///
+    /// The opt-in directory (`.dch/tmp`-shaped, the name is the
+    /// host's to configure) that temp-shaped escape errors name as
+    /// the sanctioned home for scratch files, and that fs tools
+    /// resolve into without ceremony — it sits *under* the working
+    /// directory, so containment already admits it. Only a root at
+    /// or under the working directory is honored; anything else
+    /// would advertise a directory the policy refuses. Creation is
+    /// best-effort with a warning — a missing directory the model
+    /// can still create itself.
+    #[must_use]
+    pub fn with_scratch_root(mut self, scratch_root: PathBuf) -> Self {
+        if scratch_root.starts_with(&self.cwd) {
+            if let Err(e) = std::fs::create_dir_all(&scratch_root) {
+                tracing::warn!(error = %e, root = %scratch_root.display(), "scratch root creation failed");
+            }
+            self.escape_teaching.scratch_root = Some(scratch_root);
+        } else {
+            tracing::warn!(
+                root = %scratch_root.display(),
+                cwd = %self.cwd.display(),
+                "scratch root outside the working directory ignored"
+            );
+        }
+        self
+    }
+
+    /// Declare that an unrestricted mode exists for this deployment.
+    ///
+    /// Escape errors may then name out-of-tree work under the host's
+    /// unrestricted mode as a sanctioned road — the user can enable
+    /// it. Without this, the message never advertises the hatch.
+    #[must_use]
+    pub fn with_unrestricted_available(mut self) -> Self {
+        self.escape_teaching.unrestricted_available = true;
+        self
+    }
+
+    /// Resolve a target path under this session's policy.
+    ///
+    /// The family's resolve: the same containment as
+    /// [`resolve::resolve_path`], with the session's escape teaching
+    /// appended when a path rejects — the boundary, the target
+    /// class, and the remedies that actually exist for this session.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::InvalidInput`] verbatim from the resolve, with
+    /// the teaching body appended on the escape arms.
+    pub(crate) fn resolve(&self, file_path: &str) -> Result<PathBuf, ToolError> {
+        resolve::resolve_path_for_session(
+            file_path,
+            &self.cwd,
+            self.resolve_policy,
+            &self.escape_teaching,
+        )
     }
 
     /// Install this session on `ctx` as the family's extension.
@@ -422,6 +492,7 @@ impl fmt::Debug for FileSession {
             .field("workspace_anchor", &self.workspace_anchor)
             .field("baselines", &baselines)
             .field("identities", &identities)
+            .field("escape_teaching", &self.escape_teaching)
             .finish()
     }
 }

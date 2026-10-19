@@ -117,6 +117,150 @@ pub enum ResolvePolicy {
     Unrestricted,
 }
 
+/// What an escape error may tell the model about the session's
+/// sanctioned alternatives.
+///
+/// Carried by the [`FileSession`](super::FileSession) and threaded
+/// into the session-aware resolve: the scratch root is named for
+/// temp-shaped targets only when the host configured one, and the
+/// unrestricted-mode remedy appears only when the host declared the
+/// mode exists for this deployment — the message never advertises an
+/// escape hatch the session does not have.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EscapeTeaching {
+    /// The host-configured scratch directory, under the working
+    /// directory.
+    ///
+    /// `None` unless the host opted in; temp-shaped escape errors
+    /// name it only when present.
+    pub(crate) scratch_root: Option<PathBuf>,
+
+    /// Whether the host declares an unrestricted mode exists for
+    /// this deployment (the user can enable it).
+    ///
+    /// The out-of-tree remedy line rides only when this is `true`.
+    pub(crate) unrestricted_available: bool,
+}
+
+/// Classify an escaping target for the teaching message.
+///
+/// The corpus shapes: temp scratch (a script dropped directly in a
+/// temp root — `/tmp/probe.py`), sibling workspaces (a neighbor
+/// repo's context, under the working directory's parent but not the
+/// directory itself), and system or dependency paths — each with its
+/// own remedy. Traversal spellings get the traversal class.
+pub(crate) fn classify_escape(file_path: &str, cwd: &Path) -> &'static str {
+    let path = Path::new(file_path);
+    if path.is_relative() {
+        return "traversal outside the working directory";
+    }
+    let normalized = normalize_lexical(path);
+    let temp_roots = [
+        std::path::PathBuf::from("/tmp"),
+        std::path::PathBuf::from("/var/tmp"),
+        std::path::PathBuf::from("/dev/shm"),
+        std::env::temp_dir(),
+    ];
+    if let Some(parent) = normalized.parent()
+        && temp_roots.iter().any(|root| root == parent)
+    {
+        return "temp scratch";
+    }
+    if let Some(parent) = cwd.parent() {
+        let parent_normalized = normalize_lexical(parent);
+        if normalized.starts_with(&parent_normalized) {
+            return "sibling workspace";
+        }
+    }
+    "system or dependency path"
+}
+
+/// Build the teaching body for an escape rejection.
+///
+/// The caller owns the first line (kept byte-identical for the
+/// existing pins); this renders the boundary, the target class, and
+/// the remedies that actually exist for the session.
+pub(crate) fn render_escape_teaching(
+    file_path: &str,
+    cwd: &Path,
+    teaching: &EscapeTeaching,
+) -> String {
+    use std::fmt::Write as _;
+    let class = classify_escape(file_path, cwd);
+    let mut rendered = format!(
+        "The session is contained to the working directory: {}\n\
+         Target class: {class}\n",
+        cwd.display()
+    );
+    rendered.push_str("Remedies:\n");
+    match class {
+        "temp scratch" => {
+            if let Some(scratch) = &teaching.scratch_root {
+                writeln!(
+                    rendered,
+                    "  - scratch files belong in the session's scratch root: {}, \
+                     or a Bash call",
+                    scratch.display()
+                )
+                .ok();
+            } else {
+                rendered.push_str(
+                    "  - scratch files belong inside the working directory, \
+                     or a Bash call\n",
+                );
+            }
+        }
+        "sibling workspace" => rendered.push_str(
+            "  - a sibling workspace is outside this session's reach: copy \
+             what you need into the working directory\n",
+        ),
+        "system or dependency path" => rendered.push_str(
+            "  - system and dependency paths are outside this session's \
+             reach: read them through a Bash call\n",
+        ),
+        _ => rendered.push_str(
+            "  - the spelling resolves outside the working directory: keep \
+             targets inside it\n",
+        ),
+    }
+    if teaching.unrestricted_available {
+        rendered.push_str(
+            "  - out-of-tree work is sanctioned under the host's unrestricted \
+             mode (the user can enable it)\n",
+        );
+    }
+    rendered
+}
+
+/// Resolve for a session that can teach at the rejection site.
+///
+/// The same containment as [`resolve_path`] — every escaping path
+/// still rejects, byte-identically on the first line — with the
+/// classified teaching body appended when it does.
+///
+/// # Errors
+///
+/// [`ToolError::InvalidInput`] verbatim from [`resolve_path`], with
+/// the teaching body appended on the escape arms.
+pub(crate) fn resolve_path_for_session(
+    file_path: &str,
+    cwd: &Path,
+    policy: ResolvePolicy,
+    teaching: &EscapeTeaching,
+) -> Result<PathBuf, ToolError> {
+    resolve_path(file_path, cwd, policy).map_err(|error| {
+        if let ToolError::InvalidInput(message) = &error
+            && message.contains("escapes the working directory")
+        {
+            let mut taught = message.clone();
+            taught.push_str("\n\n");
+            taught.push_str(&render_escape_teaching(file_path, cwd, teaching));
+            return ToolError::InvalidInput(taught);
+        }
+        error
+    })
+}
+
 /// Resolve a possibly-relative `file_path` against `cwd` under `policy`.
 ///
 /// The result is lexically normalized under both policies (`.`/`..`
@@ -1252,6 +1396,50 @@ mod verify_tests {
         assert!(
             err.to_string().contains("escaped"),
             "a depth-two handle opened outside and restored inside must be graded by its identity, not the restored name: {err}"
+        );
+    }
+
+    #[test]
+    fn a_direct_temp_child_is_temp_scratch() {
+        let cwd = Path::new("/home/dch/repos/loopctl");
+        assert_eq!(classify_escape("/tmp/probe.py", cwd), "temp scratch");
+    }
+
+    #[test]
+    fn a_deeper_tmp_path_is_not_scratch() {
+        // Only a direct child of a temp root is scratch-shaped; a
+        // nested path is a workspace sibling (or system) instead.
+        let cwd = Path::new("/home/dch/repos/loopctl");
+        assert_ne!(
+            classify_escape("/tmp/.tmpln/AGENTS.md", cwd),
+            "temp scratch"
+        );
+    }
+
+    #[test]
+    fn a_neighbor_repo_is_a_sibling_workspace() {
+        let cwd = Path::new("/home/dch/repos/loopctl");
+        assert_eq!(
+            classify_escape("/home/dch/repos/AGENTS.md", cwd),
+            "sibling workspace"
+        );
+    }
+
+    #[test]
+    fn a_dependency_source_is_a_system_path() {
+        let cwd = Path::new("/home/dch/repos/loopctl");
+        assert_eq!(
+            classify_escape("/home/dch/.cargo/registry/src/lib.rs", cwd),
+            "system or dependency path"
+        );
+    }
+
+    #[test]
+    fn a_traversal_spelling_is_traversal() {
+        let cwd = Path::new("/home/dch/repos/loopctl");
+        assert_eq!(
+            classify_escape("../../outside.txt", cwd),
+            "traversal outside the working directory"
         );
     }
 }

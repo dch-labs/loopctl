@@ -217,7 +217,7 @@ async fn multi_edit_inner(
 
     let parsed = parse_input(&input)?;
     let default_path = resolve_default_file_path(&input)?;
-    let mut operations = build_operations(parsed.edits, default_path, &input, &cwd, policy)?;
+    let mut operations = build_operations(parsed.edits, default_path, &input, session)?;
 
     if let Some(reason) = dup_path_check(&operations) {
         return Ok(reason.into_output());
@@ -241,7 +241,8 @@ async fn multi_edit_inner(
         return Ok(reason.into_output());
     }
 
-    let finals = match merge_per_file(&operations, &originals) {
+    let mut normalized_files: Vec<String> = Vec::new();
+    let finals = match merge_per_file(&operations, &originals, &mut normalized_files) {
         Ok(f) => f,
         Err(reason) => return Ok(reason.into_output()),
     };
@@ -252,7 +253,13 @@ async fn multi_edit_inner(
         return Ok(reason.into_output());
     }
 
-    let summary = build_preview(&operations, &originals, &finals, parsed.dry_run);
+    let summary = build_preview(
+        &operations,
+        &originals,
+        &finals,
+        parsed.dry_run,
+        &normalized_files,
+    );
     if parsed.dry_run {
         return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
     }
@@ -592,8 +599,7 @@ fn build_operations(
     edits: &[Value],
     default_path: Option<&str>,
     full_input: &Value,
-    cwd: &Path,
-    policy: ResolvePolicy,
+    session: &FileSession,
 ) -> Result<Vec<EditOperation>, ToolError> {
     let mut operations = Vec::with_capacity(edits.len());
     for edit_value in edits {
@@ -623,7 +629,7 @@ fn build_operations(
         }
         resolve::reject_path_url("MultiEdit", file_path)?;
 
-        let full_path = resolve::resolve_path(file_path, cwd, policy)?;
+        let full_path = session.resolve(file_path)?;
         operations.push(EditOperation {
             file_path: file_path.to_string(),
             full_path,
@@ -1064,10 +1070,9 @@ fn detect_edit_conflicts(
 
         let mut ranges: Vec<(usize, usize, usize, &str)> = Vec::new();
         for (edit_idx, old_text) in edits {
-            if let Some(start) = content.find(old_text) {
-                let end = start.saturating_add(old_text.len());
+            if let Some(range) = edit_range(content, old_text) {
                 let snippet = truncate_str(old_text, 60);
-                ranges.push((start, end, *edit_idx, snippet));
+                ranges.push((range.start, range.end, *edit_idx, snippet));
             }
         }
 
@@ -1188,6 +1193,7 @@ fn overlap_check(
 fn merge_per_file(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
+    normalized_files: &mut Vec<String>,
 ) -> Result<BTreeMap<String, String>, AbortReason> {
     let mut finals: BTreeMap<String, String> = BTreeMap::new();
     for op in operations {
@@ -1195,12 +1201,23 @@ fn merge_per_file(
             .entry(op.file_path.clone())
             .or_insert_with(|| originals.get(&op.file_path).cloned().unwrap_or_default());
         match locate_unique(entry, &op.old_text) {
-            FindResult::NotFound => {
-                return Err(AbortReason::Locate(format!(
-                    "Old text not found in file: {}",
-                    op.file_path
-                )));
-            }
+            FindResult::NotFound => match super::match_repair::classify_miss(entry, &op.old_text) {
+                super::match_repair::MissKind::WhitespaceUnique(window) => {
+                    let range = super::match_repair::window_core_range(entry, window);
+                    if !normalized_files.contains(&op.file_path) {
+                        normalized_files.push(op.file_path.clone());
+                    }
+                    let replacement = super::match_repair::edge_trimmed_replacement(&op.new_text);
+                    *entry = splice(entry, range, replacement);
+                }
+                kind => {
+                    return Err(AbortReason::Locate(format!(
+                        "Old text not found in file: {}\n\n{}",
+                        op.file_path,
+                        super::match_repair::render_miss(&kind, entry)
+                    )));
+                }
+            },
             FindResult::Ambiguous { count } => {
                 return Err(AbortReason::Locate(format!(
                     "old_text appears {count} times in file {}; it must be unique. \
@@ -1214,6 +1231,25 @@ fn merge_per_file(
         }
     }
     Ok(finals)
+}
+
+/// The byte range one edit will splice, exact or normalized.
+///
+/// The overlap detector needs the same range the merge will apply:
+/// the exact find first, then the unique whitespace-normalized
+/// window — so two edits that overlap only under normalization are
+/// still caught before anything writes.
+fn edit_range(content: &str, old_text: &str) -> Option<std::ops::Range<usize>> {
+    if let Some(start) = content.find(old_text) {
+        let end = start.saturating_add(old_text.len());
+        return Some(start..end);
+    }
+    match super::match_repair::classify_miss(content, old_text) {
+        super::match_repair::MissKind::WhitespaceUnique(window) => {
+            Some(super::match_repair::window_range(content, window))
+        }
+        _ => None,
+    }
 }
 
 /// Validate each distinct file's final merged content; return the first
@@ -1262,6 +1298,7 @@ fn build_preview(
     originals: &BTreeMap<String, String>,
     finals: &BTreeMap<String, String>,
     dry_run: bool,
+    normalized_files: &[String],
 ) -> String {
     let mut lines = Vec::new();
     if dry_run {
@@ -1283,6 +1320,12 @@ fn build_preview(
         let diff = format_file_change(&op.file_path, OldContent::Text(original), final_content);
         for line in diff.lines() {
             lines.push(format!("  {line}"));
+        }
+        if normalized_files.contains(&op.file_path) {
+            lines.push(format!(
+                "  │ {}",
+                super::match_repair::NORMALIZED_MATCH_NOTE
+            ));
         }
         lines.push(String::new());
         index = index.saturating_add(1);
@@ -1429,6 +1472,111 @@ mod tests {
             out.text_content().contains("a.rs (2 edits)"),
             "{}",
             out.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_mismatched_batch_edit_applies_and_discloses() {
+        // The batch's twin of Edit's tolerant apply: a unique
+        // normalized match splices with the file's own edge bytes,
+        // and the per-file block in the summary discloses it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\r\n    fn two() {}  \r\nfn three() {}\r\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "edits": [
+                {"file_path": "a.rs", "old_text": "      fn two() {}", "new_text": "fn two() { todo!() }"},
+            ]
+        });
+        let out = multi_edit_inner(&MultiEditTool::default(), input, &session)
+            .await
+            .expect("the normalized batch match applies");
+        let text = out.text_content();
+        assert!(
+            text.contains("matched with normalized indentation"),
+            "the per-file block discloses the normalization: {text}"
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).expect("read back");
+        assert!(
+            on_disk.contains("    fn two() { todo!() }"),
+            "the file's own indentation survives: {on_disk:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tolerant_batch_apply_gives_the_file_s_indentation_the_first_line() {
+        // The batch twin of the indent-ownership pin: both texts carry
+        // the model's (wrong) indent; the file's own edge bytes own
+        // the splice.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\n    fn two() {}\nfn three() {}\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "edits": [
+                {"file_path": "a.rs", "old_text": "      fn two() {}", "new_text": "      fn two() { todo!() }"},
+            ]
+        });
+        let out = multi_edit_inner(&MultiEditTool::default(), input, &session)
+            .await
+            .expect("the normalized batch match applies");
+        assert!(
+            out.text_content()
+                .contains("matched with normalized indentation"),
+            "the disclosure rides: {}",
+            out.text_content()
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).expect("read back");
+        assert!(
+            on_disk
+                .lines()
+                .any(|line| line == "    fn two() { todo!() }"),
+            "the file's 4-space indent owns the first line, no doubling: {on_disk:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_miss_carries_the_classification_and_echo() {
+        // The batch miss keeps its first line and gains the
+        // classification plus the bounded echo - the re-read the old
+        // hint used to demand.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\nfn two() { todo!() }\nfn three() {}\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "edits": [
+                {"file_path": "a.rs", "old_text": "fn two() {}", "new_text": "replaced"},
+            ]
+        });
+        let out = multi_edit_inner(&MultiEditTool::default(), input, &session)
+            .await
+            .expect("soft error");
+        let text = out.text_content();
+        assert!(
+            text.contains("Old text not found in file: a.rs"),
+            "the first line is the file-named miss: {text}"
+        );
+        assert!(text.contains("stale"), "the classification rides: {text}");
+        assert!(
+            text.contains("2 | fn two() { todo!() }"),
+            "the echo carries the file's actual lines: {text}"
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("a.rs"))
+                .expect("read back")
+                .contains("fn two() { todo!() }"),
+            "an aborted batch leaves every file untouched"
         );
     }
 
@@ -1940,8 +2088,8 @@ mod tests {
             })],
             Some("top-level-default.txt"),
             &serde_json::json!({"file_path": "top-level-default.txt", "edits": []}),
-            std::path::Path::new("/repo"),
-            ResolvePolicy::Unrestricted,
+            &FileSession::new(std::path::PathBuf::from("/repo"))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
         )
         .expect("the chain resolves");
         assert_eq!(ops.len(), 1, "one operation");
@@ -1963,8 +2111,8 @@ mod tests {
             })],
             None,
             &serde_json::json!({"edits": []}),
-            std::path::Path::new("/repo"),
-            ResolvePolicy::Unrestricted,
+            &FileSession::new(std::path::PathBuf::from("/repo"))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
         )
         .expect_err("the mistyped canonical refuses");
         assert!(
@@ -2025,8 +2173,8 @@ mod tests {
                 .map_or(&[], Vec::as_slice),
             None,
             &input,
-            std::path::Path::new("/repo"),
-            ResolvePolicy::Unrestricted,
+            &FileSession::new(std::path::PathBuf::from("/repo"))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
         )
         .expect_err("a stray top-level path serves as no default");
         assert!(
@@ -2053,8 +2201,8 @@ mod tests {
                 .map_or(&[], Vec::as_slice),
             Some("default.txt"),
             &input,
-            std::path::Path::new("/repo"),
-            ResolvePolicy::Unrestricted,
+            &FileSession::new(std::path::PathBuf::from("/repo"))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
         )
         .expect_err("a mistyped per-edit path refuses");
         let message = error.to_string();
@@ -2098,8 +2246,8 @@ mod tests {
             })],
             None,
             &serde_json::json!({"edits": []}),
-            std::path::Path::new("/repo"),
-            ResolvePolicy::Unrestricted,
+            &FileSession::new(std::path::PathBuf::from("/repo"))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
         )
         .expect("the per-edit alias spelling parses");
         assert_eq!(ops.len(), 1, "one operation");
@@ -2113,8 +2261,8 @@ mod tests {
             &[serde_json::json!({"old_text": "a", "new_text": "b"})],
             Some("src/lib.rs"),
             &serde_json::json!({"file_path": "src/lib.rs", "edits": []}),
-            std::path::Path::new("/repo"),
-            ResolvePolicy::Unrestricted,
+            &FileSession::new(std::path::PathBuf::from("/repo"))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
         )
         .expect("the top-level default fills edits lacking a path");
         assert_eq!(ops.len(), 1, "one operation on the defaulted file");
@@ -2127,8 +2275,8 @@ mod tests {
             &[serde_json::json!({"old_text": "a", "new_text": "b"})],
             None,
             &full_input,
-            std::path::Path::new("/repo"),
-            ResolvePolicy::Unrestricted,
+            &FileSession::new(std::path::PathBuf::from("/repo"))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
         )
         .expect_err("nothing names a file");
         let message = error.to_string();

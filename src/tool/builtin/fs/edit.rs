@@ -181,7 +181,7 @@ async fn edit_inner(
     let policy = session.resolve_policy();
     let cwd = session.cwd().to_path_buf();
     let parsed = parse_input(&input)?;
-    let mut full_path = resolve::resolve_path(parsed.file_path, &cwd, policy)?;
+    let mut full_path = session.resolve(parsed.file_path)?;
     if policy == ResolvePolicy::Unrestricted {
         full_path = resolve::canonicalize_existing(&full_path)?;
     }
@@ -201,8 +201,27 @@ async fn edit_inner(
             &full_path,
         )));
     }
+    let mut normalized_note = false;
     let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
         Ok(content) => content,
+        Err(EditError::NotFound) => {
+            match super::match_repair::classify_miss(&old_content, parsed.old_text) {
+                super::match_repair::MissKind::WhitespaceUnique(window) => {
+                    let range = super::match_repair::window_core_range(&old_content, window);
+                    normalized_note = true;
+                    let replacement =
+                        super::match_repair::edge_trimmed_replacement(parsed.new_text);
+                    splice(&old_content, range, replacement)
+                }
+                kind => {
+                    return Ok(ToolOutput::error_text(format!(
+                        "Old text not found in file.\n\n{}\n{}",
+                        super::match_repair::render_miss(&kind, &old_content),
+                        "Hints:\n  - The file may have changed since you last read it — try re-reading with `Read`\n  - Check for whitespace or Unicode differences\n  - Use `Grep` to search for the text you want to replace"
+                    )));
+                }
+            }
+        }
         Err(reason) => return Ok(reason.into_output()),
     };
 
@@ -239,11 +258,14 @@ async fn edit_inner(
 
     session.record_baseline(&full_path, state::observe_bytes(new_content.as_bytes()));
 
-    let message = format_file_change(
+    let mut message = format_file_change(
         parsed.file_path,
         OldContent::Text(&old_content),
         &new_content,
     );
+    if normalized_note {
+        insert_normalized_note(&mut message);
+    }
     Ok(ToolOutput::text(message)
         .with_hint(DisplayHint::Diff)
         .with_retention(Retention::Durable))
@@ -451,6 +473,24 @@ async fn read_existing(
 ///
 /// Returns `Err(EditError::NotFound)` when `old_text` is absent and
 /// `Err(EditError::Ambiguous)` when it appears more than once.
+/// Insert the normalized-match disclosure after the summary line.
+///
+/// The receipt's `│`-note channel sits between the `Changed:` header
+/// and the `@@` hunks; the disclosure rides exactly there, so the
+/// model sees *why* the edit applied without hunting the diff.
+fn insert_normalized_note(receipt: &mut String) {
+    let note = format!("│ {}\n", super::match_repair::NORMALIZED_MATCH_NOTE);
+    if let Some(position) = receipt.find("\n@@") {
+        receipt.insert_str(position.saturating_add(1), &note);
+    }
+}
+
+/// Apply one edit by exact-match locate-and-splice.
+///
+/// # Errors
+///
+/// [`EditError::NotFound`] when `old_text` is absent and
+/// [`EditError::Ambiguous`] when it appears more than once.
 fn apply_edit(content: &str, old_text: &str, new_text: &str) -> Result<String, EditError> {
     match locate_unique(content, old_text) {
         FindResult::NotFound => Err(EditError::NotFound),
@@ -627,6 +667,203 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("a.rs")).unwrap(),
             "content\n",
             "a refused edit must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_mismatched_old_text_applies_and_discloses() {
+        // The corpus's whitespace root cause: the text is right but
+        // for indentation width, trailing spaces, or line endings.
+        // A unique normalized match applies - splicing with the
+        // file's actual bytes - and the receipt says so.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\r\n    fn two() {}  \r\nfn three() {}\r\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "      fn two() {}",
+            "new_text": "fn two() { todo!() }",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        assert!(
+            out.text_content()
+                .contains("matched with normalized indentation"),
+            "the receipt discloses the normalization: {}",
+            out.text_content()
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).expect("read back");
+        assert!(on_disk.contains("fn two() { todo!() }"), "the edit landed");
+        assert!(
+            on_disk.starts_with("fn one() {}\r\n    "),
+            "the file's own indentation and line endings survive the splice: {on_disk:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tolerant_apply_gives_the_file_s_indentation_the_first_line() {
+        // The corpus shape itself: the model that mismatched the
+        // indent spells BOTH texts with its own (wrong) indent. The
+        // splice keeps the file's edge bytes and trims the
+        // replacement's own edge whitespace symmetric to the core's
+        // shrink - never the concatenated ten-space first line.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\n    fn two() {}\nfn three() {}\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "      fn two() {}",
+            "new_text": "      fn two() { todo!() }",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        assert!(
+            out.text_content()
+                .contains("matched with normalized indentation"),
+            "the disclosure rides: {}",
+            out.text_content()
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).expect("read back");
+        assert!(
+            on_disk
+                .lines()
+                .any(|line| line == "    fn two() { todo!() }"),
+            "the file's 4-space indent owns the first line, no doubling: {on_disk:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_normalized_match_rejects_with_the_echo() {
+        // Tolerant matching never applies an ambiguous match: both
+        // regions match after normalization, so the miss keeps
+        // rejecting - now carrying the classification and the file's
+        // actual lines with numbers.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "  alpha \nbeta \n\talpha \nbeta \n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "alpha\nbeta",
+            "new_text": "omega",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("soft error");
+        let text = out.text_content();
+        assert!(
+            text.contains("Old text not found"),
+            "the miss stays a miss: {text}"
+        );
+        assert!(
+            text.contains("whitespace-only mismatch"),
+            "the classification names the kind: {text}"
+        );
+        assert!(
+            text.contains("2 regions"),
+            "the ambiguity is explicit: {text}"
+        );
+        assert!(
+            text.contains("1 |   alpha"),
+            "the echo carries the file's actual lines, whitespace intact: {text}"
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).expect("read back");
+        assert_eq!(
+            on_disk, "  alpha \nbeta \n\talpha \nbeta \n",
+            "nothing was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_miss_cites_the_first_differing_line() {
+        // The stale root cause: the file changed since the model last
+        // saw it. The classification names it and quotes both sides
+        // of the first differing line.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\nfn two() { todo!() }\nfn three() {}\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "fn one() {}\nfn two() {}\nfn three() {}",
+            "new_text": "replaced",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("soft error");
+        let text = out.text_content();
+        assert!(
+            text.contains("stale"),
+            "the classification names stale: {text}"
+        );
+        assert!(
+            text.contains("line 2"),
+            "the first differing line is cited: {text}"
+        );
+        assert!(
+            text.contains("\"fn two() { todo!() }\"") && text.contains("\"fn two() {}\""),
+            "both sides are quoted, whitespace visible: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_with_no_similar_passage_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n")
+            .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "the function that makes tea",
+            "new_text": "replaced",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("soft error");
+        assert!(
+            out.text_content().contains("no similar passage"),
+            "the paraphrase shape is named: {}",
+            out.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_on_a_huge_file_echoes_bounded() {
+        // The echo replaces a re-read, not the file: a miss against a
+        // two-hundred-line file carries a bounded window.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let filler = "filler line\n".repeat(200);
+        std::fs::write(dir.path().join("big.rs"), &filler).expect("write fixture");
+        let input = json!({
+            "file_path": "big.rs",
+            "old_text": "filler line\nand its successor",
+            "new_text": "replaced",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("soft error");
+        let text = out.text_content();
+        let echoed = text.lines().filter(|line| line.contains(" | ")).count();
+        assert!(
+            echoed <= 17,
+            "the echo stays bounded on a huge file: {echoed} lines"
         );
     }
 

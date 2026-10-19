@@ -15193,6 +15193,90 @@ async fn leftovers_never_ride_turn_zero_of_the_next_run() {
     );
 }
 
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_aborted_run_task_closes_the_steering_slot() {
+    // R3-1: a host wrapping run() in a select!/timeout can drop the
+    // future before finalize ever runs — the slot must close with the
+    // drop, or push() would tell the host a dead run accepted its
+    // guidance. The abort is the crate-invisible exit path.
+    struct HangTool {
+        entered: Arc<AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl Tool for HangTool {
+        fn name(&self) -> &'static str {
+            "hang"
+        }
+        fn description(&self) -> &'static str {
+            "Block until released"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "hang".into(),
+                description: self.description().into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                entered.store(true, Ordering::SeqCst);
+                release.notified().await;
+                Ok(ToolOutput::text("done"))
+            })
+        }
+    }
+
+    let (client, _requests) = WireCaptureClient::new();
+    client.push_named_tool_turn("thinking ", "hang_1", "hang", &json!({}));
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let steering = agent.steering();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    agent.tool_registry().register(HangTool {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let task = tokio::spawn(async move { agent.run("inspect things", &make_run_config()).await });
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the run never reached its hanging tool"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        steering.push(Message::user("while it runs")),
+        "mid-run, the slot accepts guidance"
+    );
+    task.abort();
+    let _join = task.await;
+    assert!(
+        !steering.push(Message::user("after the drop")),
+        "a dropped run future closes the slot - no dead run accepts guidance"
+    );
+    assert!(
+        !steering.is_empty(),
+        "the accepted guidance survives the drop for the host to collect"
+    );
+    let collected = steering.take_all();
+    assert!(
+        collected
+            .iter()
+            .any(|message| message.text_content().contains("while it runs")),
+        "the mid-run push is collectable after the abort"
+    );
+}
+
 /// An async selector that gates each consult on a notify, counting
 /// how many times it was consulted.
 #[cfg(feature = "streaming")]

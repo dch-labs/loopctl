@@ -137,15 +137,16 @@ impl Tool for MultiEditTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "file_path": { "type": "string", "description": "The path to the file to edit" },
+                                "file_path": { "type": "string", "description": "The path to the file to edit; defaults to the top-level file_path when omitted" },
                                 "old_text": { "type": "string", "description": "The text to replace" },
                                 "new_text": { "type": "string", "description": "The replacement text" }
                             },
-                            "required": ["file_path", "old_text", "new_text"]
+                            "required": ["old_text", "new_text"]
                         },
                         "minItems": 1,
                         "maxItems": 50
                     },
+                    "file_path": { "type": "string", "description": "Default path for edits that do not name their own target" },
                     "dry_run": { "type": "boolean", "description": "Preview changes without writing files", "default": false },
                     "skip_linter": { "type": "boolean", "description": "Skip syntax validation", "default": false }
                 },
@@ -1698,6 +1699,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn the_schema_admits_the_root_default_shape() {
+        // R3-2: the runtime accepts a target-less edit under a
+        // top-level file_path default - the advertised schema must
+        // not forbid the shape the feature exists to serve. The
+        // nested path alias stays runtime-only (L-159's rule).
+        let schema = MultiEditTool::new().schema();
+        let root = &schema.input_schema["properties"]["file_path"];
+        assert!(
+            root.get("type").and_then(Value::as_str) == Some("string"),
+            "a top-level file_path joins the schema: {root}"
+        );
+        let required = schema.input_schema["required"].as_array().unwrap();
+        assert!(
+            !required.iter().any(|key| key == "file_path"),
+            "the default is optional - per-edit targets still stand alone"
+        );
+        let items = &schema.input_schema["properties"]["edits"]["items"];
+        let edit_required = items["required"].as_array().unwrap();
+        assert!(
+            !edit_required.iter().any(|key| key == "file_path"),
+            "an edit without its own target is schema-legal under the default: {edit_required:?}"
+        );
+        assert!(
+            !schema.input_schema.to_string().contains("anyOf"),
+            "the grammar-neutral rule holds - no anyOf in the fs schemas"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "schema_validation")]
+    fn the_advertised_schema_accepts_the_documented_shapes() {
+        // Schema and runtime agree: a strict JSON-Schema validator
+        // over the advertised schema accepts both documented shapes —
+        // the per-edit target and the root default carrying
+        // target-less edits. The semantic check (no target anywhere)
+        // stays the runtime's teaching error.
+        let schema = MultiEditTool::new().schema().input_schema;
+        let per_edit = json!({
+            "edits": [
+                {"file_path": "a.txt", "old_text": "x", "new_text": "y"}
+            ]
+        });
+        let root_default = json!({
+            "file_path": "a.txt",
+            "edits": [
+                {"old_text": "x", "new_text": "y"},
+                {"file_path": "b.txt", "old_text": "p", "new_text": "q"}
+            ]
+        });
+        assert!(
+            jsonschema::is_valid(&schema, &per_edit),
+            "the per-edit shape stays schema-legal"
+        );
+        assert!(
+            jsonschema::is_valid(&schema, &root_default),
+            "the root-default shape is schema-legal where schemas are enforced"
+        );
     }
 
     #[test]

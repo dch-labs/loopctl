@@ -19,7 +19,7 @@
 //! path deliberately cannot offer (its messages ride one request
 //! and never persist).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::message::Message;
 
@@ -177,6 +177,48 @@ impl Steering {
     pub(crate) fn drain_waiting(&self) -> Vec<Message> {
         let mut slot = crate::error::recover_guard(self.inner.lock());
         std::mem::take(&mut slot.waiting)
+    }
+}
+
+/// Closes a [`Steering`] slot when the owning run future is dropped.
+///
+/// `run()`'s exit paths the crate *can* see all route through
+/// `finalize`, whose explicit close is the happy path. A host that
+/// wraps the run in a `select!` or a timeout — idiomatic for exactly
+/// the live-transcript hosts steering targets — can drop the future
+/// before `finalize` ever runs; without the guard, the slot's
+/// `running` flag would stay open with no run in flight and
+/// [`push`](Steering::push) would tell the host a dead run accepted
+/// its guidance. The guard is created beside
+/// [`open_run`](Steering::open_run) and closes on drop; the close is
+/// an idempotent flag flip, so `finalize`'s explicit close and the
+/// guard's compose without ordering.
+pub(crate) struct SteeringCloseGuard {
+    /// The slot the dropped run leaves behind.
+    ///
+    /// Held for the lifetime of the guard alone; closing goes through
+    /// [`close_run`](Steering::close_run), never a direct field touch.
+    slot: Arc<Steering>,
+}
+
+impl SteeringCloseGuard {
+    /// Hold the slot this run opened.
+    ///
+    /// Created beside [`open_run`](Steering::open_run) in `run()`;
+    /// dropping the guard closes the slot — normally after
+    /// `finalize`'s own close, on abort before it.
+    pub(crate) fn new(slot: Arc<Steering>) -> Self {
+        Self { slot }
+    }
+}
+
+impl Drop for SteeringCloseGuard {
+    /// Close the slot, whatever exit the run took.
+    ///
+    /// Idempotent with `finalize`'s explicit close — the flag flip
+    /// composes without ordering.
+    fn drop(&mut self) {
+        self.slot.close_run();
     }
 }
 

@@ -2901,6 +2901,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 self.budget_run_started = Some(self.managers.clock().monotonic());
             }
             self.steering.open_run();
+            let _slot_guard = steering::SteeringCloseGuard::new(Arc::clone(&self.steering));
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
             self.overflow_retry = None;

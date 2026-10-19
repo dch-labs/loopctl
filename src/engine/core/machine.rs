@@ -980,9 +980,21 @@ impl LoopMachine {
     /// never completed therefore falls outside the prefix, along with
     /// everything after it.
     fn last_coherent_len(pending: &[Message]) -> usize {
+        Self::coherent_cut(pending, pending.len())
+    }
+
+    /// The longest coherent prefix of `messages`, bounded by `limit`.
+    ///
+    /// The same scan [`last_coherent_len`](Self::last_coherent_len)
+    /// runs, stopped at `limit`: the boundary is the last position,
+    /// no further than `limit`, after which no tool call remains
+    /// unanswered. [`rewind_to`](Self::rewind_to) uses it to snap a
+    /// requested cut that lands inside a turn down to that turn's
+    /// start, so a tool result is never orphaned from its call.
+    fn coherent_cut(messages: &[Message], limit: usize) -> usize {
         let mut open: HashSet<&str> = HashSet::new();
         let mut boundary = 0;
-        for (idx, message) in pending.iter().enumerate() {
+        for (idx, message) in messages.iter().enumerate().take(limit) {
             for part in &message.parts {
                 match part {
                     MessagePart::ToolCall { id, .. } => {
@@ -999,6 +1011,70 @@ impl LoopMachine {
             }
         }
         boundary
+    }
+
+    /// Drop committed history past `len`, cutting at a turn boundary.
+    ///
+    /// The host-side history seam: a host that lets its user replace a
+    /// prompt rewinds to the history length it observed before the
+    /// superseded turn, and the conversation reads as though that turn
+    /// never ran. `len` is a length of
+    /// [`history`](Self::history) as previously observed — no message
+    /// identity is exposed.
+    ///
+    /// The cut snaps to a turn boundary: a `len` landing inside a turn
+    /// (between a tool call and its result) snaps down to that turn's
+    /// start, so the pairing property — no
+    /// [`ToolCall`](MessagePart::ToolCall) without its
+    /// [`ToolResult`](MessagePart::ToolResult), and never the reverse —
+    /// survives the call.
+    ///
+    /// Bookkeeping: the deferred-compaction latch is cleared (a stale
+    /// latch from the dropped tail must not suppress a trigger against
+    /// the shorter history); `turns_taken` and `context_tokens` are
+    /// per-run figures the next `accept_input` resets, and the
+    /// driver's opening estimate re-feeds the token count against the
+    /// pruned history — the compaction threshold therefore re-arms
+    /// naturally on the next run. Whatever the host keeps outside
+    /// `history()` (the session's system prompt, run records) is not
+    /// the machine's to touch and survives untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::InvalidInput`] when a turn is in flight
+    /// (`AwaitingModel`, `AwaitingTools`, or `AwaitingCompaction`) —
+    /// cancel the run and let it resolve first.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use loopctl::engine::core::LoopMachine;
+    /// # use loopctl::message::Message;
+    /// let mut machine =
+    ///     LoopMachine::from_history(vec![Message::user("a"), Message::assistant("b")]);
+    /// let removed = machine.rewind_to(1).expect("a between-runs rewind succeeds");
+    /// assert_eq!((removed, machine.history().len()), (1, 1));
+    /// ```
+    pub fn rewind_to(&mut self, len: usize) -> Result<usize, LoopError> {
+        match &self.state {
+            MachineState::Start | MachineState::Terminal(_) => {}
+            in_flight => {
+                return Err(LoopError::InvalidInput(format!(
+                    "cannot rewind committed history while a turn is in \
+                     flight (state: {in_flight:?}); cancel the run and let \
+                     it resolve first"
+                )));
+            }
+        }
+        let limit = len.min(self.history.len());
+        let cut = Self::coherent_cut(&self.history, limit);
+        let removed = self.history.len().saturating_sub(cut);
+        if removed == 0 {
+            return Ok(0);
+        }
+        self.history.truncate(cut);
+        self.deferred_compaction = false;
+        Ok(removed)
     }
 
     /// Discard the current run's pending messages without committing.
@@ -1584,6 +1660,189 @@ mod tests {
             other => panic!("expected MaxTurnsExceeded, got {other:?}"),
         }
         assert!(machine.is_terminal());
+    }
+
+    #[test]
+    fn rewind_to_a_length_observed_before_a_turn_removes_exactly_that_turn() {
+        // History the host saw: one text turn, then a tool turn. The
+        // host observed len 2 before the tool turn ran; rewinding
+        // there must read as though the tool turn never happened.
+        let tool_turn = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_1",
+                    "grep",
+                    serde_json::Value::Object(serde_json::Map::new()),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "call_1",
+                    "grep",
+                    ToolContent::Text("found".to_string()),
+                    false,
+                )],
+            ),
+        ];
+        let mut history = vec![Message::user("hello"), Message::assistant("hi there")];
+        history.extend(tool_turn);
+        let mut machine = LoopMachine::from_history(history);
+        let removed = machine
+            .rewind_to(2)
+            .expect("a between-runs rewind succeeds");
+        assert_eq!(removed, 2, "exactly the tool turn's two messages leave");
+        assert_eq!(
+            machine.history().len(),
+            2,
+            "history reads as though the tool turn never ran"
+        );
+    }
+
+    #[test]
+    fn rewind_to_a_len_inside_a_turn_snaps_to_the_turn_start() {
+        // A cut between a tool call and its result must never orphan
+        // the pair; the cut snaps down to the turn's start.
+        let mut history = vec![
+            Message::user("hello"),
+            Message::assistant("hi there"),
+            Message::user("do a thing"),
+        ];
+        history.push(Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call(
+                "call_1",
+                "grep",
+                serde_json::Value::Object(serde_json::Map::new()),
+            )],
+        ));
+        history.push(Message::new(
+            Role::User,
+            vec![MessagePart::tool_result(
+                "call_1",
+                "grep",
+                ToolContent::Text("found".to_string()),
+                false,
+            )],
+        ));
+        let mut machine = LoopMachine::from_history(history);
+        let removed = machine
+            .rewind_to(4)
+            .expect("a mid-turn len snaps, not errors");
+        assert_eq!(
+            removed, 2,
+            "the whole tool turn leaves — call and result travel together"
+        );
+        let full = machine.full_history();
+        let mut open: HashSet<&str> = HashSet::new();
+        for message in &full {
+            for part in &message.parts {
+                match part {
+                    MessagePart::ToolCall { id, .. } => {
+                        open.insert(id.as_str());
+                    }
+                    MessagePart::ToolResult { call_id, .. } => {
+                        open.remove(call_id.as_str());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            open.is_empty(),
+            "the pairing property survives the snap: {open:?} left open"
+        );
+    }
+
+    #[test]
+    fn rewind_to_refuses_while_a_turn_is_in_flight() {
+        let mut machine = small_machine();
+        machine.accept_input("go");
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::CallLLM { .. }
+        ));
+        let error = machine
+            .rewind_to(0)
+            .expect_err("an in-flight turn refuses the rewind");
+        assert!(
+            error.to_string().contains("while a turn is in flight"),
+            "the refusal names why: {error}"
+        );
+        assert_eq!(
+            machine.history().len(),
+            1,
+            "an refused rewind touches nothing"
+        );
+    }
+
+    #[test]
+    fn cancel_then_rewind_succeeds_once_the_run_resolves() {
+        let mut machine = small_machine();
+        machine.accept_input("go");
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.cancel();
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::Done(MachineOutcome::Cancelled)
+        ));
+        let removed = machine
+            .rewind_to(0)
+            .expect("a resolved cancel leaves the machine rewindsable");
+        assert_eq!(removed, 1, "the committed history is gone");
+        machine.accept_input("fresh");
+        assert_eq!(
+            machine.full_history().len(),
+            1,
+            "the machine accepts input again after rewinding to zero"
+        );
+    }
+
+    #[test]
+    fn rewind_to_beyond_the_length_removes_nothing() {
+        let mut machine = small_machine();
+        let removed = machine
+            .rewind_to(9)
+            .expect("an out-of-range len is a no-op, not an error");
+        assert_eq!(removed, 0, "nothing leaves");
+        assert_eq!(machine.history().len(), 1, "history is untouched");
+        let removed = machine.rewind_to(1).expect("len == length is a no-op too");
+        assert_eq!(removed, 0, "the boundary itself removes nothing");
+    }
+
+    #[test]
+    fn rewind_clears_the_deferred_compaction_latch() {
+        // A stale latch from the dropped tail must not suppress a
+        // legitimate trigger against the shorter history.
+        let mut machine = small_machine();
+        machine.deferred_compaction = true;
+        machine
+            .rewind_to(0)
+            .expect("a between-runs rewind succeeds");
+        assert!(
+            !machine.deferred_compaction,
+            "the latch re-arms with the history it now has"
+        );
+    }
+
+    #[test]
+    fn rewind_to_zero_empties_history_and_the_machine_runs_again() {
+        let mut machine = small_machine();
+        let removed = machine.rewind_to(0).expect("a rewind to zero succeeds");
+        assert_eq!(removed, 1);
+        assert!(
+            machine.history().is_empty(),
+            "rewind to zero empties committed history"
+        );
+        machine.accept_input("start over");
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::CallLLM { .. }
+        ));
     }
 
     #[test]

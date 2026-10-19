@@ -458,70 +458,95 @@ pub(crate) fn edge_trimmed_replacement(new_text: &str) -> &str {
     new_text.trim()
 }
 
-/// The leading-whitespace width of a line, in characters.
+/// The window's per-line leading-whitespace strings, in the file's
+/// own characters.
 ///
-/// The re-indent delta's unit — simple character count, mixing tabs
-/// and spaces as they stand; the delta shifts by the same measure it
-/// was measured in.
-fn leading_width(line: &str) -> usize {
-    line.len().saturating_sub(line.trim_start().len())
+/// Each replacement line aligned to a window line takes that line's
+/// leading whitespace verbatim — characters *and* width — so a
+/// tab-indented file never receives the model's spaces back, and a
+/// delta-zero pair whose characters differ (a Makefile recipe tab
+/// versus the model's spaces) is rewritten in the file's spelling
+/// all the same.
+fn file_indents(content: &str, window: LineWindow) -> Vec<&str> {
+    let table = line_table(content);
+    let mut indents = Vec::new();
+    for (index, (offset, line)) in table.iter().enumerate() {
+        if index >= window.start && index < window.end {
+            let _ = offset;
+            let width = line.len().saturating_sub(line.trim_start().len());
+            if let Some(leading) = line.get(..width) {
+                indents.push(leading);
+            }
+        }
+    }
+    indents
 }
 
-/// Shift every replacement line's leading whitespace by `delta`.
+/// The line ending the window's own interior breaks use.
 ///
-/// The indentation delta between the matched window's file-side
-/// first line and the model's `old_text` first line: the
-/// replacement's own spelling is *relative*, the file's is absolute,
-/// so the whole block shifts uniformly — a shallower model spelling
-/// re-indents deeper (a verbatim splice would produce an
-/// `IndentationError` in indentation-sensitive languages), and an
-/// over-indented one shifts back. Pure-whitespace lines stay
-/// untouched; a negative shift strips at most the line's own leading
-/// whitespace.
-pub(crate) fn reindented_replacement(new_text: &str, delta: i64) -> String {
+/// Derived from [`window_range`](self)'s text, which contains every
+/// internal break but not the last line's terminator: a CRLF window
+/// joins replacement lines with CRLF, an LF window with LF — a
+/// repaired region never mixes endings inside one file. A single-
+/// line window reads the terminator immediately after it, so a
+/// multi-line replacement into a single-line match joins in the
+/// file's ending all the same.
+fn window_eol(content: &str, window: LineWindow) -> &'static str {
+    let range = window_range(content, window);
+    if content
+        .get(range.clone())
+        .is_some_and(|text| text.contains("\r\n"))
+    {
+        return "\r\n";
+    }
+    let after = range.end;
+    if content
+        .get(after..after.saturating_add(2))
+        .is_some_and(|terminator| terminator == "\r\n")
+    {
+        return "\r\n";
+    }
+    "\n"
+}
+
+/// Rewrite each replacement line's leading whitespace in the file's
+/// own characters.
+///
+/// Line `i` of the (edge-trimmed) replacement takes
+/// `indents[i]` — the file's aligned window line's leading
+/// whitespace — wholesale; lines past the window's end take the last
+/// indent. Pure-whitespace lines stay untouched, and the join
+/// between lines is the file's own line ending.
+fn aligned_replacement(new_text: &str, indents: &[&str], eol: &str) -> String {
     let mut rendered = String::with_capacity(new_text.len().saturating_add(16));
     for (index, line) in new_text.lines().enumerate() {
         if index > 0 {
-            rendered.push('\n');
+            rendered.push_str(eol);
         }
+        let indent = indents
+            .get(index)
+            .or_else(|| indents.last())
+            .copied()
+            .unwrap_or("");
         if line.trim().is_empty() {
             rendered.push_str(line);
             continue;
         }
-        if delta >= 0 {
-            let pad = usize::try_from(delta).unwrap_or(0);
-            for _ in 0..pad {
-                rendered.push(' ');
-            }
-            rendered.push_str(line);
-        } else {
-            let strip = delta
-                .checked_neg()
-                .and_then(|magnitude| usize::try_from(magnitude).ok())
-                .unwrap_or(0)
-                .min(leading_width(line));
-            let keep = line.len().saturating_sub(strip);
-            if let Some(rest) = line.get(line.len().saturating_sub(keep)..) {
-                rendered.push_str(rest);
-            }
+        let content_start = line.len().saturating_sub(line.trim_start().len());
+        if let Some(rest) = line.get(content_start..) {
+            rendered.push_str(indent);
+            rendered.push_str(rest);
         }
     }
     rendered
 }
 
-/// Splice a whitespace-tolerant replacement into the file's own
-/// bytes, edge-symmetric and uniformly re-indented.
-///
-/// The composed tolerant apply: the window's core range (the file's
-/// edge whitespace preserved), the replacement edge-trimmed, and
-/// every replacement line shifted by the indentation delta between
-/// the file's window and the model's `old_text`.
 /// Drop only the first line's leading whitespace.
 ///
-/// After the uniform re-indent, the first line carries exactly the
-/// file's own indentation width — which the core range already keeps
+/// After the aligned rewrite, the first line carries exactly the
+/// file's own indentation — which the core range already keeps
 /// outside the splice. Dropping it here keeps the two from stacking;
-/// interior lines keep their shifted indent.
+/// interior lines keep their rewritten indent.
 fn first_line_unindented(text: &str) -> String {
     match text.find('\n') {
         Some(cut) => format!(
@@ -533,39 +558,18 @@ fn first_line_unindented(text: &str) -> String {
     }
 }
 
-/// Splice a whitespace-tolerant replacement into the file's own
-/// bytes, edge-symmetric and uniformly re-indented.
-///
-/// The composed tolerant apply, in order: the window's core range
-/// (the file's own first-line leading and last-line trailing
-/// whitespace stay outside the splice), the replacement edge-trimmed
-/// (its own edge whitespace never stacks against the file's), every
-/// replacement line shifted by the indentation delta between the
-/// matched window's file-side first line and the model's `old_text`
-/// first line — the model's spelling stays *relative*, the file's
-/// absolute indent wins — and the reindented first line's leading
-/// dropped, because the core range already supplies it.
-///
-/// The one seam both [`Edit`](super::Edit) and [`MultiEdit`](super::MultiEditTool)
-/// route their tolerant applies
-/// through; callers owe the receipt's disclosure line.
 pub(crate) fn normalized_splice(
     content: &str,
     window: LineWindow,
     old_text: &str,
     new_text: &str,
 ) -> String {
-    let table = line_table(content);
-    let file_indent = table
-        .get(window.start)
-        .map_or(0, |(_, line)| leading_width(line));
-    let old_indent = old_text.lines().next().map_or(0, leading_width);
-    let file = i64::try_from(file_indent).unwrap_or(i64::MAX);
-    let old = i64::try_from(old_indent).unwrap_or(i64::MAX);
-    let delta = file.saturating_sub(old);
+    let _ = old_text;
+    let indents = file_indents(content, window);
+    let eol = window_eol(content, window);
     let trimmed = edge_trimmed_replacement(new_text);
-    let reindented = reindented_replacement(trimmed, delta);
-    let replacement = first_line_unindented(&reindented);
+    let aligned = aligned_replacement(trimmed, &indents, eol);
+    let replacement = first_line_unindented(&aligned);
     super::edit::splice(content, window_core_range(content, window), &replacement)
 }
 
@@ -655,22 +659,43 @@ mod tests {
     }
 
     #[test]
-    fn the_replacement_re_indents_uniformly() {
+    fn the_replacement_takes_the_file_s_indent_characters() {
+        // Characters and width both come from the file's aligned
+        // lines - a tab window never receives the model's spaces
+        // back, and extra lines take the last indent.
         assert_eq!(
-            reindented_replacement("def f(self):\n    return 2", 4),
-            "    def f(self):\n        return 2",
-            "every line shifts by the delta, interior included"
+            aligned_replacement("def f():\n    return 2", &["\t", "\t\t"], "\n"),
+            "\tdef f():\n\t\treturn 2",
+            "every line takes the aligned file indent - the first line's strip happens at the splice"
         );
         assert_eq!(
-            reindented_replacement("        fn inner() { todo!() }", -8),
-            "fn inner() { todo!() }",
-            "an over-indented spelling shifts back"
+            aligned_replacement("all:\n    echo a", &["", "\t"], "\n"),
+            "all:\n\techo a",
+            "a delta-zero pair still rewrites in the file's character"
         );
         assert_eq!(
-            reindented_replacement("code\n   \ncode", 2),
+            aligned_replacement("        return 2", &["\t"], "\n"),
+            "\treturn 2",
+            "the over-indent collapses to the file's width and character"
+        );
+        assert_eq!(
+            aligned_replacement("code\n   \ncode", &["  ", "  ", "  "], "\n"),
             "  code\n   \n  code",
             "pure-whitespace lines stay untouched"
         );
+        assert_eq!(
+            aligned_replacement("a\nb\nc\nd", &["\t"], "\r\n"),
+            "\ta\r\n\tb\r\n\tc\r\n\td",
+            "lines join with the file's own ending, extras take the last indent"
+        );
+    }
+
+    #[test]
+    fn the_window_eol_reads_the_interior_breaks() {
+        let lf = "one\n    two\nthree\n";
+        let crlf = "one\r\n    two\r\nthree\r\n";
+        assert_eq!(window_eol(lf, window(0, 3)), "\n");
+        assert_eq!(window_eol(crlf, window(0, 3)), "\r\n");
     }
 
     #[test]

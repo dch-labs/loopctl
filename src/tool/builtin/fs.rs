@@ -256,12 +256,13 @@ impl FileSession {
     /// best-effort with a warning — a missing directory the model
     /// can still create itself.
     #[must_use]
-    pub fn with_scratch_root(mut self, scratch_root: PathBuf) -> Self {
-        if resolve::scratch_root_is_contained(&self.cwd, &scratch_root) {
-            if let Err(e) = std::fs::create_dir_all(&scratch_root) {
-                tracing::warn!(error = %e, root = %scratch_root.display(), "scratch root creation failed");
+    pub fn with_scratch_root(mut self, scratch_root: impl Into<PathBuf>) -> Self {
+        let scratch_root = scratch_root.into();
+        if let Some(validated) = resolve::scratch_root_is_contained(&self.cwd, &scratch_root) {
+            if let Err(e) = std::fs::create_dir_all(&validated) {
+                tracing::warn!(error = %e, root = %validated.display(), "scratch root creation failed");
             }
-            self.escape_teaching.scratch_root = Some(scratch_root);
+            self.escape_teaching.scratch_root = Some(validated);
         } else {
             tracing::warn!(
                 root = %scratch_root.display(),

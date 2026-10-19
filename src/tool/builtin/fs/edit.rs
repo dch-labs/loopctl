@@ -810,6 +810,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tolerant_apply_preserves_the_file_s_tab_indentation() {
+        // The file's indent characters win: a tab-indented window
+        // with space-indented model texts must not splice the model's
+        // spaces back in - the written bytes match the file's own
+        // tabs exactly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.py"),
+            "def outer():\n\tdef f():\n\t\treturn 1\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "file_path": "a.py",
+            "old_text": "def f():\n    return 1",
+            "new_text": "def f():\n    return 2",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        assert!(
+            out.text_content()
+                .contains("matched with normalized indentation"),
+            "the disclosure rides: {}",
+            out.text_content()
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("a.py")).expect("read back");
+        assert_eq!(
+            on_disk, "def outer():\n\tdef f():\n\t\treturn 2\n",
+            "the file's tab characters and widths own every line"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tolerant_apply_preserves_makefile_recipe_tabs() {
+        // The delta-zero class: the first lines match at width zero
+        // while the characters differ - only a per-line rewrite in
+        // the file's character keeps the recipe tab (make: missing
+        // separator otherwise).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("Makefile"), "all:\n\techo a\n").expect("write fixture");
+        let input = json!({
+            "file_path": "Makefile",
+            "old_text": "all:\n    echo a",
+            "new_text": "all:\n    echo b",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let _ = out;
+        let on_disk = std::fs::read_to_string(dir.path().join("Makefile")).expect("read back");
+        assert_eq!(
+            on_disk, "all:\n\techo b\n",
+            "the recipe line keeps the file's tab at delta zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tolerant_apply_dedents_in_the_file_s_characters() {
+        // The dedent twin in the file's own characters: the model's
+        // deeper space indent shifts back to the file's shallower
+        // tabs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.py"), "def outer():\n\treturn 1\n")
+            .expect("write fixture");
+        let input = json!({
+            "file_path": "a.py",
+            "old_text": "        return 1",
+            "new_text": "        return 2",
+        });
+        let _ = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let on_disk = std::fs::read_to_string(dir.path().join("a.py")).expect("read back");
+        assert_eq!(
+            on_disk, "def outer():\n\treturn 2\n",
+            "the over-indent shifts back in the file's tab"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tolerant_apply_joins_lines_with_the_file_s_endings() {
+        // A multi-line replacement in a CRLF file joins with the
+        // file's CRLF, never LF-only interior breaks.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\r\n    fn two() {}\r\nfn three() {}\r\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "      fn two() {}",
+            "new_text": "      fn two() { todo!() }\n      // replaced",
+        });
+        let _ = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).expect("read back");
+        assert_eq!(
+            on_disk,
+            "fn one() {}\r\n    fn two() { todo!() }\r\n    // replaced\r\nfn three() {}\r\n",
+            "every interior join carries the file's CRLF"
+        );
+    }
+
+    #[tokio::test]
     async fn an_ambiguous_normalized_match_rejects_with_the_echo() {
         // Tolerant matching never applies an ambiguous match: both
         // regions match after normalization, so the miss keeps

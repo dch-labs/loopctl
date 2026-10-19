@@ -241,24 +241,30 @@ pub(crate) fn render_escape_teaching(
     rendered
 }
 
-/// Whether a candidate scratch root stays inside the working
-/// directory, lexically and through symlinks.
+/// The validated destination for a candidate scratch root, or
+/// `None` when it does not stay inside the working directory.
 ///
 /// The builder-side twin of the resolver's containment: the root is
 /// normalized lexically (an escape spelling like `cwd/../outside`
 /// collapses before the check) and walked with the same
 /// symlink-aware verification the file tools use, so `create_dir_all`
 /// can never follow a link below the working directory to build
-/// outside it.
-pub(crate) fn scratch_root_is_contained(cwd: &Path, root: &Path) -> bool {
+/// outside it. The returned path is the *normalized* spelling that
+/// passed — the caller creates and stores exactly what was checked,
+/// never the original spelling whose `..` segments would re-walk a
+/// symlink at creation time.
+pub(crate) fn scratch_root_is_contained(cwd: &Path, root: &Path) -> Option<PathBuf> {
     let base = normalize_lexical(cwd);
     let base_canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| base.clone());
     let normalized = normalize_lexical(root);
     if !lexically_inside(&normalized, &base) && !lexically_inside(&normalized, &base_canonical) {
-        return false;
+        return None;
     }
     let mut visited = Vec::new();
-    verify_symlinks_inside(&normalized, &base, &base_canonical, 0, &mut visited).is_ok()
+    if verify_symlinks_inside(&normalized, &base, &base_canonical, 0, &mut visited).is_err() {
+        return None;
+    }
+    Some(normalized)
 }
 
 /// Resolve for a session that can teach at the rejection site.

@@ -1189,6 +1189,44 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_scratch_root_through_a_link_and_dotdot_creates_inside() {
+        // The validate/create TOCTOU: `link/../scratch` normalizes
+        // inside and passes validation, but creating the *original*
+        // spelling walks the outbound symlink. The root that is
+        // created and stored is the one that was validated - the
+        // normalized destination, inside the working directory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let link = dir.path().join("out-link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        let session = FileSession::new(dir.path().to_path_buf())
+            .with_scratch_root(link.join("..").join("scratch"));
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/probe.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path still escapes");
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.path().join("scratch").display().to_string()),
+            "the named root is the validated inside destination: {message}"
+        );
+        assert!(
+            !outside.path().join("scratch").exists()
+                && !outside
+                    .path()
+                    .parent()
+                    .is_some_and(|parent| parent.join("scratch").exists()),
+            "nothing is created outside the working directory — not under the \
+             link's destination, and not beside it (symlink traversal escapes \
+             to the destination's parent, not the destination)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_scratch_root_through_a_symlink_is_refused() {
         // A symlink below cwd pointing out would let create_dir_all
         // build outside the workspace - the same containment the

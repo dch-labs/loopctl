@@ -207,13 +207,24 @@ async fn edit_inner(
         Err(EditError::NotFound) => {
             match super::match_repair::classify_miss(&old_content, parsed.old_text) {
                 super::match_repair::MissKind::WhitespaceUnique(window) => {
-                    normalized_note = true;
-                    super::match_repair::normalized_splice(
+                    match super::match_repair::normalized_splice(
                         &old_content,
                         window,
                         parsed.old_text,
                         parsed.new_text,
-                    )
+                    ) {
+                        Some(content) => {
+                            normalized_note = true;
+                            content
+                        }
+                        None => {
+                            return Ok(ToolOutput::error_text(format!(
+                                "Old text not found in file.\n\n{}\n{}",
+                                super::match_repair::render_refused_miss(&old_content, window),
+                                "Hints:\n  - The file may have changed since you last read it — try re-reading with `Read`\n  - Check for whitespace or Unicode differences\n  - Use `Grep` to search for the text you want to replace"
+                            )));
+                        }
+                    }
                 }
                 kind => {
                     return Ok(ToolOutput::error_text(format!(
@@ -693,7 +704,7 @@ mod tests {
         let input = json!({
             "file_path": "a.rs",
             "old_text": "      fn two() {}",
-            "new_text": "fn two() { todo!() }",
+            "new_text": "      fn two() { todo!() }",
         });
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
@@ -988,6 +999,92 @@ mod tests {
         assert_eq!(
             on_disk, "all:\n\t@mkdir -p out\n\techo b\n",
             "every recipe line keeps its tab beside the new lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surviving_line_the_model_moved_deeper_takes_the_model_depth() {
+        // The content-hit reuse defect: a line whose content matches
+        // an old line but whose model spelling moved it deeper must
+        // take the mapped base plus the relative depth - not the old
+        // line's indent verbatim.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.py"), "\tdef f():\n\t\treturn 1\n")
+            .expect("write fixture");
+        let input = json!({
+            "file_path": "a.py",
+            "old_text": "def f():\n    return 1",
+            "new_text": "def f():\n        return 1",
+        });
+        let _ = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let on_disk = std::fs::read_to_string(dir.path().join("a.py")).expect("read back");
+        assert_eq!(
+            on_disk, "\tdef f():\n\t\t\treturn 1\n",
+            "the moved line carries the model's deeper spelling in the file's tabs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shallower_line_after_a_nested_line_rises() {
+        // The dedent-clamp defect: a new line shallower than its
+        // preceding neighbor must rise - the width map's greatest
+        // base not exceeding the model width names its indent, never
+        // the neighbor's deeper one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.yml"), "a:\n\tb\n\t\tc\n").expect("write fixture");
+        let input = json!({
+            "file_path": "a.yml",
+            "old_text": "a:\n    b\n        c",
+            "new_text": "a:\n    b\nd",
+        });
+        let _ = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let on_disk = std::fs::read_to_string(dir.path().join("a.yml")).expect("read back");
+        assert_eq!(
+            on_disk, "a:\n\tb\nd\n",
+            "the shallower line rises to top level"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_shallower_than_every_old_line_refuses_the_apply() {
+        // No suitable base width exists: a model line shallower than
+        // every mapped old width cannot name its indent, and the
+        // minimum-width fallback would over-indent it - the repair
+        // refuses with the classified miss instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\n    fn two() {}\nfn three() {}\n",
+        )
+        .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "      fn two() {}",
+            "new_text": "fn two() { todo!() }",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("soft refusal");
+        let text = out.text_content();
+        assert!(
+            text.contains("Old text not found"),
+            "the refusal is the classified miss: {text}"
+        );
+        assert!(
+            text.contains("does not map consistently"),
+            "the classification names the mapping refusal: {text}"
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("a.rs")).expect("read back");
+        assert_eq!(
+            on_disk, "fn one() {}\n    fn two() {}\nfn three() {}\n",
+            "nothing was written"
         );
     }
 

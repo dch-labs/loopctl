@@ -1203,15 +1203,26 @@ fn merge_per_file(
         match locate_unique(entry, &op.old_text) {
             FindResult::NotFound => match super::match_repair::classify_miss(entry, &op.old_text) {
                 super::match_repair::MissKind::WhitespaceUnique(window) => {
-                    if !normalized_files.contains(&op.file_path) {
-                        normalized_files.push(op.file_path.clone());
-                    }
-                    *entry = super::match_repair::normalized_splice(
+                    match super::match_repair::normalized_splice(
                         entry,
                         window,
                         &op.old_text,
                         &op.new_text,
-                    );
+                    ) {
+                        Some(content) => {
+                            if !normalized_files.contains(&op.file_path) {
+                                normalized_files.push(op.file_path.clone());
+                            }
+                            *entry = content;
+                        }
+                        None => {
+                            return Err(AbortReason::Locate(format!(
+                                "Old text not found in file: {}\n\n{}",
+                                op.file_path,
+                                super::match_repair::render_refused_miss(entry, window)
+                            )));
+                        }
+                    }
                 }
                 kind => {
                     return Err(AbortReason::Locate(format!(
@@ -1492,7 +1503,7 @@ mod tests {
         .expect("write fixture");
         let input = json!({
             "edits": [
-                {"file_path": "a.rs", "old_text": "      fn two() {}", "new_text": "fn two() { todo!() }"},
+                {"file_path": "a.rs", "old_text": "      fn two() {}", "new_text": "      fn two() { todo!() }"},
             ]
         });
         let out = multi_edit_inner(&MultiEditTool::default(), input, &session)

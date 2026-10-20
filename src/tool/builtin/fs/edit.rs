@@ -663,6 +663,10 @@ mod tests {
         );
     }
 
+    fn on_disk_of(root: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(root.join(name)).expect("read back")
+    }
+
     #[tokio::test]
     async fn absent_text_is_a_soft_error_with_hints() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1085,6 +1089,68 @@ mod tests {
         assert_eq!(
             on_disk, "fn one() {}\n    fn two() {}\nfn three() {}\n",
             "nothing was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_less_tab_base_refuses_a_deeper_replacement() {
+        // A single mapped width names no conversion rate, and a tab
+        // base cannot absorb model spaces one-for-one - one line in,
+        // a block out would pad one tab per model space. The apply
+        // refuses rather than guess; nothing is written.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.py"), "def f():\n\treturn 1\n").expect("write fixture");
+        let input = json!({
+            "file_path": "a.py",
+            "old_text": "    return 1",
+            "new_text": "    if x:\n        return 2",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("soft refusal");
+        let text = out.text_content();
+        assert!(
+            text.contains("Old text not found"),
+            "the refusal is the classified miss: {text}"
+        );
+        assert!(
+            text.contains("does not map consistently"),
+            "the classification names the mapping refusal: {text}"
+        );
+        assert!(
+            on_disk_of(dir.path(), "a.py") == "def f():\n\treturn 1\n",
+            "nothing was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_less_space_base_scales_one_for_one() {
+        // The spaces fallback stays: model spaces and file spaces
+        // share a unit, so a deeper line under a single mapped width
+        // still applies, one file space per model space.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.rs"), "mod m {\n    fn inner() {}\n}\n")
+            .expect("write fixture");
+        let input = json!({
+            "file_path": "a.rs",
+            "old_text": "      fn inner() {}",
+            "new_text": "      fn inner() { todo!() }\n          nested();",
+        });
+        let out = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the space-based apply stands");
+        assert!(
+            out.text_content()
+                .contains("matched with normalized indentation"),
+            "the disclosure rides: {}",
+            out.text_content()
+        );
+        assert_eq!(
+            on_disk_of(dir.path(), "a.rs"),
+            "mod m {\n    fn inner() { todo!() }\n        nested();\n}\n",
+            "one file space per model space, the file's four kept at the edge"
         );
     }
 

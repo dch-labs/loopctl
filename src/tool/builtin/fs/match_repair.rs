@@ -603,6 +603,9 @@ fn aligned_replacement(
         let relative = model_width.saturating_sub(base_width);
         let base_file_width = base_indent.chars().count();
         let rise = if model_step == usize::MAX {
+            if relative > 0 && base_indent.contains('\t') {
+                return None;
+            }
             relative
         } else {
             relative

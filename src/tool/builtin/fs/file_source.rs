@@ -95,8 +95,7 @@ impl ContentSource for FileSource {
 /// containment policy refuses.
 fn resolve_address(session: &FileSession, address: &str) -> Result<PathBuf, ToolError> {
     resolve::reject_path_url("read", address)?;
-    let cwd = session.cwd().to_path_buf();
-    let mut full = resolve::resolve_path(address, &cwd, session.resolve_policy())?;
+    let mut full = session.resolve(address)?;
     if session.resolve_policy() == ResolvePolicy::Unrestricted {
         full = resolve::canonicalize_existing(&full)?;
     }

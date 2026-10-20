@@ -187,7 +187,7 @@ async fn write_inner(
         .get("skip_linter")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut full_path = resolve::resolve_path(file_path, &cwd, policy)?;
+    let mut full_path = session.resolve(file_path)?;
     if policy == ResolvePolicy::Unrestricted {
         full_path = resolve::canonicalize_existing(&full_path)?;
     }
@@ -985,10 +985,11 @@ mod tests {
         let error = write_inner(&WriteTool::default(), input, &session)
             .await
             .expect_err("no path rides");
+        let message = error.to_string();
         assert!(
-            error.to_string().len() < 2 * 1024,
+            message.len() < 2 * 1024,
             "a pathological key cannot flood the teaching error: {} bytes",
-            error.to_string().len()
+            message.len()
         );
     }
 
@@ -1014,6 +1015,297 @@ mod tests {
         assert!(
             message.contains("number"),
             "the received type rides: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sibling_workspace_escape_names_the_boundary_and_class() {
+        // The corpus shape: a neighbor repo's context, reached for by
+        // absolute path. The rejection keeps its first line and gains
+        // the boundary, the class, and the copy-in remedy.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("member-repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let sibling = dir.path().join("AGENTS.md");
+        std::fs::write(&sibling, "neighbor context").expect("sibling");
+        let session = FileSession::new(repo.clone());
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": sibling.to_string_lossy(), "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the sibling path escapes");
+        let message = error.to_string();
+        assert!(
+            message.contains("Path escapes the working directory"),
+            "the first line is byte-identical: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "contained to the working directory: {}",
+                repo.display()
+            )),
+            "the boundary the policy holds to is named: {message}"
+        );
+        assert!(
+            message.contains("sibling workspace"),
+            "the target class is named: {message}"
+        );
+        assert!(
+            message.contains("copy what you need into the working directory"),
+            "the sibling remedy rides: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_temp_shaped_escape_names_the_scratch_root_when_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf())
+            .with_scratch_root(dir.path().join(".dch/tmp"));
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/read_gguf_kv.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path escapes");
+        let message = error.to_string();
+        assert!(
+            message.contains("temp scratch"),
+            "the target class is named: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "scratch root: {}",
+                dir.path().join(".dch/tmp").display()
+            )),
+            "the configured scratch root is the named remedy: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_temp_shaped_escape_without_a_scratch_root_stays_generic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/read_gguf_kv.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path escapes");
+        let message = error.to_string();
+        assert!(
+            !message.contains("scratch root:"),
+            "no root is advertised the host did not configure: {message}"
+        );
+        assert!(
+            message.contains("scratch files belong inside the working directory"),
+            "the unconfigured remedy still teaches: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_unrestricted_remedy_appears_only_when_declared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/usr/share/doc/libc/notes.txt", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the system path escapes");
+        assert!(
+            !error.to_string().contains("unrestricted"),
+            "an undeclared mode is never advertised: {error}"
+        );
+
+        let session = FileSession::new(dir.path().to_path_buf()).with_unrestricted_available();
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/usr/share/doc/libc/notes.txt", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the system path escapes");
+        let message = error.to_string();
+        assert!(
+            message.contains("system or dependency path"),
+            "the class is named: {message}"
+        );
+        assert!(
+            message.contains("unrestricted"),
+            "the declared mode is the named road: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scratch_root_target_writes_without_ceremony() {
+        // The root sits under the working directory, so containment
+        // already admits it: a Write into it needs nothing else, and
+        // the model can follow its own error's advice.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scratch = dir.path().join(".dch/tmp");
+        let session = FileSession::new(dir.path().to_path_buf()).with_scratch_root(scratch.clone());
+        let out = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({
+                "file_path": scratch.join("probe.py").to_string_lossy(),
+                "content": "print('ok')\n"
+            }),
+            &session,
+        )
+        .await
+        .expect("the scratch root is sanctioned");
+        assert!(!out.is_error, "the write lands: {}", out.text_content());
+        assert!(
+            scratch.join("probe.py").is_file(),
+            "the file exists under the scratch root"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scratch_root_escape_spelling_is_refused() {
+        // `cwd/../outside` passes a naive starts_with - the builder's
+        // contract honors only a root that stays inside after
+        // lexical normalization.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf())
+            .with_scratch_root(dir.path().join("../elsewhere"));
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/probe.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path still escapes");
+        assert!(
+            !error.to_string().contains("scratch root:"),
+            "the escape spelling is never named: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scratch_root_through_a_link_and_dotdot_creates_inside() {
+        // The validate/create TOCTOU: `link/../scratch` normalizes
+        // inside and passes validation, but creating the *original*
+        // spelling walks the outbound symlink. The root that is
+        // created and stored is the one that was validated - the
+        // normalized destination, inside the working directory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let link = dir.path().join("out-link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        let session = FileSession::new(dir.path().to_path_buf())
+            .with_scratch_root(link.join("..").join("scratch"));
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/probe.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path still escapes");
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.path().join("scratch").display().to_string()),
+            "the named root is the validated inside destination: {message}"
+        );
+        assert!(
+            !outside.path().join("scratch").exists()
+                && !outside
+                    .path()
+                    .parent()
+                    .is_some_and(|parent| parent.join("scratch").exists()),
+            "nothing is created outside the working directory — not under the \
+             link's destination, and not beside it (symlink traversal escapes \
+             to the destination's parent, not the destination)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scratch_root_through_a_symlink_is_refused() {
+        // A symlink below cwd pointing out would let create_dir_all
+        // build outside the workspace - the same containment the
+        // resolver grades, checked before creating or storing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let link = dir.path().join("out-link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        let session =
+            FileSession::new(dir.path().to_path_buf()).with_scratch_root(link.join("scratch"));
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/probe.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path still escapes");
+        assert!(
+            !error.to_string().contains("scratch root:"),
+            "a root through an outbound symlink is never named: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_escape_classifies_as_a_link_pointing_out() {
+        // A spelling inside the workspace whose target is a link out
+        // is not traversal: the class names the link and the remedy
+        // names a real target inside.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "x").expect("outside file");
+        let link = dir.path().join("leak.txt");
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).expect("symlink");
+        let session = FileSession::new(dir.path().to_path_buf());
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({
+                "file_path": link.to_string_lossy(),
+                "content": "x"
+            }),
+            &session,
+        )
+        .await
+        .expect_err("the symlink target escapes");
+        let message = error.to_string();
+        assert!(
+            message.contains("via symlink"),
+            "the first line is the pinned symlink arm: {message}"
+        );
+        assert!(
+            message.contains("a symlink inside the working directory points outside it"),
+            "the class names the link: {message}"
+        );
+        assert!(
+            message.contains("pass the real path"),
+            "the remedy names a real target: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scratch_root_outside_the_working_directory_is_ignored() {
+        // The gate: only a root at or under the working directory is
+        // honored — anything else would advertise a directory the
+        // policy refuses.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let session = FileSession::new(dir.path().to_path_buf())
+            .with_scratch_root(elsewhere.path().to_path_buf());
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/probe.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path still escapes");
+        assert!(
+            !error.to_string().contains("scratch root:"),
+            "the ignored root is never named: {error}"
         );
     }
 }

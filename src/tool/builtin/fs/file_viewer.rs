@@ -158,8 +158,7 @@ impl Tool for FileViewerTool {
 /// fails.
 async fn view_inner(input: Value, session: &FileSession) -> Result<ToolOutput, ToolError> {
     let parsed = parse_input(&input)?;
-    let full_path =
-        resolve::resolve_path(parsed.file_path, session.cwd(), session.resolve_policy())?;
+    let full_path = session.resolve(parsed.file_path)?;
 
     match tokio::fs::metadata(&full_path).await {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

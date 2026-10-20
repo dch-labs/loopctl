@@ -132,6 +132,19 @@ pub(crate) fn coalesce_adjacent_assistants(messages: Vec<Message>) -> Vec<Messag
             && out.last().is_some_and(|prev| prev.role == Role::Assistant)
         {
             if let Some(previous) = out.last_mut() {
+                let previous_ends_text = previous
+                    .parts
+                    .last()
+                    .is_some_and(crate::message::MessagePart::is_text);
+                let next_starts_text = message
+                    .parts
+                    .first()
+                    .is_some_and(crate::message::MessagePart::is_text);
+                if previous_ends_text && next_starts_text {
+                    previous
+                        .parts
+                        .push(crate::message::MessagePart::text("\n\n"));
+                }
                 previous.parts.extend(message.parts);
             }
         } else {

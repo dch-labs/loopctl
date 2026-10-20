@@ -2052,6 +2052,10 @@ mod tests {
             text.contains("SUMMARY: the task so far.") && text.contains("the preserved tail turn"),
             "both texts ride the merged message: {text}"
         );
+        assert!(
+            text.contains("\\n\\n"),
+            "the merged wire text parts the two statements with a separator: {text}"
+        );
     }
 
     #[test]

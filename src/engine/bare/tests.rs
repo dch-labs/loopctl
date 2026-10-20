@@ -15490,6 +15490,13 @@ impl StrictAssistantShapeClient {
                 index: 0,
                 part: Some(MessagePart::text(text)),
             }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: text.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
@@ -15569,8 +15576,8 @@ impl crate::compact::ContextCompactor for HostileShapeCompactor {
         Box::pin(async move {
             crate::compact::CompactionOutcome::compacted(
                 vec![
-                    crate::message::Message::assistant("SUMMARY: the task so far."),
-                    crate::message::Message::assistant("the preserved tail turn"),
+                    crate::message::Message::assistant("S"),
+                    crate::message::Message::assistant("t"),
                 ],
                 before,
                 after,
@@ -15588,12 +15595,11 @@ async fn a_post_compaction_request_is_legal_on_a_strict_provider() {
     // and the run completes.
     let (client, requests, rejections) = StrictAssistantShapeClient::new();
     client.push_tool_turn(&"history ballast ".repeat(2200), "grow_1");
-    client.push_tool_turn("small", "grow_2");
     client.push_text_turn("after compaction");
     let registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = SessionConfig::default()
-        .with_context_window(100)
+        .with_context_window(200)
         .with_compact_threshold(50);
     let calls = Arc::new(Mutex::new(0));
     let mut agent = BareLoop::new(Arc::new(client), registry, config);
@@ -15603,10 +15609,16 @@ async fn a_post_compaction_request_is_legal_on_a_strict_provider() {
             tokens_after: 20,
             calls: Arc::clone(&calls),
         }))
-        .with_context_window(100),
+        .with_context_window(200),
     ));
 
-    let _outcome = agent.run("drive it", &make_run_config()).await;
+    let outcome = agent.run("drive it", &make_run_config()).await;
+    let run = outcome.expect("the post-compaction request is served and the run completes");
+    assert_eq!(
+        run.output.as_deref(),
+        Some("after compaction"),
+        "the scripted final turn is the run's output"
+    );
 
     let rejections = crate::error::recover_guard(rejections.lock()).clone();
     assert!(

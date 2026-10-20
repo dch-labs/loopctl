@@ -920,6 +920,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_added_nested_block_keeps_the_model_s_relative_depth() {
+        // Edits change structure - that is their point. A genuinely
+        // new line inherits the nearest mapped neighbor's file indent
+        // shifted by the model's relative depth to that neighbor's
+        // old spelling, so the nesting intent survives in the file's
+        // characters.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.py"), "\tdef f():\n\t\treturn 1\n")
+            .expect("write fixture");
+        let input = json!({
+            "file_path": "a.py",
+            "old_text": "def f():\n    return 1",
+            "new_text": "def f():\n    if x:\n        return 2\n    return 1",
+        });
+        let _ = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let on_disk = std::fs::read_to_string(dir.path().join("a.py")).expect("read back");
+        assert_eq!(
+            on_disk, "\tdef f():\n\t\tif x:\n\t\t\treturn 2\n\t\treturn 1\n",
+            "the added block keeps the model's relative depth in the file's tabs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_line_does_not_inherit_its_neighbor_s_block() {
+        // The silent-move class: a line that survives the edit must
+        // keep its own block membership - its content names its
+        // indent, not its new position.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.yml"), "a:\n\tb\nc\n").expect("write fixture");
+        let input = json!({
+            "file_path": "a.yml",
+            "old_text": "a:\n    b\nc",
+            "new_text": "a:\nc",
+        });
+        let _ = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let on_disk = std::fs::read_to_string(dir.path().join("a.yml")).expect("read back");
+        assert_eq!(
+            on_disk, "a:\nc\n",
+            "c stays top-level - it never moves into the a: block"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_makefile_recipe_keeps_its_tab_beside_new_lines() {
+        // A new recipe line among matched content keeps its tab: the
+        // recipe indent comes from content-adjacent mapping, not from
+        // whatever window index the line happens to land on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = FileSession::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("Makefile"), "all:\n\techo a\n").expect("write fixture");
+        let input = json!({
+            "file_path": "Makefile",
+            "old_text": "all:\n    echo a",
+            "new_text": "all:\n    @mkdir -p out\n    echo b",
+        });
+        let _ = edit_inner(&EditTool::default(), input, &session)
+            .await
+            .expect("the normalized match applies");
+        let on_disk = std::fs::read_to_string(dir.path().join("Makefile")).expect("read back");
+        assert_eq!(
+            on_disk, "all:\n\t@mkdir -p out\n\techo b\n",
+            "every recipe line keeps its tab beside the new lines"
+        );
+    }
+
+    #[tokio::test]
     async fn an_ambiguous_normalized_match_rejects_with_the_echo() {
         // Tolerant matching never applies an ambiguous match: both
         // regions match after normalization, so the miss keeps

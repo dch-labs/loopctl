@@ -458,6 +458,15 @@ pub(crate) fn edge_trimmed_replacement(new_text: &str) -> &str {
     new_text.trim()
 }
 
+/// The leading-whitespace width of a line, in characters.
+///
+/// The model-side measure for the relative-depth mapping: how deep
+/// the model spelled the line, counted in the model's own
+/// characters.
+fn leading_width(line: &str) -> usize {
+    line.len().saturating_sub(line.trim_start().len())
+}
+
 /// The window's per-line leading-whitespace strings, in the file's
 /// own characters.
 ///
@@ -510,37 +519,129 @@ fn window_eol(content: &str, window: LineWindow) -> &'static str {
 }
 
 /// Rewrite each replacement line's leading whitespace in the file's
-/// own characters.
+/// own characters, mapped through `old_text` by content.
 ///
-/// Line `i` of the (edge-trimmed) replacement takes
-/// `indents[i]` — the file's aligned window line's leading
-/// whitespace — wholesale; lines past the window's end take the last
-/// indent. Pure-whitespace lines stay untouched, and the join
-/// between lines is the file's own line ending.
-fn aligned_replacement(new_text: &str, indents: &[&str], eol: &str) -> String {
+/// Edits change structure, so position alone cannot name an indent.
+/// Each `old_text` line's normalized content is keyed to its
+/// window line's actual indent (the pair the match already proved
+/// equivalent); a new line whose normalized content matches an old
+/// line takes that old line's file indent — a surviving line keeps
+/// its own block membership however the edit re-arranges it. A line
+/// with no old counterpart (genuinely new) inherits the nearest
+/// preceding mapped line's file indent shifted by the model's
+/// relative depth to that neighbor's old spelling — the model's
+/// nesting intent survives, expressed in the file's characters.
+/// Duplicate contents resolve to the first unused candidate at or
+/// after the matching cursor — positionally nearest, deterministic.
+/// Pure-whitespace lines stay untouched, and the join between lines
+/// is the file's own line ending.
+fn aligned_replacement(new_text: &str, old_text: &str, indents: &[&str], eol: &str) -> String {
+    let old_raw: Vec<&str> = old_text.lines().collect();
+    let old_norm: Vec<&str> = old_raw.iter().map(|line| normalized_line(line)).collect();
+    let old_widths: Vec<usize> = old_raw.iter().map(|line| leading_width(line)).collect();
+    let file_widths: Vec<usize> = indents
+        .iter()
+        .map(|indent| indent.chars().count())
+        .collect();
+    let mut model_step = usize::MAX;
+    let mut file_step = 1;
+    for from in 0..old_widths.len() {
+        for to in 0..old_widths.len() {
+            if let (Some(&to_width), Some(&from_width)) = (old_widths.get(to), old_widths.get(from))
+                && to_width > from_width
+            {
+                let difference = to_width.saturating_sub(from_width);
+                if difference < model_step {
+                    model_step = difference;
+                    let file_cost = file_widths
+                        .get(to)
+                        .copied()
+                        .unwrap_or(1)
+                        .saturating_sub(file_widths.get(from).copied().unwrap_or(1))
+                        .max(1);
+                    file_step = file_cost;
+                }
+            }
+        }
+    }
+
+    let mut used = vec![false; old_norm.len()];
+    let mut cursor = 0;
+    let mut last_mapped: Option<(usize, &str)> = None;
     let mut rendered = String::with_capacity(new_text.len().saturating_add(16));
     for (index, line) in new_text.lines().enumerate() {
         if index > 0 {
             rendered.push_str(eol);
         }
-        let indent = indents
-            .get(index)
-            .or_else(|| indents.last())
-            .copied()
-            .unwrap_or("");
         if line.trim().is_empty() {
             rendered.push_str(line);
             continue;
         }
+        let content = normalized_line(line);
+        let mut search = (cursor..old_norm.len()).chain(0..cursor.min(old_norm.len()));
+        let hit = search.find(|old_index| {
+            !used.get(*old_index).copied().unwrap_or(false)
+                && old_norm.get(*old_index) == Some(&content)
+        });
+        if let Some(old_index) = hit {
+            if let Some(flag) = used.get_mut(old_index) {
+                *flag = true;
+            }
+            cursor = old_index.saturating_add(1);
+            let indent = indents.get(old_index).copied().unwrap_or("");
+            if let Some(width) = old_widths.get(old_index) {
+                last_mapped = Some((*width, indent));
+            }
+            rendered.push_str(indent);
+            let content_start = line.len().saturating_sub(line.trim_start().len());
+            if let Some(rest) = line.get(content_start..) {
+                rendered.push_str(rest);
+            }
+            continue;
+        }
+        let model_width = leading_width(line);
+        let Some((neighbor_width, neighbor_indent)) = last_mapped else {
+            let indent = indents.last().copied().unwrap_or("");
+            rendered.push_str(indent);
+            let content_start = line.len().saturating_sub(line.trim_start().len());
+            if let Some(rest) = line.get(content_start..) {
+                rendered.push_str(rest);
+            }
+            continue;
+        };
+        let neighbor_file_width = neighbor_indent.chars().count();
+        let target_width = if model_step == usize::MAX {
+            neighbor_file_width.saturating_add(model_width.saturating_sub(neighbor_width))
+        } else {
+            let levels = model_width
+                .saturating_sub(neighbor_width)
+                .checked_div(model_step)
+                .unwrap_or(0);
+            neighbor_file_width.saturating_add(levels.saturating_mul(file_step))
+        };
+        let unit = neighbor_indent
+            .chars()
+            .last()
+            .or_else(|| {
+                indents
+                    .iter()
+                    .find(|indent| !indent.is_empty())
+                    .and_then(|indent| indent.chars().next())
+            })
+            .unwrap_or(' ');
+        for _ in 0..target_width {
+            rendered.push(unit);
+        }
         let content_start = line.len().saturating_sub(line.trim_start().len());
         if let Some(rest) = line.get(content_start..) {
-            rendered.push_str(indent);
             rendered.push_str(rest);
         }
     }
     rendered
 }
 
+/// The line ending the window's own interior breaks use.
+///
 /// Drop only the first line's leading whitespace.
 ///
 /// After the aligned rewrite, the first line carries exactly the
@@ -564,11 +665,10 @@ pub(crate) fn normalized_splice(
     old_text: &str,
     new_text: &str,
 ) -> String {
-    let _ = old_text;
     let indents = file_indents(content, window);
     let eol = window_eol(content, window);
     let trimmed = edge_trimmed_replacement(new_text);
-    let aligned = aligned_replacement(trimmed, &indents, eol);
+    let aligned = aligned_replacement(trimmed, old_text, &indents, eol);
     let replacement = first_line_unindented(&aligned);
     super::edit::splice(content, window_core_range(content, window), &replacement)
 }
@@ -660,33 +760,43 @@ mod tests {
 
     #[test]
     fn the_replacement_takes_the_file_s_indent_characters() {
-        // Characters and width both come from the file's aligned
-        // lines - a tab window never receives the model's spaces
-        // back, and extra lines take the last indent.
+        // Characters and width both come from the aligned file lines,
+        // mapped through old_text by content - the position of a line
+        // in the replacement never names its indent.
         assert_eq!(
-            aligned_replacement("def f():\n    return 2", &["\t", "\t\t"], "\n"),
+            aligned_replacement(
+                "def f():\n    return 2",
+                "def f():\n    return 1",
+                &["\t", "\t\t"],
+                "\n"
+            ),
             "\tdef f():\n\t\treturn 2",
-            "every line takes the aligned file indent - the first line's strip happens at the splice"
+            "content-matched lines take the aligned file indent"
         );
         assert_eq!(
-            aligned_replacement("all:\n    echo a", &["", "\t"], "\n"),
+            aligned_replacement("all:\n    echo a", "all:\n    echo a", &["", "\t"], "\n"),
             "all:\n\techo a",
-            "a delta-zero pair still rewrites in the file's character"
+            "a surviving line keeps its own block membership"
         );
         assert_eq!(
-            aligned_replacement("        return 2", &["\t"], "\n"),
+            aligned_replacement("        return 2", "        return 1", &["\t"], "\n"),
             "\treturn 2",
             "the over-indent collapses to the file's width and character"
         );
         assert_eq!(
-            aligned_replacement("code\n   \ncode", &["  ", "  ", "  "], "\n"),
+            aligned_replacement(
+                "code\n   \ncode",
+                "code\n   \ncode",
+                &["  ", "  ", "  "],
+                "\n"
+            ),
             "  code\n   \n  code",
             "pure-whitespace lines stay untouched"
         );
         assert_eq!(
-            aligned_replacement("a\nb\nc\nd", &["\t"], "\r\n"),
+            aligned_replacement("a\nb\nc\nd", "a", &["\t"], "\r\n"),
             "\ta\r\n\tb\r\n\tc\r\n\td",
-            "lines join with the file's own ending, extras take the last indent"
+            "lines join with the file's own ending, new lines inherit and step"
         );
     }
 

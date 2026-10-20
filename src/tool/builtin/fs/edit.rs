@@ -477,15 +477,6 @@ async fn read_existing(
     }
 }
 
-/// Locate `old_text` in `content` and splice `new_text` into its place.
-///
-/// On success returns the new content. The result is structured; the
-/// caller formats the error for the loop via [`EditError::into_output`].
-///
-/// # Errors
-///
-/// Returns `Err(EditError::NotFound)` when `old_text` is absent and
-/// `Err(EditError::Ambiguous)` when it appears more than once.
 /// Insert the normalized-match disclosure after the summary line.
 ///
 /// The receipt's `│`-note channel sits between the `Changed:` header

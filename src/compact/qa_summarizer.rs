@@ -153,9 +153,13 @@ const CHARS_PER_TOKEN: u64 = 4;
 pub struct PriorSummary {
     /// The text of the summary produced by the previous compaction pass.
     ///
-    /// Exactly the text of the summary message that pass prepended to the
-    /// history, which is how the next pass recognizes and excludes that
-    /// message from its transcript.
+    /// The leading text of the history's first assistant message —
+    /// which is how the next pass recognizes and excludes it from its
+    /// transcript: the adoption seam coalesces the summary into the
+    /// preserved tail's opening assistant message (the summary's
+    /// parts first), so the recognition is a prefix match on that
+    /// coalesced head alongside an exact text equality anywhere else
+    /// in the dropped region.
     pub text: String,
 
     /// Which compaction pass produced it, 1-indexed.
@@ -671,20 +675,44 @@ impl QaSummarizer {
     /// Renders through the module's shared renderer (role lines, tool
     /// call/result one-liners, per-part truncation) at the configured
     /// character budget. In accumulate mode the previous pass's summary
-    /// message — recognizable by exact text equality, since this
-    /// compactor authored it — is filtered out: its content already
-    /// reaches the prompt through the `<prior-summary>` block, and
-    /// presenting it twice invites the model to re-summarize the summary.
+    /// is filtered out — exact text equality anywhere, and on the
+    /// first assistant message alone (pins may ride ahead of it),
+    /// where the adoption seam's coalescing folded the summary in as
+    /// the leading text part: only that part leaves, and the tail
+    /// turn's own text, tool calls, and thinking ride on as
+    /// transcript content. The summary already reaches the prompt
+    /// through the `<prior-summary>` block, and presenting it twice
+    /// invites the model to re-summarize the summary. A later message
+    /// that merely echoes the summary and continues is not the
+    /// summary; its continuation rides.
     fn transcript(&self, dropped: &[Message], prior: Option<&PriorSummary>) -> String {
         let prior_text = prior
             .filter(|_| self.config.accumulate)
             .map_or(String::new(), |prior| prior.text.clone());
         let hiding_prior = !prior_text.is_empty();
         let rendered_source: Vec<Message> = if hiding_prior {
+            let first_assistant = dropped.iter().position(|msg| msg.role == Role::Assistant);
             dropped
                 .iter()
-                .filter(|msg| !(msg.role == Role::Assistant && msg.text_content() == prior_text))
-                .cloned()
+                .enumerate()
+                .filter_map(|(index, msg)| {
+                    if msg.role != Role::Assistant {
+                        return Some(msg.clone());
+                    }
+                    if msg.text_content() == prior_text {
+                        return None;
+                    }
+                    let head_is_summary = msg.parts.first().and_then(|part| match part {
+                        crate::message::MessagePart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    }) == Some(prior_text.as_str());
+                    if Some(index) == first_assistant && head_is_summary {
+                        let rest: Vec<crate::message::MessagePart> =
+                            msg.parts.iter().skip(1).cloned().collect();
+                        return (!rest.is_empty()).then(|| Message::new(Role::Assistant, rest));
+                    }
+                    Some(msg.clone())
+                })
                 .collect()
         } else {
             dropped.to_vec()
@@ -1618,6 +1646,75 @@ mod tests {
         for (got, want) in preserved.iter().zip(&expected.preserved) {
             assert_eq!(got.text_content(), want.text_content());
         }
+    }
+
+    #[test]
+    fn a_coalesced_summary_behind_a_pinned_message_is_still_recognized() {
+        // Pins ride ahead of the summary in the adopted history, so
+        // the coalesced summary is not at index 0 of the dropped
+        // region. The prefix arm must find the first *assistant*
+        // message, wherever the pins left it - and it strips only
+        // the summary part: the tail turn's own content is the next
+        // pass's transcript, not part of the summary.
+        let (_, summarizer) = scripted(vec![]);
+        let prior = PriorSummary {
+            text: "SUMMARY".to_string(),
+            pass: 1,
+        };
+        let mut coalesced = Message::assistant("SUMMARY");
+        coalesced
+            .parts
+            .push(crate::message::MessagePart::text("and the tail rides here"));
+        let dropped = vec![
+            Message::user("pinned context the host keeps ahead"),
+            coalesced,
+            Message::user("next"),
+            Message::assistant("SUMMARY and then the model wrote more"),
+        ];
+        let rendered = summarizer.transcript(&dropped, Some(&prior));
+        assert!(
+            rendered.contains("and the tail rides here"),
+            "only the summary part leaves the head; the tail turn's content is transcript: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SUMMARY\n"),
+            "the summary text itself does not ride twice: {rendered}"
+        );
+        assert!(
+            rendered.contains("and then the model wrote more"),
+            "the echo-echo continuation is transcript content: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_echoed_summary_with_continuation_survives_the_transcript() {
+        // A later message that merely echoes the summary and
+        // continues is not the head: its continuation must reach the
+        // next pass's transcript, and only the head's own summary
+        // part leaves.
+        let (_, summarizer) = scripted(vec![]);
+        let prior = PriorSummary {
+            text: "SUMMARY".to_string(),
+            pass: 1,
+        };
+        let mut coalesced = Message::assistant("SUMMARY");
+        coalesced
+            .parts
+            .push(crate::message::MessagePart::text("and the tail rides here"));
+        let dropped = vec![
+            coalesced,
+            Message::user("next"),
+            Message::assistant("SUMMARY and then the model wrote more"),
+        ];
+        let rendered = summarizer.transcript(&dropped, Some(&prior));
+        assert!(
+            rendered.contains("and the tail rides here"),
+            "the coalesced head keeps its tail content: {rendered}"
+        );
+        assert!(
+            rendered.contains("and then the model wrote more"),
+            "the echo-echo continuation is transcript content: {rendered}"
+        );
     }
 
     #[test]

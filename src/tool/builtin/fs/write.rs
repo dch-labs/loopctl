@@ -1142,6 +1142,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_relative_scratch_root_joins_the_working_directory() {
+        // The doc's own `.dch/tmp` shape is relative; the builder
+        // joins it to the working directory before validation, the
+        // same joining `resolve` applies to tool inputs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session =
+            FileSession::new(dir.path().to_path_buf()).with_scratch_root(".dch/tmp".to_string());
+        let error = write_inner(
+            &WriteTool::default(),
+            serde_json::json!({"file_path": "/tmp/probe.py", "content": "x"}),
+            &session,
+        )
+        .await
+        .expect_err("the temp path still escapes");
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.path().join(".dch/tmp").display().to_string()),
+            "the relative root joined and is the named remedy: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_scratch_root_target_writes_without_ceremony() {
         // The root sits under the working directory, so containment
         // already admits it: a Write into it needs nothing else, and

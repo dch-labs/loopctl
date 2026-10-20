@@ -746,6 +746,12 @@ impl LoopMachine {
 
     /// Feed compacted history back into the machine.
     ///
+    /// The adopted history is coalesced first: runs of adjacent
+    /// assistant messages fold into one (the summary's parts first,
+    /// then the tail's), so a summary landing before an
+    /// assistant-role preserved tail — the shape strict providers
+    /// reject outright — never reaches the machine or the wire.
+    ///
     /// The driver calls this after servicing a [`MachineStep::Compact`] that
     /// rewrote the history, passing the compacted history plus two measured
     /// estimates from the same counter: `tokens_before` — the payload the
@@ -768,7 +774,7 @@ impl LoopMachine {
         if self.terminate_on_no_progress(tokens_before, tokens_after) {
             return;
         }
-        self.history = compacted;
+        self.history = crate::message::coalesce_adjacent_assistants(compacted);
         self.pending.clear();
         self.context_tokens = tokens_after;
         self.state = MachineState::Start;
@@ -2225,6 +2231,47 @@ mod tests {
             }
             other => panic!("expected emergency Compact, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compaction_result_coalesces_an_adjacent_assistant_pair() {
+        // The f8e96a6a shape: a compactor's summary lands as its own
+        // assistant message directly before a preserved tail that
+        // opens with one - two adjacent assistants, which strict
+        // providers (zai's GLM) reject outright. The adopting seam
+        // coalesces: the summary's parts join the tail's message,
+        // the glued shape the rebuild path already produces.
+        let mut machine = LoopMachine::from_history(Vec::new());
+        machine.compaction_result(
+            vec![
+                Message::assistant("SUMMARY: the task so far."),
+                Message::assistant("tail turn in flight"),
+            ],
+            100,
+            50,
+        );
+        let history = machine.history();
+        assert_eq!(
+            history.len(),
+            1,
+            "the pair is one message: {:?}",
+            history
+                .iter()
+                .map(crate::message::Message::text_content)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(history[0].role, Role::Assistant);
+        let text = history[0].text_content();
+        assert!(
+            text.starts_with("SUMMARY: the task so far.") && text.contains("tail turn in flight"),
+            "the summary's parts ride first, then the tail's: {text:?}"
+        );
+        assert!(
+            !history
+                .windows(2)
+                .any(|pair| pair[0].role == Role::Assistant && pair[1].role == Role::Assistant),
+            "the assembled machine never carries two adjacent assistant messages"
+        );
     }
 
     #[test]

@@ -250,14 +250,21 @@ impl FileSession {
     /// host's to configure) that temp-shaped escape errors name as
     /// the sanctioned home for scratch files, and that fs tools
     /// resolve into without ceremony — it sits *under* the working
-    /// directory, so containment already admits it. Only a root at
-    /// or under the working directory is honored; anything else
-    /// would advertise a directory the policy refuses. Creation is
-    /// best-effort with a warning — a missing directory the model
-    /// can still create itself.
+    /// directory, so containment already admits it. A relative
+    /// spelling joins the working directory first, the same joining
+    /// `resolve` applies to tool inputs. Only a root at or under the
+    /// working directory is honored; anything else would advertise a
+    /// directory the policy refuses. Creation is best-effort with a
+    /// warning — a missing directory the model can still create
+    /// itself.
     #[must_use]
     pub fn with_scratch_root(mut self, scratch_root: impl Into<PathBuf>) -> Self {
         let scratch_root = scratch_root.into();
+        let scratch_root = if scratch_root.is_relative() {
+            self.cwd.join(scratch_root)
+        } else {
+            scratch_root
+        };
         if let Some(validated) = resolve::scratch_root_is_contained(&self.cwd, &scratch_root) {
             if let Err(e) = std::fs::create_dir_all(&validated) {
                 tracing::warn!(error = %e, root = %validated.display(), "scratch root creation failed");

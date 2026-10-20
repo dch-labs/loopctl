@@ -1249,10 +1249,13 @@ fn merge_per_file(
 
 /// The byte range one edit will splice, exact or normalized.
 ///
-/// The overlap detector needs the same range the merge will apply:
-/// the exact find first, then the unique whitespace-normalized
-/// window — so two edits that overlap only under normalization are
-/// still caught before anything writes.
+/// The overlap detector sees a superset of the range the merge
+/// applies: the exact find is exact, while the normalized arm
+/// returns the whole-line window and the merge splices through the
+/// narrower core range — so two edits whose spliced bytes are
+/// disjoint can still abort as overlapping when only their window
+/// edges collide. The superset errs safe: normalization-only
+/// overlaps always abort before anything writes.
 fn edit_range(content: &str, old_text: &str) -> Option<std::ops::Range<usize>> {
     if let Some(start) = content.find(old_text) {
         let end = start.saturating_add(old_text.len());

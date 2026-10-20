@@ -106,6 +106,41 @@ pub struct Message {
     pub parts: Vec<MessagePart>,
 }
 
+/// Fold runs of adjacent assistant messages into one message.
+///
+/// The compaction seam's coalescer and the Anthropic request build's
+/// safety net: some providers (zai's GLM among them) reject two
+/// adjacent assistant messages outright, and a compaction summary
+/// placed at the head of a preserved tail that opens with an
+/// assistant turn produces exactly that shape. The run folds into
+/// one assistant message carrying the parts of every member in
+/// order — the summary's parts first, then the tail's — the same
+/// glued shape a transcript rebuild produces. Runs of user or system
+/// messages pass through untouched.
+///
+/// The machine seam covers every compactor's output; the
+/// provider-side safety net lives in the Anthropic request build
+/// alone (which zai rides) — the other providers tolerate the
+/// adjacent-assistant shape today, and a transcript rebuild
+/// coalesces before resuming, so the guarantee is universal in
+/// practice but the *wire* merge is Anthropic-build-only until a
+/// strict consumer appears on another route.
+pub(crate) fn coalesce_adjacent_assistants(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if message.role == Role::Assistant
+            && out.last().is_some_and(|prev| prev.role == Role::Assistant)
+        {
+            if let Some(previous) = out.last_mut() {
+                previous.parts.extend(message.parts);
+            }
+        } else {
+            out.push(message);
+        }
+    }
+    out
+}
+
 impl Message {
     /// Create a user message from plain text.
     ///

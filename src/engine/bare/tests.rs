@@ -15394,3 +15394,242 @@ async fn a_steering_message_refreshes_the_context_estimate() {
         agent.machine().context_tokens()
     );
 }
+
+/// The request log a [`StrictAssistantShapeClient`] shares with its test.
+#[cfg(feature = "streaming")]
+type StrictShapeLog = Arc<Mutex<Vec<crate::api::StreamRequest>>>;
+
+/// The rejection log a [`StrictAssistantShapeClient`] shares with its test.
+#[cfg(feature = "streaming")]
+type StrictShapeRejections = Arc<Mutex<Vec<String>>>;
+
+/// A client that rejects any request carrying two adjacent assistant
+/// messages, the way zai's GLM API does (`HTTP 400 [1214]`), and
+/// scripts its turns otherwise.
+#[cfg(feature = "streaming")]
+struct StrictAssistantShapeClient {
+    /// The requests the engine issued, in call order.
+    requests: Arc<Mutex<Vec<crate::api::StreamRequest>>>,
+
+    /// The scripted responses, served front first.
+    responses: Arc<Mutex<std::collections::VecDeque<Vec<StreamEvent>>>>,
+
+    /// The rejections that fired, for failure messages.
+    rejections: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl StrictAssistantShapeClient {
+    /// Build the client over a shareable request log, empty script.
+    fn new() -> (Self, StrictShapeLog, StrictShapeRejections) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let rejections = Arc::new(Mutex::new(Vec::new()));
+        let client = Self {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            rejections: Arc::clone(&rejections),
+        };
+        (client, requests, rejections)
+    }
+
+    /// Script one tool-call turn against `echo`, whose text part
+    /// carries the fill that grows the history.
+    fn push_tool_turn(&self, fill: &str, call_id: &str) {
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: format!("msg_{call_id}"),
+                    role: "assistant".into(),
+                    model: "strict-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::text(fill)),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: fill.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: Some(MessagePart::tool_call(call_id, "echo", Value::Null)),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::InputJson {
+                    partial_json: "{}".to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(1) },
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("tool_call".to_string()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        crate::error::recover_guard(self.responses.lock()).push_back(events);
+    }
+
+    /// Script one plain text turn.
+    fn push_text_turn(&self, text: &str) {
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_strict".into(),
+                    role: "assistant".into(),
+                    model: "strict-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::text(text)),
+            }),
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".to_string()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        crate::error::recover_guard(self.responses.lock()).push_back(events);
+    }
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for StrictAssistantShapeClient {
+    fn model(&self) -> String {
+        "strict-model".to_string()
+    }
+
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let adjacent = request.messages.windows(2).any(|pair| {
+            pair[0].role == crate::message::Role::Assistant
+                && pair[1].role == crate::message::Role::Assistant
+        });
+        if adjacent {
+            crate::error::recover_guard(self.requests.lock()).push(request.clone());
+            crate::error::recover_guard(self.rejections.lock())
+                .push("400 [1214] The messages parameter is illegal".to_string());
+            return Box::pin(futures::stream::iter(vec![Err(ApiError::api(
+                "400 [1214] The messages parameter is illegal",
+            ))]));
+        }
+        crate::error::recover_guard(self.requests.lock()).push(request.clone());
+        let mut guard = crate::error::recover_guard(self.responses.lock());
+        if let Some(events) = guard.pop_front() {
+            let events: Vec<Result<StreamEvent, ApiError>> = events.into_iter().map(Ok).collect();
+            Box::pin(futures::stream::iter(events))
+        } else {
+            Box::pin(futures::stream::iter(vec![Err(ApiError::api(
+                "no scripted response",
+            ))]))
+        }
+    }
+
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        Box::pin(std::future::ready(Err(ApiError::api("unreachable"))))
+    }
+}
+
+/// A compactor whose output is exactly the hostile shape: an
+/// assistant summary directly before a preserved tail that opens
+/// with an assistant message.
+#[cfg(feature = "streaming")]
+struct HostileShapeCompactor {
+    tokens_before: u64,
+    tokens_after: u64,
+    calls: Arc<Mutex<usize>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::compact::ContextCompactor for HostileShapeCompactor {
+    fn compact(
+        &self,
+        _messages: Vec<crate::message::Message>,
+        _target_tokens: u64,
+        _context: crate::compact::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::CompactionOutcome> + Send + '_>> {
+        let (before, after) = (self.tokens_before, self.tokens_after);
+        let mut calls = crate::error::recover_guard(self.calls.lock());
+        *calls = calls.saturating_add(1);
+        Box::pin(async move {
+            crate::compact::CompactionOutcome::compacted(
+                vec![
+                    crate::message::Message::assistant("SUMMARY: the task so far."),
+                    crate::message::Message::assistant("the preserved tail turn"),
+                ],
+                before,
+                after,
+            )
+        })
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_post_compaction_request_is_legal_on_a_strict_provider() {
+    // The f8e96a6a death: compact, then the immediate next request
+    // carries two adjacent assistant messages and the strict provider
+    // 400s the run dead. The seam coalesces, so the request is legal
+    // and the run completes.
+    let (client, requests, rejections) = StrictAssistantShapeClient::new();
+    client.push_tool_turn(&"history ballast ".repeat(2200), "grow_1");
+    client.push_tool_turn("small", "grow_2");
+    client.push_text_turn("after compaction");
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let config = SessionConfig::default()
+        .with_context_window(100)
+        .with_compact_threshold(50);
+    let calls = Arc::new(Mutex::new(0));
+    let mut agent = BareLoop::new(Arc::new(client), registry, config);
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(HostileShapeCompactor {
+            tokens_before: 90,
+            tokens_after: 20,
+            calls: Arc::clone(&calls),
+        }))
+        .with_context_window(100),
+    ));
+
+    let _outcome = agent.run("drive it", &make_run_config()).await;
+
+    let rejections = crate::error::recover_guard(rejections.lock()).clone();
+    assert!(
+        rejections.is_empty(),
+        "the strict provider never sees an adjacent assistant pair: {rejections:?}"
+    );
+    assert!(
+        *crate::error::recover_guard(calls.lock()) >= 1,
+        "the hostile compactor actually ran - the pin is not vacuous"
+    );
+    let log = crate::error::recover_guard(requests.lock()).clone();
+    for request in &log {
+        assert!(
+            !request.messages.windows(2).any(|pair| {
+                pair[0].role == crate::message::Role::Assistant
+                    && pair[1].role == crate::message::Role::Assistant
+            }),
+            "every served request is legal: {:?}",
+            request
+                .messages
+                .iter()
+                .map(|message| format!("{:?}", message.role))
+                .collect::<Vec<_>>()
+        );
+    }
+}

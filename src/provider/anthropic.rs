@@ -1010,6 +1010,8 @@ fn build_request_body(
 
     let tools = tools.filter(|t| !t.is_empty());
     let (non_system, effective_system) = super::fold_system_messages(messages, *system);
+    let owned: Vec<crate::message::Message> = non_system.into_iter().cloned().collect();
+    let non_system = crate::message::coalesce_adjacent_assistants(owned);
     let msgs: Vec<Value> = non_system
         .iter()
         .map(|m| convert_message(m, replay_reasoning, effort.is_some()))
@@ -2017,6 +2019,41 @@ impl StreamEmitter {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_request_build_merges_adjacent_assistant_messages() {
+        // The provider-side safety net: a future producer of the
+        // adjacent-assistant shape cannot kill a run - the Anthropic
+        // body build (zai rides it) merges the pair into one
+        // assistant message carrying both texts' content blocks.
+        let spec = RequestBodySpec {
+            model: "glm-4.7",
+            messages: &[
+                crate::message::Message::user("drive it"),
+                crate::message::Message::assistant("SUMMARY: the task so far."),
+                crate::message::Message::assistant("the preserved tail turn"),
+            ],
+            system: None,
+            tools: Some(&[]),
+            response_format: None,
+            tool_constraint: &ToolConstraint::None,
+        };
+        let body = build_request_body(&spec, false, 1024, None, false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "the adjacent pair merges: {messages:?}");
+        let merged = &messages[1];
+        assert_eq!(
+            merged["role"], "assistant",
+            "the merged message keeps the assistant role: {merged:?}"
+        );
+        let text = merged["content"].to_string();
+        assert!(
+            text.contains("SUMMARY: the task so far.") && text.contains("the preserved tail turn"),
+            "both texts ride the merged message: {text}"
+        );
+    }
+
     #[test]
     fn emitter_ignores_events_after_message_stop() {
         let mut emitter = StreamEmitter::default();
@@ -2056,7 +2093,6 @@ mod tests {
         );
     }
 
-    use super::*;
     use crate::message::{Message, MessagePart, Role, ToolContent};
 
     #[tokio::test]

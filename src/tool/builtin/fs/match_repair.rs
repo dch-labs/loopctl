@@ -148,12 +148,6 @@ fn line_table(content: &str) -> Vec<(usize, &str)> {
     table
 }
 
-/// Whether two normalized lines resemble each other.
-///
-/// Word-overlap at the half mark (computed without floats): the file
-/// line `fn two() { todo!() }` resembles the old text's
-/// `fn two() {}` — the stale shape — while a paraphrase shares no
-/// half of its words with anything in the file.
 /// A line prepared for window comparison: its normalized form and
 /// its token set, computed once per line instead of once per compared
 /// pair.
@@ -407,8 +401,9 @@ pub(crate) fn render_miss(kind: &MissKind, content: &str) -> String {
     let mut rendered = String::new();
     match kind {
         MissKind::WhitespaceUnique(_) => rendered.push_str(
-            "Classification: whitespace-only mismatch - but the normalized \
-             match is not unique, so it does not apply.\n",
+            "Classification: whitespace-only mismatch - a unique normalized \
+             match exists and applies; if this line appears, the caller \
+             refused a match it should have applied.\n",
         ),
         MissKind::WhitespaceAmbiguous { count, first } => {
             writeln!(
@@ -467,10 +462,14 @@ fn prepared_replacement(new_text: &str) -> String {
 /// The leading-whitespace width of a line, in characters.
 ///
 /// The model-side measure for the relative-depth mapping: how deep
-/// the model spelled the line, counted in the model's own
-/// characters.
+/// the model spelled the line, counted in characters so the value
+/// shares one vocabulary with the file-side `chars().count()` widths
+/// (a byte count would disagree under multi-byte whitespace such as
+/// NBSP).
 fn leading_width(line: &str) -> usize {
-    line.len().saturating_sub(line.trim_start().len())
+    line.chars()
+        .take_while(|character| character.is_whitespace())
+        .count()
 }
 
 /// The window's per-line leading-whitespace strings, in the file's
@@ -634,8 +633,6 @@ fn aligned_replacement(
     Some(rendered)
 }
 
-/// The line ending the window's own interior breaks use.
-///
 /// Drop only the first line's leading whitespace.
 ///
 /// After the aligned rewrite, the first line carries exactly the

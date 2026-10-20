@@ -799,15 +799,19 @@ fn build_request_body(
 /// The `thinkingConfig.thinkingBudget` value for one effort level.
 ///
 /// The fixed ladder from [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
-/// table: `Low` budgets `1024` tokens, `Medium` `8192`, `High` `16384`,
-/// and `Max` `24576`. The provider's dynamic sentinels (`0`, `-1`) are
-/// deliberately not on the ladder — a set level always names a real
-/// budget.
+/// table: `Minimal` budgets `512` tokens, `Low` `1024`, `Medium` `8192`,
+/// `High` `16384`, `Xhigh` `20480`, and `Max` `24576`. The `None` level
+/// carries the provider's own off sentinel, `0` — the one dynamic
+/// value on the ladder; `-1` (dynamic, model-chosen) stays off it, so
+/// every other set level names a real budget.
 fn gemini_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
     match effort {
+        crate::structured::ThinkingEffort::None => 0,
+        crate::structured::ThinkingEffort::Minimal => 512,
         crate::structured::ThinkingEffort::Low => 1024,
         crate::structured::ThinkingEffort::Medium => 8192,
         crate::structured::ThinkingEffort::High => 16384,
+        crate::structured::ThinkingEffort::Xhigh => 20480,
         crate::structured::ThinkingEffort::Max => 24576,
     }
 }
@@ -3632,6 +3636,26 @@ mod tests {
         assert!(
             low.contains("\"thinkingBudget\":1024"),
             "the Low rung maps to the ladder's 1024 budget: {low}"
+        );
+        let minimal = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Minimal),
+        )
+        .await;
+        assert!(
+            minimal.contains("\"thinkingBudget\":512"),
+            "Minimal budgets the ladder's floor: {minimal}"
+        );
+        let off = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+        )
+        .await;
+        assert!(
+            off.contains("\"thinkingBudget\":0"),
+            "the None rung carries the provider's own off sentinel: {off}"
         );
         let max = captured_effort_body(
             None,

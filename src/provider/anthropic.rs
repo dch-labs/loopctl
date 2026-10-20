@@ -429,7 +429,8 @@ impl ApiClient for AnthropicClient {
             }));
         }
         let effort = options.effort.or(self.thinking_effort);
-        if options.response_format.is_some() && effort.is_some() {
+        if options.response_format.is_some() && effort.and_then(anthropic_thinking_budget).is_some()
+        {
             return Box::pin(futures::stream::once(async move {
                 Err(effort_tool_choice_conflict_error())
             }));
@@ -492,7 +493,8 @@ impl ApiClient for AnthropicClient {
             return Box::pin(async move { Err(strict_unsupported_error("Anthropic")) });
         }
         let effort = options.effort.or(self.thinking_effort);
-        if options.response_format.is_some() && effort.is_some() {
+        if options.response_format.is_some() && effort.and_then(anthropic_thinking_budget).is_some()
+        {
             return Box::pin(async move { Err(effort_tool_choice_conflict_error()) });
         }
         let system = request.system.clone();
@@ -682,21 +684,27 @@ impl AnthropicClientBuilder {
     /// `budget_tokens` (per
     /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table),
     /// and a `max_tokens` below `budget_tokens + 1` rises to fit the
-    /// budget. A per-request
+    /// budget — except the
+    /// [`None`](crate::structured::ThinkingEffort::None) rung, the
+    /// client-wide off, which sends no `thinking` block at all. A
+    /// per-request
     /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
     /// always wins; an unset client default leaves unconfigured requests
     /// byte-identical to prior versions. A
     /// [`response_format`](crate::structured::RequestOptions::response_format)
-    /// request under a default set here is rejected up front — extended
-    /// thinking cannot combine with the forced tool choice a response
-    /// format synthesizes — so configure effort per request when both
-    /// are needed on other calls. Extended thinking also demands the
-    /// assistant's original signed thinking blocks on continuations: a
-    /// history whose tool-use message carries an unsigned thinking part
-    /// (recorded before this version, cross-provider, or hand-built)
-    /// still sends `tool_use` alone, which the Messages API rejects —
-    /// clear the effort for such histories or re-record them against
-    /// this version, whose response path captures signatures.
+    /// request under a default that budgets is rejected up front —
+    /// extended thinking cannot combine with the forced tool choice a
+    /// response format synthesizes — so configure effort per request
+    /// (or to the `None` rung) when both are needed. An effort that
+    /// budgets also demands the assistant's original signed thinking
+    /// blocks on continuations: a history whose tool-use message
+    /// carries an unsigned thinking part (recorded before this
+    /// version, cross-provider, or hand-built) still sends `tool_use`
+    /// alone, which the Messages API rejects — clear the effort for
+    /// such histories or re-record them against this version, whose
+    /// response path captures signatures. Under the `None` rung,
+    /// history reasoning instead rides as the capped plain-text
+    /// replay (see [`replay_reasoning`](Self::replay_reasoning)).
     #[must_use]
     pub fn thinking_effort(mut self, effort: crate::structured::ThinkingEffort) -> Self {
         self.thinking_effort = Some(effort);
@@ -711,7 +719,11 @@ impl AnthropicClientBuilder {
     /// part order, so reasoning-capable models keep their working
     /// memory across turns. The blocks are plain text — every
     /// Messages-compatible endpoint accepts them, including gateways
-    /// that reject unsigned native thinking blocks.
+    /// that reject unsigned native thinking blocks. The `None`
+    /// effort rung renders history reasoning the same way with the
+    /// flag left off: native thinking blocks are wire-illegal on a
+    /// request that disables thinking, and dropping the parts
+    /// silently would lose the context they carry.
     #[must_use]
     pub fn replay_reasoning(mut self, enabled: bool) -> Self {
         self.replay_reasoning = enabled;
@@ -994,7 +1006,7 @@ fn build_request_body(
     effort: Option<crate::structured::ThinkingEffort>,
     replay_reasoning: bool,
 ) -> Value {
-    let budget = effort.map(anthropic_thinking_budget);
+    let budget = effort.and_then(anthropic_thinking_budget);
     let max_tokens = match budget {
         Some(budget) => max_tokens.max(budget.saturating_add(1)),
         None => max_tokens,
@@ -1014,7 +1026,7 @@ fn build_request_body(
     let non_system = crate::message::coalesce_adjacent_assistants(owned);
     let msgs: Vec<Value> = non_system
         .iter()
-        .map(|m| convert_message(m, replay_reasoning, effort.is_some()))
+        .map(|m| convert_message(m, replay_reasoning, effort))
         .collect();
     let effective_system = effective_system.unwrap_or_default();
     let (tools_val, tool_choice) = if let Some(rf) = response_format {
@@ -1172,15 +1184,21 @@ fn apply_prompt_cache_breakpoints(body: &mut Value) {
 
 /// The Messages API `thinking.budget_tokens` for one effort level.
 ///
-/// The fixed ladder from [`ThinkingEffort`]'s table: `Low` budgets `2048`
-/// tokens, `Medium` `8192`, `High` `16384`, and `Max` `32768`. Provider-
-/// native numbers, never invented per model.
-fn anthropic_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
+/// The fixed ladder from [`ThinkingEffort`]'s table: `Minimal` budgets
+/// `1024` tokens (the API's floor for an enabled block), `Low` `2048`,
+/// `Medium` `8192`, `High` `16384`, `Xhigh` `24576`, and `Max` `32768`.
+/// The `None` level budgets nothing — `None` back, so the request
+/// carries no `thinking` block at all. Provider-native numbers, never
+/// invented per model.
+fn anthropic_thinking_budget(effort: crate::structured::ThinkingEffort) -> Option<u32> {
     match effort {
-        crate::structured::ThinkingEffort::Low => 2048,
-        crate::structured::ThinkingEffort::Medium => 8192,
-        crate::structured::ThinkingEffort::High => 16384,
-        crate::structured::ThinkingEffort::Max => 32768,
+        crate::structured::ThinkingEffort::None => None,
+        crate::structured::ThinkingEffort::Minimal => Some(1024),
+        crate::structured::ThinkingEffort::Low => Some(2048),
+        crate::structured::ThinkingEffort::Medium => Some(8192),
+        crate::structured::ThinkingEffort::High => Some(16384),
+        crate::structured::ThinkingEffort::Xhigh => Some(24576),
+        crate::structured::ThinkingEffort::Max => Some(32768),
     }
 }
 
@@ -1210,17 +1228,21 @@ fn native_thinking_block(text: &str, signature: Option<&str>, redacted: Option<&
 /// - Messages with tool calls or tool results use the full `content` array.
 /// - Thinking parts render as one capped `<thinking>` text block
 ///   each, in part order, ahead of the other content when
-///   `replay_reasoning` is set — except that a signed or redacted
-///   part rides back natively while `thinking_enabled` (an effective
-///   thinking-effort level) is set, because Anthropic requires the
-///   original block ahead of tool use on continuation requests;
-///   image parts are skipped, as this wire carries no images in
-///   conversation history.
+///   `replay_reasoning` is set or the effective effort is the
+///   `None` rung (thinking off, where native blocks are
+///   wire-illegal) — except that a signed or redacted part rides
+///   back natively while the effective effort budgets a thinking
+///   block, because Anthropic requires the original block ahead of
+///   tool use on continuation requests; image parts are skipped,
+///   as this wire carries no images in conversation history.
 pub(super) fn convert_message(
     m: &Message,
     replay_reasoning: bool,
-    thinking_enabled: bool,
+    effort: Option<crate::structured::ThinkingEffort>,
 ) -> Value {
+    let thinking_on = effort.and_then(anthropic_thinking_budget).is_some();
+    let reasoning_as_text =
+        replay_reasoning || matches!(effort, Some(crate::structured::ThinkingEffort::None));
     let role = match m.role {
         Role::User | Role::System => "user",
         Role::Assistant => "assistant",
@@ -1238,14 +1260,14 @@ pub(super) fn convert_message(
                 text,
                 signature,
                 redacted,
-            } if thinking_enabled && (signature.is_some() || redacted.is_some()) => {
+            } if thinking_on && (signature.is_some() || redacted.is_some()) => {
                 thinking_blocks.push(native_thinking_block(
                     text,
                     signature.as_deref(),
                     redacted.as_deref(),
                 ));
             }
-            MessagePart::Thinking { text, .. } if replay_reasoning && !text.is_empty() => {
+            MessagePart::Thinking { text, .. } if reasoning_as_text && !text.is_empty() => {
                 let tail = super::replay_reasoning_tail(text);
                 thinking_blocks.push(serde_json::json!({
                     "type": "text",
@@ -2401,6 +2423,90 @@ mod tests {
             body.contains("\"type\":\"redacted_thinking\"")
                 && body.contains("\"data\":\"opaque-data\""),
             "a redacted block returns its opaque payload verbatim on continuations: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_none_rung_renders_history_thinking_as_replay() {
+        // The off rung's twin of the disabled-replay pin: a
+        // per-request `None` over a `High` client default disables
+        // the thinking block, so signed history parts must render as
+        // the plain-text replay - native thinking blocks on a
+        // thinking-disabled request are a Messages API rejection.
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "alpha pass".to_string(),
+                    signature: Some("sig-blob".to_string()),
+                    redacted: None,
+                },
+                MessagePart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::None),
+            history,
+        )
+        .await;
+        assert!(
+            body.contains("<thinking>\\nalpha pass\\n</thinking>"),
+            "the off rung renders reasoning as the plain-text replay: {body}"
+        );
+        assert!(
+            !body.contains("\"signature\""),
+            "no native thinking block rides a request the rung turned off: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_none_rung_lets_a_response_format_request_proceed() {
+        // The format/effort conflict guard keys on thinking being
+        // enabled: with the off rung there is no thinking block, so a
+        // forced-format request is legal and must reach the wire -
+        // the guard's rejection is reserved for rungs that budget.
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .with_max_tokens(64)
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        let options = crate::structured::RequestOptions::new()
+            .with_effort(crate::structured::ThinkingEffort::None)
+            .with_response_format(crate::structured::ResponseFormat {
+                name: "result".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+                strict: false,
+            });
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![Message::user("hi")]),
+            options,
+        );
+        let _ = stream.next().await;
+        drop(stream);
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("\"messages\""),
+            "the request reached the wire instead of the conflict guard: {request}"
         );
     }
 
@@ -4365,7 +4471,7 @@ mod tests {
                 true,
             )],
         );
-        let json = convert_message(&msg, false, false);
+        let json = convert_message(&msg, false, None);
         assert_eq!(
             json.pointer("/content/0/is_error"),
             Some(&serde_json::json!(true)),
@@ -4380,7 +4486,7 @@ mod tests {
                 false,
             )],
         );
-        let ok_json = convert_message(&ok, false, false);
+        let ok_json = convert_message(&ok, false, None);
         assert!(
             ok_json.pointer("/content/0/is_error").is_none(),
             "successful results carry no is_error (the wire default is false): {ok_json}"
@@ -4626,6 +4732,43 @@ mod tests {
         assert!(
             no_default.contains("\"budget_tokens\":16384"),
             "a request effort reaches the wire without any client default: {no_default}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wider_rungs_reach_the_anthropic_wire() {
+        let minimal = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Minimal),
+            8192,
+        )
+        .await;
+        assert!(
+            minimal.contains("\"budget_tokens\":1024"),
+            "Minimal budgets the API's floor: {minimal}"
+        );
+        let xhigh = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Xhigh),
+            8192,
+        )
+        .await;
+        assert!(
+            xhigh.contains("\"budget_tokens\":24576"),
+            "Xhigh budgets between High and Max: {xhigh}"
+        );
+        let off = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::High),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+            8192,
+        )
+        .await;
+        assert!(
+            !off.contains("budget_tokens") && !off.contains("\"type\":\"enabled\""),
+            "the None rung overrides a client default by omitting the thinking block: {off}"
         );
     }
 

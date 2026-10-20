@@ -328,34 +328,43 @@ pub struct RequestOptions {
     /// a client with its own effort default (see each builder's
     /// `thinking_effort`) inherits it, a client without one omits the
     /// parameter entirely, so unconfigured requests are byte-identical.
-    /// A set value always wins over the client default. There is no
-    /// per-request way to turn off a client-level default — build the
-    /// client without one. On the Anthropic client, an effective
-    /// effort — set here or inherited from a client default — also
-    /// demands the assistant's original signed thinking blocks on
-    /// tool-use continuations: a history whose tool-use message
-    /// carries an unsigned thinking part still sends `tool_use`
-    /// alone, which the Messages API rejects; the Anthropic
-    /// builder's `thinking_effort` documentation states the full
-    /// caveat. Set via
-    /// [`with_effort`](Self::with_effort).
+    /// A set value always wins over the client default — including
+    /// [`ThinkingEffort::None`], the per-request off that overrides a
+    /// client-level default. On the Anthropic client, an effective
+    /// effort that budgets — every level above
+    /// [`None`](ThinkingEffort::None), set here or inherited from a
+    /// client default — also demands the assistant's original signed
+    /// thinking blocks on tool-use continuations: a history whose
+    /// tool-use message carries an unsigned thinking part still
+    /// sends `tool_use` alone, which the Messages API rejects; under
+    /// the `None` rung, history reasoning instead rides as the
+    /// capped plain-text replay. The Anthropic builder's
+    /// `thinking_effort` documentation states the full caveat. Set
+    /// via [`with_effort`](Self::with_effort).
     pub effort: Option<ThinkingEffort>,
 }
 
 /// The thinking effort a request asks the model for.
 ///
-/// A four-step vocabulary, `None`-means-unset: every built-in provider
-/// maps each level onto its native parameter, and a request that sets
-/// none leaves the wire exactly as before. The ladder is fixed and
+/// A seven-step vocabulary whose bottom rung turns thinking off: every
+/// built-in provider maps each level onto its native parameter, and a
+/// request that sets none leaves the wire exactly as before. The
+/// OpenAI-family label is the level's own name, verbatim — a provider
+/// whose parameter tops out lower (stock OpenAI accepts neither
+/// `"xhigh"` nor `"max"`) rejects the label with its own error rather
+/// than the ladder silently clamping it. The ladder is fixed and
 /// documented — the numbers are loopctl's chosen defaults, not the
 /// providers' only valid values:
 ///
 /// | level | OpenAI `reasoning_effort` | Anthropic `thinking.budget_tokens` | Gemini `thinkingConfig.thinkingBudget` |
 /// |-------|---------------------------|-------------------------------------|----------------------------------------|
+/// | `None` | `"none"` | omitted — no `thinking` block | `0` (the provider's off sentinel) |
+/// | `Minimal` | `"minimal"` | `1024` (the API's floor) | `512` |
 /// | `Low` | `"low"` | `2048` | `1024` |
 /// | `Medium` | `"medium"` | `8192` | `8192` |
 /// | `High` | `"high"` | `16384` | `16384` |
-/// | `Max` | `"high"` (clamped — the parameter has no higher step) | `32768` | `24576` |
+/// | `Xhigh` | `"xhigh"` | `24576` | `20480` |
+/// | `Max` | `"max"` | `32768` | `24576` |
 ///
 /// Anthropic requests enforce headroom: when the budget plus one
 /// exceeds the request's `max_tokens`, `max_tokens` rises to
@@ -364,16 +373,33 @@ pub struct RequestOptions {
 /// forced tool choice a
 /// [`response_format`](RequestOptions::response_format) synthesizes —
 /// the Messages API rejects that pair, so the Anthropic entry points
-/// reject it up front. Turning effort off is a client-level concern:
-/// not setting an effort (and building the client without a default)
-/// omits the parameter and the provider's own defaults apply — with a
-/// client default set, no per-request value expresses off.
+/// reject it up front. Not setting an effort leaves the provider's
+/// own defaults in charge; the [`None`](ThinkingEffort::None) level is
+/// the explicit off — it sends the provider's own no-thinking value
+/// where one exists (OpenAI `"none"`, Gemini `0`) and omits the
+/// `thinking` block on the Messages API, overriding any client
+/// default.
 ///
 /// The enum is `#[non_exhaustive]`: a later level widens it in a minor
 /// release, so out-of-crate consumers match with a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ThinkingEffort {
+    /// Thinking off — the ladder's explicit bottom rung.
+    ///
+    /// Distinct from an unset effort, where the provider's defaults
+    /// apply: `None` asks for no thinking in the provider's own
+    /// spelling — OpenAI `"none"`, no `thinking` block on the
+    /// Messages API, and Gemini's `0` sentinel.
+    None,
+
+    /// A token-check of thinking.
+    ///
+    /// Maps to OpenAI `"minimal"`, an Anthropic `budget_tokens` of
+    /// `1024` (the API's floor for an enabled block), and a Gemini
+    /// `thinkingBudget` of `512`.
+    Minimal,
+
     /// The smallest thinking allocation the ladder offers.
     ///
     /// Maps to OpenAI `"low"`, an Anthropic `budget_tokens` of
@@ -397,13 +423,20 @@ pub enum ThinkingEffort {
     /// request.
     High,
 
-    /// The ladder's top step, clamped where a provider has no higher
-    /// setting.
+    /// A step past `High`, below the top.
     ///
-    /// OpenAI's `reasoning_effort` stops at `"high"`, so the level
-    /// clamps there; Anthropic budgets `32768` tokens and Gemini
-    /// `24576`. Providers may also cap below a model's ceiling — the
-    /// wire value is always the table's, never invented per model.
+    /// Maps to OpenAI `"xhigh"`, an Anthropic `budget_tokens` of
+    /// `24576`, and a Gemini `thinkingBudget` of `20480`.
+    Xhigh,
+
+    /// The ladder's top step, sent verbatim.
+    ///
+    /// OpenAI `reasoning_effort` carries `"max"`: a provider that
+    /// rejects the label answers with its own error, which surfaces
+    /// the mismatch instead of silently downgrading the run.
+    /// Anthropic budgets `32768` tokens and Gemini `24576`.
+    /// Providers may also cap below a model's ceiling — the wire
+    /// value is always the table's, never invented per model.
     Max,
 }
 

@@ -1004,7 +1004,7 @@ fn anthropic_body(request: &StreamRequest, max_tokens: u32) -> serde_json::Value
     let converted: Vec<serde_json::Value> = messages
         .iter()
         .filter(|m| !m.parts.is_empty())
-        .map(|m| crate::provider::anthropic::convert_message(m, false, false))
+        .map(|m| crate::provider::anthropic::convert_message(m, false, None))
         .collect();
     let mut body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",

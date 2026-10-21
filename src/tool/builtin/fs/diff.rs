@@ -61,6 +61,13 @@ const MAX_TOTAL_LCS_CELLS: usize = MAX_LCS_PRODUCT.saturating_mul(4);
 /// never print more than the fallback that bounded every large file before
 /// hunks existed. A change wider than that is a rewrite, and a rewrite is what
 /// the preview describes better anyway.
+///
+/// The charge is the printed footprint, not the changed-line count: what a
+/// region contributes to the sequence, the [`CONTEXT_LINES`] the renderer draws
+/// around it, the `@@` header that opens it, and once per receipt the
+/// [`RECEIPT_SCAFFOLD_LINES`] and the closing gap. Regions are priced where they
+/// are resolved, which over-charges hunks that turn out to share context — the
+/// safe direction for a figure meant to be an upper limit.
 const MAX_DIFF_LINES: usize = LARGE_DIFF_PREVIEW_LINES.saturating_mul(2);
 
 // The three bounds are pinned against each other here rather than in a test,
@@ -72,6 +79,15 @@ const MAX_DIFF_LINES: usize = LARGE_DIFF_PREVIEW_LINES.saturating_mul(2);
 // receipt got bigger.
 const _: () = assert!(MAX_TOTAL_LCS_CELLS > MAX_LCS_PRODUCT);
 const _: () = assert!(MAX_DIFF_LINES == LARGE_DIFF_PREVIEW_LINES.saturating_mul(2));
+
+/// Lines a receipt prints around its hunks, whatever the change is.
+///
+/// The `Changed:` header, the `│` change summary, and — when only a trailing
+/// newline moved — the end-of-file note. Charged to the budget before any region
+/// is priced, together with the context the gap after the last window can print:
+/// without that the print bound would cap what the matcher produced rather than
+/// what the reader sees, which is the thing the bound is for.
+const RECEIPT_SCAFFOLD_LINES: usize = 3;
 
 /// Unchanged lines printed on each side of a change region.
 ///
@@ -338,9 +354,13 @@ struct DiffBudget {
 
     /// Lines still available to print, both sides together.
     ///
-    /// Charged with everything a region contributes to the sequence, which is
-    /// what the reader actually sees: the region's changes, plus whatever the
-    /// matcher paired inside it.
+    /// Charged with the reader's cost rather than the matcher's: each region's
+    /// own lines, the context drawn on either side of it, the `@@` header that
+    /// opens it, and once per receipt the [`RECEIPT_SCAFFOLD_LINES`] plus the
+    /// closing gap. Pricing regions separately from the context they can end up
+    /// sharing over-charges a change whose hunks merge, which keeps the figure
+    /// an upper bound on the rendered receipt — the only direction a bound may
+    /// err in.
     lines_left: usize,
 }
 
@@ -392,9 +412,10 @@ impl DiffBudget {
     /// expensive to align and expensive to read for unrelated reasons, and a
     /// change can be affordable on one axis and not the other — 20 regions of a
     /// re-indented file cost almost nothing to match and print a diff of the
-    /// whole file. The charge is everything the region contributes to the
-    /// sequence, which only the matcher knows; hence the order, cells paid
-    /// before the match and lines refused after it. That spends cells on a
+    /// whole file. The charge is the region's printed footprint —
+    /// what it contributes to the sequence, plus the context and header around
+    /// it — and only the matcher knows the first part of it; hence the order,
+    /// cells paid before the match and lines refused after it. That spends cells on a
     /// receipt the size then declines, and the waste is bounded by
     /// [`MAX_LCS_PRODUCT`] — the cheaper failure by far, since the alternative
     /// is a size bound nobody can compute before matching.
@@ -447,6 +468,11 @@ fn build_diff_lines_within(
     new_lines: &[&str],
 ) -> Option<Vec<LineDiff>> {
     let mut windows: Vec<ChangeWindow> = Vec::new();
+    budget.buy_lines(
+        CONTEXT_LINES
+            .saturating_mul(2)
+            .saturating_add(RECEIPT_SCAFFOLD_LINES),
+    )?;
     let mut work: Vec<Segment> = vec![Segment {
         old: 0..old_lines.len(),
         new: 0..new_lines.len(),
@@ -547,8 +573,13 @@ fn split_segment(
             old_lines.get(old_start..old_end).unwrap_or_default(),
             new_lines.get(new_start..new_end).unwrap_or_default(),
         );
-        budget.buy_lines(entries.len())?;
         if !entries.is_empty() {
+            budget.buy_lines(
+                entries
+                    .len()
+                    .saturating_add(CONTEXT_LINES.saturating_mul(2))
+                    .saturating_add(1),
+            )?;
             windows.push(ChangeWindow {
                 old: old_start..old_end,
                 new: new_start..new_end,
@@ -1622,6 +1653,80 @@ mod tests {
             "the receipt is bounded by the preview's own size, not by the 6 000 \
              changed lines the aligned regions would have printed: {} lines",
             result.lines().count()
+        );
+    }
+
+    #[test]
+    fn scattered_one_line_changes_past_the_print_bound_render_the_preview() {
+        // The shape charging a region's own lines missed. 700 one-line edits in a
+        // 20 000-line file: every changed line sits between neighbours unique on
+        // both sides, so the anchor split cuts the work into 700 regions of 1 × 1
+        // — one DP cell and two changed lines each, comfortably inside a bound
+        // that counts only what the matcher produced. What the reader gets is a
+        // header, two changed lines, and three lines of context on each side per
+        // change: some 6 300 lines, durable, kept through compaction, three times
+        // the size of the preview this change replaced.
+        let old: Vec<String> = (1..=20_000).map(|i| format!("line {i}")).collect();
+        let mut new = old.clone();
+        for i in (0..new.len()).step_by(29).take(700) {
+            new[i] = format!("line {} CHANGED", i.saturating_add(1));
+        }
+        let result =
+            format_file_change("big.rs", OldContent::Text(&old.join("\n")), &new.join("\n"));
+        assert!(
+            result.contains("Changed: big.rs (modified, large file)"),
+            "700 scattered changes print more than a receipt may hold, however \
+             little each of them cost to match: {}",
+            result.chars().take(200).collect::<String>()
+        );
+        assert!(!result.contains("@@"), "{result}");
+        assert_eq!(
+            result.lines().count(),
+            LARGE_DIFF_PREVIEW_LINES.saturating_mul(2).saturating_add(5),
+            "the receipt is bounded by the preview's size, not by 6 300 lines of \
+             hunked context: {} lines",
+            result.lines().count()
+        );
+    }
+
+    #[test]
+    fn scattered_changes_under_the_print_bound_keep_their_hunks() {
+        // The same shape, small enough to be worth hunking. 150 one-line edits in
+        // a 20 000-line file print 150 hunks of two changed lines and three lines
+        // of context each — priced at 150 × 9 and let through. A print bound that
+        // turned every scattered change into a preview would have thrown away the
+        // reason hunks exist, so the bound is pinned at both ends.
+        let old: Vec<String> = (1..=20_000).map(|i| format!("line {i}")).collect();
+        let mut new = old.clone();
+        for i in (0..new.len()).step_by(133).take(150) {
+            new[i] = format!("line {} CHANGED", i.saturating_add(1));
+        }
+        let result =
+            format_file_change("big.rs", OldContent::Text(&old.join("\n")), &new.join("\n"));
+        assert!(
+            result.contains("Changed: big.rs (modified)"),
+            "{}",
+            result.chars().take(200).collect::<String>()
+        );
+        assert!(
+            !result.contains("large file"),
+            "an ordinary number of scattered edits is what hunks are for: {}",
+            result.chars().take(200).collect::<String>()
+        );
+        assert_eq!(
+            result.lines().filter(|line| line.starts_with("@@")).count(),
+            150,
+            "one hunk per change, each addressing its own lines"
+        );
+        let printed = result.lines().count();
+        assert!(
+            printed <= MAX_DIFF_LINES,
+            "the bound is a bound on what is printed, not on what was matched: \
+             {printed} lines"
+        );
+        assert!(
+            result.contains("+ line 1 CHANGED"),
+            "{printed} lines printed"
         );
     }
 

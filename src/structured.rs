@@ -337,8 +337,9 @@ pub struct RequestOptions {
     /// thinking blocks on tool-use continuations: a history whose
     /// tool-use message carries an unsigned thinking part still
     /// sends `tool_use` alone, which the Messages API rejects; under
-    /// the `None` rung, history reasoning instead rides as the
-    /// capped plain-text replay. The Anthropic builder's
+    /// the `None` rung, history reasoning that carries text instead
+    /// rides as the capped plain-text replay — a redacted part has no
+    /// text to replay and is dropped. The Anthropic builder's
     /// `thinking_effort` documentation states the full caveat. Set
     /// via [`with_effort`](Self::with_effort).
     pub effort: Option<ThinkingEffort>,
@@ -369,11 +370,12 @@ pub struct RequestOptions {
 /// Anthropic requests enforce headroom: when the budget plus one
 /// exceeds the request's `max_tokens`, `max_tokens` rises to
 /// `budget + 1`, so a set effort never produces a self-rejecting
-/// `max_tokens` pair. A set effort is also never combined with the
-/// forced tool choice a
+/// `max_tokens` pair. An effort that budgets is also never combined
+/// with the forced tool choice a
 /// [`response_format`](RequestOptions::response_format) synthesizes —
 /// the Messages API rejects that pair, so the Anthropic entry points
-/// reject it up front. Not setting an effort leaves the provider's
+/// reject it up front, while the `None` rung budgets nothing and
+/// composes with one. Not setting an effort leaves the provider's
 /// own defaults in charge; the [`None`](ThinkingEffort::None) level is
 /// the explicit off — it sends the provider's own no-thinking value
 /// where one exists (OpenAI `"none"`, Gemini `0`) and omits the

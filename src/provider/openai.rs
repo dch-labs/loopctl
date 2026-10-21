@@ -4951,7 +4951,7 @@ mod tests {
         let request = server.await.unwrap();
         assert!(
             request.contains("\"reasoning_effort\":\"medium\""),
-            "an unset per-request effort inherits the client default — there is no per-request off: {request}"
+            "an unset per-request effort inherits the client default — the per-request off is the `None` rung: {request}"
         );
     }
 

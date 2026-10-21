@@ -703,8 +703,10 @@ impl AnthropicClientBuilder {
     /// alone, which the Messages API rejects — clear the effort for
     /// such histories or re-record them against this version, whose
     /// response path captures signatures. Under the `None` rung,
-    /// history reasoning instead rides as the capped plain-text
-    /// replay (see [`replay_reasoning`](Self::replay_reasoning)).
+    /// history reasoning that carries text instead rides as the
+    /// capped plain-text replay (see
+    /// [`replay_reasoning`](Self::replay_reasoning)); a redacted
+    /// part has no text to replay and is dropped.
     #[must_use]
     pub fn thinking_effort(mut self, effort: crate::structured::ThinkingEffort) -> Self {
         self.thinking_effort = Some(effort);
@@ -720,10 +722,12 @@ impl AnthropicClientBuilder {
     /// memory across turns. The blocks are plain text — every
     /// Messages-compatible endpoint accepts them, including gateways
     /// that reject unsigned native thinking blocks. The `None`
-    /// effort rung renders history reasoning the same way with the
-    /// flag left off: native thinking blocks are wire-illegal on a
-    /// request that disables thinking, and dropping the parts
-    /// silently would lose the context they carry.
+    /// effort rung renders text-carrying history reasoning the same
+    /// way with the flag left off: native thinking blocks are
+    /// wire-illegal on a request that disables thinking, and dropping
+    /// the parts silently would lose the context they carry. A
+    /// redacted part has no text to replay and is dropped — only an
+    /// effort that budgets returns its payload natively.
     #[must_use]
     pub fn replay_reasoning(mut self, enabled: bool) -> Self {
         self.replay_reasoning = enabled;
@@ -2461,6 +2465,39 @@ mod tests {
         assert!(
             !body.contains("\"signature\""),
             "no native thinking block rides a request the rung turned off: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_none_rung_drops_a_redacted_part_with_no_text_to_replay() {
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: String::new(),
+                    signature: None,
+                    redacted: Some("opaque-data".to_string()),
+                },
+                MessagePart::ToolCall {
+                    id: "call_2".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::None),
+            history,
+        )
+        .await;
+        assert!(
+            !body.contains("\"type\":\"redacted_thinking\"") && !body.contains("opaque-data"),
+            "a redacted part carries no text to replay, so neither its native block nor its payload rides a request the rung turned off: {body}"
+        );
+        assert!(
+            body.contains("\"type\":\"tool_use\""),
+            "the sibling tool call still rides the continuation request: {body}"
         );
     }
 

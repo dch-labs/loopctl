@@ -637,8 +637,10 @@ impl GeminiClientBuilder {
     ///
     /// Every request then carries the level's budget as
     /// `generationConfig.thinkingConfig.thinkingBudget` (per
-    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table). A
-    /// per-request
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table) —
+    /// except the [`None`](crate::structured::ThinkingEffort::None)
+    /// rung, the client-wide off, which carries the provider's own
+    /// `0` sentinel. A per-request
     /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
     /// always wins; an unset client default leaves unconfigured requests
     /// byte-identical to prior versions.
@@ -801,7 +803,7 @@ fn build_request_body(
 /// The fixed ladder from [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
 /// table: `Minimal` budgets `512` tokens, `Low` `1024`, `Medium` `8192`,
 /// `High` `16384`, `Xhigh` `20480`, and `Max` `24576`. The `None` level
-/// carries the provider's own off sentinel, `0` — the one dynamic
+/// carries the provider's own off sentinel, `0` — the one sentinel
 /// value on the ladder; `-1` (dynamic, model-chosen) stays off it, so
 /// every other set level names a real budget.
 fn gemini_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
@@ -3622,6 +3624,17 @@ mod tests {
         assert!(
             no_default.contains("\"thinkingBudget\":16384"),
             "a request effort reaches the wire without any client default: {no_default}"
+        );
+        let none_overrides = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::High),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+        )
+        .await;
+        assert!(
+            none_overrides.contains("\"thinkingBudget\":0")
+                && !none_overrides.contains("\"thinkingBudget\":16384"),
+            "the None rung overrides a client default with the provider's own off sentinel: {none_overrides}"
         );
     }
 

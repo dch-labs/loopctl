@@ -1493,6 +1493,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_edit_hunks_merge_cumulatively() {
+        // Two edits to one 2 000-line file are one file section carrying two
+        // hunks, each addressing the line it changed: the batch renders the
+        // file's whole change at once, never the file itself. At this size the
+        // receipt used to read `(modified, large file)` and carry no hunks at
+        // all, which is the shape a diff display has nothing to render.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lines: Vec<String> = (1..=2000).map(|i| format!("fn item_{i}() {{}}")).collect();
+        std::fs::write(tmp.path().join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let out = MultiEditTool::new()
+            .call(
+                json!({"edits": [
+                    edit("a.rs", "fn item_10() {}", "fn first() {}"),
+                    edit("a.rs", "fn item_1500() {}", "fn second() {}")
+                ]}),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        let text = out.text_content();
+        assert!(text.contains("File 1: a.rs"), "{text}");
+        assert!(!text.contains("File 2:"), "one file is one section: {text}");
+        assert!(!text.contains("large file"), "{text}");
+        assert!(text.contains("@@ -7,7 +7,7 @@"), "{text}");
+        assert!(text.contains("@@ -1497,7 +1497,7 @@"), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim_start().starts_with("@@"))
+                .count(),
+            2,
+            "one section, two hunks, nothing echoed between them: {text}"
+        );
+        assert!(
+            text.contains("2 lines removed, 2 lines added"),
+            "the stats bar counts every change in the batch: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_whitespace_mismatched_batch_edit_applies_and_discloses() {
         // The batch's twin of Edit's tolerant apply: a unique
         // normalized match splices with the file's own edge bytes,

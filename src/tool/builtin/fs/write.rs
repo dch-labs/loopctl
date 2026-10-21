@@ -882,6 +882,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wholesale_overwrite_of_a_large_file_keeps_the_preview() {
+        // The fallback receipts still need. Two interleaved halves of filler
+        // share no line that occurs once on each side, so nothing anchors an
+        // alignment and no hunk could honestly address the middle: the receipt
+        // says `large file` in its header and prints two bounded sides instead
+        // of inventing line numbers.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let before: String = (0..1200).map(|_| "a\nb\n").collect();
+        std::fs::write(tmp.path().join("data.txt"), &before).unwrap();
+        let after: String = (0..1200).map(|_| "b\na\n").collect();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = WriteTool::new()
+            .call(
+                json!({"file_path": "data.txt", "content": after}),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("Changed: data.txt (modified, large file)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Before:") && text.contains("After:"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("@@"),
+            "no hunk may address lines the diff never reached: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_at_cap_target_still_diffs_normally() {
         let cap = crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES;
         let tmp = tempfile::TempDir::new().unwrap();

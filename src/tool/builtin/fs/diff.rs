@@ -4,8 +4,13 @@
 //! and its cost is bounded by the *change* rather than by the file: the
 //! unchanged bulk surrounding a change is measured by linear scans and
 //! rendered as counted elisions, never carried through the quadratic
-//! matching core. A receipt therefore stays hunk-sized however long the file
-//! it describes is.
+//! matching core. Two bounds hold that promise, because a limit that only ever
+//! applies to one change region limits no receipt: [`MAX_LCS_PRODUCT`] caps
+//! one region's matching and [`DiffBudget`] caps the receipt as a whole —
+//! matcher work and printed lines together. A receipt therefore stays
+//! hunk-sized however long the file it describes is, and a change too wide to
+//! fit either bound is a rewrite, rendered as the bounded before/after preview
+//! rather than as a diff of the whole file.
 //!
 //! The shape it emits — a `Changed:`/`Created:` header, a `│`-prefixed
 //! change summary, and `@@ -old,count +new,count @@` hunks with three lines
@@ -26,6 +31,47 @@ use std::fmt::Write;
 /// cover are aligned on lines unique to each side and matched in parts;
 /// only a region with nothing to align on falls back to the preview.
 const MAX_LCS_PRODUCT: usize = 1_000_000;
+
+/// Total LCS cells one receipt may spend, across every change region.
+///
+/// [`MAX_LCS_PRODUCT`] bounds a *region*, and a receipt is made of regions. The
+/// shape that bound cannot see is a wholesale rewrite whose structure survives:
+/// re-indenting a 20 000-line file leaves its top-level signatures unique and
+/// untouched, so there is plenty to align on — every signature an anchor, every
+/// re-indented line a change — and each resulting region fits the per-region
+/// bound comfortably while the receipt that comes out is a diff of the whole
+/// file. Total work is the *sum* of the per-region products, which is how a
+/// hunk-sized receipt came to cost 10⁸ DP cells inside one synchronous tool
+/// call.
+///
+/// Four regions' worth: a region too wide for [`MAX_LCS_PRODUCT`] still splits
+/// on unique anchors and matches part by part as before, and a change spread
+/// past four such regions returns `None`, leaving the caller the bounded
+/// preview — the honest form, since a diff of an entire file says nothing a
+/// preview of it does not.
+const MAX_TOTAL_LCS_CELLS: usize = MAX_LCS_PRODUCT.saturating_mul(4);
+
+/// Lines one receipt's change regions may print, both sides together.
+///
+/// The size half of the bound, where [`MAX_TOTAL_LCS_CELLS`] is the time half:
+/// aligning many regions is cheap and *reading* them is not, and these receipts
+/// carry `Retention::Durable` — an oversized one does not merely cost this
+/// turn, it stays in context through compaction. The number is the preview's
+/// own ([`LARGE_DIFF_PREVIEW_LINES`] lines per side), so a hunked receipt can
+/// never print more than the fallback that bounded every large file before
+/// hunks existed. A change wider than that is a rewrite, and a rewrite is what
+/// the preview describes better anyway.
+const MAX_DIFF_LINES: usize = LARGE_DIFF_PREVIEW_LINES.saturating_mul(2);
+
+// The three bounds are pinned against each other here rather than in a test,
+// because a misconfigured pair should fail every build and not only the run
+// that happens to execute: a whole-receipt cell budget below one region's bound
+// would leave no region affordable, making the anchor split dead code and every
+// large edit a preview, and a print budget above the preview's own size would
+// make hunks the looser of the two forms — the bound would then be the reason a
+// receipt got bigger.
+const _: () = assert!(MAX_TOTAL_LCS_CELLS > MAX_LCS_PRODUCT);
+const _: () = assert!(MAX_DIFF_LINES == LARGE_DIFF_PREVIEW_LINES.saturating_mul(2));
 
 /// Unchanged lines printed on each side of a change region.
 ///
@@ -272,6 +318,100 @@ struct Segment {
     new: std::ops::Range<usize>,
 }
 
+/// What one receipt is allowed to spend, on work and on print.
+///
+/// [`build_diff_lines`] threads it down the worklist and [`split_segment`] is
+/// the only spender: it buys the cells a region is about to cost before the
+/// matcher runs, and the lines that region prints once it has. Both are bought
+/// where they are spent rather than tallied at the end, because the point of a
+/// budget is to stop spending — a receipt found too large after the fact has
+/// already paid for itself. Exhausting either half fails the whole build, which
+/// is the caller's signal that this change is not hunkable and the bounded
+/// preview is its honest form.
+struct DiffBudget {
+    /// DP cells still available across every region.
+    ///
+    /// Charged per region by the product its matcher runs on, and not at all
+    /// for a region one side of which is empty — a pure insertion or deletion
+    /// is addressed directly, costing no matching whatever its width.
+    cells_left: usize,
+
+    /// Lines still available to print, both sides together.
+    ///
+    /// Charged with everything a region contributes to the sequence, which is
+    /// what the reader actually sees: the region's changes, plus whatever the
+    /// matcher paired inside it.
+    lines_left: usize,
+}
+
+impl Default for DiffBudget {
+    /// The bounds an ordinary receipt gets: [`MAX_TOTAL_LCS_CELLS`] of matcher
+    /// work and [`MAX_DIFF_LINES`] of printed diff, each spent across every
+    /// region the change turns out to have.
+    ///
+    /// Neither half is scaled to the file, which is the whole design: the same
+    /// numbers cover a one-line edit and a wholesale rewrite, because what is
+    /// being bounded is the receipt — its cost to build and its weight in
+    /// context — not the target it describes. The relation between the three
+    /// constants is asserted where they are defined, so a build with these
+    /// configured the wrong way round does not reach a test at all.
+    fn default() -> Self {
+        Self {
+            cells_left: MAX_TOTAL_LCS_CELLS,
+            lines_left: MAX_DIFF_LINES,
+        }
+    }
+}
+
+impl DiffBudget {
+    /// Buy `cells` of matcher work, or refuse the receipt.
+    ///
+    /// [`split_segment`] calls this with the product the region is about to run
+    /// the matcher on. The price is known before the table is allocated, and a
+    /// budget that could only notice afterwards would have paid for precisely
+    /// the work it exists to prevent. A region with one side empty is passed
+    /// `0`: a pure insertion or deletion is addressed line by line and never
+    /// reaches the quadratic core, so it cannot spend what it does not use.
+    ///
+    /// Returns `None`, charging nothing, when `cells` exceeds what is left. The
+    /// refusal is of the whole receipt rather than of the region — half a diff
+    /// is not a renderable thing — and the `Option<()>` shape is what carries it
+    /// up the worklist with `?` to the caller, whose bounded preview is the
+    /// honest form of a change this receipt cannot pay for.
+    fn buy_cells(&mut self, cells: usize) -> Option<()> {
+        if cells > self.cells_left {
+            return None;
+        }
+        self.cells_left = self.cells_left.saturating_sub(cells);
+        Some(())
+    }
+
+    /// Buy `lines` of printed diff, or refuse the receipt.
+    ///
+    /// The size half, where [`Self::buy_cells`] is the time half: regions are
+    /// expensive to align and expensive to read for unrelated reasons, and a
+    /// change can be affordable on one axis and not the other — 20 regions of a
+    /// re-indented file cost almost nothing to match and print a diff of the
+    /// whole file. The charge is everything the region contributes to the
+    /// sequence, which only the matcher knows; hence the order, cells paid
+    /// before the match and lines refused after it. That spends cells on a
+    /// receipt the size then declines, and the waste is bounded by
+    /// [`MAX_LCS_PRODUCT`] — the cheaper failure by far, since the alternative
+    /// is a size bound nobody can compute before matching.
+    ///
+    /// Returns `None`, charging nothing, when the region would print past what
+    /// is left, and does so for a receipt whose earlier regions were already
+    /// paid for: a change is rendered as all hunks or all preview, never as the
+    /// first half of itself.
+    fn buy_lines(&mut self, lines: usize) -> Option<()> {
+        if lines > self.lines_left {
+            return None;
+        }
+        self.lines_left = self.lines_left.saturating_sub(lines);
+        Some(())
+    }
+}
+
 /// Build the diff sequence between two files' lines at a cost the change sets.
 ///
 /// The unchanged bulk around a change is the expensive part of diffing a
@@ -286,20 +426,40 @@ struct Segment {
 /// than the context margin — so `format_diff_with_context` numbers every hunk
 /// from real file positions.
 ///
-/// Returns `None` when a region too wide to match has no line unique to each
-/// side to align on: a wholesale rewrite, for which the caller renders the
-/// bounded before/after preview rather than a diff that would either cost the
-/// file's square or silently drop the lines it skipped.
+/// Returns `None` when the change is not hunkable: a region too wide to match
+/// with no line unique to each side to align on, or a change wide enough to
+/// exhaust [`DiffBudget`] — either way the caller renders the bounded
+/// before/after preview rather than a diff that would cost the file's square,
+/// print the file's length, or silently drop the lines it skipped.
 fn build_diff_lines(old_lines: &[&str], new_lines: &[&str]) -> Option<Vec<LineDiff>> {
+    build_diff_lines_within(&mut DiffBudget::default(), old_lines, new_lines)
+}
+
+/// [`build_diff_lines`] against a budget the caller sets.
+///
+/// Split out so a test can hand the builder a receipt too expensive for the
+/// bounds without building a fixture large enough to exhaust them, and so the
+/// real bounds stay in one place ([`DiffBudget::default`]) instead of being
+/// restated wherever a diff is wanted.
+fn build_diff_lines_within(
+    budget: &mut DiffBudget,
+    old_lines: &[&str],
+    new_lines: &[&str],
+) -> Option<Vec<LineDiff>> {
     let mut windows: Vec<ChangeWindow> = Vec::new();
     let mut work: Vec<Segment> = vec![Segment {
         old: 0..old_lines.len(),
         new: 0..new_lines.len(),
     }];
-    // The worklist is a stack and `split_segment` pushes the parts it derives
-    // in reverse, so regions come off it in document order.
     while let Some(segment) = work.pop() {
-        split_segment(old_lines, new_lines, &segment, &mut windows, &mut work)?;
+        split_segment(
+            old_lines,
+            new_lines,
+            &segment,
+            &mut windows,
+            &mut work,
+            budget,
+        )?;
     }
     if windows.is_empty() {
         return Some(Vec::new());
@@ -348,12 +508,19 @@ fn build_diff_lines(old_lines: &[&str], new_lines: &[&str]) -> Option<Vec<LineDi
 ///    surviving line. `None` sends the caller to the preview: no bound can be
 ///    honoured, and eliding the middle would print numbers about lines the
 ///    diff never saw.
+///
+/// A fourth outcome closes either path in the same direction: a region the
+/// receipt-wide [`DiffBudget`] cannot pay for. Regions 1 and 2 are individually
+/// affordable and this one is affordable only in the aggregate, so it is
+/// charged here, where each region is bought once and no window is counted
+/// twice.
 fn split_segment(
     old_lines: &[&str],
     new_lines: &[&str],
     segment: &Segment,
     windows: &mut Vec<ChangeWindow>,
     work: &mut Vec<Segment>,
+    budget: &mut DiffBudget,
 ) -> Option<()> {
     let old_mid = old_lines.get(segment.old.clone())?;
     let new_mid = new_lines.get(segment.new.clone())?;
@@ -371,10 +538,16 @@ fn split_segment(
 
     let addressable = old_count == 0 || new_count == 0;
     if addressable || old_count.saturating_mul(new_count) <= MAX_LCS_PRODUCT {
+        budget.buy_cells(if addressable {
+            0
+        } else {
+            old_count.saturating_mul(new_count)
+        })?;
         let entries = compute_lcs_diff(
             old_lines.get(old_start..old_end).unwrap_or_default(),
             new_lines.get(new_start..new_end).unwrap_or_default(),
         );
+        budget.buy_lines(entries.len())?;
         if !entries.is_empty() {
             windows.push(ChangeWindow {
                 old: old_start..old_end,
@@ -1407,6 +1580,136 @@ mod tests {
             result.lines().count(),
             LARGE_DIFF_PREVIEW_LINES.saturating_mul(2).saturating_add(5),
             "two bounded sides, two tails, one header: {result}"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_large_file_that_still_aligns_falls_back_to_the_preview() {
+        // The shape a per-region bound cannot see. Re-indenting a file leaves
+        // every top-level signature unique and untouched, so there is plenty to
+        // align on — each signature an anchor, every re-indented line a change —
+        // and each resulting region sits comfortably inside the per-region
+        // bound. Region by region the work is affordable; the receipt that comes
+        // out is a diff of the whole file, stamped durable and kept through
+        // compaction. The receipt-wide budget is what notices that 20 regions
+        // x 300 changed lines is a rewrite rather than a change.
+        let mut old = String::new();
+        let mut new = String::new();
+        for block in 0..20 {
+            writeln!(old, "fn signature_{block}() {{").ok();
+            writeln!(new, "fn signature_{block}() {{").ok();
+            for line in 0..150 {
+                writeln!(old, "  body {block} {line}").ok();
+                writeln!(new, "    body {block} {line}").ok();
+            }
+            writeln!(old, "}}").ok();
+            writeln!(new, "}}").ok();
+        }
+        let result = format_file_change("big.rs", OldContent::Text(&old), &new);
+        assert!(
+            result.contains("Changed: big.rs (modified, large file)"),
+            "a change wider than a receipt may print is a rewrite, and the preview \
+             is its bounded form: {}",
+            result.chars().take(240).collect::<String>()
+        );
+        assert!(
+            !result.contains("@@"),
+            "no hunk may address lines the matcher did not reach: {result}"
+        );
+        assert_eq!(
+            result.lines().count(),
+            LARGE_DIFF_PREVIEW_LINES.saturating_mul(2).saturating_add(5),
+            "the receipt is bounded by the preview's own size, not by the 6 000 \
+             changed lines the aligned regions would have printed: {} lines",
+            result.lines().count()
+        );
+    }
+
+    #[test]
+    fn a_budget_a_region_exhausts_returns_the_change_to_the_preview() {
+        // Both halves of the receipt-wide budget, on a fixture small enough to
+        // read: 200 lines against 200, which no shared edge trims and no line
+        // pairs up as an anchor — 40 000 DP cells, 400 printed lines. A budget
+        // that cannot pay for the cells has to refuse the receipt instead of
+        // running the matcher, and one that cannot pay for the lines has to
+        // refuse it rather than print past the bound.
+        let old: Vec<String> = (0..200).map(|i| format!("old {i}")).collect();
+        let new: Vec<String> = (0..200).map(|i| format!("new {i}")).collect();
+        let old_refs: Vec<&str> = old.iter().map(String::as_str).collect();
+        let new_refs: Vec<&str> = new.iter().map(String::as_str).collect();
+
+        let mut paid = DiffBudget {
+            cells_left: 40_000,
+            lines_left: MAX_DIFF_LINES,
+        };
+        assert!(
+            build_diff_lines_within(&mut paid, &old_refs, &new_refs).is_some(),
+            "a region the budget can pay for is matched exactly as it always was"
+        );
+
+        let mut short_of_cells = DiffBudget {
+            cells_left: 39_999,
+            lines_left: MAX_DIFF_LINES,
+        };
+        assert!(
+            build_diff_lines_within(&mut short_of_cells, &old_refs, &new_refs).is_none(),
+            "the cell half of the budget has to bite before the matcher runs"
+        );
+
+        let mut short_of_lines = DiffBudget {
+            cells_left: MAX_TOTAL_LCS_CELLS,
+            lines_left: 399,
+        };
+        assert!(
+            build_diff_lines_within(&mut short_of_lines, &old_refs, &new_refs).is_none(),
+            "the print half has to bite too, or the bound is only about time"
+        );
+        assert_eq!(
+            short_of_lines.cells_left,
+            MAX_TOTAL_LCS_CELLS.saturating_sub(40_000),
+            "the cells were paid before the match and the lines refused after it: \
+             only the matcher knows what a region prints"
+        );
+    }
+
+    #[test]
+    fn repeated_lines_move_between_context_and_deletion_where_counts_cannot() {
+        // Why the changelog says equivalent rather than identical. Old `a b a`
+        // against `a`: the whole-file matcher backtracks to the last `a`, while
+        // trimming the shared head keeps the first one and deletes the rest.
+        // Which copy survives is the matcher's business; how many lines changed
+        // is the reader's, and that part does not move.
+        let whole_file = compute_lcs_diff(&["a", "b", "a"], &["a"]);
+        assert_eq!(
+            whole_file
+                .iter()
+                .filter(|entry| matches!(entry, LineDiff::Unchanged(_)))
+                .count(),
+            1,
+            "one `a` survives either way: {whole_file:?}"
+        );
+        assert!(
+            matches!(whole_file.first(), Some(LineDiff::Deleted(line)) if line == "a"),
+            "the whole-file matcher deletes the leading `a` and keeps the last: {whole_file:?}"
+        );
+
+        let receipt = format_file_change("reps.txt", OldContent::Text("a\nb\na"), "a");
+        let body: Vec<&str> = receipt
+            .lines()
+            .filter(|line| {
+                line.starts_with("  ") || line.starts_with("- ") || line.starts_with("+ ")
+            })
+            .collect();
+        assert_eq!(
+            body.iter().filter(|line| line.starts_with("- ")).count(),
+            2,
+            "two lines gone, whichever `a` was kept: {receipt}"
+        );
+        assert_eq!(
+            (body.first().copied(), body.last().copied()),
+            (Some("  a"), Some("- a")),
+            "the trimmed head keeps the first `a` where the whole-file matcher kept \
+             the last: {receipt}"
         );
     }
 

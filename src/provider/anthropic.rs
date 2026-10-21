@@ -70,6 +70,14 @@ pub(super) const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// a completion was given.
 const CAPABILITIES_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many models one client caches thinking disclosures for.
+///
+/// A loose bound rather than a tight one: a run consults a handful of models,
+/// and an evicted entry costs the next request one probe. What it rules out is
+/// a long-lived client handed a fresh model name per request growing the map
+/// for the lifetime of the process.
+const CAPABILITY_CACHE_MAX_MODELS: usize = 32;
+
 /// An Anthropic Claude chat client with streaming support.
 ///
 /// Implements [`ApiClient`] by translating between the framework's
@@ -128,10 +136,12 @@ pub struct AnthropicClient {
     ///
     /// Shared behind an [`std::sync::Arc`] because the streaming path reads
     /// it from inside a `'static` stream, and locked because a probe
-    /// resolves asynchronously while later requests are being built. The
-    /// answer is per-model, so [`set_model`](ApiClient::set_model) clears
-    /// it; an entry names the model it describes, so a swap mid-probe
-    /// cannot have the new model read the old model's answer.
+    /// resolves asynchronously while later requests are being built. Entries
+    /// are keyed by model, so a swap mid-probe cannot have one model read
+    /// another's answer and the map is never cleared wholesale — the cached
+    /// answer belongs to whichever request names that model, the client's own
+    /// or a [`RequestOptions::model`](crate::structured::RequestOptions::model)
+    /// override.
     thinking_capabilities: std::sync::Arc<std::sync::Mutex<CapabilityCache>>,
 
     /// Whether prior-turn reasoning is replayed on outgoing requests.
@@ -428,7 +438,6 @@ impl ApiClient for AnthropicClient {
             return false;
         }
         *crate::error::recover_guard(self.model.lock()) = model.to_string();
-        *crate::error::recover_guard(self.thinking_capabilities.lock()) = CapabilityCache::Unprobed;
         true
     }
 
@@ -925,7 +934,7 @@ impl AnthropicClientBuilder {
             max_tokens: self.max_tokens,
             thinking_effort: self.thinking_effort,
             thinking_capabilities: std::sync::Arc::new(std::sync::Mutex::new(
-                CapabilityCache::Unprobed,
+                CapabilityCache::default(),
             )),
             replay_reasoning: self.replay_reasoning,
             prompt_caching: self.prompt_caching,
@@ -1141,76 +1150,108 @@ impl ThinkingCapabilities {
     }
 }
 
-/// The per-model cache of a thinking-capability probe.
+/// What one model's probe learned about the thinking it accepts, once the
+/// endpoint has actually answered.
 ///
-/// "Never asked" is kept distinct from "asked and the endpoint disclosed
-/// nothing", because caching only the successes would re-probe a silent
-/// server on every request that sets an effort.
-enum CapabilityCache {
-    /// Nothing is cached: no probe has resolved since the client was built
-    /// or since the last [`set_model`](ApiClient::set_model).
+/// Only a definitive answer is representable here. A probe that got no answer
+/// at all — a timeout, a `503` — is [`ProbeOutcome::Inconclusive`] and is
+/// never filed, because nothing clears a filed answer later: deciding a
+/// model's wire shape from one lost round trip would keep the verdict and the
+/// 400s it causes for the rest of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedDisclosure {
+    /// The endpoint answered and stated at least one thinking control.
     ///
-    /// The state a fresh client starts in, and the one a model change
-    /// returns to so a swapped-in model cannot inherit what the outgoing one
-    /// disclosed. It is also the only state a probe's answer is written
-    /// over, which is what keeps one client's cache from thrashing when a
-    /// host alternates models — see [`Self::Known`]'s `model`.
-    Unprobed,
+    /// The tri-states [`thinking_wire`] reads to pick the wire shape; a member
+    /// the answer left out keeps [`anthropic_thinking_budget`]'s own mapping
+    /// in charge rather than guessing at it.
+    Known(ThinkingCapabilities),
 
-    /// A disclosure for one named model.
+    /// The endpoint answered and stated nothing usable about thinking.
     ///
-    /// Keyed by model id so a hot-swap between a probe's start and its cache
-    /// write cannot leave the new model reading the old model's answer: an
-    /// entry naming another model reads as unprobed and is re-fetched.
-    Known {
-        /// The model this disclosure was read for, spelled as the probe
-        /// addressed it — the cache's key, kept beside the answer rather
-        /// than assumed from the client's current model.
-        ///
-        /// The two can diverge: a request names its own model through
-        /// [`RequestOptions::model`](crate::structured::RequestOptions::model)
-        /// without touching the client, and
-        /// [`set_model`](ApiClient::set_model) can land while a probe is in
-        /// flight. A lookup for any other model therefore ignores this entry
-        /// and asks for its own; since an answer is stored only over
-        /// [`Self::Unprobed`], that asking is served for the request rather
-        /// than evicting the entry, so a host alternating two models pays a
-        /// probe per request instead of a cache that swaps sides per turn.
-        model: String,
+    /// Filed on purpose. A `404` (an endpoint with no Models API), a gateway
+    /// answering `200` with HTML, and JSON listing none of the thinking
+    /// members are ordinary deployments rather than failures, and an uncached
+    /// miss would put a probe under a 5-second deadline in front of every
+    /// request that sets an effort. It is also the narrowest verdict a probe
+    /// can reach — the ladder's own mapping stands, which is what every
+    /// endpoint that never heard of this client already gets.
+    Undisclosed,
+}
 
-        /// What that model disclosed, taken by value.
-        ///
-        /// The tri-states [`thinking_wire`] reads to pick the wire shape; an
-        /// undisclosed member there keeps [`anthropic_thinking_budget`]'s own
-        /// mapping in charge rather than guessing. At least one member is
-        /// stated by construction — a probe that disclosed nothing lands in
-        /// [`Self::Unknown`] instead — so a `Known` entry always carries
-        /// something to act on. The value is `Copy`, which lets a reader take
-        /// the answer and release the cache lock before it starts building a
-        /// request, rather than holding a guard across the probe that follows.
-        caps: ThinkingCapabilities,
-    },
+/// The outcome of one Models API probe.
+///
+/// The two failures it distinguishes are what a probe is for: an endpoint
+/// that *said* something is believed, and an endpoint that was busy, wedged,
+/// or mid-credential-rotation is not. A cache that cannot tell them apart
+/// turns one blip into a permanent decision — the disclosure a probe never
+/// read, held for the life of the client.
+enum ProbeOutcome {
+    /// The endpoint answered, or definitively declined to. Filed under the
+    /// model asked about, and already applied to this request.
+    Answered(CachedDisclosure),
 
-    /// A probe for one named model resolved and disclosed nothing usable.
+    /// Nothing was learned: the request never completed, or the endpoint
+    /// refused or failed it in a way that says nothing about thinking. This
+    /// request falls back to the ladder's own mapping — the documented answer
+    /// for an endpoint that discloses nothing — and the next one asks again.
+    Inconclusive,
+}
+
+/// The client's thinking-capability cache, keyed by model id.
+///
+/// Keyed rather than one slot because one client serves more than one model:
+/// [`RequestOptions::model`](crate::structured::RequestOptions::model) is how
+/// the fallback machinery routes a retry, and
+/// [`set_model`](ApiClient::set_model) can land between turns. With a single
+/// slot, every model but the cached one missed on every request and paid a
+/// probe round trip to find that out; a host alternating two models paid one
+/// probe per request forever. Keyed, each model pays once.
+///
+/// Entries are never cleared wholesale — an answer about `claude-opus-5` is
+/// still true of `claude-opus-5` whoever asked — and
+/// [`CAPABILITY_CACHE_MAX_MODELS`] bounds the map for a host handed a new
+/// model name per request.
+#[derive(Debug, Default)]
+struct CapabilityCache {
+    /// Model id → that model's definitive answer, or `None` when nothing has
+    /// been learned about it yet.
     ///
-    /// Caches the several non-answers alike: a failure status (a `404` from
-    /// an endpoint with no Models API), a connect or read timeout, a body
-    /// that is not JSON (a gateway answering `200` with HTML), and JSON that
-    /// states none of the thinking members. Storing the miss is the point —
-    /// a Messages-compatible server without a Models API is an ordinary
-    /// deployment, not a failure, and an uncached miss would put a probe
-    /// under a 5-second deadline in front of every request that sets an
-    /// effort.
-    Unknown {
-        /// The model that was asked and answered nothing.
-        ///
-        /// Recorded even though the answer is empty, so the miss stays
-        /// scoped to the model that earned it: another model behind the same
-        /// endpoint still gets its own probe, and
-        /// [`set_model`](ApiClient::set_model) clears the entry so a model
-        /// swapped back cannot read a miss recorded against its predecessor.
-        model: String,
-    },
+    /// A *present* key always means "the endpoint answered": an inconclusive
+    /// probe stores nothing at all, so a missing key is the only shape a retry
+    /// takes, and a `404` endpoint is asked once rather than per request.
+    entries: std::collections::HashMap<String, CachedDisclosure>,
+}
+
+impl CapabilityCache {
+    /// What one model's probe answered, if the endpoint ever answered.
+    ///
+    /// A missing key means nothing was learned about that model — either no
+    /// probe has run for it or every probe came back inconclusive — and it is
+    /// the only shape that sends the next request to the endpoint. A model
+    /// whose endpoint answered `404` is present with
+    /// [`CachedDisclosure::Undisclosed`], which is what keeps an endpoint with
+    /// no Models API from being asked once per request.
+    fn get(&self, model: &str) -> Option<CachedDisclosure> {
+        self.entries.get(model).copied()
+    }
+
+    /// File one model's definitive answer, replacing any earlier one.
+    ///
+    /// Replacement, not first-write-wins: two requests naming one model can
+    /// race their probes, and the second answer is no less the endpoint's than
+    /// the first. At capacity an entry for some other model makes room — an
+    /// arbitrary one, since the map has no age order to lose, and the cost of
+    /// a wrong pick is exactly one re-probe.
+    fn insert(&mut self, model: &str, answer: CachedDisclosure) {
+        if !self.entries.contains_key(model)
+            && self.entries.len() >= CAPABILITY_CACHE_MAX_MODELS
+            && let Some(evicted) = self.entries.keys().next().cloned()
+        {
+            self.entries.remove(&evicted);
+        }
+        self.entries.insert(model.to_string(), answer);
+    }
 }
 
 /// The thinking shape a request writes for one rung on one model.
@@ -1417,8 +1458,9 @@ struct ThinkingProbe {
     /// probe. Behind an [`std::sync::Arc`] because the streaming path reaches
     /// it from a `'static` stream, and behind a lock because a probe resolves
     /// asynchronously while later requests are being built.
-    /// [`set_model`](ApiClient::set_model) clears it through the client's own
-    /// handle, so both sides see the invalidation.
+    /// Entries are keyed by model, so
+    /// [`set_model`](ApiClient::set_model) neither invalidates nor evicts
+    /// anything: a swapped-in model finds no entry and asks for its own.
     cache: std::sync::Arc<std::sync::Mutex<CapabilityCache>>,
 
     /// The model this probe addresses.
@@ -1465,51 +1507,60 @@ impl ThinkingProbe {
             .ok_or_else(|| thinking_unavailable_error(&self.model))
     }
 
-    /// Read the cached disclosure, probing once per model on a miss.
+    /// Read the cached disclosure for this probe's model, asking once.
     ///
-    /// A probe that resolves after a hot-swap still serves its own caller,
-    /// and its answer is filed under the model it asked about, so the
-    /// swapped-in model re-probes rather than inheriting it.
+    /// A cached answer is taken under the lock and the lock is dropped before
+    /// anything else happens; the probe then files its verdict under the model
+    /// it asked about, which is not necessarily the client's current one.
+    /// Concurrent probes of one model may each fetch — the second filing
+    /// replaces the first, and both requests carried a real answer.
     async fn capabilities(&self) -> ThinkingCapabilities {
-        {
-            let cache = crate::error::recover_guard(self.cache.lock());
-            match &*cache {
-                CapabilityCache::Known { model, caps } if *model == self.model => return *caps,
-                CapabilityCache::Unknown { model } if *model == self.model => {
-                    return ThinkingCapabilities::default();
-                }
-                // Unprobed, or an answer naming a model this request is not
-                // asking about: either way the disclosure is still ahead.
-                _ => {}
+        let cached = crate::error::recover_guard(self.cache.lock()).get(&self.model);
+        if let Some(answer) = cached {
+            return Self::apply(answer);
+        }
+        match self.fetch().await {
+            ProbeOutcome::Answered(answer) => {
+                crate::error::recover_guard(self.cache.lock()).insert(&self.model, answer);
+                Self::apply(answer)
             }
+            ProbeOutcome::Inconclusive => ThinkingCapabilities::default(),
         }
-        let caps = self.fetch().await;
-        let mut cache = crate::error::recover_guard(self.cache.lock());
-        if matches!(&*cache, CapabilityCache::Unprobed) {
-            *cache = if caps.is_empty() {
-                CapabilityCache::Unknown {
-                    model: self.model.clone(),
-                }
-            } else {
-                CapabilityCache::Known {
-                    model: self.model.clone(),
-                    caps,
-                }
-            };
+    }
+
+    /// The disclosure a request acts on for one cached verdict.
+    ///
+    /// An endpoint that answered "nothing" and one that never answered take
+    /// the same wire shape — the ladder's own mapping — and differ only in
+    /// whether the next request asks again.
+    fn apply(answer: CachedDisclosure) -> ThinkingCapabilities {
+        match answer {
+            CachedDisclosure::Known(caps) => caps,
+            CachedDisclosure::Undisclosed => ThinkingCapabilities::default(),
         }
-        caps
     }
 
     /// Ask the Models API what this model disclosed about thinking.
     ///
-    /// Every failure answers with no disclosure at all — a timeout, a
-    /// non-success status, an over-cap body, or a body that is not JSON —
-    /// because the ladder's own mapping is the documented fallback and an
-    /// endpoint without a Models API is a normal deployment. The request
-    /// carries [`CAPABILITIES_PROBE_TIMEOUT`] rather than the client's
-    /// conversational read timeout, so a wedged metadata route cannot stall
-    /// a run's first turn.
-    async fn fetch(&self) -> ThinkingCapabilities {
+    /// The answer separates what an endpoint *said* from what it merely
+    /// failed to deliver. Definitive and cacheable: a success (whether or not
+    /// it discloses thinking members), a non-JSON success (a gateway in front
+    /// of the API), and a `404` or `405`, which says there is no Models API at
+    /// this base URL. Inconclusive and never cached: a transport failure or
+    /// timeout, `401`/`403` (a rotated credential says nothing about the
+    /// model), `429` and any `5xx` (busy, not silent), and a body that could
+    /// not be read within [`MAX_RESPONSE_BODY`].
+    ///
+    /// The distinction is the difference between a soft fallback and a stuck
+    /// one: a filed answer is never revisited, so a probe that filed a blip
+    /// would send the ladder's `budget_tokens` to an adaptive-tier model on
+    /// every later turn, and each of those turns would 400 on the spelling the
+    /// probe never read. The request carries [`CAPABILITIES_PROBE_TIMEOUT`]
+    /// rather than the conversational read timeout either way, so a wedged
+    /// metadata route cannot stall a run's first turn.
+    ///
+    /// [`MAX_RESPONSE_BODY`]: super::MAX_RESPONSE_BODY
+    async fn fetch(&self) -> ProbeOutcome {
         let Ok(response) = self
             .http
             .get(&self.url)
@@ -1522,16 +1573,23 @@ impl ThinkingProbe {
             .send()
             .await
         else {
-            return ThinkingCapabilities::default();
+            return ProbeOutcome::Inconclusive;
         };
-        if !response.status().is_success() {
-            return ThinkingCapabilities::default();
+        let status = response.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return ProbeOutcome::Answered(CachedDisclosure::Undisclosed);
+        }
+        if !status.is_success() {
+            return ProbeOutcome::Inconclusive;
         }
         let Ok(bytes) = super::read_bounded_body(response).await else {
-            return ThinkingCapabilities::default();
+            return ProbeOutcome::Inconclusive;
         };
         let Ok(model) = serde_json::from_slice::<Value>(&bytes) else {
-            return ThinkingCapabilities::default();
+            return ProbeOutcome::Answered(CachedDisclosure::Undisclosed);
         };
         let types = model.pointer("/capabilities/thinking/types");
         let disclosed = |name: &str| {
@@ -1540,12 +1598,17 @@ impl ThinkingProbe {
                 .and_then(|entry| entry.get("supported"))
                 .and_then(Value::as_bool)
         };
-        ThinkingCapabilities::from_states(
+        let caps = ThinkingCapabilities::from_states(
             disclosed("disabled"),
             disclosed("between_tools"),
             disclosed("enabled"),
             disclosed("adaptive"),
-        )
+        );
+        ProbeOutcome::Answered(if caps.is_empty() {
+            CachedDisclosure::Undisclosed
+        } else {
+            CachedDisclosure::Known(caps)
+        })
     }
 }
 
@@ -3008,6 +3071,27 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        let status = if disclosure.is_empty() { 404 } else { 200 };
+        recording_listener_answering(disclosure, status).await
+    }
+
+    /// A recording endpoint that answers the thinking probe with a chosen
+    /// status.
+    ///
+    /// [`recording_listener`] is this with the status an endpoint that has a
+    /// Models API would use. A `200` carries `disclosure`; any other status
+    /// answers empty, standing in for a metadata route that is down, busy, or
+    /// refusing. Messages requests always fail: the caller drives a client
+    /// repeatedly and reads back what it asked for, which is how a pin counts
+    /// how many times the Models API was consulted.
+    async fn recording_listener_answering(
+        disclosure: &'static str,
+        probe_status: u16,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3027,6 +3111,10 @@ mod tests {
                 let text = String::from_utf8_lossy(&buf[..n]).into_owned();
                 let reply: Vec<u8> = if !text.starts_with("GET /v1/models") {
                     b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if probe_status != 200 {
+                    format!(
+                        "HTTP/1.1 {probe_status} Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ).into_bytes()
                 } else if disclosure.is_empty() {
                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         .to_vec()
@@ -3042,6 +3130,69 @@ mod tests {
             }
         });
         (addr, seen, task)
+    }
+
+    /// A recording endpoint whose thinking probe fails once and then answers.
+    ///
+    /// The first `GET /v1/models/…` gets `503` — a metadata route briefly down
+    /// — and every later probe gets `disclosure`. Messages requests fail as
+    /// elsewhere and every request is recorded, header and body together, so a
+    /// caller sees both how often the client asked and what each of its two
+    /// turns put on the wire: the point being that a client which filed the
+    /// `503` as an answer would never learn that the endpoint had come back.
+    async fn recording_listener_failing_probe_once(
+        disclosure: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let reply: Vec<u8> = if !text.starts_with("GET /v1/models") {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{disclosure}",
+                        disclosure.len()
+                    ).into_bytes()
+                };
+                recorded.lock().unwrap().push(text);
+                drop(sock.write_all(&reply).await);
+                drop(sock.shutdown().await);
+            }
+        });
+        (addr, seen, task)
+    }
+
+    /// Drive one streaming request on `client` and let it fail.
+    ///
+    /// These pins care about what the client *sent*, not what came back: the
+    /// endpoint answers Messages requests with a failure on purpose.
+    async fn drive_request(client: &AnthropicClient, options: crate::structured::RequestOptions) {
+        use futures::StreamExt;
+
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), options);
+        let _ = stream.next().await;
     }
 
     /// Capture the streaming body a client puts on the wire for one history.
@@ -5833,6 +5984,126 @@ mod tests {
         assert!(
             asked.iter().all(|request| !request.starts_with("GET")),
             "with no effort resolved a disclosure could change nothing, so the Models API is not consulted: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_probe_failure_is_asked_again_on_the_next_request() {
+        let (addr, seen, task) = recording_listener_answering(ADAPTIVE_DISCLOSURE, 503).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probes: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/models/"))
+            .collect();
+        assert_eq!(
+            probes.len(),
+            2,
+            "an endpoint that was unavailable said nothing, so it is asked again; a filed silence would keep sending the budget ladder to a model that refuses it: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_fails_once_recovers_on_the_next_turn() {
+        let (addr, seen, task) = recording_listener_failing_probe_once(ADAPTIVE_DISCLOSURE).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .with_max_tokens(1024)
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let bodies: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("POST"))
+            .collect();
+        assert_eq!(bodies.len(), 2, "both turns reached the wire: {asked:?}");
+        assert!(
+            bodies[0].contains("\"budget_tokens\":16384"),
+            "the turn whose probe failed takes the ladder's mapping, the documented answer for an endpoint that disclosed nothing: {}",
+            bodies[0]
+        );
+        assert!(
+            bodies[1].contains("\"output_config\":{\"effort\":\"high\"}")
+                && bodies[1].contains("\"max_tokens\":1024"),
+            "the next turn reads the disclosure the endpoint did give and takes the effort path with its configured max_tokens back — the 503 was not filed as an answer: {}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definitive_404_is_filed_so_the_endpoint_is_asked_once() {
+        let (addr, seen, task) = recording_listener("").await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probes: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/models/"))
+            .collect();
+        assert_eq!(
+            probes.len(),
+            1,
+            "an endpoint that answered `404` answered definitively — no Models API at this base URL — and is not asked again per request: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_another_model_caches_its_own_disclosure() {
+        let (addr, seen, task) = recording_listener(ADAPTIVE_DISCLOSURE).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        let override_model = crate::structured::RequestOptions::new()
+            .with_model("claude-opus-5")
+            .with_effort(crate::structured::ThinkingEffort::High);
+        // Two turns each, alternating: the shape a fallback chain makes, where
+        // a single cache slot made every turn after the first pay a probe.
+        for _ in 0..2 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+            drive_request(&client, override_model.clone()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probed: Vec<&str> = asked
+            .iter()
+            .filter_map(|request| request.split_whitespace().nth(1))
+            .filter(|path| path.starts_with("/v1/models/"))
+            .collect();
+        assert_eq!(
+            probed.len(),
+            2,
+            "each model is asked once, whichever channel named it — the client's own or a per-request override: {asked:?}"
+        );
+        assert!(
+            probed.contains(&"/v1/models/claude-sonnet-4-20250514")
+                && probed.contains(&"/v1/models/claude-opus-5"),
+            "both models got their own disclosure read: {probed:?}"
         );
     }
 

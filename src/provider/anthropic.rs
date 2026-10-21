@@ -93,8 +93,33 @@ const CAPABILITY_CACHE_MAX_MODELS: usize = 32;
 /// exactly how an Anthropic-compatible gateway profile becomes slow.
 ///
 /// The streak resets whenever the endpoint answers, so an outage shorter than
-/// the limit still recovers on the next turn.
+/// the limit still recovers on the next turn. Past the limit the verdict is
+/// *served* rather than filed, and [`CAPABILITY_PROBE_REPROBE_AFTER`] decides
+/// when the route is asked again.
 const CAPABILITY_PROBE_MISS_LIMIT: u8 = 3;
+
+/// Requests served on the give-up verdict before the route is asked again.
+///
+/// The give-up verdict is this client's inference — three refusals in a row
+/// read as "nothing to disclose" — and an inference cannot be allowed to
+/// outlive the outage it was drawn from. Filed as though it were an answer, a
+/// route that came back an hour later would leave an adaptive-tier model
+/// served the budget spelling it refuses, on every turn, for the life of the
+/// client: the one failure mode the definitive/inconclusive split exists to
+/// avoid, arriving by a different road.
+///
+/// So the verdict expires instead of standing. The count is what replaces
+/// permanence: at most one probe per this many effort-bearing requests, which
+/// keeps a permanently dead route to one probe (and at worst one
+/// [`CAPABILITIES_PROBE_TIMEOUT`]) per 29 turns after the initial three, while
+/// a route that recovered is believed again within a turn or two of ordinary
+/// use. A definitive non-answer — a `404`, a body that was never JSON — is not
+/// on this path at all: that endpoint *answered*, and is asked once.
+///
+/// Must stay above [`CAPABILITY_PROBE_MISS_LIMIT`], and
+/// `the_capability_cache_renews_its_give_up_verdict_on_a_bound` fails if the
+/// two are ever configured the wrong way round.
+const CAPABILITY_PROBE_REPROBE_AFTER: u8 = 32;
 
 /// An Anthropic Claude chat client with streaming support.
 ///
@@ -1194,9 +1219,11 @@ enum CachedDisclosure {
     /// request that sets an effort. It is also the narrowest verdict a probe
     /// can reach — the ladder's own mapping stands, which is what every
     /// endpoint that never heard of this client already gets. It is also
-    /// where a model lands after [`CAPABILITY_PROBE_MISS_LIMIT`] consecutive
-    /// inconclusive probes: a route that never answers has said, in effect,
-    /// that it has nothing to disclose.
+    /// where a model runs after [`CAPABILITY_PROBE_MISS_LIMIT`] consecutive
+    /// inconclusive probes — a route that never answers has said, in effect,
+    /// that it has nothing to disclose. Served rather than filed there: that
+    /// reading is this client's, so [`CAPABILITY_PROBE_REPROBE_AFTER`] brings
+    /// the route back up for a probe when it may have recovered.
     Undisclosed,
 }
 
@@ -1217,8 +1244,9 @@ enum ProbeOutcome {
     /// request falls back to the ladder's own mapping — the documented answer
     /// for an endpoint that discloses nothing — and the next one asks again,
     /// up to [`CAPABILITY_PROBE_MISS_LIMIT`] times in a row; a route that
-    /// cannot answer is then treated as one with nothing to disclose, rather
-    /// than being probed forever ahead of every turn.
+    /// cannot answer is then run as one with nothing to disclose rather than
+    /// probed ahead of every turn, until [`CAPABILITY_PROBE_REPROBE_AFTER`]
+    /// turns of that say enough time has passed to ask once more.
     Inconclusive,
 }
 
@@ -1244,19 +1272,25 @@ enum ProbeOutcome {
 /// every bound on the answers and keep counting toward a verdict nobody reads.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct CapabilityEntry {
-    /// The endpoint's definitive answer, once it gave one.
+    /// The endpoint's own definitive answer, once it gave one.
     ///
-    /// `None` while every probe for this model came back inconclusive — the
-    /// one state that keeps asking — and `Some` from the moment the endpoint
-    /// says anything, including the [`CachedDisclosure::Undisclosed`] filed
-    /// after the miss streak reaches its limit.
+    /// `Some` only for what the endpoint actually said: a disclosure, a `404`
+    /// or `405`, a non-JSON body, a JSON answer that named no thinking member.
+    /// `None` for everything else — including the [`CachedDisclosure::Undisclosed`]
+    /// the give-up streak serves, which lives in [`Self::misses`] instead,
+    /// because an inference this client drew is not the endpoint's answer and
+    /// must stay open to correction.
     answer: Option<CachedDisclosure>,
 
-    /// Consecutive inconclusive probes since the last definitive answer.
+    /// Inconclusive probes so far, and once past the limit, requests served on
+    /// the give-up verdict.
     ///
-    /// Counted rather than merely remembered: a single blip must not become a
-    /// verdict, while a third refusal in a row is a deployment fact worth
-    /// acting on. See [`CAPABILITY_PROBE_MISS_LIMIT`].
+    /// One counter carries two thresholds, and [`CapabilityCache::verdict`] is
+    /// what reads them: below [`CAPABILITY_PROBE_MISS_LIMIT`] every request
+    /// asks, from there to [`CAPABILITY_PROBE_REPROBE_AFTER`] requests run on
+    /// the verdict while counting toward its renewal, and at the renewal the
+    /// request asks again — where an answer files normally and a fresh miss
+    /// rewinds to the limit rather than starting the initial streak over.
     misses: u8,
 }
 
@@ -1265,21 +1299,42 @@ struct CapabilityCache {
     /// Model id → that model's row. A missing key means no probe has run for
     /// this model since the client was built; a key with `answer: None` means
     /// probes have run and none learned anything, which is the state that
-    /// still retries. A `404` endpoint is filed at once, so it is asked once
-    /// rather than per request.
+    /// retries — every request, until the streak gives up, then on the renewal
+    /// cadence [`CapabilityCache::verdict`] keeps. A `404` endpoint is filed at
+    /// once, so it is asked once rather than per request.
     entries: std::collections::HashMap<String, CapabilityEntry>,
 }
 
 impl CapabilityCache {
-    /// What one model's probe answered, if the endpoint ever answered.
+    /// What this model has established so far, or `None` to go and ask.
     ///
-    /// `None` covers both "never asked" and "asked, learned nothing, still
-    /// under the retry limit", and is the only shape that sends the next
-    /// request to the endpoint. A model whose endpoint answered `404` is
-    /// present with [`CachedDisclosure::Undisclosed`], which is what keeps an
-    /// endpoint with no Models API from being asked once per request.
-    fn get(&self, model: &str) -> Option<CachedDisclosure> {
-        self.entries.get(model).and_then(|entry| entry.answer)
+    /// A definitive answer is returned for as long as the row holds one, and
+    /// that is the only thing that ends the asking. Short of it, the row's
+    /// miss count sets the rule: below [`CAPABILITY_PROBE_MISS_LIMIT`] the
+    /// request asks, and from there up to [`CAPABILITY_PROBE_REPROBE_AFTER`]
+    /// the request runs on [`CachedDisclosure::Undisclosed`] — the inference
+    /// that a route refusing three times in a row has nothing to disclose —
+    /// while counting the turn it spent. At the renewal boundary the count
+    /// stops short of answering for the endpoint and the request asks again.
+    ///
+    /// The asymmetry with [`Self::insert`] is the point: an endpoint that
+    /// *said* "no Models API" is filed and never re-asked, while this
+    /// client's own give-up verdict is re-checked for as long as the client
+    /// runs. A row is never created here — a model nobody has probed yet has
+    /// nothing to age.
+    fn verdict(&mut self, model: &str) -> Option<CachedDisclosure> {
+        let entry = self.entries.get_mut(model)?;
+        if let Some(answer) = entry.answer {
+            return Some(answer);
+        }
+        if entry.misses < CAPABILITY_PROBE_MISS_LIMIT {
+            return None;
+        }
+        if entry.misses >= CAPABILITY_PROBE_REPROBE_AFTER {
+            return None;
+        }
+        entry.misses = entry.misses.saturating_add(1);
+        Some(CachedDisclosure::Undisclosed)
     }
 
     /// File one model's definitive answer, replacing any earlier one.
@@ -1295,16 +1350,19 @@ impl CapabilityCache {
         entry.misses = 0;
     }
 
-    /// Note that a probe learned nothing, and stop asking once a streak has
-    /// proven the route dead.
+    /// Note that a probe learned nothing: extend the streak, or rewind it when
+    /// what failed was the renewal.
     ///
     /// This files no *answer* — a blip is not a disclosure, and the whole
     /// point of [`ProbeOutcome::Inconclusive`] is that this request runs on
     /// the ladder's mapping and the next one tries again. What it accumulates
-    /// is the evidence that turns into [`CachedDisclosure::Undisclosed`] at
-    /// [`CAPABILITY_PROBE_MISS_LIMIT`], which is what keeps a permanently
-    /// failing metadata route from costing a probe — or its full timeout —
-    /// ahead of every turn of a run.
+    /// is the evidence that starts serving [`CachedDisclosure::Undisclosed`] at
+    /// [`CAPABILITY_PROBE_MISS_LIMIT`], which is what keeps a failing metadata
+    /// route from costing a probe — or its full timeout — ahead of every turn
+    /// of a run. A miss at the renewal boundary rewinds to the limit rather
+    /// than parking at the ceiling, where every following request would probe
+    /// again and the bound would be the very cost this streak exists to
+    /// prevent.
     fn note_inconclusive(&mut self, model: &str) {
         let entry = self.entry(model);
         if entry.answer.is_some() {
@@ -1315,10 +1373,11 @@ impl CapabilityCache {
             // replace a real disclosure with "nothing".
             return;
         }
-        entry.misses = entry.misses.saturating_add(1);
-        if entry.misses >= CAPABILITY_PROBE_MISS_LIMIT {
-            entry.answer = Some(CachedDisclosure::Undisclosed);
-        }
+        entry.misses = if entry.misses >= CAPABILITY_PROBE_REPROBE_AFTER {
+            CAPABILITY_PROBE_MISS_LIMIT
+        } else {
+            entry.misses.saturating_add(1)
+        };
     }
 
     /// The row for one model, evicting an arbitrary other row at capacity.
@@ -1599,7 +1658,7 @@ impl ThinkingProbe {
     /// Concurrent probes of one model may each fetch — the second filing
     /// replaces the first, and both requests carried a real answer.
     async fn capabilities(&self) -> ThinkingCapabilities {
-        let cached = crate::error::recover_guard(self.cache.lock()).get(&self.model);
+        let cached = crate::error::recover_guard(self.cache.lock()).verdict(&self.model);
         if let Some(answer) = cached {
             return Self::apply(answer);
         }
@@ -1617,9 +1676,10 @@ impl ThinkingProbe {
 
     /// The disclosure a request acts on for one cached verdict.
     ///
-    /// An endpoint that answered "nothing" and one that never answered take
-    /// the same wire shape — the ladder's own mapping — and differ only in
-    /// whether the next request asks again.
+    /// An endpoint that answered "nothing", a route this client gave up on, and
+    /// one still being asked take the same wire shape — the ladder's own
+    /// mapping. They differ only in how soon anyone asks again: never, on the
+    /// renewal cadence, and next request, respectively.
     fn apply(answer: CachedDisclosure) -> ThinkingCapabilities {
         match answer {
             CachedDisclosure::Known(caps) => caps,
@@ -3221,16 +3281,20 @@ mod tests {
         (addr, seen, task)
     }
 
-    /// A recording endpoint whose thinking probe fails once and then answers.
+    /// A recording endpoint whose thinking probe fails `failures` times, then answers.
     ///
-    /// The first `GET /v1/models/…` gets `503` — a metadata route briefly down
-    /// — and every later probe gets `disclosure`. Messages requests fail as
-    /// elsewhere and every request is recorded, header and body together, so a
-    /// caller sees both how often the client asked and what each of its two
-    /// turns put on the wire: the point being that a client which filed the
+    /// The first `failures` `GET /v1/models/…` requests get `503` — a metadata
+    /// route briefly down — and every later probe gets `disclosure`. Messages
+    /// requests fail as elsewhere and every request is recorded, header and
+    /// body together, so a caller sees both how often the client asked and what
+    /// each turn put on the wire: the point being that a client which filed the
     /// `503` as an answer would never learn that the endpoint had come back.
-    async fn recording_listener_failing_probe_once(
+    /// One failure covers the blip case; a count reaching
+    /// [`CAPABILITY_PROBE_MISS_LIMIT`] covers the outage that outlasted the
+    /// streak, where the client has already settled into the give-up verdict.
+    async fn recording_listener_failing_probe(
         disclosure: &'static str,
+        failures: usize,
     ) -> (
         String,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -3256,7 +3320,7 @@ mod tests {
                 let text = String::from_utf8_lossy(&buf[..n]).into_owned();
                 let reply: Vec<u8> = if !text.starts_with("GET /v1/models") {
                     b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                } else if probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                } else if probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < failures {
                     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
                 } else {
                     format!(
@@ -6103,7 +6167,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_probe_that_fails_once_recovers_on_the_next_turn() {
-        let (addr, seen, task) = recording_listener_failing_probe_once(ADAPTIVE_DISCLOSURE).await;
+        let (addr, seen, task) = recording_listener_failing_probe(ADAPTIVE_DISCLOSURE, 1).await;
         let client = AnthropicClient::builder()
             .with_api_key("k")
             .with_base_url(format!("http://{addr}"))
@@ -6224,6 +6288,129 @@ mod tests {
     }
 
     #[test]
+    fn the_capability_cache_renews_its_give_up_verdict_on_a_bound() {
+        // The bound the give-up verdict has to live with. Three misses hand the
+        // run to the ladder's mapping, every following turn reads that verdict,
+        // and the route is asked again on the renewal cadence: five probes in
+        // sixty-four requests, not sixty-four probes and not one probe forever.
+        let mut cache = CapabilityCache::default();
+        let mut asked = 0_usize;
+        for _ in 0..64 {
+            if cache.verdict("m").is_none() {
+                asked = asked.saturating_add(1);
+                cache.note_inconclusive("m");
+            }
+        }
+        assert_eq!(
+            asked,
+            5,
+            "the initial three, then one renewal every {} served turns",
+            usize::from(CAPABILITY_PROBE_REPROBE_AFTER)
+                .saturating_sub(usize::from(CAPABILITY_PROBE_MISS_LIMIT))
+        );
+    }
+
+    #[test]
+    fn a_recovered_route_takes_over_the_given_up_verdict() {
+        // And the recovery itself. Once the renewal slot comes round, whatever
+        // the endpoint finally says replaces the inference — filed, this time,
+        // so the asking ends there as it always has for a real disclosure.
+        let mut cache = CapabilityCache::default();
+        for _ in 0..CAPABILITY_PROBE_MISS_LIMIT {
+            assert!(
+                cache.verdict("m").is_none(),
+                "under the limit every request asks"
+            );
+            cache.note_inconclusive("m");
+        }
+        assert!(
+            matches!(cache.verdict("m"), Some(CachedDisclosure::Undisclosed)),
+            "past the limit the run reads the verdict"
+        );
+        let mut turns = 1_usize;
+        loop {
+            if cache.verdict("m").is_none() {
+                break;
+            }
+            turns = turns.saturating_add(1);
+        }
+        assert!(
+            turns <= usize::from(CAPABILITY_PROBE_REPROBE_AFTER),
+            "the verdict expires on the bound rather than standing: it held for {turns} turns"
+        );
+        cache.insert(
+            "m",
+            CachedDisclosure::Known(ThinkingCapabilities {
+                disabled: Some(false),
+                between_tools: Some(true),
+                enabled: Some(false),
+                adaptive: Some(true),
+            }),
+        );
+        assert!(
+            matches!(
+                cache.verdict("m"),
+                Some(CachedDisclosure::Known(ThinkingCapabilities {
+                    adaptive: Some(true),
+                    ..
+                }))
+            ),
+            "what the endpoint said outranks what this client inferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_that_recovers_after_the_give_up_verdict_reaches_the_wire() {
+        // The cost of letting the verdict stand. Three misses settle the client
+        // on the ladder's mapping; the metadata route comes back afterwards. A
+        // client that filed its own inference would go on sending the budget
+        // spelling this model refuses — a 400 on every turn, for the life of the
+        // process. The renewal has to reach the wire, not just the cache.
+        let (addr, seen, task) = recording_listener_failing_probe(
+            ADAPTIVE_DISCLOSURE,
+            usize::from(CAPABILITY_PROBE_MISS_LIMIT),
+        )
+        .await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .with_max_tokens(1024)
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..=usize::from(CAPABILITY_PROBE_REPROBE_AFTER) {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probes = asked
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/models/"))
+            .count();
+        assert_eq!(
+            probes, 4,
+            "three misses, then the verdict serves the turns until the renewal asks once more: {asked:?}"
+        );
+        let bodies: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("POST"))
+            .collect();
+        assert!(
+            bodies[0].contains("\"budget_tokens\":16384")
+                && bodies[2].contains("\"budget_tokens\":16384"),
+            "the outage itself runs on the ladder's mapping: {}",
+            bodies[0]
+        );
+        let last = bodies.last().expect("the run reached the wire");
+        assert!(
+            last.contains("\"output_config\":{\"effort\":\"high\"}")
+                && last.contains("\"max_tokens\":1024"),
+            "the recovered disclosure takes the effort path with the configured max_tokens back; \
+             a filed give-up verdict would still be sending a budget this model refuses: {last}"
+        );
+    }
+
+    #[test]
     fn a_conclusive_answer_clears_the_miss_streak() {
         let mut cache = CapabilityCache::default();
         cache.note_inconclusive("m");
@@ -6246,7 +6433,7 @@ mod tests {
         cache.note_inconclusive("m");
         assert!(
             matches!(
-                cache.get("m"),
+                cache.verdict("m"),
                 Some(CachedDisclosure::Known(ThinkingCapabilities {
                     disabled: Some(true),
                     ..
@@ -6257,7 +6444,7 @@ mod tests {
         );
         cache.note_inconclusive("m");
         assert!(
-            matches!(cache.get("m"), Some(CachedDisclosure::Known(_))),
+            matches!(cache.verdict("m"), Some(CachedDisclosure::Known(_))),
             "a model that answered is never demoted to undisclosed by later blips"
         );
     }

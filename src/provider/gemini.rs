@@ -640,7 +640,9 @@ impl GeminiClientBuilder {
     /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table) —
     /// except the [`None`](crate::structured::ThinkingEffort::None)
     /// rung, the client-wide off, which carries the provider's own
-    /// `0` sentinel. A per-request
+    /// `0` sentinel — switched off only on a model that accepts that
+    /// value, so a client pointed at a model with no off level hears
+    /// the provider's own error. A per-request
     /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
     /// always wins; an unset client default leaves unconfigured requests
     /// byte-identical to prior versions.
@@ -806,6 +808,14 @@ fn build_request_body(
 /// carries the provider's own off sentinel, `0` — the one sentinel
 /// value on the ladder; `-1` (dynamic, model-chosen) stays off it, so
 /// every other set level names a real budget.
+///
+/// Whether that sentinel switches thinking off belongs to the serving
+/// model, not to the mapping: a model with no off level — Gemini 2.5
+/// Pro lists `low`, `medium`, and `high`, so a `0` budget sits below
+/// anything it accepts — answers the request with its own error. The
+/// budget is sent as mapped whatever model the client names; the ladder
+/// never probes the model, so the refusal stays the provider's own and
+/// reaches the caller as one.
 fn gemini_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
     match effort {
         crate::structured::ThinkingEffort::None => 0,
@@ -3679,6 +3689,22 @@ mod tests {
         assert!(
             max.contains("\"thinkingBudget\":24576"),
             "the Max rung maps to the ladder's 24576 budget: {max}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_off_sentinel_reaches_a_model_with_no_off_level() {
+        let request = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_model("gemini-2.5-pro")
+                .with_effort(crate::structured::ThinkingEffort::None),
+        )
+        .await;
+        assert!(
+            request.contains("/models/gemini-2.5-pro:streamGenerateContent")
+                && request.contains("\"thinkingBudget\":0"),
+            "the off rung is mapped whatever model the request names — whether that model accepts 0 is the provider's to answer: {request}"
         );
     }
 

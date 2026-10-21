@@ -380,7 +380,12 @@ pub struct RequestOptions {
 /// the explicit off — it sends the provider's own no-thinking value
 /// where one exists (OpenAI `"none"`, Gemini `0`) and omits the
 /// `thinking` block on the Messages API, overriding any client
-/// default.
+/// default. Gemini's off rung is model-dependent: `0` switches
+/// thinking off only where the serving model accepts it, and a model
+/// with no off level (Gemini 2.5 Pro lists `low`, `medium`, and `high`)
+/// answers such a request with its own error — the mapped value is
+/// sent and the provider judges it, as it does for any level its
+/// endpoint refuses.
 ///
 /// The enum is `#[non_exhaustive]`: a later level widens it in a minor
 /// release, so out-of-crate consumers match with a wildcard arm.
@@ -392,7 +397,10 @@ pub enum ThinkingEffort {
     /// Distinct from an unset effort, where the provider's defaults
     /// apply: `None` asks for no thinking in the provider's own
     /// spelling — OpenAI `"none"`, no `thinking` block on the
-    /// Messages API, and Gemini's `0` sentinel.
+    /// Messages API, and Gemini's `0` sentinel. Gemini honours that
+    /// sentinel only on a model with an off level to switch to; on one
+    /// without it the request comes back as the provider's error
+    /// rather than as an un-thought answer.
     None,
 
     /// A token-check of thinking.

@@ -691,12 +691,12 @@ impl QaSummarizer {
             .map_or(String::new(), |prior| prior.text.clone());
         let hiding_prior = !prior_text.is_empty();
         let rendered_source: Vec<Message> = if hiding_prior {
-            let first_assistant = dropped.iter().position(|msg| msg.role == Role::Assistant);
+            let first_summary_carrier = dropped.iter().position(|msg| msg.role == Role::User);
             dropped
                 .iter()
                 .enumerate()
                 .filter_map(|(index, msg)| {
-                    if msg.role != Role::Assistant {
+                    if msg.role != Role::User {
                         return Some(msg.clone());
                     }
                     if msg.text_content() == prior_text {
@@ -706,10 +706,10 @@ impl QaSummarizer {
                         crate::message::MessagePart::Text { text } => Some(text.as_str()),
                         _ => None,
                     }) == Some(prior_text.as_str());
-                    if Some(index) == first_assistant && head_is_summary {
+                    if Some(index) == first_summary_carrier && head_is_summary {
                         let rest: Vec<crate::message::MessagePart> =
                             msg.parts.iter().skip(1).cloned().collect();
-                        return (!rest.is_empty()).then(|| Message::new(Role::Assistant, rest));
+                        return (!rest.is_empty()).then(|| Message::new(Role::User, rest));
                     }
                     Some(msg.clone())
                 })
@@ -1076,7 +1076,7 @@ impl QaSummarizer {
         {
             out.push(first.clone());
         }
-        out.push(Message::assistant(summary.to_string()));
+        out.push(Message::user(summary.to_string()));
         out.extend_from_slice(pulled);
         out.extend_from_slice(preserved);
         out
@@ -1661,7 +1661,7 @@ mod tests {
             text: "SUMMARY".to_string(),
             pass: 1,
         };
-        let mut coalesced = Message::assistant("SUMMARY");
+        let mut coalesced = Message::user("SUMMARY");
         coalesced
             .parts
             .push(crate::message::MessagePart::text("and the tail rides here"));
@@ -1669,7 +1669,7 @@ mod tests {
             Message::user("pinned context the host keeps ahead"),
             coalesced,
             Message::user("next"),
-            Message::assistant("SUMMARY and then the model wrote more"),
+            Message::user("SUMMARY and then the model wrote more"),
         ];
         let rendered = summarizer.transcript(&dropped, Some(&prior));
         assert!(
@@ -1697,14 +1697,14 @@ mod tests {
             text: "SUMMARY".to_string(),
             pass: 1,
         };
-        let mut coalesced = Message::assistant("SUMMARY");
+        let mut coalesced = Message::user("SUMMARY");
         coalesced
             .parts
             .push(crate::message::MessagePart::text("and the tail rides here"));
         let dropped = vec![
             coalesced,
             Message::user("next"),
-            Message::assistant("SUMMARY and then the model wrote more"),
+            Message::user("SUMMARY and then the model wrote more"),
         ];
         let rendered = summarizer.transcript(&dropped, Some(&prior));
         assert!(
@@ -1915,7 +1915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_summary_message_is_assistant_role_and_precedes_the_preserved_tail() {
+    async fn the_summary_message_is_user_role_and_precedes_the_preserved_tail() {
         let (_client, summarizer) = scripted(vec![ok("SUMMARY-C"), ok("[]")]);
         let messages = conversation();
         let target =
@@ -1926,8 +1926,8 @@ mod tests {
         let first = outcome.messages.first().expect("the output is non-empty");
         assert_eq!(
             first.role,
-            Role::Assistant,
-            "the summary is an assistant message"
+            Role::User,
+            "the summary is a user message — a compacted history opens the way providers expect"
         );
         assert_eq!(first.text_content(), "SUMMARY-C");
         assert_eq!(
@@ -1958,8 +1958,8 @@ mod tests {
         assert_eq!(first.text_content(), "standing instructions");
         assert_eq!(
             outcome.messages.get(1).map(|m| m.role),
-            Some(Role::Assistant),
-            "the summary follows the system message"
+            Some(Role::User),
+            "the summary follows the system message as a user-role head"
         );
         assert_eq!(
             outcome.evicted.len(),
@@ -2014,8 +2014,8 @@ mod tests {
         );
         assert_eq!(
             outcome.messages.get(1).map(|m| m.role),
-            Some(Role::Assistant),
-            "the summary follows the system message"
+            Some(Role::User),
+            "the summary follows the system message as a user-role head"
         );
         assert!(
             outcome

@@ -1027,7 +1027,9 @@ fn build_request_body(
     let tools = tools.filter(|t| !t.is_empty());
     let (non_system, effective_system) = super::fold_system_messages(messages, *system);
     let owned: Vec<crate::message::Message> = non_system.into_iter().cloned().collect();
-    let non_system = crate::message::coalesce_adjacent_assistants(owned);
+    let non_system = crate::message::user_head_before_tool_use_opening(
+        crate::message::coalesce_adjacent_assistants(owned),
+    );
     let msgs: Vec<Value> = non_system
         .iter()
         .map(|m| convert_message(m, replay_reasoning, effort))
@@ -2048,6 +2050,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_request_build_injects_a_user_head_before_a_tool_use_opening() {
+        // The provider-side safety net for the tool-use opening: a
+        // history that begins with an assistant carrying a tool call —
+        // the coalesced-seam shape — cannot be the request's first
+        // message on strict providers, so the build rides a minimal
+        // user message ahead of it.
+        let spec = RequestBodySpec {
+            model: "glm-4.7",
+            messages: &[crate::message::Message::new(
+                crate::message::Role::Assistant,
+                vec![
+                    crate::message::MessagePart::text("SUMMARY: the task so far."),
+                    crate::message::MessagePart::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "Bash".to_string(),
+                        input: serde_json::json!({"command": "ls"}),
+                    },
+                ],
+            )],
+            system: None,
+            tools: Some(&[]),
+            response_format: None,
+            tool_constraint: &ToolConstraint::None,
+        };
+        let body = build_request_body(&spec, false, 1024, None, false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            2,
+            "the opening assistant gains a user head: {messages:?}"
+        );
+        assert_eq!(
+            messages[0]["role"], "user",
+            "the injected head is user-role: {messages:?}"
+        );
+        assert_eq!(
+            messages[1]["role"], "assistant",
+            "the tool-carrying assistant follows: {messages:?}"
+        );
+    }
+
+    #[test]
     fn the_request_build_merges_adjacent_assistant_messages() {
         // The provider-side safety net: a future producer of the
         // adjacent-assistant shape cannot kill a run - the Anthropic
@@ -2773,14 +2817,17 @@ mod tests {
 
     #[test]
     fn request_body_assistant_tool_calls() {
-        let msgs = vec![Message::new(
-            Role::Assistant,
-            vec![MessagePart::ToolCall {
-                id: "call_1".into(),
-                name: "echo".into(),
-                input: serde_json::json!({"msg": "hi"}),
-            }],
-        )];
+        let msgs = vec![
+            Message::user("drive it"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"msg": "hi"}),
+                }],
+            ),
+        ];
         let body = build_request_body(
             &RequestBodySpec {
                 model: "claude-3",
@@ -2796,7 +2843,7 @@ mod tests {
             false,
         );
 
-        let msg = &body["messages"][0];
+        let msg = &body["messages"][1];
         assert_eq!(msg["role"], "assistant");
         let content = msg["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "tool_use");
@@ -3056,17 +3103,20 @@ mod tests {
 
     #[test]
     fn request_body_assistant_with_text_and_tool_call() {
-        let msgs = vec![Message::new(
-            Role::Assistant,
-            vec![
-                MessagePart::text("Let me search."),
-                MessagePart::ToolCall {
-                    id: "call_1".into(),
-                    name: "search".into(),
-                    input: serde_json::json!({"q": "rust"}),
-                },
-            ],
-        )];
+        let msgs = vec![
+            Message::user("find it"),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    MessagePart::text("Let me search."),
+                    MessagePart::ToolCall {
+                        id: "call_1".into(),
+                        name: "search".into(),
+                        input: serde_json::json!({"q": "rust"}),
+                    },
+                ],
+            ),
+        ];
         let body = build_request_body(
             &RequestBodySpec {
                 model: "claude-3",
@@ -3082,7 +3132,7 @@ mod tests {
             false,
         );
 
-        let msg = &body["messages"][0];
+        let msg = &body["messages"][1];
         assert_eq!(msg["role"], "assistant");
         let content = msg["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);

@@ -380,7 +380,7 @@ impl RollingCompactor {
         messages
             .get(index)
             .is_some_and(|message| {
-                if message.role != Role::Assistant {
+                if message.role != Role::User {
                     return false;
                 }
                 match carried {
@@ -491,7 +491,7 @@ impl RollingCompactor {
             }
         }
         for summary in summaries {
-            out.push(Message::assistant(summary.clone()));
+            out.push(Message::user(summary.clone()));
         }
         let mut kept: Vec<usize> = (young_from..messages.len()).collect();
         for index in durable {
@@ -921,7 +921,7 @@ mod tests {
                 .with_min_messages(4),
         );
         rolling.restore_ledger(Some(ledger_text.to_string()));
-        let mut messages = vec![Message::assistant(ledger_text)];
+        let mut messages = vec![Message::user(ledger_text)];
         messages.extend(turn_history(4, 40));
         let outcome = rolling
             .compact(messages.clone(), 40_000, context_for(&messages))
@@ -931,7 +931,7 @@ mod tests {
             outcome
                 .messages
                 .iter()
-                .any(|m| m.role == Role::Assistant && m.text_content() == ledger_text),
+                .any(|m| m.role == Role::User && m.text_content() == ledger_text),
             "the ledger message survives the rolling pass verbatim"
         );
         let ledger_evicted = outcome
@@ -1075,7 +1075,7 @@ mod tests {
         );
         let ledger_text =
             "## Conversation summary (compacted)\n- the task ledger survived the handoff";
-        let mut messages = vec![Message::assistant(ledger_text)];
+        let mut messages = vec![Message::user(ledger_text)];
         messages.extend(turn_history(4, 40));
         let outcome = rolling
             .compact(messages.clone(), 40_000, context_for(&messages))
@@ -1085,7 +1085,7 @@ mod tests {
             outcome
                 .messages
                 .iter()
-                .any(|m| m.role == Role::Assistant && m.text_content() == ledger_text),
+                .any(|m| m.role == Role::User && m.text_content() == ledger_text),
             "a big-bang summary at the head is adopted and carried verbatim, \
              never re-summarized"
         );
@@ -1172,7 +1172,7 @@ mod tests {
                 vec![crate::message::MessagePart::text("rules")],
             ),
             pin.clone(),
-            Message::assistant(ledger_text),
+            Message::user(ledger_text),
         ];
         messages.extend(turn_history(4, 40));
         let mut context = context_for(&messages);
@@ -1212,7 +1212,7 @@ mod tests {
             outcome_two
                 .messages
                 .iter()
-                .any(|m| m.role == Role::Assistant && m.text_content() == ledger_text),
+                .any(|m| m.role == Role::User && m.text_content() == ledger_text),
             "the ledger still rides the next pass behind the pin"
         );
     }

@@ -15523,7 +15523,14 @@ impl ApiClient for StrictAssistantShapeClient {
             pair[0].role == crate::message::Role::Assistant
                 && pair[1].role == crate::message::Role::Assistant
         });
-        if adjacent {
+        let tool_use_opening = request.messages.first().is_some_and(|first| {
+            first.role == crate::message::Role::Assistant
+                && first
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::ToolCall { .. }))
+        });
+        if adjacent || tool_use_opening {
             crate::error::recover_guard(self.requests.lock()).push(request.clone());
             crate::error::recover_guard(self.rejections.lock())
                 .push("400 [1214] The messages parameter is illegal".to_string());

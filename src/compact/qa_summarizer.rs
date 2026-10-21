@@ -153,13 +153,13 @@ const CHARS_PER_TOKEN: u64 = 4;
 pub struct PriorSummary {
     /// The text of the summary produced by the previous compaction pass.
     ///
-    /// The leading text of the history's first assistant message —
-    /// which is how the next pass recognizes and excludes it from its
-    /// transcript: the adoption seam coalesces the summary into the
-    /// preserved tail's opening assistant message (the summary's
-    /// parts first), so the recognition is a prefix match on that
-    /// coalesced head alongside an exact text equality anywhere else
-    /// in the dropped region.
+    /// The leading text of the summary carrier — which is how the next
+    /// pass recognizes and excludes it from its transcript: a compactor
+    /// emits its summary as a user-role message, and where the adoption
+    /// seam has coalesced it into a turn the summary's parts ride first,
+    /// so the recognition matches that leading part wherever the carrier
+    /// sits — a host-pinned message may ride ahead of it — alongside an
+    /// exact text equality anywhere else in the dropped region.
     pub text: String,
 
     /// Which compaction pass produced it, 1-indexed.
@@ -676,22 +676,25 @@ impl QaSummarizer {
     /// call/result one-liners, per-part truncation) at the configured
     /// character budget. In accumulate mode the previous pass's summary
     /// is filtered out — exact text equality anywhere, and on the
-    /// first assistant message alone (pins may ride ahead of it),
-    /// where the adoption seam's coalescing folded the summary in as
-    /// the leading text part: only that part leaves, and the tail
-    /// turn's own text, tool calls, and thinking ride on as
-    /// transcript content. The summary already reaches the prompt
-    /// through the `<prior-summary>` block, and presenting it twice
-    /// invites the model to re-summarize the summary. A later message
-    /// that merely echoes the summary and continues is not the
-    /// summary; its continuation rides.
+    /// first user message whose own leading part is the summary, where
+    /// the adoption seam's coalescing folded it in. The carrier is
+    /// found by that part rather than by its position, because a
+    /// host-pinned message can ride ahead of it in the dropped region:
+    /// only the summary part leaves, and the tail turn's own text, tool
+    /// calls, and thinking ride on as transcript content. The summary
+    /// already reaches the prompt through the `<prior-summary>` block,
+    /// and presenting it twice invites the model to re-summarize the
+    /// summary. A later message that merely echoes the summary and
+    /// continues is not the summary; its continuation rides.
     fn transcript(&self, dropped: &[Message], prior: Option<&PriorSummary>) -> String {
         let prior_text = prior
             .filter(|_| self.config.accumulate)
             .map_or(String::new(), |prior| prior.text.clone());
         let hiding_prior = !prior_text.is_empty();
         let rendered_source: Vec<Message> = if hiding_prior {
-            let first_summary_carrier = dropped.iter().position(|msg| msg.role == Role::User);
+            let first_summary_carrier = dropped.iter().position(|msg| {
+                msg.role == Role::User && leading_text_part(msg) == Some(prior_text.as_str())
+            });
             dropped
                 .iter()
                 .enumerate()
@@ -702,11 +705,7 @@ impl QaSummarizer {
                     if msg.text_content() == prior_text {
                         return None;
                     }
-                    let head_is_summary = msg.parts.first().and_then(|part| match part {
-                        crate::message::MessagePart::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    }) == Some(prior_text.as_str());
-                    if Some(index) == first_summary_carrier && head_is_summary {
+                    if Some(index) == first_summary_carrier {
                         let rest: Vec<crate::message::MessagePart> =
                             msg.parts.iter().skip(1).cloned().collect();
                         return (!rest.is_empty()).then(|| Message::new(Role::User, rest));
@@ -1263,6 +1262,19 @@ impl TokenSpend {
     }
 }
 
+/// The text of a message's leading part, when that part carries text.
+///
+/// A folded-in summary rides as its carrier's first text part, so the
+/// leading part — never the message's position — is what identifies a
+/// summary carrier: a host-pinned message can ride ahead of it through
+/// the adopted history.
+fn leading_text_part(msg: &Message) -> Option<&str> {
+    match msg.parts.first() {
+        Some(crate::message::MessagePart::Text { text }) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
 /// The heuristic token estimate for one summary-sized text.
 ///
 /// Wraps the text in a single assistant message and runs the standard
@@ -1677,12 +1689,35 @@ mod tests {
             "only the summary part leaves the head; the tail turn's content is transcript: {rendered}"
         );
         assert!(
-            !rendered.contains("SUMMARY\n"),
-            "the summary text itself does not ride twice: {rendered}"
+            rendered.contains("User: and the tail rides here"),
+            "the carrier sheds its summary part even behind a pin, keeping its own text at the line head: {rendered}"
         );
         assert!(
             rendered.contains("and then the model wrote more"),
             "the echo-echo continuation is transcript content: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_head_does_not_hide_the_summary_carrier() {
+        // The carrier lookup keys on the leading summary part, not on
+        // "the first user message": a host pin ahead of the carrier
+        // would otherwise leave the whole summary in the transcript,
+        // so the prompt would carry it twice.
+        let (_, summarizer) = scripted(vec![]);
+        let prior = PriorSummary {
+            text: "SUMMARY".to_string(),
+            pass: 1,
+        };
+        let mut coalesced = Message::user("SUMMARY");
+        coalesced
+            .parts
+            .push(crate::message::MessagePart::text("tail content"));
+        let dropped = vec![Message::user("host pin ahead of the carrier"), coalesced];
+        let rendered = summarizer.transcript(&dropped, Some(&prior));
+        assert_eq!(
+            rendered, "User: host pin ahead of the carrier\nUser: tail content\n",
+            "the pin rides, the carrier's summary part leaves, and the prior summary reaches the prompt once: {rendered}"
         );
     }
 

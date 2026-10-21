@@ -359,13 +359,31 @@ pub struct RequestOptions {
 ///
 /// | level | OpenAI `reasoning_effort` | Anthropic `thinking.budget_tokens` | Gemini `thinkingConfig.thinkingBudget` |
 /// |-------|---------------------------|-------------------------------------|----------------------------------------|
-/// | `None` | `"none"` | omitted — no `thinking` block | `0` (the provider's off sentinel) |
+/// | `None` | `"none"` | `{"type": "disabled"}` | `0` (the provider's off sentinel) |
 /// | `Minimal` | `"minimal"` | `1024` (the API's floor) | `512` |
 /// | `Low` | `"low"` | `2048` | `1024` |
 /// | `Medium` | `"medium"` | `8192` | `8192` |
 /// | `High` | `"high"` | `16384` | `16384` |
 /// | `Xhigh` | `"xhigh"` | `24576` | `20480` |
 /// | `Max` | `"max"` | `32768` | `24576` |
+///
+/// The Anthropic column names one spelling: extended thinking, sent as
+/// `thinking: {"type": "enabled"}` around the budget. That is what the
+/// API's extended-thinking models accept; Anthropic's newer adaptive
+/// tier (Opus 4.7 and later, Sonnet 5 and later, Haiku 5.5, Fable and
+/// Mythos) rejects `budget_tokens` and takes thinking depth from
+/// `output_config.effort` instead, whose levels run `low` through `max`
+/// with no `minimal` rung. The rung's name is still sent verbatim there —
+/// the provider refuses it, which is the same honest refusal an OpenAI
+/// label an endpoint tops out below draws — and an effort the tier takes
+/// at all is written to `output_config.effort` rather than as a budget.
+/// The Anthropic client resolves the tier from the endpoint rather than
+/// from a table: a request that sets an effort reads the model's disclosed
+/// thinking controls once and writes the spelling that model accepts (the
+/// off rung taking `{"type": "between_tools"}` on a model that refuses
+/// `"disabled"`, and being refused up front where the model offers no off
+/// at all), while an endpoint that discloses nothing keeps the table's own
+/// mapping and answers a refused request with its own error.
 ///
 /// Anthropic requests enforce headroom: when the budget plus one
 /// exceeds the request's `max_tokens`, `max_tokens` rises to
@@ -378,9 +396,11 @@ pub struct RequestOptions {
 /// composes with one. Not setting an effort leaves the provider's
 /// own defaults in charge; the [`None`](ThinkingEffort::None) level is
 /// the explicit off — it sends the provider's own no-thinking value
-/// where one exists (OpenAI `"none"`, Gemini `0`) and omits the
-/// `thinking` block on the Messages API, overriding any client
-/// default. Gemini's off rung is model-dependent: `0` switches
+/// where one exists (OpenAI `"none"`, Gemini `0`) and says
+/// `thinking: {"type": "disabled"}` on the Messages API, overriding
+/// any client default; omitting that block instead would leave a
+/// thinking-by-default model on its adaptive setting, not off. Gemini's
+/// off rung is model-dependent: `0` switches
 /// thinking off only where the serving model accepts it, and a model
 /// with no off level (Gemini 2.5 Pro lists `low`, `medium`, and `high`)
 /// answers such a request with its own error — the mapped value is
@@ -396,8 +416,12 @@ pub enum ThinkingEffort {
     ///
     /// Distinct from an unset effort, where the provider's defaults
     /// apply: `None` asks for no thinking in the provider's own
-    /// spelling — OpenAI `"none"`, no `thinking` block on the
-    /// Messages API, and Gemini's `0` sentinel. Gemini honours that
+    /// spelling — OpenAI `"none"`, `thinking: {"type": "disabled"}` on
+    /// the Messages API, and Gemini's `0` sentinel. The Messages API is
+    /// told rather than left unsaid because an omitted `thinking` block
+    /// leaves a thinking-by-default model thinking adaptively, which is
+    /// neither off nor a value a caller can tell from a request that set
+    /// no effort. Gemini honours that
     /// sentinel only on a model with an off level to switch to; on one
     /// without it the request comes back as the provider's error
     /// rather than as an un-thought answer.

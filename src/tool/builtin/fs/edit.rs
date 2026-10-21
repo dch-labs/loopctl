@@ -1247,10 +1247,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_disclosure_survives_the_large_diff_path() {
-        // Past MAX_LCS_PRODUCT the receipt carries no @@ hunk marker;
-        // the disclosure must ride anyway - it is the only signal
-        // that the model's text was not applied as sent.
+    async fn the_disclosure_rides_the_large_file_receipt() {
+        // A twelve-hundred-line file with a one-line edit is past the budget
+        // the matcher once checked the whole file against, so this receipt used
+        // to be the hunkless preview with the note appended after it. The
+        // receipt now carries hunks, and the disclosure still rides - in the
+        // `|`-note channel ahead of the first hunk, because it is the only
+        // signal that the model's text was not applied as sent.
         let dir = tempfile::tempdir().expect("tempdir");
         let session = FileSession::new(dir.path().to_path_buf());
         let mut content = "filler line\n".repeat(1100);
@@ -1265,11 +1268,18 @@ mod tests {
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
+        let text = out.text_content();
         assert!(
-            out.text_content()
-                .contains("matched with normalized indentation"),
-            "the disclosure survives every receipt path: {}",
-            out.text_content()
+            text.contains("matched with normalized indentation"),
+            "the disclosure survives every receipt path: {text}"
+        );
+        let hunk = text.find("@@ -").expect("the receipt carries a hunk");
+        let note = text
+            .find("matched with normalized indentation")
+            .expect("the disclosure is on the receipt");
+        assert!(
+            note < hunk,
+            "the note reads beside the header, above the hunks: {text}"
         );
     }
 

@@ -1,21 +1,51 @@
 //! Plain-text diff renderer for file-write/edit success messages.
+//!
+//! The renderer addresses every line it prints by its position in the file,
+//! and its cost is bounded by the *change* rather than by the file: the
+//! unchanged bulk surrounding a change is measured by linear scans and
+//! rendered as counted elisions, never carried through the quadratic
+//! matching core. A receipt therefore stays hunk-sized however long the file
+//! it describes is.
+//!
+//! The shape it emits — a `Changed:`/`Created:` header, a `│`-prefixed
+//! change summary, and `@@ -old,count +new,count @@` hunks with three lines
+//! of context — is a read contract for any consumer that renders these
+//! receipts as diffs, so the hunked form is what every diffable change must
+//! reach, and the hunkless before/after preview survives only where no
+//! diffable region could be bounded at all.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
-/// Max old×new line-count product before the LCS diff falls back to a preview.
+/// Max old×new line-count product one change region may carry into the LCS
+/// matcher, past which the region is split before it is matched.
 ///
-/// The DP table is that product of cells, so past this bound the full
-/// diff would dominate the write's own output; the preview keeps
-/// the message proportional to the change instead.
+/// The DP table is that product of cells, so the bound is what keeps a
+/// single region's matching proportional to the change: it caps the
+/// quadratic core, not the file it describes. Regions the bound cannot
+/// cover are aligned on lines unique to each side and matched in parts;
+/// only a region with nothing to align on falls back to the preview.
 const MAX_LCS_PRODUCT: usize = 1_000_000;
 
-/// Lines shown per side in the large-file fallback preview (past `MAX_LCS_PRODUCT`).
+/// Unchanged lines printed on each side of a change region.
 ///
-/// Large enough that a reviewer sees the shape of each side, small
-/// enough that even a giant rename renders as two bounded blocks.
+/// The width a reader needs to see where a change sits: three lines before
+/// and after, and the same width of elision margin — an unchanged run
+/// longer than twice this is skipped rather than printed, its line count
+/// carried into the next hunk header instead.
+const CONTEXT_LINES: usize = 3;
+
+/// Lines a bounded receipt block may print per side.
+///
+/// Two blocks are bounded by this: the large-file fallback preview (past
+/// [`MAX_LCS_PRODUCT`] with nothing to align on), which prints this many
+/// lines of each side, and a new file's additions, which print this many
+/// `+ ` lines before the `... +N more lines` tail. The bound keeps a
+/// receipt proportional to what was written even when the answer is "this
+/// whole file", where no smaller honest form exists.
 const LARGE_DIFF_PREVIEW_LINES: usize = 1000;
 
-/// One line in an LCS diff, produced by `compute_lcs_diff`.
+/// One line in a diff sequence, produced by `build_diff_lines`.
 ///
 /// Each variant carries the line's raw text content (no prefix). The diff
 /// algorithm walks the old and new line lists and classifies each line:
@@ -46,6 +76,31 @@ enum LineDiff {
     /// `format_diff_with_context` emits it with a `+ ` prefix so the reader
     /// can see what was introduced.
     Inserted(String),
+
+    /// A run of unchanged lines the sequence leaves out, sized but not spelled.
+    ///
+    /// An unchanged run wider than the context margin is not printed — but
+    /// the lines it holds still count, because the `@@` headers address
+    /// lines by position. This entry carries the count on each side (always
+    /// equal for unchanged content, stored twice so the counts stay honest
+    /// however the sequence was assembled) and is never rendered itself: it
+    /// ends the hunk it follows and advances both line counters, which is
+    /// what lets a change at line 9 000 of a large file print its real
+    /// numbers without printing 9 000 lines to reach it.
+    Skipped {
+        /// Old-side lines the entry stands in for.
+        ///
+        /// Counted into every old-side line number that follows it, so a
+        /// hunk printed past the elision still addresses the line it names.
+        old: usize,
+
+        /// New-side lines the entry stands in for.
+        ///
+        /// Equal to [`Skipped::old`](Self::old) for the unchanged runs this
+        /// renderer builds; carried separately so no caller can quietly make
+        /// the two sides agree by accident.
+        new: usize,
+    },
 }
 
 /// What a success message renders against: the previous state of the
@@ -97,13 +152,17 @@ pub(crate) enum OldContent<'a> {
 /// The output differs by what [`OldContent`] says the target held:
 ///
 /// - **New file** ([`OldContent::Absent`]): prints a `Created:` header
-///   followed by the first 10 lines, each prefixed with `+ `. If the file
-///   exceeds 10 lines, a `... +N more lines` summary is appended.
+///   followed by the file's additions, each prefixed with `+ `, up to
+///   [`LARGE_DIFF_PREVIEW_LINES`] lines. Past that a `... +N more lines`
+///   summary closes the block, so a generated file stays bounded instead of
+///   echoing itself into the reader's context.
 /// - **Modified, readable text** ([`OldContent::Text`]): prints a
-///   `Changed:` header followed by an LCS-based line diff with 3 lines
+///   `Changed:` header followed by a line diff with [`CONTEXT_LINES`] lines
 ///   of context around each change region. Unchanged context lines are
 ///   prefixed with two spaces; inserted lines with `+ `; deleted lines
-///   with `- `.
+///   with `- `. Every region opens with an `@@` header carrying its real
+///   line numbers whatever the file's length, so an edit to a
+///   ten-thousand-line file prints its change and its margin, not its file.
 /// - **Modified, undecodable bytes** ([`OldContent::NotUtf8`]): prints
 ///   the `Changed:` header labeled `previous content not UTF-8` with no
 ///   diff body — there is no text to diff against, and an overwrite
@@ -124,7 +183,7 @@ pub(crate) fn format_file_change(
     match old_content {
         OldContent::Absent => {
             let lines: Vec<&str> = new_content.lines().collect();
-            let preview_count = lines.len().min(10);
+            let preview_count = lines.len().min(LARGE_DIFF_PREVIEW_LINES);
             let mut result = format!("Created: {file_path} (new file)\n");
             for line in lines.iter().take(preview_count) {
                 writeln!(result, "+ {line}").ok();
@@ -144,12 +203,10 @@ pub(crate) fn format_file_change(
         OldContent::Text(old) => {
             let old_lines: Vec<&str> = old.lines().collect();
             let new_lines: Vec<&str> = new_content.lines().collect();
-
-            if old_lines.len().saturating_mul(new_lines.len()) > MAX_LCS_PRODUCT {
+            let Some(diff) = build_diff_lines(&old_lines, &new_lines) else {
                 return format_large_diff(file_path, &old_lines, &new_lines);
-            }
+            };
 
-            let diff = compute_lcs_diff(&old_lines, &new_lines);
             let mut result = format!("Changed: {file_path} (modified)\n");
             if let Some(summary) = change_summary(&diff) {
                 result.push_str(&summary);
@@ -157,9 +214,414 @@ pub(crate) fn format_file_change(
             if let Some(note) = eof_change_note(old, new_content) {
                 result.push_str(&note);
             }
-            result.push_str(&format_diff_with_context(&diff, 3));
+            result.push_str(&format_diff_with_context(&diff, CONTEXT_LINES));
             result
         }
+    }
+}
+
+/// A change region located in the file: the changed lines and where they sit.
+///
+/// Produced by [`split_segment`] and stitched into the diff sequence by
+/// [`build_diff_lines`]. The ranges are absolute, half-open line positions in
+/// the old and new content and hold only the region's own changes — context
+/// is not stored here but drawn from the file around the range when the
+/// sequence is assembled, which is what keeps the stored work proportional to
+/// the change rather than to the file.
+struct ChangeWindow {
+    /// Half-open line range this region replaces in the old content.
+    ///
+    /// Absolute in the old file, and empty for a pure insertion — the pair of
+    /// ranges is what tells the stitcher how wide the unchanged stretch
+    /// around the region is, without carrying that stretch anywhere.
+    old: std::ops::Range<usize>,
+
+    /// Half-open line range this region writes into the new content.
+    ///
+    /// Absolute in the new file, and empty for a pure deletion. It usually
+    /// differs in length from [`ChangeWindow::old`], and by exactly the
+    /// region's net change — the stitcher's arithmetic depends on that.
+    new: std::ops::Range<usize>,
+
+    /// The region's own diff: removed and inserted lines, in order.
+    ///
+    /// Never holds [`LineDiff::Unchanged`] entries: context belongs to the
+    /// gaps between regions, which is where it can be shared, elided, and
+    /// counted without being materialised once per region.
+    entries: Vec<LineDiff>,
+}
+
+/// A stretch of the two files still to be aligned, in absolute line indices.
+///
+/// The unit of [`split_segment`]'s worklist: a segment is either resolved
+/// into a [`ChangeWindow`] outright or cut at anchor lines into smaller
+/// segments, so a file's whole diff is driven by an explicit queue rather than
+/// by call depth — a relocated block in a huge file cannot overflow the stack
+/// by being one recursion level deep per anchor.
+struct Segment {
+    /// Lines still to be matched on the old side, absolute in that file.
+    ///
+    /// Shrink-only: every part derived from a segment excludes the anchor
+    /// lines that split it, which is what makes the worklist terminate.
+    old: std::ops::Range<usize>,
+
+    /// Lines still to be matched on the new side, absolute in that file.
+    ///
+    /// Paired with [`Segment::old`] by the trimming and anchoring above it, so
+    /// the two ranges describe the same stretch of content on each side.
+    new: std::ops::Range<usize>,
+}
+
+/// Build the diff sequence between two files' lines at a cost the change sets.
+///
+/// The unchanged bulk around a change is the expensive part of diffing a
+/// large file and the least interesting part of reading one, so it is
+/// measured rather than matched: [`common_edges`] trims what the two sides
+/// share at their heads and tails by scanning, [`split_segment`] cuts anything
+/// still too wide to match at lines unique to each side, and the unchanged
+/// runs between the resulting regions are rendered by [`push_gap`] as context
+/// lines plus a counted [`LineDiff::Skipped`]. What comes out is the sequence
+/// a whole-file matcher would have produced — unchanged, deleted, and inserted
+/// lines in document order, with counted elisions standing in for runs wider
+/// than the context margin — so `format_diff_with_context` numbers every hunk
+/// from real file positions.
+///
+/// Returns `None` when a region too wide to match has no line unique to each
+/// side to align on: a wholesale rewrite, for which the caller renders the
+/// bounded before/after preview rather than a diff that would either cost the
+/// file's square or silently drop the lines it skipped.
+fn build_diff_lines(old_lines: &[&str], new_lines: &[&str]) -> Option<Vec<LineDiff>> {
+    let mut windows: Vec<ChangeWindow> = Vec::new();
+    let mut work: Vec<Segment> = vec![Segment {
+        old: 0..old_lines.len(),
+        new: 0..new_lines.len(),
+    }];
+    // The worklist is a stack and `split_segment` pushes the parts it derives
+    // in reverse, so regions come off it in document order.
+    while let Some(segment) = work.pop() {
+        split_segment(old_lines, new_lines, &segment, &mut windows, &mut work)?;
+    }
+    if windows.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut sequence: Vec<LineDiff> = Vec::new();
+    let mut old_at = 0_usize;
+    let mut new_at = 0_usize;
+    for window in windows {
+        push_gap(
+            &mut sequence,
+            old_lines,
+            old_at,
+            window.old.start,
+            new_at,
+            window.new.start,
+        );
+        old_at = window.old.end;
+        new_at = window.new.end;
+        sequence.extend(window.entries);
+    }
+    push_gap(
+        &mut sequence,
+        old_lines,
+        old_at,
+        old_lines.len(),
+        new_at,
+        new_lines.len(),
+    );
+    Some(sequence)
+}
+
+/// Resolve one segment into a change region, or cut it into smaller ones.
+///
+/// Three outcomes, tried in order:
+///
+/// 1. The segment's differing middle fits inside [`MAX_LCS_PRODUCT`], so
+///    [`compute_lcs_diff`] matches it there and the middle becomes a
+///    [`ChangeWindow`]. A middle empty on one side is a pure insertion or
+///    deletion and needs no matching at all.
+/// 2. The middle is wider, but [`unique_anchors`] finds lines occurring once
+///    on each side: the segment is cut at them and the stretches between
+///    consecutive anchors go back on the worklist, each one strictly smaller
+///    than the segment they came from.
+/// 3. The middle is wider and has nothing to align on — a rewrite with no
+///    surviving line. `None` sends the caller to the preview: no bound can be
+///    honoured, and eliding the middle would print numbers about lines the
+///    diff never saw.
+fn split_segment(
+    old_lines: &[&str],
+    new_lines: &[&str],
+    segment: &Segment,
+    windows: &mut Vec<ChangeWindow>,
+    work: &mut Vec<Segment>,
+) -> Option<()> {
+    let old_mid = old_lines.get(segment.old.clone())?;
+    let new_mid = new_lines.get(segment.new.clone())?;
+    let (prefix, suffix) = common_edges(old_mid, new_mid);
+    let old_start = segment.old.start.saturating_add(prefix);
+    let old_end = segment.old.end.saturating_sub(suffix);
+    let new_start = segment.new.start.saturating_add(prefix);
+    let new_end = segment.new.end.saturating_sub(suffix);
+    let old_count = old_end.saturating_sub(old_start);
+    let new_count = new_end.saturating_sub(new_start);
+
+    if old_count == 0 && new_count == 0 {
+        return Some(());
+    }
+
+    let addressable = old_count == 0 || new_count == 0;
+    if addressable || old_count.saturating_mul(new_count) <= MAX_LCS_PRODUCT {
+        let entries = compute_lcs_diff(
+            old_lines.get(old_start..old_end).unwrap_or_default(),
+            new_lines.get(new_start..new_end).unwrap_or_default(),
+        );
+        if !entries.is_empty() {
+            windows.push(ChangeWindow {
+                old: old_start..old_end,
+                new: new_start..new_end,
+                entries,
+            });
+        }
+        return Some(());
+    }
+
+    let anchors: Vec<(usize, usize)> = unique_anchors(
+        old_lines.get(old_start..old_end).unwrap_or_default(),
+        new_lines.get(new_start..new_end).unwrap_or_default(),
+    )
+    .into_iter()
+    .map(|(old_at, new_at)| {
+        (
+            old_start.saturating_add(old_at),
+            new_start.saturating_add(new_at),
+        )
+    })
+    .collect();
+    if anchors.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<Segment> = Vec::with_capacity(anchors.len().saturating_add(1));
+    let mut cursor = (old_start, new_start);
+    for &(anchor_old, anchor_new) in anchors.iter().chain(std::iter::once(&(old_end, new_end))) {
+        if anchor_old > cursor.0 || anchor_new > cursor.1 {
+            parts.push(Segment {
+                old: cursor.0..anchor_old,
+                new: cursor.1..anchor_new,
+            });
+        }
+        cursor = (anchor_old.saturating_add(1), anchor_new.saturating_add(1));
+    }
+    work.extend(parts.into_iter().rev());
+    Some(())
+}
+
+/// Count the lines the two sides share at their head and at their tail.
+///
+/// The cheap measurement that keeps the quadratic core off unchanged
+/// material: a prefix scan and a suffix scan, the second bounded by what the
+/// prefix left so the two runs cannot overlap. Everything between the counts
+/// is what actually differs — for a one-line edit anywhere in a large file,
+/// one line per side.
+fn common_edges(old: &[&str], new: &[&str]) -> (usize, usize) {
+    let prefix = old
+        .iter()
+        .zip(new.iter())
+        .take_while(|(before, after)| before == after)
+        .count();
+    let room = old
+        .len()
+        .saturating_sub(prefix)
+        .min(new.len().saturating_sub(prefix));
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take_while(|(before, after)| before == after)
+        .take(room)
+        .count();
+    (prefix, suffix)
+}
+
+/// The line pairs a too-wide region can be cut at, in ascending file order.
+///
+/// A line occurring exactly once on each side of a region is no coincidence:
+/// pairing its two occurrences is sound alignment however far apart they sit,
+/// which is what lets a region too wide for [`MAX_LCS_PRODUCT`] be cut into
+/// pieces small enough to match. Candidate pairs are the lines unique on both
+/// sides, taken in old-side order; the longest strictly increasing run of
+/// their new-side positions is returned, because an anchor sequence that
+/// crossed itself would align nothing. Content that genuinely moved — a
+/// relocated block, a file of repeated filler — yields few or no pairs, and
+/// [`split_segment`] then reports the region unalignable rather than guessing.
+fn unique_anchors(old: &[&str], new: &[&str]) -> Vec<(usize, usize)> {
+    let old_once = single_occurrences(old);
+    let new_once = single_occurrences(new);
+    let pairs: Vec<(usize, usize)> = old
+        .iter()
+        .enumerate()
+        .filter_map(|(old_at, line)| match old_once.get(line) {
+            Some(Slot::Once(first)) if *first == old_at => {
+                new_once.get(line).and_then(|slot| match slot {
+                    Slot::Once(new_at) => Some((old_at, *new_at)),
+                    Slot::Many => None,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    longest_anchor_run(&pairs)
+}
+
+/// How often a line occurs in a stretch: once, at which index, or more.
+///
+/// The histogram behind [`unique_anchors`], kept deliberately two-valued:
+/// an anchor only needs to know that a line is singular and where it sits,
+/// and a count would let a repeated line look almost unique.
+enum Slot {
+    /// The line occurred exactly once, at this index.
+    ///
+    /// The index is the pairing candidate — sound because there is no other
+    /// occurrence on this side to confuse it with.
+    Once(usize),
+
+    /// The line occurred more than once, so it cannot anchor an alignment.
+    ///
+    /// Marked on the second sighting and never revisited: which copy a
+    /// repeated line should pair with is not something the matcher can
+    /// decide from line identity alone.
+    Many,
+}
+
+/// Index every line that occurs exactly once in `lines`, by first occurrence.
+///
+/// Singleness is what makes an anchor trustworthy: a line repeated on either
+/// side could be paired with the wrong copy of itself. Lines seen twice or
+/// more are marked [`Slot::Many`] and never offered as a pair.
+fn single_occurrences<'a>(lines: &[&'a str]) -> HashMap<&'a str, Slot> {
+    let mut seen: HashMap<&str, Slot> = HashMap::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        match seen.entry(line) {
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(Slot::Once(index));
+            }
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                occupied.insert(Slot::Many);
+            }
+        }
+    }
+    seen
+}
+
+/// The longest strictly increasing run of new-side anchor positions.
+///
+/// `pairs` arrives ordered by old-side position, so an anchor sequence is
+/// valid exactly when its new-side positions rise. The classic patience tails
+/// array finds one in `O(k log k)`: `tails[len]` holds the index of the
+/// smallest new-side position that can end a run of `len + 1` anchors, and
+/// each pair records its predecessor so the winning run can be walked back
+/// out. Equal positions cannot occur — every pair's new-side index is unique
+/// by construction — so the run is strict without special-casing ties.
+fn longest_anchor_run(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut tails: Vec<usize> = Vec::new();
+    let mut predecessors: Vec<Option<usize>> = vec![None; pairs.len()];
+
+    for (index, pair) in pairs.iter().enumerate() {
+        let position = tails
+            .partition_point(|tail| pairs.get(*tail).is_some_and(|earlier| earlier.1 < pair.1));
+        if position > 0 {
+            let previous = tails.get(position.saturating_sub(1)).copied();
+            if let Some(slot) = predecessors.get_mut(index)
+                && let Some(previous) = previous
+            {
+                *slot = Some(previous);
+            }
+        }
+        if position == tails.len() {
+            tails.push(index);
+        } else if let Some(slot) = tails.get_mut(position) {
+            *slot = index;
+        }
+    }
+
+    let mut run: Vec<(usize, usize)> = Vec::with_capacity(tails.len());
+    let mut cursor = tails.last().copied();
+    while let Some(index) = cursor {
+        if let Some(pair) = pairs.get(index) {
+            run.push(*pair);
+        }
+        cursor = predecessors.get(index).copied().flatten();
+    }
+    run.reverse();
+    run
+}
+
+/// Append one shared line to the sequence, when the range still holds it.
+///
+/// The only writer of [`LineDiff::Unchanged`] in the stitcher, and the bounds
+/// check is the whole reason it exists: a context margin at either end of a
+/// large file is measured from a position that may not have [`CONTEXT_LINES`]
+/// lines left before or after it.
+fn push_shared(out: &mut Vec<LineDiff>, lines: &[&str], at: usize) {
+    if let Some(line) = lines.get(at) {
+        out.push(LineDiff::Unchanged((*line).to_string()));
+    }
+}
+
+/// Render the unchanged stretch between two change regions as context.
+///
+/// A short run — no wider than the context margin on both sides together — is
+/// printed whole, which is what keeps two nearby changes inside one hunk
+/// rather than splitting them across two. A wider run prints the margin on
+/// each side and a [`LineDiff::Skipped`] carrying the lines left out, so the
+/// next hunk's header still addresses real file positions.
+///
+/// The printed text comes from the old side because the run between two
+/// regions is shared content — trimming and anchoring only ever cut at lines
+/// both sides hold — so the counts are taken from both ranges and the printed
+/// lines from one. A caller whose ranges disagreed would print the margin it
+/// measured on the old side and count the difference into the elision, keeping
+/// the following numbers honest about lines it did not print.
+fn push_gap(
+    out: &mut Vec<LineDiff>,
+    old_lines: &[&str],
+    old_from: usize,
+    old_to: usize,
+    new_from: usize,
+    new_to: usize,
+) {
+    let old_gap = old_to.saturating_sub(old_from);
+    let new_gap = new_to.saturating_sub(new_from);
+    if old_gap == 0 && new_gap == 0 {
+        return;
+    }
+    let shared = old_gap.min(new_gap);
+    let margin = CONTEXT_LINES.saturating_mul(2);
+
+    if shared > margin {
+        for offset in 0..CONTEXT_LINES {
+            push_shared(out, old_lines, old_from.saturating_add(offset));
+        }
+        out.push(LineDiff::Skipped {
+            old: shared.saturating_sub(margin),
+            new: shared.saturating_sub(margin),
+        });
+        for offset in shared.saturating_sub(CONTEXT_LINES)..shared {
+            push_shared(out, old_lines, old_from.saturating_add(offset));
+        }
+    } else {
+        for offset in 0..shared {
+            push_shared(out, old_lines, old_from.saturating_add(offset));
+        }
+    }
+
+    let old_extra = old_gap.saturating_sub(shared);
+    let new_extra = new_gap.saturating_sub(shared);
+    if old_extra > 0 || new_extra > 0 {
+        out.push(LineDiff::Skipped {
+            old: old_extra,
+            new: new_extra,
+        });
     }
 }
 
@@ -423,20 +885,81 @@ fn is_new_line_inserted(dp: &[usize], stride: usize, i: usize, j: usize) -> bool
 /// next region's header. The numbers let a reader — model or display —
 /// address the change where it sits in the file, not only in the
 /// preview.
+///
+/// A [`LineDiff::Skipped`] is never printed. It closes the run it follows and
+/// advances both counters by the lines it stands for, so the numbers on the
+/// far side of an elision are still the file's own: what a reader sees is a
+/// change's real address even when the diff reached it across unchanged lines
+/// it did not print.
 fn format_diff_with_context(line_diff: &[LineDiff], context: usize) -> String {
+    let mut result = String::new();
+    let mut old_at = 0_usize;
+    let mut new_at = 0_usize;
+    let mut cursor = 0_usize;
+    loop {
+        let run_end = line_diff
+            .get(cursor..)
+            .and_then(|rest| {
+                rest.iter()
+                    .position(|entry| matches!(entry, LineDiff::Skipped { .. }))
+            })
+            .map_or(line_diff.len(), |offset| cursor.saturating_add(offset));
+        let run = line_diff.get(cursor..run_end).unwrap_or_default();
+        if !run.is_empty() {
+            result.push_str(&format_numbered_run(run, context, old_at, new_at));
+            for entry in run {
+                match entry {
+                    LineDiff::Unchanged(_) => {
+                        old_at = old_at.saturating_add(1);
+                        new_at = new_at.saturating_add(1);
+                    }
+                    LineDiff::Deleted(_) => old_at = old_at.saturating_add(1),
+                    LineDiff::Inserted(_) => new_at = new_at.saturating_add(1),
+                    LineDiff::Skipped { .. } => {}
+                }
+            }
+        }
+        let Some(LineDiff::Skipped { old, new }) = line_diff.get(run_end) else {
+            break;
+        };
+        old_at = old_at.saturating_add(*old);
+        new_at = new_at.saturating_add(*new);
+        cursor = run_end.saturating_add(1);
+    }
+    result
+}
+
+/// Render one numbering run — a stretch of diff entries with no elision in it.
+///
+/// `old_at` and `new_at` are the lines each side has already accounted for
+/// before this run, printed or elided, so numbering continues where the file
+/// stands instead of restarting at one. A run with no line on one side is an
+/// empty side and is addressed at the line *before* the change: an insertion
+/// below line 400 opens `-400,0`, and the head of a file opens at zero.
+fn format_numbered_run(
+    line_diff: &[LineDiff],
+    context: usize,
+    old_at: usize,
+    new_at: usize,
+) -> String {
     /// One numbered diff entry: the kind, its text, and its 1-based
     /// line number on whichever side it occupies.
     struct Numbered<'a> {
+        /// Set for a line only the old content holds — printed with `- `.
         deleted: bool,
+        /// Set for a line only the new content holds — printed with `+ `.
         inserted: bool,
+        /// The line's text, without the gutter prefix.
         text: &'a str,
-        old_no: Option<u32>,
-        new_no: Option<u32>,
+        /// Its 1-based position in the old file, or `None` if it has none.
+        old_no: Option<usize>,
+        /// Its 1-based position in the new file, or `None` if it has none.
+        new_no: Option<usize>,
     }
 
     let mut numbered: Vec<Numbered> = Vec::with_capacity(line_diff.len());
-    let mut old_no = 0_u32;
-    let mut new_no = 0_u32;
+    let mut old_no = old_at;
+    let mut new_no = new_at;
     for diff in line_diff {
         match diff {
             LineDiff::Unchanged(text) => {
@@ -470,12 +993,13 @@ fn format_diff_with_context(line_diff: &[LineDiff], context: usize) -> String {
                     new_no: Some(new_no),
                 });
             }
+            LineDiff::Skipped { old, new } => {
+                old_no = old_no.saturating_add(*old);
+                new_no = new_no.saturating_add(*new);
+            }
         }
     }
 
-    // A change region per maximal run of changes, widened by `context`
-    // on both sides; regions whose windows overlap or touch merge, the
-    // same elision the headerless form produced.
     let mut regions: Vec<(usize, usize)> = Vec::new();
     let mut index = 0_usize;
     while let Some(change_at) = numbered.get(index..).and_then(|rest| {
@@ -511,8 +1035,14 @@ fn format_diff_with_context(line_diff: &[LineDiff], context: usize) -> String {
     let mut result = String::new();
     for (start, end) in regions {
         let slice = numbered.get(start..end).unwrap_or_default();
-        let old_start = slice.iter().find_map(|entry| entry.old_no).unwrap_or(0);
-        let new_start = slice.iter().find_map(|entry| entry.new_no).unwrap_or(0);
+        let old_start = slice
+            .iter()
+            .find_map(|entry| entry.old_no)
+            .unwrap_or(old_at);
+        let new_start = slice
+            .iter()
+            .find_map(|entry| entry.new_no)
+            .unwrap_or(new_at);
         let old_count = slice.iter().filter(|entry| entry.old_no.is_some()).count();
         let new_count = slice.iter().filter(|entry| entry.new_no.is_some()).count();
         writeln!(
@@ -549,11 +1079,40 @@ mod tests {
     }
 
     #[test]
-    fn new_file_truncates_long_preview() {
-        let content: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    fn created_file_renders_full_additions() {
+        // Every line of a new file is an addition, yet the block printed ten
+        // of them and a count: a 30-line write showed 10 lines and told the
+        // reader about the other 20. The additions are the diff here, so they
+        // print.
+        let content: String = (1..=30).map(|i| format!("line {i}\n")).collect();
         let result = format_file_change("test.rs", OldContent::Absent, &content);
-        assert!(result.contains("... +10 more lines"));
-        assert!(!result.contains("+ line 11"));
+        assert!(result.contains("Created: test.rs (new file)"), "{result}");
+        assert!(result.contains("+ line 30"), "{result}");
+        assert!(!result.contains("more lines"), "{result}");
+        let added = result.lines().filter(|line| line.starts_with("+ ")).count();
+        assert_eq!(added, 30, "every addition is on the receipt: {result}");
+    }
+
+    #[test]
+    fn a_new_file_past_the_preview_bound_keeps_its_tail_note() {
+        // The bound is what stops a generated file from echoing itself into
+        // the reader's context, and the tail is what keeps the bound honest
+        // about how much it left out.
+        let content: String = (1..=1200).map(|i| format!("line {i}\n")).collect();
+        let result = format_file_change("test.rs", OldContent::Absent, &content);
+        let added = result.lines().filter(|line| line.starts_with("+ ")).count();
+        assert_eq!(
+            added, LARGE_DIFF_PREVIEW_LINES,
+            "the additions block stays bounded"
+        );
+        assert!(
+            result.contains("... +200 more lines"),
+            "the tail names what it hid"
+        );
+        assert!(
+            !result.contains("+ line 1001"),
+            "nothing prints past the bound"
+        );
     }
 
     #[test]
@@ -669,20 +1228,186 @@ mod tests {
     }
 
     #[test]
-    fn large_files_fall_back_to_a_preview() {
+    fn large_file_edit_emits_hunks() {
+        // Two thousand lines against two thousand lines is four million pairs,
+        // past the budget the matcher used to check the whole file against —
+        // which is where every real source file landed: a `Changed:` header,
+        // no `@@` at all, and up to a thousand untouched lines echoed per
+        // side. The change is one line wide, so the receipt is now too.
         let old: String = (1..=2000).map(|i| format!("line {i}\n")).collect();
         let new: String = (1..=2000)
-            .map(|i| format!("line {i}\n"))
-            .chain(std::iter::once("APPENDED\n".to_string()))
+            .map(|i| {
+                if i == 1500 {
+                    "CHANGED\n".to_string()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
             .collect();
         let result = format_file_change("big.rs", OldContent::Text(&old), &new);
+
+        assert!(result.contains("Changed: big.rs (modified)"), "{result}");
+        assert!(!result.contains("large file"), "{result}");
+        assert!(!result.contains("Before:"), "{result}");
+        assert!(result.contains("@@ -1497,7 +1497,7 @@"), "{result}");
+        assert!(result.contains("- line 1500"), "{result}");
+        assert!(result.contains("+ CHANGED"), "{result}");
+        assert_eq!(
+            result.lines().count(),
+            11,
+            "a header, a summary, one hunk header, and the change with three \
+             context lines per side — the file itself is never echoed: {result}"
+        );
+    }
+
+    #[test]
+    fn a_line_appended_to_a_large_file_reports_the_end_of_the_file() {
+        let old: String = (1..=2000).map(|i| format!("line {i}\n")).collect();
+        let new: String = old
+            .lines()
+            .chain(std::iter::once("APPENDED"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let result = format_file_change("big.rs", OldContent::Text(&old), &new);
+        assert!(result.contains("Changed: big.rs (modified)"), "{result}");
+        assert!(!result.contains("large file"), "{result}");
+        assert!(result.contains("@@ -1998,3 +1998,4 @@"), "{result}");
+        assert!(result.contains("+ APPENDED"), "{result}");
+    }
+
+    #[test]
+    fn hunk_line_numbers_match_the_file() {
+        // Hand-computed fixture: 2 000 distinct lines, the change at line
+        // 1 001, so the region addresses lines 998..=1004 on each side.
+        // Numbers taken from the change alone would say 1..=7; an elision
+        // that lost count of the lines it stepped over would say anything
+        // else, which is the failure this fixture exists to catch.
+        let old: String = (1..=2000).map(|i| format!("line {i}\n")).collect();
+        let new: String = (1..=2000)
+            .map(|i| {
+                if i == 1001 {
+                    "CHANGED\n".to_string()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        let result = format_file_change("big.rs", OldContent::Text(&old), &new);
+        assert!(result.contains("@@ -998,7 +998,7 @@"), "{result}");
+        let body: Vec<&str> = result.lines().skip(3).collect();
+        assert_eq!(
+            body,
+            vec![
+                "  line 998",
+                "  line 999",
+                "  line 1000",
+                "- line 1001",
+                "+ CHANGED",
+                "  line 1002",
+                "  line 1003",
+                "  line 1004",
+            ],
+            "the region prints exactly the file's own lines around the change: {result}"
+        );
+    }
+
+    #[test]
+    fn two_far_apart_edits_in_a_large_file_report_their_own_hunks() {
+        // The stretch between the two changes is ~1 400 lines per side — over
+        // the matcher's budget on its own — so the region is aligned on lines
+        // each side holds once, and each change keeps its real address.
+        let lines: Vec<String> = (1..=2000).map(|i| format!("line {i}")).collect();
+        let mut changed = lines.clone();
+        changed[9] = "FIRST".to_string();
+        changed[1499] = "SECOND".to_string();
+        let old = lines.join("\n");
+        let new = changed.join("\n");
+
+        let result = format_file_change("big.rs", OldContent::Text(&old), &new);
+        let hunks: Vec<&str> = result
+            .lines()
+            .filter(|line| line.starts_with("@@"))
+            .collect();
+        assert_eq!(
+            hunks,
+            vec!["@@ -7,7 +7,7 @@", "@@ -1497,7 +1497,7 @@"],
+            "both changes report where they sit: {result}"
+        );
         assert!(
-            result.contains("Changed: big.rs (modified, large file)"),
+            result.contains("2 lines removed, 2 lines added"),
             "{result}"
         );
-        assert!(result.contains("Before:"));
-        assert!(result.contains("After:"));
-        assert!(result.contains("more lines"));
+        assert!(
+            !result.contains("line 700"),
+            "the stretch between them is not echoed: {result}"
+        );
+        assert!(
+            result.lines().count() <= 20,
+            "two regions cost two hunks, not the file between them: {result}"
+        );
+    }
+
+    #[test]
+    fn two_edits_within_the_context_margin_share_one_hunk() {
+        // The merge the elision depends on: changes close enough that their
+        // context windows touch print as one region, exactly as two changes in
+        // a small file do.
+        let lines: Vec<String> = (1..=2000).map(|i| format!("line {i}")).collect();
+        let mut changed = lines.clone();
+        changed[1499] = "FIRST".to_string();
+        changed[1502] = "SECOND".to_string();
+        let old = lines.join("\n");
+        let new = changed.join("\n");
+
+        let result = format_file_change("big.rs", OldContent::Text(&old), &new);
+        let hunks: Vec<&str> = result
+            .lines()
+            .filter(|line| line.starts_with("@@"))
+            .collect();
+        assert_eq!(hunks, vec!["@@ -1497,10 +1497,10 @@"], "{result}");
+    }
+
+    #[test]
+    fn a_line_deleted_from_a_large_file_reports_both_sides_counts() {
+        // A removal is asymmetric, and the header has to say so: seven old
+        // lines addressed, six on the new side, because one line is gone.
+        let old: String = (1..=2000).map(|i| format!("line {i}\n")).collect();
+        let new: String = (1..=2000)
+            .filter(|i| *i != 1000)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let result = format_file_change("big.rs", OldContent::Text(&old), &new);
+        assert!(result.contains("@@ -997,7 +997,6 @@"), "{result}");
+        assert!(result.contains("- line 1000"), "{result}");
+        assert!(result.contains("1 line removed"), "{result}");
+        assert!(!result.contains("added"), "{result}");
+    }
+
+    #[test]
+    fn an_unalignable_large_rewrite_keeps_the_preview() {
+        // The fallback keeps its own pin. Interleaved filler shares no line
+        // that occurs once on each side, so there is nothing to align the
+        // region on; past the budget the honest answer is the bounded
+        // before/after block, labelled as such and readable as prose — never a
+        // hunk whose numbers would describe lines the diff never reached.
+        let old: String = (0..1200).map(|_| "a\nb\n").collect();
+        let new: String = (0..1200).map(|_| "b\na\n").collect();
+        let result = format_file_change("data.txt", OldContent::Text(&old), &new);
+        assert!(
+            result.contains("Changed: data.txt (modified, large file)"),
+            "{result}"
+        );
+        assert!(result.contains("Before:"), "{result}");
+        assert!(result.contains("After:"), "{result}");
+        assert!(
+            !result.contains("@@"),
+            "no hunk may claim addresses the matcher did not reach: {result}"
+        );
+        assert_eq!(
+            result.lines().count(),
+            LARGE_DIFF_PREVIEW_LINES.saturating_mul(2).saturating_add(5),
+            "two bounded sides, two tails, one header: {result}"
+        );
     }
 
     #[test]

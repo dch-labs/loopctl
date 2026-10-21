@@ -1155,10 +1155,11 @@ struct RequestBody {
 
     /// The top-level `reasoning_effort` for reasoning-capable models.
     ///
-    /// `None` omits the parameter entirely — the byte-identical default.
-    /// Carries the level's wire label with `Max` already clamped to
-    /// `"high"` per [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
-    /// table.
+    /// `None` omits the parameter entirely — the byte-identical
+    /// default. Carries the level's own wire label verbatim per
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
+    /// table — `Max` rides as `"max"`, never clamped to a lower
+    /// step.
     reasoning_effort: Option<&'static str>,
 
     /// Whether to request `stream_options.include_usage` when streaming.
@@ -1321,16 +1322,22 @@ impl RequestBody {
 
 /// The Chat Completions `reasoning_effort` label for one effort level.
 ///
-/// The fixed mapping from [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
-/// table: `Low` and `Medium` pass through as `"low"`/`"medium"`, while
-/// `High` and `Max` both send `"high"` — the parameter tops out there,
-/// so the ladder's top step clamps instead of inventing a value the API
-/// rejects.
+/// The level's own name, verbatim, from
+/// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table:
+/// `None` sends `"none"`, `Minimal` `"minimal"`, `Xhigh` `"xhigh"`,
+/// and `Max` `"max"` — the ladder does not clamp. A provider whose
+/// parameter tops out lower (stock OpenAI accepts neither `"xhigh"`
+/// nor `"max"`) rejects the label with its own error, which surfaces
+/// the mismatch instead of silently downgrading the run.
 fn reasoning_effort_label(effort: crate::structured::ThinkingEffort) -> &'static str {
     match effort {
+        crate::structured::ThinkingEffort::None => "none",
+        crate::structured::ThinkingEffort::Minimal => "minimal",
         crate::structured::ThinkingEffort::Low => "low",
         crate::structured::ThinkingEffort::Medium => "medium",
-        crate::structured::ThinkingEffort::High | crate::structured::ThinkingEffort::Max => "high",
+        crate::structured::ThinkingEffort::High => "high",
+        crate::structured::ThinkingEffort::Xhigh => "xhigh",
+        crate::structured::ThinkingEffort::Max => "max",
     }
 }
 
@@ -4814,6 +4821,16 @@ mod tests {
             low.contains("\"reasoning_effort\":\"low\""),
             "the Low rung maps to the provider's low label: {low}"
         );
+        let xhigh = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Xhigh),
+        )
+        .await;
+        assert!(
+            xhigh.contains("\"reasoning_effort\":\"xhigh\""),
+            "the Xhigh rung rides the wire under its own name: {xhigh}"
+        );
         let max = captured_effort_body(
             None,
             crate::structured::RequestOptions::new()
@@ -4821,9 +4838,19 @@ mod tests {
         )
         .await;
         assert!(
-            max.contains("\"reasoning_effort\":\"high\"")
-                && !max.contains("\"reasoning_effort\":\"max\""),
-            "Max clamps to the parameter's high ceiling, never a literal max label: {max}"
+            max.contains("\"reasoning_effort\":\"max\"")
+                && !max.contains("\"reasoning_effort\":\"high\""),
+            "Max rides verbatim — no silent clamp to high: {max}"
+        );
+        let none = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+        )
+        .await;
+        assert!(
+            none.contains("\"reasoning_effort\":\"none\""),
+            "the None rung is the wire's own off spelling: {none}"
         );
     }
 
@@ -4924,7 +4951,7 @@ mod tests {
         let request = server.await.unwrap();
         assert!(
             request.contains("\"reasoning_effort\":\"medium\""),
-            "an unset per-request effort inherits the client default — there is no per-request off: {request}"
+            "an unset per-request effort inherits the client default — the per-request off is the `None` rung: {request}"
         );
     }
 

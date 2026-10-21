@@ -637,8 +637,12 @@ impl GeminiClientBuilder {
     ///
     /// Every request then carries the level's budget as
     /// `generationConfig.thinkingConfig.thinkingBudget` (per
-    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table). A
-    /// per-request
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table) —
+    /// except the [`None`](crate::structured::ThinkingEffort::None)
+    /// rung, the client-wide off, which carries the provider's own
+    /// `0` sentinel — switched off only on a model that accepts that
+    /// value, so a client pointed at a model with no off level hears
+    /// the provider's own error. A per-request
     /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
     /// always wins; an unset client default leaves unconfigured requests
     /// byte-identical to prior versions.
@@ -799,15 +803,27 @@ fn build_request_body(
 /// The `thinkingConfig.thinkingBudget` value for one effort level.
 ///
 /// The fixed ladder from [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
-/// table: `Low` budgets `1024` tokens, `Medium` `8192`, `High` `16384`,
-/// and `Max` `24576`. The provider's dynamic sentinels (`0`, `-1`) are
-/// deliberately not on the ladder — a set level always names a real
-/// budget.
+/// table: `Minimal` budgets `512` tokens, `Low` `1024`, `Medium` `8192`,
+/// `High` `16384`, `Xhigh` `20480`, and `Max` `24576`. The `None` level
+/// carries the provider's own off sentinel, `0` — the one sentinel
+/// value on the ladder; `-1` (dynamic, model-chosen) stays off it, so
+/// every other set level names a real budget.
+///
+/// Whether that sentinel switches thinking off belongs to the serving
+/// model, not to the mapping: a model with no off level — Gemini 2.5
+/// Pro lists `low`, `medium`, and `high`, so a `0` budget sits below
+/// anything it accepts — answers the request with its own error. The
+/// budget is sent as mapped whatever model the client names; the ladder
+/// never probes the model, so the refusal stays the provider's own and
+/// reaches the caller as one.
 fn gemini_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
     match effort {
+        crate::structured::ThinkingEffort::None => 0,
+        crate::structured::ThinkingEffort::Minimal => 512,
         crate::structured::ThinkingEffort::Low => 1024,
         crate::structured::ThinkingEffort::Medium => 8192,
         crate::structured::ThinkingEffort::High => 16384,
+        crate::structured::ThinkingEffort::Xhigh => 20480,
         crate::structured::ThinkingEffort::Max => 24576,
     }
 }
@@ -3619,6 +3635,17 @@ mod tests {
             no_default.contains("\"thinkingBudget\":16384"),
             "a request effort reaches the wire without any client default: {no_default}"
         );
+        let none_overrides = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::High),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+        )
+        .await;
+        assert!(
+            none_overrides.contains("\"thinkingBudget\":0")
+                && !none_overrides.contains("\"thinkingBudget\":16384"),
+            "the None rung overrides a client default with the provider's own off sentinel: {none_overrides}"
+        );
     }
 
     #[tokio::test]
@@ -3633,6 +3660,26 @@ mod tests {
             low.contains("\"thinkingBudget\":1024"),
             "the Low rung maps to the ladder's 1024 budget: {low}"
         );
+        let minimal = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Minimal),
+        )
+        .await;
+        assert!(
+            minimal.contains("\"thinkingBudget\":512"),
+            "Minimal budgets the ladder's floor: {minimal}"
+        );
+        let off = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+        )
+        .await;
+        assert!(
+            off.contains("\"thinkingBudget\":0"),
+            "the None rung carries the provider's own off sentinel: {off}"
+        );
         let max = captured_effort_body(
             None,
             crate::structured::RequestOptions::new()
@@ -3642,6 +3689,22 @@ mod tests {
         assert!(
             max.contains("\"thinkingBudget\":24576"),
             "the Max rung maps to the ladder's 24576 budget: {max}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_off_sentinel_reaches_a_model_with_no_off_level() {
+        let request = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_model("gemini-2.5-pro")
+                .with_effort(crate::structured::ThinkingEffort::None),
+        )
+        .await;
+        assert!(
+            request.contains("/models/gemini-2.5-pro:streamGenerateContent")
+                && request.contains("\"thinkingBudget\":0"),
+            "the off rung is mapped whatever model the request names — whether that model accepts 0 is the provider's to answer: {request}"
         );
     }
 

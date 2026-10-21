@@ -125,6 +125,36 @@ pub struct Message {
 /// coalesces before resuming, so the guarantee is universal in
 /// practice but the *wire* merge is Anthropic-build-only until a
 /// strict consumer appears on another route.
+/// Guarantee a tool-carrying assistant never opens a request.
+///
+/// Some providers reject a request whose first message is an
+/// assistant carrying a tool call — the shape a compacted history can
+/// wear when its head coalesces the summary into the tail's opening
+/// tool turn. When `messages` opens that way, a minimal user message
+/// rides ahead of it so the request opens the way providers expect;
+/// every other shape passes through untouched. A per-request,
+/// stateless repair: the injected head is never persisted, so a
+/// compactor that keeps producing the shape cannot lock the engine
+/// into an inject-and-drop loop.
+#[cfg(feature = "anthropic")]
+pub(crate) fn user_head_before_tool_use_opening(messages: Vec<Message>) -> Vec<Message> {
+    let opens_with_tool_use = messages.first().is_some_and(|first| {
+        first.role == Role::Assistant
+            && first
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::ToolCall { .. }))
+    });
+    if opens_with_tool_use {
+        let mut out = Vec::with_capacity(messages.len().saturating_add(1));
+        out.push(Message::user("(the conversation continues)"));
+        out.extend(messages);
+        out
+    } else {
+        messages
+    }
+}
+
 pub(crate) fn coalesce_adjacent_assistants(messages: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     for message in messages {

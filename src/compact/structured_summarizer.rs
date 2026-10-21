@@ -1364,7 +1364,7 @@ impl ContextCompactor for StructuredSummarizer {
             {
                 out.push(first.clone());
             }
-            out.push(Message::assistant(text));
+            out.push(Message::user(text));
             out.extend_from_slice(&pulled);
             out.extend_from_slice(&split.preserved);
             crate::compact::prepend_pinned(&mut out, &context.pinned);
@@ -2110,7 +2110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_summary_message_is_assistant_role_and_precedes_the_preserved_tail() {
+    async fn the_summary_message_is_user_role_and_precedes_the_preserved_tail() {
         let (_client, summarizer) = scripted_with(
             vec![ok(&canonical_response())],
             StructuredSummaryConfig::default().with_summary_budget_pct(0.9),
@@ -2122,7 +2122,11 @@ mod tests {
             .compact(messages.clone(), target, context_for(&messages))
             .await;
         let first = outcome.messages.first().expect("the output is non-empty");
-        assert_eq!(first.role, Role::Assistant, "the summary is assistant-role");
+        assert_eq!(
+            first.role,
+            Role::User,
+            "the summary is user-role — a compacted history opens the way providers expect"
+        );
         assert!(first.text_content().starts_with("## Conversation summary"));
         assert_eq!(
             outcome.messages.len(),
@@ -2163,8 +2167,8 @@ mod tests {
         );
         assert_eq!(
             outcome.messages.get(1).map(|message| message.role),
-            Some(Role::Assistant),
-            "the summary follows the system message"
+            Some(Role::User),
+            "the summary follows the system message as a user-role head"
         );
         assert!(
             outcome

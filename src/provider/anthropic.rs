@@ -61,6 +61,66 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// them never silently changes the output budget.
 pub(super) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
+/// The deadline on the Models API thinking-capability probe.
+///
+/// Deliberately far shorter than the conversational read timeout: an
+/// endpoint without a Models API (a gateway, a local Messages-compatible
+/// server) is a normal deployment rather than a failure, and a wedged
+/// metadata route must not stall a run's first turn waiting on the timeout
+/// a completion was given.
+const CAPABILITIES_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many models one client caches thinking disclosures for.
+///
+/// A loose bound rather than a tight one: a run consults a handful of models,
+/// and an evicted entry costs the next request one probe. What it rules out is
+/// a long-lived client handed a fresh model name per request growing the map
+/// for the lifetime of the process.
+const CAPABILITY_CACHE_MAX_MODELS: usize = 32;
+
+/// How many consecutive inconclusive probes one model gets before the client
+/// stops asking it.
+///
+/// Three, a deliberately small number. One blip is not a verdict — that is the
+/// whole reason [`ProbeOutcome::Inconclusive`] exists and is not filed — but a
+/// metadata route that refuses or ignores three probes in a row is stating a
+/// deployment fact rather than having bad luck: a scoped key that answers
+/// `401` on `/v1/models` while happily serving `/v1/messages`, a gateway that
+/// `5xx`-es every path it does not know, or a route that accepts the
+/// connection and never responds. Untreated, each of those puts a probe in
+/// front of *every* request that sets an effort — on the hanging shape, the
+/// full [`CAPABILITIES_PROBE_TIMEOUT`] added to every turn of a run, which is
+/// exactly how an Anthropic-compatible gateway profile becomes slow.
+///
+/// The streak resets whenever the endpoint answers, so an outage shorter than
+/// the limit still recovers on the next turn. Past the limit the verdict is
+/// *served* rather than filed, and [`CAPABILITY_PROBE_REPROBE_AFTER`] decides
+/// when the route is asked again.
+const CAPABILITY_PROBE_MISS_LIMIT: u8 = 3;
+
+/// Requests served on the give-up verdict before the route is asked again.
+///
+/// The give-up verdict is this client's inference — three refusals in a row
+/// read as "nothing to disclose" — and an inference cannot be allowed to
+/// outlive the outage it was drawn from. Filed as though it were an answer, a
+/// route that came back an hour later would leave an adaptive-tier model
+/// served the budget spelling it refuses, on every turn, for the life of the
+/// client: the one failure mode the definitive/inconclusive split exists to
+/// avoid, arriving by a different road.
+///
+/// So the verdict expires instead of standing. The count is what replaces
+/// permanence: at most one probe per this many effort-bearing requests, which
+/// keeps a permanently dead route to one probe (and at worst one
+/// [`CAPABILITIES_PROBE_TIMEOUT`]) per 29 turns after the initial three, while
+/// a route that recovered is believed again within a turn or two of ordinary
+/// use. A definitive non-answer — a `404`, a body that was never JSON — is not
+/// on this path at all: that endpoint *answered*, and is asked once.
+///
+/// Must stay above [`CAPABILITY_PROBE_MISS_LIMIT`], and
+/// `the_capability_cache_renews_its_give_up_verdict_on_a_bound` fails if the
+/// two are ever configured the wrong way round.
+const CAPABILITY_PROBE_REPROBE_AFTER: u8 = 32;
+
 /// An Anthropic Claude chat client with streaming support.
 ///
 /// Implements [`ApiClient`] by translating between the framework's
@@ -111,8 +171,21 @@ pub struct AnthropicClient {
     /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table)
     /// unless the request carries its own
     /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort).
-    /// Set via [`AnthropicClientBuilder::thinking_effort`].
+    /// A model whose disclosure names a different thinking control gets that
+    /// one instead; set via [`AnthropicClientBuilder::thinking_effort`].
     thinking_effort: Option<crate::structured::ThinkingEffort>,
+
+    /// What the serving model disclosed about the thinking it accepts.
+    ///
+    /// Shared behind an [`std::sync::Arc`] because the streaming path reads
+    /// it from inside a `'static` stream, and locked because a probe
+    /// resolves asynchronously while later requests are being built. Entries
+    /// are keyed by model, so a swap mid-probe cannot have one model read
+    /// another's answer and the map is never cleared wholesale — the cached
+    /// answer belongs to whichever request names that model, the client's own
+    /// or a [`RequestOptions::model`](crate::structured::RequestOptions::model)
+    /// override.
+    thinking_capabilities: std::sync::Arc<std::sync::Mutex<CapabilityCache>>,
 
     /// Whether prior-turn reasoning is replayed on outgoing requests.
     ///
@@ -261,6 +334,24 @@ impl AnthropicClient {
             apply_prompt_cache_breakpoints(&mut body);
         }
         body
+    }
+
+    /// Snapshot what a thinking probe needs to address one model.
+    ///
+    /// Built per request because a request can name its own model
+    /// ([`RequestOptions::model`](crate::structured::RequestOptions::model))
+    /// and the client's model can be hot-swapped between requests; the
+    /// expensive parts it carries are the pooled handle (an `Arc` clone) and
+    /// the shared capability cache.
+    fn thinking_probe(&self, model: &str) -> ThinkingProbe {
+        ThinkingProbe {
+            http: self.http.clone(),
+            api_key: self.api_key.clone(),
+            url: format!("{}/v1/models/{model}", self.base_url),
+            cache: std::sync::Arc::clone(&self.thinking_capabilities),
+            model: model.to_string(),
+            configured_max_tokens: self.max_tokens,
+        }
     }
 
     /// Build a typed [`NonStreamingResponse`] from Anthropic's native JSON.
@@ -429,7 +520,8 @@ impl ApiClient for AnthropicClient {
             }));
         }
         let effort = options.effort.or(self.thinking_effort);
-        if options.response_format.is_some() && effort.is_some() {
+        if options.response_format.is_some() && effort.and_then(anthropic_thinking_budget).is_some()
+        {
             return Box::pin(futures::stream::once(async move {
                 Err(effort_tool_choice_conflict_error())
             }));
@@ -456,8 +548,14 @@ impl ApiClient for AnthropicClient {
         let url = self.messages_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
+        let probe = effort.is_some().then(|| self.thinking_probe(&model));
 
         Box::pin(async_stream::try_stream! {
+            let mut body = body;
+            if let Some(probe) = &probe {
+                let wire = probe.resolve(effort).await?;
+                apply_model_thinking(&mut body, wire, probe.configured_max_tokens);
+            }
             let resp = Self::post_messages(&http, &url, &api_key, &body).await?;
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
@@ -492,7 +590,8 @@ impl ApiClient for AnthropicClient {
             return Box::pin(async move { Err(strict_unsupported_error("Anthropic")) });
         }
         let effort = options.effort.or(self.thinking_effort);
-        if options.response_format.is_some() && effort.is_some() {
+        if options.response_format.is_some() && effort.and_then(anthropic_thinking_budget).is_some()
+        {
             return Box::pin(async move { Err(effort_tool_choice_conflict_error()) });
         }
         let system = request.system.clone();
@@ -515,7 +614,13 @@ impl ApiClient for AnthropicClient {
             effort,
         );
         let url = self.messages_url();
+        let probe = effort.is_some().then(|| self.thinking_probe(&model));
         Box::pin(async move {
+            let mut body = body;
+            if let Some(probe) = &probe {
+                let wire = probe.resolve(effort).await?;
+                apply_model_thinking(&mut body, wire, probe.configured_max_tokens);
+            }
             let resp = Self::post_messages(&self.http, &url, &self.api_key, &body).await?;
             let resp = super::read_bounded_body(resp).await?;
             let raw = serde_json::from_slice::<Value>(&resp)
@@ -682,21 +787,41 @@ impl AnthropicClientBuilder {
     /// `budget_tokens` (per
     /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table),
     /// and a `max_tokens` below `budget_tokens + 1` rises to fit the
-    /// budget. A per-request
+    /// budget — except the
+    /// [`None`](crate::structured::ThinkingEffort::None) rung, the
+    /// client-wide off, which sends `thinking: {"type": "disabled"}` —
+    /// omitting the block instead means adaptive thinking on any model
+    /// that thinks by default, so the off is stated, not implied. A
+    /// per-request
     /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
     /// always wins; an unset client default leaves unconfigured requests
     /// byte-identical to prior versions. A
     /// [`response_format`](crate::structured::RequestOptions::response_format)
-    /// request under a default set here is rejected up front — extended
-    /// thinking cannot combine with the forced tool choice a response
-    /// format synthesizes — so configure effort per request when both
-    /// are needed on other calls. Extended thinking also demands the
-    /// assistant's original signed thinking blocks on continuations: a
-    /// history whose tool-use message carries an unsigned thinking part
-    /// (recorded before this version, cross-provider, or hand-built)
-    /// still sends `tool_use` alone, which the Messages API rejects —
-    /// clear the effort for such histories or re-record them against
-    /// this version, whose response path captures signatures.
+    /// request under a default that budgets is rejected up front —
+    /// extended thinking cannot combine with the forced tool choice a
+    /// response format synthesizes — so configure effort per request
+    /// (or to the `None` rung) when both are needed. An effort that
+    /// budgets also demands the assistant's original signed thinking
+    /// blocks on continuations: a history whose tool-use message
+    /// carries an unsigned thinking part (recorded before this
+    /// version, cross-provider, or hand-built) still sends `tool_use`
+    /// alone, which the Messages API rejects — clear the effort for
+    /// such histories or re-record them against this version, whose
+    /// response path captures signatures. Under the `None` rung,
+    /// history reasoning that carries text instead rides as the
+    /// capped plain-text replay (see
+    /// [`replay_reasoning`](Self::replay_reasoning)); a redacted
+    /// part has no text to replay and is dropped.
+    ///
+    /// A request that resolves an effort first reads what the model
+    /// disclosed about thinking from the Models API — once per model, under
+    /// its own short deadline — and writes the control that model accepts: a
+    /// model taking depth from `output_config.effort` gets the rung's label
+    /// there instead of a `budget_tokens` block, and the off rung takes
+    /// `{"type":"between_tools"}` on a model that refuses `"disabled"`. An
+    /// endpoint that discloses nothing (a gateway, a local
+    /// Messages-compatible server) keeps the table's own mapping, and a
+    /// request with no effort never probes.
     #[must_use]
     pub fn thinking_effort(mut self, effort: crate::structured::ThinkingEffort) -> Self {
         self.thinking_effort = Some(effort);
@@ -711,7 +836,13 @@ impl AnthropicClientBuilder {
     /// part order, so reasoning-capable models keep their working
     /// memory across turns. The blocks are plain text — every
     /// Messages-compatible endpoint accepts them, including gateways
-    /// that reject unsigned native thinking blocks.
+    /// that reject unsigned native thinking blocks. The `None`
+    /// effort rung renders text-carrying history reasoning the same
+    /// way with the flag left off: native thinking blocks are
+    /// wire-illegal on a request that disables thinking, and dropping
+    /// the parts silently would lose the context they carry. A
+    /// redacted part has no text to replay and is dropped — only an
+    /// effort that budgets returns its payload natively.
     #[must_use]
     pub fn replay_reasoning(mut self, enabled: bool) -> Self {
         self.replay_reasoning = enabled;
@@ -845,6 +976,9 @@ impl AnthropicClientBuilder {
             model: std::sync::Mutex::new(self.model),
             max_tokens: self.max_tokens,
             thinking_effort: self.thinking_effort,
+            thinking_capabilities: std::sync::Arc::new(std::sync::Mutex::new(
+                CapabilityCache::default(),
+            )),
             replay_reasoning: self.replay_reasoning,
             prompt_caching: self.prompt_caching,
         })
@@ -957,6 +1091,676 @@ fn effort_tool_choice_conflict_error() -> ApiError {
     )
 }
 
+/// The error for a model the provider says cannot turn thinking off.
+///
+/// The off rung has no spelling on a model whose disclosure refuses both off
+/// shapes, so the rung is refused up front: sent anyway, the request would
+/// 400 over `thinking.type` without saying that no accepted value exists,
+/// and the two moves that would work — leave the effort unset and accept the
+/// model's own thinking, or move to a model with an off level — are not in
+/// that message.
+fn thinking_unavailable_error(model: &str) -> ApiError {
+    ApiError::config_validation(format!(
+        "the model {model} does not accept `thinking: {{\"type\":\"disabled\"}}` \
+         and disclosed no thinking setting that turns it off, so thinking \
+         cannot be turned off on it; drop the effort (request-level or \
+         client default) or move to a model with an off level"
+    ))
+}
+
+/// What a serving model disclosed about the thinking controls it accepts.
+///
+/// Read from the Models API's `capabilities.thinking.types` object. Every
+/// member is an [`Option`] because a disclosure can be partial: `None` means
+/// the endpoint never said, which is not the answer `Some(false)` — that the
+/// model rejects the spelling — gives. Undisclosed leaves
+/// [`anthropic_thinking_budget`]'s own mapping in charge, which is what
+/// gateways and Messages-compatible servers without a Models API get.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ThinkingCapabilities {
+    /// `capabilities.thinking.types.disabled.supported`.
+    ///
+    /// Anthropic documents this as `true` also for a model with no thinking
+    /// at all, and as possibly-true on a model that still 400s a `disabled`
+    /// request for another reason, such as an effort level the model
+    /// disallows with thinking off.
+    disabled: Option<bool>,
+
+    /// `capabilities.thinking.types.between_tools.supported`.
+    ///
+    /// Whether the model accepts `thinking: {"type":"between_tools"}`, the
+    /// spelling under which it reasons only while composing between tool
+    /// calls — on the models that disclose it, the quietest setting they
+    /// take, and the closest approach to off that a model refusing
+    /// `"disabled"` still offers.
+    ///
+    /// Read for exactly one decision: the fallback the off rung takes when
+    /// [`Self::disabled`] is `Some(false)` (see
+    /// [`ThinkingWire::BetweenTools`]). A budgeted rung is never rewritten
+    /// to it — that would trade a depth someone asked for for a setting
+    /// nobody did. Only `Some(true)` licenses the fallback: `Some(false)`
+    /// rules it out, and `None` — the endpoint never said — leaves the off
+    /// rung on `"disabled"`, where an endpoint that discloses nothing stays
+    /// the arbiter of whether the request runs.
+    between_tools: Option<bool>,
+
+    /// `capabilities.thinking.types.enabled.supported`.
+    ///
+    /// Not a documented member: read opportunistically because it is the
+    /// direct answer to "does this model take a `budget_tokens` block", and
+    /// treated as undisclosed when absent.
+    enabled: Option<bool>,
+
+    /// `capabilities.thinking.types.adaptive.supported`.
+    ///
+    /// Undocumented, read with [`Self::enabled`]'s caution; together the two
+    /// identify a model that takes depth from `output_config.effort` instead
+    /// of a budget.
+    adaptive: Option<bool>,
+}
+
+impl ThinkingCapabilities {
+    /// Assemble a disclosure from the tri-states a model answer yields.
+    ///
+    /// Absent members stay `None` rather than defaulting to `false`, so an
+    /// endpoint answering part of the shape is trusted only for the part it
+    /// answered. An unrelated body — an error document served under a
+    /// success status, a list response — simply discloses nothing.
+    const fn from_states(
+        disabled: Option<bool>,
+        between_tools: Option<bool>,
+        enabled: Option<bool>,
+        adaptive: Option<bool>,
+    ) -> Self {
+        Self {
+            disabled,
+            between_tools,
+            enabled,
+            adaptive,
+        }
+    }
+
+    /// Whether the disclosure carries anything this client can act on.
+    ///
+    /// An all-`None` answer is the same non-answer as a probe that never
+    /// resolved, and caches identically so a silent endpoint is not re-asked
+    /// per request.
+    fn is_empty(self) -> bool {
+        self.disabled.is_none()
+            && self.between_tools.is_none()
+            && self.enabled.is_none()
+            && self.adaptive.is_none()
+    }
+}
+
+/// What one model's probe learned about the thinking it accepts, once the
+/// endpoint has actually answered.
+///
+/// Only a definitive answer is representable here. A probe that got no answer
+/// at all — a timeout, a `503` — is [`ProbeOutcome::Inconclusive`] and is
+/// never filed, because nothing clears a filed answer later: deciding a
+/// model's wire shape from one lost round trip would keep the verdict and the
+/// 400s it causes for the rest of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedDisclosure {
+    /// The endpoint answered and stated at least one thinking control.
+    ///
+    /// The tri-states [`thinking_wire`] reads to pick the wire shape; a member
+    /// the answer left out keeps [`anthropic_thinking_budget`]'s own mapping
+    /// in charge rather than guessing at it.
+    Known(ThinkingCapabilities),
+
+    /// The endpoint answered and stated nothing usable about thinking.
+    ///
+    /// Filed on purpose. A `404` (an endpoint with no Models API), a gateway
+    /// answering `200` with HTML, and JSON listing none of the thinking
+    /// members are ordinary deployments rather than failures, and an uncached
+    /// miss would put a probe under a 5-second deadline in front of every
+    /// request that sets an effort. It is also the narrowest verdict a probe
+    /// can reach — the ladder's own mapping stands, which is what every
+    /// endpoint that never heard of this client already gets. It is also
+    /// where a model runs after [`CAPABILITY_PROBE_MISS_LIMIT`] consecutive
+    /// inconclusive probes — a route that never answers has said, in effect,
+    /// that it has nothing to disclose. Served rather than filed there: that
+    /// reading is this client's, so [`CAPABILITY_PROBE_REPROBE_AFTER`] brings
+    /// the route back up for a probe when it may have recovered.
+    Undisclosed,
+}
+
+/// The outcome of one Models API probe.
+///
+/// The two failures it distinguishes are what a probe is for: an endpoint
+/// that *said* something is believed, and an endpoint that was busy, wedged,
+/// or mid-credential-rotation is not. A cache that cannot tell them apart
+/// turns one blip into a permanent decision — the disclosure a probe never
+/// read, held for the life of the client.
+enum ProbeOutcome {
+    /// The endpoint answered, or definitively declined to. Filed under the
+    /// model asked about, and already applied to this request.
+    Answered(CachedDisclosure),
+
+    /// Nothing was learned: the request never completed, or the endpoint
+    /// refused or failed it in a way that says nothing about thinking. This
+    /// request falls back to the ladder's own mapping — the documented answer
+    /// for an endpoint that discloses nothing — and the next one asks again,
+    /// up to [`CAPABILITY_PROBE_MISS_LIMIT`] times in a row; a route that
+    /// cannot answer is then run as one with nothing to disclose rather than
+    /// probed ahead of every turn, until [`CAPABILITY_PROBE_REPROBE_AFTER`]
+    /// turns of that say enough time has passed to ask once more.
+    Inconclusive,
+}
+
+/// The client's thinking-capability cache, keyed by model id.
+///
+/// Keyed rather than one slot because one client serves more than one model:
+/// [`RequestOptions::model`](crate::structured::RequestOptions::model) is how
+/// the fallback machinery routes a retry, and
+/// [`set_model`](ApiClient::set_model) can land between turns. With a single
+/// slot, every model but the cached one missed on every request and paid a
+/// probe round trip to find that out; a host alternating two models paid one
+/// probe per request forever. Keyed, each model pays once.
+///
+/// Entries are never cleared wholesale — an answer about `claude-opus-5` is
+/// still true of `claude-opus-5` whoever asked — and
+/// [`CAPABILITY_CACHE_MAX_MODELS`] bounds the map for a host handed a new
+/// model name per request.
+/// One model's row in the thinking-capability cache.
+///
+/// The answer and the miss streak live in one row rather than two maps because
+/// the streak belongs to the model it was accumulated against: kept apart, a
+/// miss counter for a model name nobody is asking about any more would outlive
+/// every bound on the answers and keep counting toward a verdict nobody reads.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CapabilityEntry {
+    /// The endpoint's own definitive answer, once it gave one.
+    ///
+    /// `Some` only for what the endpoint actually said: a disclosure, a `404`
+    /// or `405`, a non-JSON body, a JSON answer that named no thinking member.
+    /// `None` for everything else — including the [`CachedDisclosure::Undisclosed`]
+    /// the give-up streak serves, which lives in [`Self::misses`] instead,
+    /// because an inference this client drew is not the endpoint's answer and
+    /// must stay open to correction.
+    answer: Option<CachedDisclosure>,
+
+    /// Inconclusive probes so far, and once past the limit, requests served on
+    /// the give-up verdict.
+    ///
+    /// One counter carries two thresholds, and [`CapabilityCache::verdict`] is
+    /// what reads them: below [`CAPABILITY_PROBE_MISS_LIMIT`] every request
+    /// asks, from there to [`CAPABILITY_PROBE_REPROBE_AFTER`] requests run on
+    /// the verdict while counting toward its renewal, and at the renewal the
+    /// request asks again — where an answer files normally and a fresh miss
+    /// rewinds to the limit rather than starting the initial streak over.
+    misses: u8,
+}
+
+#[derive(Debug, Default)]
+struct CapabilityCache {
+    /// Model id → that model's row. A missing key means no probe has run for
+    /// this model since the client was built; a key with `answer: None` means
+    /// probes have run and none learned anything, which is the state that
+    /// retries — every request, until the streak gives up, then on the renewal
+    /// cadence [`CapabilityCache::verdict`] keeps. A `404` endpoint is filed at
+    /// once, so it is asked once rather than per request.
+    entries: std::collections::HashMap<String, CapabilityEntry>,
+}
+
+impl CapabilityCache {
+    /// What this model has established so far, or `None` to go and ask.
+    ///
+    /// A definitive answer is returned for as long as the row holds one, and
+    /// that is the only thing that ends the asking. Short of it, the row's
+    /// miss count sets the rule: below [`CAPABILITY_PROBE_MISS_LIMIT`] the
+    /// request asks, and from there up to [`CAPABILITY_PROBE_REPROBE_AFTER`]
+    /// the request runs on [`CachedDisclosure::Undisclosed`] — the inference
+    /// that a route refusing three times in a row has nothing to disclose —
+    /// while counting the turn it spent. At the renewal boundary the count
+    /// stops short of answering for the endpoint and the request asks again.
+    ///
+    /// The asymmetry with [`Self::insert`] is the point: an endpoint that
+    /// *said* "no Models API" is filed and never re-asked, while this
+    /// client's own give-up verdict is re-checked for as long as the client
+    /// runs. A row is never created here — a model nobody has probed yet has
+    /// nothing to age.
+    fn verdict(&mut self, model: &str) -> Option<CachedDisclosure> {
+        let entry = self.entries.get_mut(model)?;
+        if let Some(answer) = entry.answer {
+            return Some(answer);
+        }
+        if entry.misses < CAPABILITY_PROBE_MISS_LIMIT {
+            return None;
+        }
+        if entry.misses >= CAPABILITY_PROBE_REPROBE_AFTER {
+            return None;
+        }
+        entry.misses = entry.misses.saturating_add(1);
+        Some(CachedDisclosure::Undisclosed)
+    }
+
+    /// File one model's definitive answer, replacing any earlier one.
+    ///
+    /// Replacement, not first-write-wins: two requests naming one model can
+    /// race their probes, and the second answer is no less the endpoint's than
+    /// the first. At capacity an entry for some other model makes room — an
+    /// arbitrary one, since the map has no age order to lose, and the cost of
+    /// a wrong pick is exactly one re-probe.
+    fn insert(&mut self, model: &str, answer: CachedDisclosure) {
+        let entry = self.entry(model);
+        entry.answer = Some(answer);
+        entry.misses = 0;
+    }
+
+    /// Note that a probe learned nothing: extend the streak, or rewind it when
+    /// what failed was the renewal.
+    ///
+    /// This files no *answer* — a blip is not a disclosure, and the whole
+    /// point of [`ProbeOutcome::Inconclusive`] is that this request runs on
+    /// the ladder's mapping and the next one tries again. What it accumulates
+    /// is the evidence that starts serving [`CachedDisclosure::Undisclosed`] at
+    /// [`CAPABILITY_PROBE_MISS_LIMIT`], which is what keeps a failing metadata
+    /// route from costing a probe — or its full timeout — ahead of every turn
+    /// of a run. A miss at the renewal boundary rewinds to the limit rather
+    /// than parking at the ceiling, where every following request would probe
+    /// again and the bound would be the very cost this streak exists to
+    /// prevent.
+    fn note_inconclusive(&mut self, model: &str) {
+        let entry = self.entry(model);
+        if entry.answer.is_some() {
+            // A model with a disclosure is done being probed, and a blip from
+            // a losing race — two requests that both found no entry, one of
+            // which got an answer filed first — must not stack onto a verdict
+            // the endpoint never implied, let alone reach the limit that would
+            // replace a real disclosure with "nothing".
+            return;
+        }
+        entry.misses = if entry.misses >= CAPABILITY_PROBE_REPROBE_AFTER {
+            CAPABILITY_PROBE_MISS_LIMIT
+        } else {
+            entry.misses.saturating_add(1)
+        };
+    }
+
+    /// The row for one model, evicting an arbitrary other row at capacity.
+    ///
+    /// Both the answer and the streak go when a row is evicted, so an evicted
+    /// streak restarts from zero — at worst one more round of
+    /// [`CAPABILITY_PROBE_MISS_LIMIT`] probes for a model this client has
+    /// taken up again.
+    fn entry(&mut self, model: &str) -> &mut CapabilityEntry {
+        if !self.entries.contains_key(model)
+            && self.entries.len() >= CAPABILITY_CACHE_MAX_MODELS
+            && let Some(evicted) = self.entries.keys().next().cloned()
+        {
+            self.entries.remove(&evicted);
+        }
+        self.entries.entry(model.to_string()).or_default()
+    }
+}
+
+/// The thinking shape a request writes for one rung on one model.
+///
+/// The ladder's own mapping — `thinking: {"type":"enabled"}` around a
+/// `budget_tokens` — is what a model with no disclosure gets. A disclosure
+/// can replace it with the control that model actually accepts, so the
+/// request runs instead of 400ing over a spelling nobody chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingWire {
+    /// No effort resolved: the request carries no `thinking` field at all.
+    ///
+    /// The shape an effort-less client and an effort-less request both get,
+    /// and the one the probe never disturbs: [`ThinkingProbe`] is not even
+    /// built for such a request, so the wire stays byte-identical to a client
+    /// that never had a ladder and no Models API call is made on its behalf.
+    Unset,
+
+    /// The off rung in the API's own off spelling:
+    /// `thinking: {"type":"disabled"}`.
+    ///
+    /// Chosen whenever the disclosure did not refuse `disabled` — accepted
+    /// `Some(true)` or never stated. The block replaces whatever budget the
+    /// ladder wrote, and no `max_tokens` headroom raise accompanies it, since
+    /// the off rung budgets nothing. On an endpoint that disclosed nothing,
+    /// this is also the spelling a model with no off level answers with its
+    /// own error — the honest refusal the ladder states in place of silently
+    /// thinking.
+    Off,
+
+    /// The off rung on a model that refuses `"disabled"` and accepts
+    /// `thinking: {"type":"between_tools"}`.
+    ///
+    /// The model reasons only while composing between tool calls, which on
+    /// the models offering it (Claude Sonnet 5.5 among them) is the lowest
+    /// thinking level the API takes — the nearest thing to off such a model
+    /// has, so the off rung is served rather than refused. Reached only
+    /// through an affirmative disclosure and only from the off rung: a
+    /// disclosure merely omitting the member leaves the rung on
+    /// [`Self::Off`], and a disclosure refusing both is refused outright
+    /// ([`thinking_wire`]).
+    BetweenTools,
+
+    /// Extended thinking: `thinking: {"type":"enabled"}` around the rung's
+    /// `budget_tokens`, with the `max_tokens` headroom raise that goes with
+    /// it.
+    ///
+    /// The ladder's own mapping, so this is the one shape
+    /// [`apply_model_thinking`] does not rewrite — [`build_request_body`]
+    /// already wrote the block and raised `max_tokens` to `budget + 1` when
+    /// the caller's value could not hold it. Every model that does not
+    /// disclose a different control keeps it, which is what an endpoint
+    /// behind a gateway or a Messages-compatible server without a Models API
+    /// is asked to serve.
+    ///
+    /// Holds the [`anthropic_thinking_budget`] the block carries, so a caller
+    /// can see the depth the rung asked for rather than re-deriving it.
+    Budget(u32),
+
+    /// A model that takes thinking depth from `output_config.effort` rather
+    /// than a budget: the `thinking` block is removed, the caller's own
+    /// `max_tokens` is restored, and the rung's label rides in
+    /// `output_config`.
+    ///
+    /// Chosen on the disclosure's say-so alone — extended thinking refused and
+    /// adaptive thinking accepted, the shape of Anthropic's adaptive tier.
+    /// Restoring `max_tokens` is load-bearing, not cosmetic: the raise was
+    /// made for a budget this model cannot take, and leaving it would quietly
+    /// spend output tokens the caller never configured.
+    ///
+    /// Holds the label verbatim as [`effort_label`] spells it, refusals
+    /// included: `"minimal"` rides to the API and comes back as its error,
+    /// because a ladder that clamped the rung to the nearest accepted level
+    /// would hide the mismatch it exists to surface.
+    Effort(&'static str),
+}
+
+/// Choose the wire shape for one rung against one model's disclosure.
+///
+/// [`None`] is returned for the one case worth refusing rather than sending:
+/// a disclosure that says the model accepts neither off spelling. Every
+/// alternative is worse than the error — `disabled` would 400 unexplainably,
+/// omitting the block means adaptive thinking on a model that thinks by
+/// default, and quietly degrading to `between_tools` is the substitution the
+/// ladder exists to prevent.
+fn thinking_wire(
+    effort: crate::structured::ThinkingEffort,
+    caps: ThinkingCapabilities,
+) -> Option<ThinkingWire> {
+    if effort == crate::structured::ThinkingEffort::None {
+        return match (caps.disabled, caps.between_tools) {
+            (Some(false), Some(true)) => Some(ThinkingWire::BetweenTools),
+            (Some(false), _) => None,
+            _ => Some(ThinkingWire::Off),
+        };
+    }
+    match (caps.enabled, caps.adaptive) {
+        (Some(false), Some(true)) => Some(ThinkingWire::Effort(effort_label(effort))),
+        _ => Some(ThinkingWire::Budget(
+            anthropic_thinking_budget(effort).unwrap_or_default(),
+        )),
+    }
+}
+
+/// The `output_config.effort` label for a rung: the rung's own name, verbatim.
+///
+/// Anthropic's effort ladder has no token-check level, so `Minimal` sends
+/// `"minimal"` and the API rejects it with its own error — the rule
+/// [`ThinkingEffort`](crate::structured::ThinkingEffort) already states for
+/// an OpenAI endpoint that tops out below `"xhigh"`: the provider's refusal
+/// beats the ladder silently clamping the rung.
+fn effort_label(effort: crate::structured::ThinkingEffort) -> &'static str {
+    use crate::structured::ThinkingEffort;
+    match effort {
+        ThinkingEffort::Minimal => "minimal",
+        ThinkingEffort::Low | ThinkingEffort::None => "low",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::Xhigh => "xhigh",
+        ThinkingEffort::Max => "max",
+    }
+}
+
+/// Rewrite a built request body onto the model's supported thinking shape.
+///
+/// The body arrives carrying the ladder's own mapping; this replaces it only
+/// where the model disclosed a different control, and restores the caller's
+/// configured `max_tokens` when the headroom raise was made for a budget the
+/// model does not take. [`ThinkingWire::Unset`] and
+/// [`ThinkingWire::Budget`] leave the body untouched, which is what an
+/// effort-less request and an undisclosed endpoint both get: the wire stays
+/// byte-identical to the ladder's.
+fn apply_model_thinking(body: &mut Value, wire: ThinkingWire, configured_max_tokens: u32) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    match wire {
+        ThinkingWire::Unset | ThinkingWire::Budget(_) => {}
+        ThinkingWire::Off => {
+            obj.insert(
+                "thinking".to_string(),
+                serde_json::json!({ "type": "disabled" }),
+            );
+        }
+        ThinkingWire::BetweenTools => {
+            obj.insert(
+                "thinking".to_string(),
+                serde_json::json!({ "type": "between_tools" }),
+            );
+        }
+        ThinkingWire::Effort(label) => {
+            obj.remove("thinking");
+            obj.insert(
+                "max_tokens".to_string(),
+                serde_json::json!(configured_max_tokens),
+            );
+            obj.insert(
+                "output_config".to_string(),
+                serde_json::json!({ "effort": label }),
+            );
+        }
+    }
+}
+
+/// The Models API probe that resolves what one model accepts for thinking.
+///
+/// Owns everything a probe needs so both request paths can run it from
+/// inside their `'static` async blocks: the client's pooled HTTP handle, its
+/// credential, the model's metadata URL, and the cache shared with the
+/// client. Built only for a request that resolved a thinking effort, so an
+/// effort-less client pays neither the probe nor the clones.
+struct ThinkingProbe {
+    /// The client's pooled HTTP handle, shared with completion requests.
+    ///
+    /// Cloned, not rebuilt: a `reqwest::Client` clone shares the connection
+    /// pool, so a probe costs a request on a connection the client already
+    /// holds rather than a fresh TLS handshake ahead of the turn it serves.
+    /// Only the request's own timeout differs —
+    /// [`CAPABILITIES_PROBE_TIMEOUT`], never the conversational read timeout.
+    http: reqwest::Client,
+
+    /// The credential sent as `x-api-key`, exactly as on a Messages request.
+    ///
+    /// The same key, because a disclosure is worth only as much as the
+    /// account it describes: a model's accepted thinking controls are read
+    /// from the endpoint this credential serves, not from an anonymous
+    /// metadata route. Owned rather than borrowed because the streaming path
+    /// runs the probe inside a `'static` stream.
+    api_key: String,
+
+    /// The `{base_url}/v1/models/{model}` URL the disclosure is read from.
+    ///
+    /// Built per request off the *same* base URL the Messages endpoint uses,
+    /// so a deployment that fronts one fronts the other and a `404` here
+    /// means what it says: no Models API behind this base URL. It cannot be
+    /// cached on the client, because a request can name a model the client
+    /// does not run.
+    url: String,
+
+    /// The per-model cache, shared with the owning client.
+    ///
+    /// Shared because the disclosure belongs to a model rather than to a
+    /// request: the second turn of a run should not pay for the first turn's
+    /// probe. Behind an [`std::sync::Arc`] because the streaming path reaches
+    /// it from a `'static` stream, and behind a lock because a probe resolves
+    /// asynchronously while later requests are being built.
+    /// Entries are keyed by model, so
+    /// [`set_model`](ApiClient::set_model) neither invalidates nor evicts
+    /// anything: a swapped-in model finds no entry and asks for its own.
+    cache: std::sync::Arc<std::sync::Mutex<CapabilityCache>>,
+
+    /// The model this probe addresses.
+    ///
+    /// Matched against the [`CapabilityCache`] entry's key so a cached
+    /// disclosure never crosses models, and named in the refusal
+    /// [`resolve`] raises when the model offers no way to turn thinking off —
+    /// a host running a fallback chain has to learn which model said no.
+    model: String,
+
+    /// The caller's configured `max_tokens`, before any headroom raise.
+    ///
+    /// Read back out of the request only for [`ThinkingWire::Effort`], whose
+    /// model takes no budget and so has no claim on the raise
+    /// [`build_request_body`] made to hold one. Carried here rather than
+    /// re-derived from the body, which by then carries the raised figure and
+    /// cannot say which of its two values the caller chose.
+    configured_max_tokens: u32,
+}
+
+impl ThinkingProbe {
+    /// Resolve one rung against the model's disclosed controls.
+    ///
+    /// One call per request: the disclosure comes from the shared cache, so
+    /// the first request for a model pays the probe and the rest read the
+    /// answer.
+    ///
+    /// An unset effort resolves without probing: the request writes no
+    /// thinking field, so there is nothing a disclosure could change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::config_validation`] naming the model when the
+    /// disclosure says thinking cannot be turned off here and the off rung
+    /// was asked for; the refusal is raised before the request is sent.
+    async fn resolve(
+        &self,
+        effort: Option<crate::structured::ThinkingEffort>,
+    ) -> Result<ThinkingWire, ApiError> {
+        let Some(effort) = effort else {
+            return Ok(ThinkingWire::Unset);
+        };
+        thinking_wire(effort, self.capabilities().await)
+            .ok_or_else(|| thinking_unavailable_error(&self.model))
+    }
+
+    /// Read the cached disclosure for this probe's model, asking once.
+    ///
+    /// A cached answer is taken under the lock and the lock is dropped before
+    /// anything else happens; the probe then files its verdict under the model
+    /// it asked about, which is not necessarily the client's current one.
+    /// Concurrent probes of one model may each fetch — the second filing
+    /// replaces the first, and both requests carried a real answer.
+    async fn capabilities(&self) -> ThinkingCapabilities {
+        let cached = crate::error::recover_guard(self.cache.lock()).verdict(&self.model);
+        if let Some(answer) = cached {
+            return Self::apply(answer);
+        }
+        match self.fetch().await {
+            ProbeOutcome::Answered(answer) => {
+                crate::error::recover_guard(self.cache.lock()).insert(&self.model, answer);
+                Self::apply(answer)
+            }
+            ProbeOutcome::Inconclusive => {
+                crate::error::recover_guard(self.cache.lock()).note_inconclusive(&self.model);
+                ThinkingCapabilities::default()
+            }
+        }
+    }
+
+    /// The disclosure a request acts on for one cached verdict.
+    ///
+    /// An endpoint that answered "nothing", a route this client gave up on, and
+    /// one still being asked take the same wire shape — the ladder's own
+    /// mapping. They differ only in how soon anyone asks again: never, on the
+    /// renewal cadence, and next request, respectively.
+    fn apply(answer: CachedDisclosure) -> ThinkingCapabilities {
+        match answer {
+            CachedDisclosure::Known(caps) => caps,
+            CachedDisclosure::Undisclosed => ThinkingCapabilities::default(),
+        }
+    }
+
+    /// Ask the Models API what this model disclosed about thinking.
+    ///
+    /// The answer separates what an endpoint *said* from what it merely
+    /// failed to deliver. Definitive and cacheable: a success (whether or not
+    /// it discloses thinking members), a non-JSON success (a gateway in front
+    /// of the API), and a `404` or `405`, which says there is no Models API at
+    /// this base URL.
+    /// Inconclusive and not filed as an answer (though a streak of them ends
+    /// the asking): a transport failure or
+    /// timeout, `401`/`403` (a rotated credential says nothing about the
+    /// model), `429` and any `5xx` (busy, not silent), and a body that could
+    /// not be read within [`MAX_RESPONSE_BODY`].
+    ///
+    /// The distinction is the difference between a soft fallback and a stuck
+    /// one: a filed answer is never revisited, so a probe that filed a blip
+    /// would send the ladder's `budget_tokens` to an adaptive-tier model on
+    /// every later turn, and each of those turns would 400 on the spelling the
+    /// probe never read. The request carries [`CAPABILITIES_PROBE_TIMEOUT`]
+    /// rather than the conversational read timeout either way, so a wedged
+    /// metadata route cannot stall a run's first turn.
+    ///
+    /// [`MAX_RESPONSE_BODY`]: super::MAX_RESPONSE_BODY
+    async fn fetch(&self) -> ProbeOutcome {
+        let Ok(response) = self
+            .http
+            .get(&self.url)
+            .header("x-api-key", &self.api_key)
+            .header(
+                reqwest::header::HeaderName::from_static("anthropic-version"),
+                reqwest::header::HeaderValue::from_static(ANTHROPIC_VERSION),
+            )
+            .timeout(CAPABILITIES_PROBE_TIMEOUT)
+            .send()
+            .await
+        else {
+            return ProbeOutcome::Inconclusive;
+        };
+        let status = response.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return ProbeOutcome::Answered(CachedDisclosure::Undisclosed);
+        }
+        if !status.is_success() {
+            return ProbeOutcome::Inconclusive;
+        }
+        let Ok(bytes) = super::read_bounded_body(response).await else {
+            return ProbeOutcome::Inconclusive;
+        };
+        let Ok(model) = serde_json::from_slice::<Value>(&bytes) else {
+            return ProbeOutcome::Answered(CachedDisclosure::Undisclosed);
+        };
+        let types = model.pointer("/capabilities/thinking/types");
+        let disclosed = |name: &str| {
+            types
+                .and_then(|types| types.get(name))
+                .and_then(|entry| entry.get("supported"))
+                .and_then(Value::as_bool)
+        };
+        let caps = ThinkingCapabilities::from_states(
+            disclosed("disabled"),
+            disclosed("between_tools"),
+            disclosed("enabled"),
+            disclosed("adaptive"),
+        );
+        ProbeOutcome::Answered(if caps.is_empty() {
+            CachedDisclosure::Undisclosed
+        } else {
+            CachedDisclosure::Known(caps)
+        })
+    }
+}
+
 /// The error for a `strict` request the Anthropic Messages API cannot
 /// express.
 ///
@@ -974,8 +1778,9 @@ fn strict_unsupported_error(provider: &str) -> ApiError {
 ///
 /// Each [`Message`] is serialized via [`convert_message`], then assembled
 /// with the model, `max_tokens`, system prompt, and optional tools. A set
-/// `effort` emits the `thinking` block with the level's `budget_tokens`
-/// and raises `max_tokens` for headroom (see [`anthropic_thinking_budget`]).
+/// `effort` emits the `thinking` block — the level's `budget_tokens`, or
+/// `{"type": "disabled"}` on the off rung — and a budget raises
+/// `max_tokens` for headroom (see [`anthropic_thinking_budget`]).
 ///
 /// Tool-call constraint:
 /// - When `response_format` is set, synthesizes a single forced tool
@@ -994,10 +1799,20 @@ fn build_request_body(
     effort: Option<crate::structured::ThinkingEffort>,
     replay_reasoning: bool,
 ) -> Value {
-    let budget = effort.map(anthropic_thinking_budget);
+    let budget = effort.and_then(anthropic_thinking_budget);
     let max_tokens = match budget {
         Some(budget) => max_tokens.max(budget.saturating_add(1)),
         None => max_tokens,
+    };
+    let thinking = match (effort, budget) {
+        (Some(crate::structured::ThinkingEffort::None), _) => {
+            Some(serde_json::json!({ "type": "disabled" }))
+        }
+        (Some(_), Some(budget)) => Some(serde_json::json!({
+            "type": "enabled",
+            "budget_tokens": budget,
+        })),
+        _ => None,
     };
     let RequestBodySpec {
         model,
@@ -1011,10 +1826,12 @@ fn build_request_body(
     let tools = tools.filter(|t| !t.is_empty());
     let (non_system, effective_system) = super::fold_system_messages(messages, *system);
     let owned: Vec<crate::message::Message> = non_system.into_iter().cloned().collect();
-    let non_system = crate::message::coalesce_adjacent_assistants(owned);
+    let non_system = crate::message::user_head_before_tool_use_opening(
+        crate::message::coalesce_adjacent_assistants(owned),
+    );
     let msgs: Vec<Value> = non_system
         .iter()
-        .map(|m| convert_message(m, replay_reasoning, effort.is_some()))
+        .map(|m| convert_message(m, replay_reasoning, effort))
         .collect();
     let effective_system = effective_system.unwrap_or_default();
     let (tools_val, tool_choice) = if let Some(rf) = response_format {
@@ -1054,16 +1871,10 @@ fn build_request_body(
         obj.insert("tool_choice".to_string(), choice);
     }
 
-    if let Some(budget) = budget
+    if let Some(thinking) = thinking
         && let Some(obj) = body.as_object_mut()
     {
-        obj.insert(
-            "thinking".to_string(),
-            serde_json::json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-            }),
-        );
+        obj.insert("thinking".to_string(), thinking);
     }
 
     body
@@ -1172,15 +1983,37 @@ fn apply_prompt_cache_breakpoints(body: &mut Value) {
 
 /// The Messages API `thinking.budget_tokens` for one effort level.
 ///
-/// The fixed ladder from [`ThinkingEffort`]'s table: `Low` budgets `2048`
-/// tokens, `Medium` `8192`, `High` `16384`, and `Max` `32768`. Provider-
-/// native numbers, never invented per model.
-fn anthropic_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
+/// The fixed ladder from [`ThinkingEffort`]'s table: `Minimal` budgets
+/// `1024` tokens (the API's floor for an enabled block), `Low` `2048`,
+/// `Medium` `8192`, `High` `16384`, `Xhigh` `24576`, and `Max` `32768`.
+/// The `None` level budgets nothing — `None` back. The off rung is
+/// stated to the API as `thinking: {"type": "disabled"}` rather than by
+/// omission, because omitting the block means adaptive thinking on every
+/// model that thinks by default. Provider-native numbers, never
+/// invented per model.
+///
+/// The spelling is extended thinking — `thinking: {"type": "enabled"}`
+/// around the budget — which is what the Messages API's
+/// extended-thinking models accept. Anthropic's adaptive-tier models
+/// (Opus 4.7 and later, Sonnet 5 and later, Haiku 5.5, Fable and Mythos)
+/// refuse `budget_tokens` and take thinking depth from
+/// `output_config.effort` instead, whose own ladder has no token-check
+/// rung at all. Which tier a model sits in is deliberately not this
+/// function's business — a copy of Anthropic's catalogue would age into a
+/// wrong answer about someone else's models — so the tier is read from the
+/// endpoint instead: a request that resolves an effort consults the Models
+/// API once per model (see [`ThinkingProbe`]) and writes the control that
+/// model disclosed, while an endpoint that discloses nothing keeps the
+/// mapping below.
+fn anthropic_thinking_budget(effort: crate::structured::ThinkingEffort) -> Option<u32> {
     match effort {
-        crate::structured::ThinkingEffort::Low => 2048,
-        crate::structured::ThinkingEffort::Medium => 8192,
-        crate::structured::ThinkingEffort::High => 16384,
-        crate::structured::ThinkingEffort::Max => 32768,
+        crate::structured::ThinkingEffort::None => None,
+        crate::structured::ThinkingEffort::Minimal => Some(1024),
+        crate::structured::ThinkingEffort::Low => Some(2048),
+        crate::structured::ThinkingEffort::Medium => Some(8192),
+        crate::structured::ThinkingEffort::High => Some(16384),
+        crate::structured::ThinkingEffort::Xhigh => Some(24576),
+        crate::structured::ThinkingEffort::Max => Some(32768),
     }
 }
 
@@ -1210,17 +2043,22 @@ fn native_thinking_block(text: &str, signature: Option<&str>, redacted: Option<&
 /// - Messages with tool calls or tool results use the full `content` array.
 /// - Thinking parts render as one capped `<thinking>` text block
 ///   each, in part order, ahead of the other content when
-///   `replay_reasoning` is set — except that a signed or redacted
-///   part rides back natively while `thinking_enabled` (an effective
-///   thinking-effort level) is set, because Anthropic requires the
-///   original block ahead of tool use on continuation requests;
-///   image parts are skipped, as this wire carries no images in
-///   conversation history.
+///   `replay_reasoning` is set or the effective effort is the
+///   `None` rung (thinking off, where native blocks are
+///   wire-illegal) — except that a signed or redacted part rides
+///   back natively while the effective effort budgets a thinking
+///   block, because Anthropic requires the original block ahead of
+///   tool use on continuation requests; image parts are skipped,
+///   as this wire carries no images in conversation history.
 pub(super) fn convert_message(
     m: &Message,
     replay_reasoning: bool,
-    thinking_enabled: bool,
+    effort: Option<crate::structured::ThinkingEffort>,
 ) -> Value {
+    let thinking_on =
+        effort.is_some_and(|effort| effort != crate::structured::ThinkingEffort::None);
+    let reasoning_as_text =
+        replay_reasoning || matches!(effort, Some(crate::structured::ThinkingEffort::None));
     let role = match m.role {
         Role::User | Role::System => "user",
         Role::Assistant => "assistant",
@@ -1238,14 +2076,14 @@ pub(super) fn convert_message(
                 text,
                 signature,
                 redacted,
-            } if thinking_enabled && (signature.is_some() || redacted.is_some()) => {
+            } if thinking_on && (signature.is_some() || redacted.is_some()) => {
                 thinking_blocks.push(native_thinking_block(
                     text,
                     signature.as_deref(),
                     redacted.as_deref(),
                 ));
             }
-            MessagePart::Thinking { text, .. } if replay_reasoning && !text.is_empty() => {
+            MessagePart::Thinking { text, .. } if reasoning_as_text && !text.is_empty() => {
                 let tail = super::replay_reasoning_tail(text);
                 thinking_blocks.push(serde_json::json!({
                     "type": "text",
@@ -2022,6 +2860,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_request_build_injects_a_user_head_before_a_tool_use_opening() {
+        // The provider-side safety net for the tool-use opening: a
+        // history that begins with an assistant carrying a tool call —
+        // the coalesced-seam shape — cannot be the request's first
+        // message on strict providers, so the build rides a minimal
+        // user message ahead of it.
+        let spec = RequestBodySpec {
+            model: "glm-4.7",
+            messages: &[crate::message::Message::new(
+                crate::message::Role::Assistant,
+                vec![
+                    crate::message::MessagePart::text("SUMMARY: the task so far."),
+                    crate::message::MessagePart::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "Bash".to_string(),
+                        input: serde_json::json!({"command": "ls"}),
+                    },
+                ],
+            )],
+            system: None,
+            tools: Some(&[]),
+            response_format: None,
+            tool_constraint: &ToolConstraint::None,
+        };
+        let body = build_request_body(&spec, false, 1024, None, false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            2,
+            "the opening assistant gains a user head: {messages:?}"
+        );
+        assert_eq!(
+            messages[0]["role"], "user",
+            "the injected head is user-role: {messages:?}"
+        );
+        assert_eq!(
+            messages[1]["role"], "assistant",
+            "the tool-carrying assistant follows: {messages:?}"
+        );
+    }
+
+    #[test]
     fn the_request_build_merges_adjacent_assistant_messages() {
         // The provider-side safety net: a future producer of the
         // adjacent-assistant shape cannot kill a run - the Anthropic
@@ -2258,27 +3138,234 @@ mod tests {
         Message::new(Role::Assistant, parts)
     }
 
-    /// Capture the streaming body a client puts on the wire for one
-    /// history, with replay and an effective thinking-effort level on
-    /// or off.
+    /// A Models API disclosure for a model that thinks by default and takes
+    /// its depth from `output_config.effort`: extended thinking refused,
+    /// adaptive thinking accepted, `disabled` still accepted.
+    const ADAPTIVE_DISCLOSURE: &str = r#"{"capabilities":{"thinking":{"types":{"disabled":{"supported":true},"between_tools":{"supported":false},"enabled":{"supported":false},"adaptive":{"supported":true}}}}}"#;
+
+    /// A disclosure for a model whose lowest thinking setting is
+    /// `between_tools`: Claude Sonnet 5.5, which refuses `"disabled"`.
+    const BETWEEN_TOOLS_DISCLOSURE: &str = r#"{"capabilities":{"thinking":{"types":{"disabled":{"supported":false},"between_tools":{"supported":true}}}}}"#;
+
+    /// A disclosure for a model that offers no way to turn thinking off at
+    /// all: both off spellings refused. The rung has no wire shape here, so
+    /// the client refuses the request before sending it rather than collecting
+    /// a `400` over `thinking.type`.
+    const NO_OFF_DISCLOSURE: &str = r#"{"capabilities":{"thinking":{"types":{"disabled":{"supported":false},"between_tools":{"supported":false}}}}}"#;
+
+    /// A local endpoint that answers the thinking probe, then captures one request.
+    ///
+    /// A client with a resolved effort reads the model's thinking disclosure
+    /// before it sends a Messages request, so a capture listener has to play
+    /// both roles. `disclosure` is the document served for
+    /// `GET /v1/models/{model}`; an empty `disclosure` answers `404`, the
+    /// shape of an endpoint with no Models API. The Messages request that
+    /// follows is captured and failed, so a caller asserts on the body the
+    /// client would have sent.
+    async fn capture_after_answering_probe(
+        disclosure: &str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let disclosure = disclosure.to_string();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return String::new();
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                if !text.starts_with("GET /v1/models") {
+                    drop(
+                        sock.write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await,
+                    );
+                    drop(sock.shutdown().await);
+                    return text;
+                }
+                let reply = if disclosure.is_empty() {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{disclosure}",
+                        disclosure.len()
+                    )
+                };
+                drop(sock.write_all(reply.as_bytes()).await);
+                drop(sock.shutdown().await);
+            }
+        });
+        (addr, server)
+    }
+
+    /// A local endpoint that records every request line it receives.
+    ///
+    /// Answers the thinking probe with `disclosure` (empty means `404`) and
+    /// fails every other request, so a test can drive a client and still see
+    /// what it asked for — how many times it consulted the Models API among
+    /// it. The caller aborts the task when done.
+    async fn recording_listener(
+        disclosure: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let status = if disclosure.is_empty() { 404 } else { 200 };
+        recording_listener_answering(disclosure, status).await
+    }
+
+    /// A recording endpoint that answers the thinking probe with a chosen
+    /// status.
+    ///
+    /// [`recording_listener`] is this with the status an endpoint that has a
+    /// Models API would use. A `200` carries `disclosure`; any other status
+    /// answers empty, standing in for a metadata route that is down, busy, or
+    /// refusing. Messages requests always fail: the caller drives a client
+    /// repeatedly and reads back what it asked for, which is how a pin counts
+    /// how many times the Models API was consulted.
+    async fn recording_listener_answering(
+        disclosure: &'static str,
+        probe_status: u16,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let reply: Vec<u8> = if !text.starts_with("GET /v1/models") {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if probe_status != 200 {
+                    format!(
+                        "HTTP/1.1 {probe_status} Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ).into_bytes()
+                } else if disclosure.is_empty() {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{disclosure}",
+                        disclosure.len()
+                    ).into_bytes()
+                };
+                recorded.lock().unwrap().push(text);
+                drop(sock.write_all(&reply).await);
+                drop(sock.shutdown().await);
+            }
+        });
+        (addr, seen, task)
+    }
+
+    /// A recording endpoint whose thinking probe fails `failures` times, then answers.
+    ///
+    /// The first `failures` `GET /v1/models/…` requests get `503` — a metadata
+    /// route briefly down — and every later probe gets `disclosure`. Messages
+    /// requests fail as elsewhere and every request is recorded, header and
+    /// body together, so a caller sees both how often the client asked and what
+    /// each turn put on the wire: the point being that a client which filed the
+    /// `503` as an answer would never learn that the endpoint had come back.
+    /// One failure covers the blip case; a count reaching
+    /// [`CAPABILITY_PROBE_MISS_LIMIT`] covers the outage that outlasted the
+    /// streak, where the client has already settled into the give-up verdict.
+    async fn recording_listener_failing_probe(
+        disclosure: &'static str,
+        failures: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let reply: Vec<u8> = if !text.starts_with("GET /v1/models") {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < failures {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{disclosure}",
+                        disclosure.len()
+                    ).into_bytes()
+                };
+                recorded.lock().unwrap().push(text);
+                drop(sock.write_all(&reply).await);
+                drop(sock.shutdown().await);
+            }
+        });
+        (addr, seen, task)
+    }
+
+    /// Drive one streaming request on `client` and let it fail.
+    ///
+    /// These pins care about what the client *sent*, not what came back: the
+    /// endpoint answers Messages requests with a failure on purpose.
+    async fn drive_request(client: &AnthropicClient, options: crate::structured::RequestOptions) {
+        use futures::StreamExt;
+
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), options);
+        let _ = stream.next().await;
+    }
+
+    /// Capture the streaming body a client puts on the wire for one history.
+    ///
+    /// Drives a client against an endpoint that answers the thinking probe
+    /// with `404` — the shape of an endpoint with no Models API — so the
+    /// captured body shows the ladder's own mapping rather than a
+    /// disclosure-driven rewrite. `replay` turns reasoning replay on or off,
+    /// `effort` is the client-level thinking default (the level is set on the
+    /// builder, not on the request), and `history` is the conversation sent.
+    /// The endpoint fails the Messages request on purpose: the caller asserts
+    /// on the body the client would have sent.
     async fn captured_replay_body(
         replay: bool,
         effort: Option<crate::structured::ThinkingEffort>,
         history: Vec<Message>,
     ) -> String {
         use futures::StreamExt;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap();
-            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
-            drop(sock.write_all(head.as_bytes()).await);
-            String::from_utf8_lossy(&buf[..n]).into_owned()
-        });
+        let (addr, server) = capture_after_answering_probe("").await;
 
         let mut builder = AnthropicClient::builder()
             .with_api_key("k")
@@ -2401,6 +3488,113 @@ mod tests {
             body.contains("\"type\":\"redacted_thinking\"")
                 && body.contains("\"data\":\"opaque-data\""),
             "a redacted block returns its opaque payload verbatim on continuations: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_none_rung_renders_history_thinking_as_replay() {
+        // The off rung's twin of the disabled-replay pin: a
+        // per-request `None` over a `High` client default disables
+        // the thinking block, so signed history parts must render as
+        // the plain-text replay - native thinking blocks on a
+        // thinking-disabled request are a Messages API rejection.
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "alpha pass".to_string(),
+                    signature: Some("sig-blob".to_string()),
+                    redacted: None,
+                },
+                MessagePart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::None),
+            history,
+        )
+        .await;
+        assert!(
+            body.contains("<thinking>\\nalpha pass\\n</thinking>"),
+            "the off rung renders reasoning as the plain-text replay: {body}"
+        );
+        assert!(
+            !body.contains("\"signature\""),
+            "no native thinking block rides a request the rung turned off: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_none_rung_drops_a_redacted_part_with_no_text_to_replay() {
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: String::new(),
+                    signature: None,
+                    redacted: Some("opaque-data".to_string()),
+                },
+                MessagePart::ToolCall {
+                    id: "call_2".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::None),
+            history,
+        )
+        .await;
+        assert!(
+            !body.contains("\"type\":\"redacted_thinking\"") && !body.contains("opaque-data"),
+            "a redacted part carries no text to replay, so neither its native block nor its payload rides a request the rung turned off: {body}"
+        );
+        assert!(
+            body.contains("\"type\":\"tool_use\""),
+            "the sibling tool call still rides the continuation request: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_none_rung_lets_a_response_format_request_proceed() {
+        // The format/effort conflict guard keys on thinking being
+        // enabled: with the off rung there is no thinking block, so a
+        // forced-format request is legal and must reach the wire -
+        // the guard's rejection is reserved for rungs that budget.
+        use futures::StreamExt;
+
+        let (addr, server) = capture_after_answering_probe("").await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .with_max_tokens(64)
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        let options = crate::structured::RequestOptions::new()
+            .with_effort(crate::structured::ThinkingEffort::None)
+            .with_response_format(crate::structured::ResponseFormat {
+                name: "result".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+                strict: false,
+            });
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![Message::user("hi")]),
+            options,
+        );
+        let _ = stream.next().await;
+        drop(stream);
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("\"messages\""),
+            "the request reached the wire instead of the conflict guard: {request}"
         );
     }
 
@@ -2630,14 +3824,17 @@ mod tests {
 
     #[test]
     fn request_body_assistant_tool_calls() {
-        let msgs = vec![Message::new(
-            Role::Assistant,
-            vec![MessagePart::ToolCall {
-                id: "call_1".into(),
-                name: "echo".into(),
-                input: serde_json::json!({"msg": "hi"}),
-            }],
-        )];
+        let msgs = vec![
+            Message::user("drive it"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"msg": "hi"}),
+                }],
+            ),
+        ];
         let body = build_request_body(
             &RequestBodySpec {
                 model: "claude-3",
@@ -2653,7 +3850,7 @@ mod tests {
             false,
         );
 
-        let msg = &body["messages"][0];
+        let msg = &body["messages"][1];
         assert_eq!(msg["role"], "assistant");
         let content = msg["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "tool_use");
@@ -2913,17 +4110,20 @@ mod tests {
 
     #[test]
     fn request_body_assistant_with_text_and_tool_call() {
-        let msgs = vec![Message::new(
-            Role::Assistant,
-            vec![
-                MessagePart::text("Let me search."),
-                MessagePart::ToolCall {
-                    id: "call_1".into(),
-                    name: "search".into(),
-                    input: serde_json::json!({"q": "rust"}),
-                },
-            ],
-        )];
+        let msgs = vec![
+            Message::user("find it"),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    MessagePart::text("Let me search."),
+                    MessagePart::ToolCall {
+                        id: "call_1".into(),
+                        name: "search".into(),
+                        input: serde_json::json!({"q": "rust"}),
+                    },
+                ],
+            ),
+        ];
         let body = build_request_body(
             &RequestBodySpec {
                 model: "claude-3",
@@ -2939,7 +4139,7 @@ mod tests {
             false,
         );
 
-        let msg = &body["messages"][0];
+        let msg = &body["messages"][1];
         assert_eq!(msg["role"], "assistant");
         let content = msg["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
@@ -4365,7 +5565,7 @@ mod tests {
                 true,
             )],
         );
-        let json = convert_message(&msg, false, false);
+        let json = convert_message(&msg, false, None);
         assert_eq!(
             json.pointer("/content/0/is_error"),
             Some(&serde_json::json!(true)),
@@ -4380,7 +5580,7 @@ mod tests {
                 false,
             )],
         );
-        let ok_json = convert_message(&ok, false, false);
+        let ok_json = convert_message(&ok, false, None);
         assert!(
             ok_json.pointer("/content/0/is_error").is_none(),
             "successful results carry no is_error (the wire default is false): {ok_json}"
@@ -4564,19 +5764,20 @@ mod tests {
         options: crate::structured::RequestOptions,
         max_tokens: u32,
     ) -> String {
-        use futures::StreamExt;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        captured_effort_body_serving("", default, options, max_tokens).await
+    }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap();
-            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
-            drop(sock.write_all(head.as_bytes()).await);
-            String::from_utf8_lossy(&buf[..n]).into_owned()
-        });
+    /// As [`captured_effort_body`], on an endpoint that answers the thinking
+    /// probe with `disclosure` (empty for an endpoint with no Models API).
+    async fn captured_effort_body_serving(
+        disclosure: &str,
+        default: Option<crate::structured::ThinkingEffort>,
+        options: crate::structured::RequestOptions,
+        max_tokens: u32,
+    ) -> String {
+        use futures::StreamExt;
+
+        let (addr, server) = capture_after_answering_probe(disclosure).await;
 
         let mut builder = AnthropicClient::builder()
             .with_api_key("k")
@@ -4626,6 +5827,625 @@ mod tests {
         assert!(
             no_default.contains("\"budget_tokens\":16384"),
             "a request effort reaches the wire without any client default: {no_default}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wider_rungs_reach_the_anthropic_wire() {
+        let minimal = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Minimal),
+            8192,
+        )
+        .await;
+        assert!(
+            minimal.contains("\"budget_tokens\":1024"),
+            "Minimal budgets the API's floor: {minimal}"
+        );
+        let xhigh = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Xhigh),
+            8192,
+        )
+        .await;
+        assert!(
+            xhigh.contains("\"budget_tokens\":24576"),
+            "Xhigh budgets between High and Max: {xhigh}"
+        );
+        let off = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::High),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+            8192,
+        )
+        .await;
+        assert!(
+            off.contains("\"type\":\"disabled\"")
+                && !off.contains("budget_tokens")
+                && !off.contains("\"type\":\"enabled\""),
+            "the None rung overrides a client default with the API's explicit off: {off}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_off_rung_says_disabled_rather_than_omitting_the_block() {
+        let off = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+            8192,
+        )
+        .await;
+        assert!(
+            off.contains("\"thinking\":{\"type\":\"disabled\"}"),
+            "omitting `thinking` reads as adaptive thinking on a model that thinks by default, so the off rung must state it: {off}"
+        );
+        let unset =
+            captured_effort_body(None, crate::structured::RequestOptions::new(), 8192).await;
+        assert!(
+            !unset.contains("\"thinking\""),
+            "an unset effort still sends no thinking field at all: {unset}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adaptive_model_gets_output_config_effort_instead_of_a_budget() {
+        let body = captured_effort_body_serving(
+            ADAPTIVE_DISCLOSURE,
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+            1024,
+        )
+        .await;
+        assert!(
+            body.contains("\"output_config\":{\"effort\":\"high\"}")
+                && !body.contains("\"thinking\"")
+                && !body.contains("budget_tokens"),
+            "a model that refuses a thinking budget takes the rung as output_config.effort, thinking left at its default: {body}"
+        );
+        assert!(
+            body.contains("\"max_tokens\":1024"),
+            "the headroom raise made for a budget this model cannot take is undone: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_minimal_rung_names_itself_on_the_effort_ladder() {
+        let body = captured_effort_body_serving(
+            ADAPTIVE_DISCLOSURE,
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Minimal),
+            8192,
+        )
+        .await;
+        assert!(
+            body.contains("\"effort\":\"minimal\""),
+            "the rung keeps its own label where Anthropic's ladder has no such level, so the API refuses the request rather than the ladder clamping the rung: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_refuses_disabled_is_turned_off_at_its_lowest_setting() {
+        let body = captured_effort_body_serving(
+            BETWEEN_TOOLS_DISCLOSURE,
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+            8192,
+        )
+        .await;
+        assert!(
+            body.contains("\"thinking\":{\"type\":\"between_tools\"}")
+                && !body.contains("disabled"),
+            "the off rung takes the lowest setting the model discloses, not the spelling it refuses: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_with_no_off_level_refuses_the_off_rung_before_sending() {
+        use futures::StreamExt;
+
+        let (addr, seen, task) = recording_listener(NO_OFF_DISCLOSURE).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![]),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+        );
+        let outcome = stream
+            .next()
+            .await
+            .expect("a model with no off level answers with an error event");
+        task.abort();
+        let text = outcome
+            .expect_err("the refusal arrives as an error, not as a stream of events")
+            .to_string();
+        assert!(
+            text.contains("thinking cannot be turned off")
+                && text.contains("claude-sonnet-4-20250514"),
+            "the refusal names why and which model, where a raw 400 about thinking.type would say neither: {text}"
+        );
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        assert!(
+            !asked.iter().any(|request| request.starts_with("POST")),
+            "a rung the model cannot honour never reaches the Messages API: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_refuses_disabled_without_an_off_alternative_refuses() {
+        use futures::StreamExt;
+
+        // The disclosure answers one of the two off questions: `disabled` is
+        // refused and nothing else is mentioned. Neither `disabled` (a known
+        // 400) nor an unmentioned alternative (a guess) is a defensible send,
+        // so the rung is refused with the model named.
+        let (addr, seen, task) = recording_listener(
+            r#"{"capabilities":{"thinking":{"types":{"disabled":{"supported":false}}}}}"#,
+        )
+        .await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![]),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::None),
+        );
+        let outcome = stream
+            .next()
+            .await
+            .expect("a refusal arrives as an error event");
+        task.abort();
+        let text = outcome
+            .expect_err("the refusal is an error, not an un-thought answer")
+            .to_string();
+        assert!(
+            text.contains("disclosed no thinking setting that turns it off"),
+            "the refusal says what the endpoint left unanswered: {text}"
+        );
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        assert!(
+            !asked.iter().any(|request| request.starts_with("POST")),
+            "the request is refused before the Messages API sees a spelling it rejects: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_without_a_models_api_keeps_the_budget_ladder() {
+        let body = captured_effort_body_serving(
+            "",
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+            1024,
+        )
+        .await;
+        assert!(
+            body.contains("\"budget_tokens\":16384") && !body.contains("output_config"),
+            "an endpoint that discloses nothing keeps the ladder's own mapping, so a gateway costs a caller nothing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_probe_asks_the_models_api_once_with_the_client_credential() {
+        use futures::StreamExt;
+
+        let (addr, seen, task) = recording_listener(ADAPTIVE_DISCLOSURE).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let mut stream = client.stream_messages_with_options(
+                &crate::api::StreamRequest::new(vec![]),
+                crate::structured::RequestOptions::default(),
+            );
+            let _ = stream.next().await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probes: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/models/"))
+            .collect();
+        assert_eq!(
+            probes.len(),
+            1,
+            "the disclosure is read once per model, not once per request: {asked:?}"
+        );
+        assert!(
+            probes[0].contains("/v1/models/claude-sonnet-4-20250514")
+                && probes[0].contains("x-api-key: k"),
+            "the probe addresses the client's own model with the client's own credential: {}",
+            probes[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_change_rereads_the_disclosure() {
+        use futures::StreamExt;
+
+        let (addr, seen, task) = recording_listener(ADAPTIVE_DISCLOSURE).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        let mut first = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![]),
+            crate::structured::RequestOptions::default(),
+        );
+        let _ = first.next().await;
+        drop(first);
+        assert!(
+            client.set_model("claude-opus-5"),
+            "the hot-swap seam accepts a real model name"
+        );
+        let mut second = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![]),
+            crate::structured::RequestOptions::default(),
+        );
+        let _ = second.next().await;
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let models: Vec<&str> = asked
+            .iter()
+            .filter_map(|request| request.split_whitespace().nth(1))
+            .filter(|path| path.starts_with("/v1/models/"))
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                "/v1/models/claude-sonnet-4-20250514",
+                "/v1/models/claude-opus-5"
+            ],
+            "a swapped model reads its own disclosure instead of inheriting the previous one: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_effort_less_request_never_probes_the_models_api() {
+        use futures::StreamExt;
+
+        let (addr, seen, task) = recording_listener(ADAPTIVE_DISCLOSURE).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![]),
+            crate::structured::RequestOptions::default(),
+        );
+        let _ = stream.next().await;
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        assert!(
+            asked.iter().all(|request| !request.starts_with("GET")),
+            "with no effort resolved a disclosure could change nothing, so the Models API is not consulted: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_probe_failure_is_asked_again_on_the_next_request() {
+        let (addr, seen, task) = recording_listener_answering(ADAPTIVE_DISCLOSURE, 503).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probes: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/models/"))
+            .collect();
+        assert_eq!(
+            probes.len(),
+            2,
+            "an endpoint that was unavailable said nothing, so it is asked again; a filed silence would keep sending the budget ladder to a model that refuses it: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_fails_once_recovers_on_the_next_turn() {
+        let (addr, seen, task) = recording_listener_failing_probe(ADAPTIVE_DISCLOSURE, 1).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .with_max_tokens(1024)
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let bodies: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("POST"))
+            .collect();
+        assert_eq!(bodies.len(), 2, "both turns reached the wire: {asked:?}");
+        assert!(
+            bodies[0].contains("\"budget_tokens\":16384"),
+            "the turn whose probe failed takes the ladder's mapping, the documented answer for an endpoint that disclosed nothing: {}",
+            bodies[0]
+        );
+        assert!(
+            bodies[1].contains("\"output_config\":{\"effort\":\"high\"}")
+                && bodies[1].contains("\"max_tokens\":1024"),
+            "the next turn reads the disclosure the endpoint did give and takes the effort path with its configured max_tokens back — the 503 was not filed as an answer: {}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definitive_404_is_filed_so_the_endpoint_is_asked_once() {
+        let (addr, seen, task) = recording_listener("").await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probes: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/models/"))
+            .collect();
+        assert_eq!(
+            probes.len(),
+            1,
+            "an endpoint that answered `404` answered definitively — no Models API at this base URL — and is not asked again per request: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_another_model_caches_its_own_disclosure() {
+        let (addr, seen, task) = recording_listener(ADAPTIVE_DISCLOSURE).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        let override_model = crate::structured::RequestOptions::new()
+            .with_model("claude-opus-5")
+            .with_effort(crate::structured::ThinkingEffort::High);
+        // Two turns each, alternating: the shape a fallback chain makes, where
+        // a single cache slot made every turn after the first pay a probe.
+        for _ in 0..2 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+            drive_request(&client, override_model.clone()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probed: Vec<&str> = asked
+            .iter()
+            .filter_map(|request| request.split_whitespace().nth(1))
+            .filter(|path| path.starts_with("/v1/models/"))
+            .collect();
+        assert_eq!(
+            probed.len(),
+            2,
+            "each model is asked once, whichever channel named it — the client's own or a per-request override: {asked:?}"
+        );
+        assert!(
+            probed.contains(&"/v1/models/claude-sonnet-4-20250514")
+                && probed.contains(&"/v1/models/claude-opus-5"),
+            "both models got their own disclosure read: {probed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_never_answers_stops_being_probed() {
+        let (addr, seen, task) = recording_listener_answering(ADAPTIVE_DISCLOSURE, 503).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..5 {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probes: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/models/"))
+            .collect();
+        assert_eq!(
+            probes.len(),
+            usize::from(CAPABILITY_PROBE_MISS_LIMIT),
+            "a route that fails every probe three times running has said it has nothing to \
+             disclose; asking a fourth time puts another probe — or its full timeout — in front \
+             of every turn of the run: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn the_capability_cache_renews_its_give_up_verdict_on_a_bound() {
+        // The bound the give-up verdict has to live with. Three misses hand the
+        // run to the ladder's mapping, every following turn reads that verdict,
+        // and the route is asked again on the renewal cadence: five probes in
+        // sixty-four requests, not sixty-four probes and not one probe forever.
+        let mut cache = CapabilityCache::default();
+        let mut asked = 0_usize;
+        for _ in 0..64 {
+            if cache.verdict("m").is_none() {
+                asked = asked.saturating_add(1);
+                cache.note_inconclusive("m");
+            }
+        }
+        assert_eq!(
+            asked,
+            5,
+            "the initial three, then one renewal every {} served turns",
+            usize::from(CAPABILITY_PROBE_REPROBE_AFTER)
+                .saturating_sub(usize::from(CAPABILITY_PROBE_MISS_LIMIT))
+        );
+    }
+
+    #[test]
+    fn a_recovered_route_takes_over_the_given_up_verdict() {
+        // And the recovery itself. Once the renewal slot comes round, whatever
+        // the endpoint finally says replaces the inference — filed, this time,
+        // so the asking ends there as it always has for a real disclosure.
+        let mut cache = CapabilityCache::default();
+        for _ in 0..CAPABILITY_PROBE_MISS_LIMIT {
+            assert!(
+                cache.verdict("m").is_none(),
+                "under the limit every request asks"
+            );
+            cache.note_inconclusive("m");
+        }
+        assert!(
+            matches!(cache.verdict("m"), Some(CachedDisclosure::Undisclosed)),
+            "past the limit the run reads the verdict"
+        );
+        let mut turns = 1_usize;
+        loop {
+            if cache.verdict("m").is_none() {
+                break;
+            }
+            turns = turns.saturating_add(1);
+        }
+        assert!(
+            turns <= usize::from(CAPABILITY_PROBE_REPROBE_AFTER),
+            "the verdict expires on the bound rather than standing: it held for {turns} turns"
+        );
+        cache.insert(
+            "m",
+            CachedDisclosure::Known(ThinkingCapabilities {
+                disabled: Some(false),
+                between_tools: Some(true),
+                enabled: Some(false),
+                adaptive: Some(true),
+            }),
+        );
+        assert!(
+            matches!(
+                cache.verdict("m"),
+                Some(CachedDisclosure::Known(ThinkingCapabilities {
+                    adaptive: Some(true),
+                    ..
+                }))
+            ),
+            "what the endpoint said outranks what this client inferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_that_recovers_after_the_give_up_verdict_reaches_the_wire() {
+        // The cost of letting the verdict stand. Three misses settle the client
+        // on the ladder's mapping; the metadata route comes back afterwards. A
+        // client that filed its own inference would go on sending the budget
+        // spelling this model refuses — a 400 on every turn, for the life of the
+        // process. The renewal has to reach the wire, not just the cache.
+        let (addr, seen, task) = recording_listener_failing_probe(
+            ADAPTIVE_DISCLOSURE,
+            usize::from(CAPABILITY_PROBE_MISS_LIMIT),
+        )
+        .await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .with_max_tokens(1024)
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        for _ in 0..=usize::from(CAPABILITY_PROBE_REPROBE_AFTER) {
+            drive_request(&client, crate::structured::RequestOptions::default()).await;
+        }
+        task.abort();
+        let asked = crate::error::recover_guard(seen.lock()).clone();
+        let probes = asked
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/models/"))
+            .count();
+        assert_eq!(
+            probes, 4,
+            "three misses, then the verdict serves the turns until the renewal asks once more: {asked:?}"
+        );
+        let bodies: Vec<&String> = asked
+            .iter()
+            .filter(|request| request.starts_with("POST"))
+            .collect();
+        assert!(
+            bodies[0].contains("\"budget_tokens\":16384")
+                && bodies[2].contains("\"budget_tokens\":16384"),
+            "the outage itself runs on the ladder's mapping: {}",
+            bodies[0]
+        );
+        let last = bodies.last().expect("the run reached the wire");
+        assert!(
+            last.contains("\"output_config\":{\"effort\":\"high\"}")
+                && last.contains("\"max_tokens\":1024"),
+            "the recovered disclosure takes the effort path with the configured max_tokens back; \
+             a filed give-up verdict would still be sending a budget this model refuses: {last}"
+        );
+    }
+
+    #[test]
+    fn a_conclusive_answer_clears_the_miss_streak() {
+        let mut cache = CapabilityCache::default();
+        cache.note_inconclusive("m");
+        cache.note_inconclusive("m");
+        cache.insert(
+            "m",
+            CachedDisclosure::Known(ThinkingCapabilities {
+                disabled: Some(true),
+                between_tools: None,
+                enabled: None,
+                adaptive: None,
+            }),
+        );
+        assert_eq!(
+            cache.entry("m").misses,
+            0,
+            "an answer outranks the failures that preceded it"
+        );
+        cache.note_inconclusive("m");
+        cache.note_inconclusive("m");
+        assert!(
+            matches!(
+                cache.verdict("m"),
+                Some(CachedDisclosure::Known(ThinkingCapabilities {
+                    disabled: Some(true),
+                    ..
+                }))
+            ),
+            "two later misses cannot stack onto the pre-answer streak and overwrite what the \
+             endpoint actually disclosed"
+        );
+        cache.note_inconclusive("m");
+        assert!(
+            matches!(cache.verdict("m"), Some(CachedDisclosure::Known(_))),
+            "a model that answered is never demoted to undisclosed by later blips"
         );
     }
 

@@ -9,15 +9,16 @@
 //! one region's matching and [`DiffBudget`] caps the receipt as a whole —
 //! matcher work and printed lines together. A receipt therefore stays
 //! hunk-sized however long the file it describes is, and a change too wide to
-//! fit either bound is a rewrite, rendered as the bounded before/after preview
-//! rather than as a diff of the whole file.
+//! fit either bound gets no hunks at all: the receipt names the change and says
+//! why it could not be shown.
 //!
 //! The shape it emits — a `Changed:`/`Created:` header, a `│`-prefixed
 //! change summary, and `@@ -old,count +new,count @@` hunks with three lines
 //! of context — is a read contract for any consumer that renders these
 //! receipts as diffs, so the hunked form is what every diffable change must
-//! reach, and the hunkless before/after preview survives only where no
-//! diffable region could be bounded at all.
+//! reach. A change no bound can hunk is the exception, stated in two lines
+//! about the change: a receipt that names what it could not show, never one
+//! containing the file it describes.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -29,7 +30,8 @@ use std::fmt::Write;
 /// single region's matching proportional to the change: it caps the
 /// quadratic core, not the file it describes. Regions the bound cannot
 /// cover are aligned on lines unique to each side and matched in parts;
-/// only a region with nothing to align on falls back to the preview.
+/// a region with no such line is refused, and its receipt says so without
+/// hunks rather than echoing what it never aligned.
 const MAX_LCS_PRODUCT: usize = 1_000_000;
 
 /// Total LCS cells one receipt may spend, across every change region.
@@ -40,15 +42,15 @@ const MAX_LCS_PRODUCT: usize = 1_000_000;
 /// untouched, so there is plenty to align on — every signature an anchor, every
 /// re-indented line a change — and each resulting region fits the per-region
 /// bound comfortably while the receipt that comes out is a diff of the whole
-/// file. Total work is the *sum* of the per-region products, which is how a
-/// hunk-sized receipt came to cost 10⁸ DP cells inside one synchronous tool
-/// call.
+/// file. Total work is the *sum* of the per-region products, so without a
+/// receipt-wide figure one synchronous tool call can reach 10⁸ DP cells on a
+/// change that satisfies every regional check it meets.
 ///
 /// Four regions' worth: a region too wide for [`MAX_LCS_PRODUCT`] still splits
-/// on unique anchors and matches part by part as before, and a change spread
-/// past four such regions returns `None`, leaving the caller the bounded
-/// preview — the honest form, since a diff of an entire file says nothing a
-/// preview of it does not.
+/// on unique anchors and matches part by part, and a change spread past four
+/// such regions is refused, and the receipt says so without hunks — a diff of
+/// the entire file says nothing a `Read` of it does not, and costs a receipt's
+/// worth of context to say.
 const MAX_TOTAL_LCS_CELLS: usize = MAX_LCS_PRODUCT.saturating_mul(4);
 
 /// Lines one receipt's change regions may print, both sides together.
@@ -56,11 +58,13 @@ const MAX_TOTAL_LCS_CELLS: usize = MAX_LCS_PRODUCT.saturating_mul(4);
 /// The size half of the bound, where [`MAX_TOTAL_LCS_CELLS`] is the time half:
 /// aligning many regions is cheap and *reading* them is not, and these receipts
 /// carry `Retention::Durable` — an oversized one does not merely cost this
-/// turn, it stays in context through compaction. The number is the preview's
-/// own ([`LARGE_DIFF_PREVIEW_LINES`] lines per side), so a hunked receipt can
-/// never print more than the fallback that bounded every large file before
-/// hunks existed. A change wider than that is a rewrite, and a rewrite is what
-/// the preview describes better anyway.
+/// turn, it stays in context through compaction.
+///
+/// What it bounds is what a reader pays, so the receipts that matter scale with
+/// the change and not with the file: a one-line edit costs a dozen lines however
+/// long its target. A change that would print past the bound is refused outright
+/// ([`DiffPlan::TooWide`]): a receipt trimmed to a bound and a receipt labelled
+/// as exceeding it are the same size, and only one of them pretends.
 ///
 /// The charge is the printed footprint, not the changed-line count: what a
 /// region contributes to the sequence, the [`CONTEXT_LINES`] the renderer draws
@@ -68,17 +72,20 @@ const MAX_TOTAL_LCS_CELLS: usize = MAX_LCS_PRODUCT.saturating_mul(4);
 /// [`RECEIPT_SCAFFOLD_LINES`] and the closing gap. Regions are priced where they
 /// are resolved, which over-charges hunks that turn out to share context — the
 /// safe direction for a figure meant to be an upper limit.
-const MAX_DIFF_LINES: usize = LARGE_DIFF_PREVIEW_LINES.saturating_mul(2);
+const MAX_DIFF_LINES: usize = 2_000;
 
-// The three bounds are pinned against each other here rather than in a test,
-// because a misconfigured pair should fail every build and not only the run
-// that happens to execute: a whole-receipt cell budget below one region's bound
-// would leave no region affordable, making the anchor split dead code and every
-// large edit a preview, and a print budget above the preview's own size would
-// make hunks the looser of the two forms — the bound would then be the reason a
-// receipt got bigger.
+// Pinned where they are defined rather than in a test, because a misconfigured
+// pair should fail every build and not only the run that happens to execute: a
+// whole-receipt cell budget at or below one region's bound would leave no region
+// affordable, making the anchor split dead code and every large change a
+// refusal.
 const _: () = assert!(MAX_TOTAL_LCS_CELLS > MAX_LCS_PRODUCT);
-const _: () = assert!(MAX_DIFF_LINES == LARGE_DIFF_PREVIEW_LINES.saturating_mul(2));
+const _: () = assert!(
+    MAX_DIFF_LINES
+        > CONTEXT_LINES
+            .saturating_mul(2)
+            .saturating_add(RECEIPT_SCAFFOLD_LINES)
+);
 
 /// Lines a receipt prints around its hunks, whatever the change is.
 ///
@@ -96,16 +103,6 @@ const RECEIPT_SCAFFOLD_LINES: usize = 3;
 /// longer than twice this is skipped rather than printed, its line count
 /// carried into the next hunk header instead.
 const CONTEXT_LINES: usize = 3;
-
-/// Lines a bounded receipt block may print per side.
-///
-/// Two blocks are bounded by this: the large-file fallback preview (past
-/// [`MAX_LCS_PRODUCT`] with nothing to align on), which prints this many
-/// lines of each side, and a new file's additions, which print this many
-/// `+ ` lines before the `... +N more lines` tail. The bound keeps a
-/// receipt proportional to what was written even when the answer is "this
-/// whole file", where no smaller honest form exists.
-const LARGE_DIFF_PREVIEW_LINES: usize = 1000;
 
 /// One line in a diff sequence, produced by `build_diff_lines`.
 ///
@@ -165,6 +162,39 @@ enum LineDiff {
     },
 }
 
+/// Format the receipt for a change that gets no hunks.
+///
+/// Two failures reach it, and `why` names which: a change with no line unique to
+/// either side to align on, and a change whose hunks would print past
+/// [`MAX_DIFF_LINES`]. Neither has a hunk worth showing — the first was never
+/// matched, so any address printed for it would name lines the diff did not
+/// reach, and the second was priced out of the receipt, not out of the file. So
+/// the receipt states what is known and stops, the shape this module already uses
+/// for a change it cannot diff line by line ([`OldContent::NotUtf8`],
+/// [`OldContent::Unreadable`]).
+///
+/// `why` is phrased by the caller because the two failures read differently to
+/// the model that has to act on them: one means the edit rewrote the file, the
+/// other means the edit was too spread out to display. Both counts are exact and
+/// cheap — line counts of the two contents, not a measurement of what differs,
+/// which is exactly the figure the matcher could not produce. Seeing a change
+/// this wide is the `Read` tool's job; the receipt's job is to say what the edit
+/// cost, and it says that in two lines.
+fn wholesale_change_receipt(
+    file_path: &str,
+    why: &str,
+    old_lines: usize,
+    new_lines: usize,
+) -> String {
+    let mut result = format!("Changed: {file_path} (modified, change not shown)\n");
+    writeln!(
+        result,
+        "│ {old_lines} lines before, {new_lines} after — {why}"
+    )
+    .ok();
+    result
+}
+
 /// What a success message renders against: the previous state of the
 /// written target.
 ///
@@ -178,14 +208,18 @@ enum LineDiff {
 pub(crate) enum OldContent<'a> {
     /// The target had no existing filesystem entry.
     ///
-    /// The message renders the `Created:` block: the new content's
-    /// first lines as an addition preview.
+    /// The message renders the `Created:` header and every added line, each
+    /// `+`-prefixed and bounded at [`MAX_DIFF_LINES`] like the rest of this
+    /// module's output; past the bound a `... +N more lines` tail carries what
+    /// went unprinted, so a generated file cannot echo itself into context.
     Absent,
 
     /// The target's previous content, decoded as text.
     ///
-    /// The message renders the `Changed:` block: a line diff (or the
-    /// large-file preview) computed against this text.
+    /// The message renders the `Changed:` header and the hunks computed against
+    /// this text, each region opening with its own `@@` address. A change the
+    /// bounds refuse prints no hunks at all, only the reason
+    /// ([`DiffPlan::Unalignable`], [`DiffPlan::TooWide`]).
     Text(&'a str),
 
     /// The target existed, but its bytes were not valid UTF-8.
@@ -215,7 +249,7 @@ pub(crate) enum OldContent<'a> {
 ///
 /// - **New file** ([`OldContent::Absent`]): prints a `Created:` header
 ///   followed by the file's additions, each prefixed with `+ `, up to
-///   [`LARGE_DIFF_PREVIEW_LINES`] lines. Past that a `... +N more lines`
+///   [`MAX_DIFF_LINES`] lines. Past that a `... +N more lines`
 ///   summary closes the block, so a generated file stays bounded instead of
 ///   echoing itself into the reader's context.
 /// - **Modified, readable text** ([`OldContent::Text`]): prints a
@@ -245,7 +279,7 @@ pub(crate) fn format_file_change(
     match old_content {
         OldContent::Absent => {
             let lines: Vec<&str> = new_content.lines().collect();
-            let preview_count = lines.len().min(LARGE_DIFF_PREVIEW_LINES);
+            let preview_count = lines.len().min(MAX_DIFF_LINES);
             let mut result = format!("Created: {file_path} (new file)\n");
             for line in lines.iter().take(preview_count) {
                 writeln!(result, "+ {line}").ok();
@@ -265,8 +299,25 @@ pub(crate) fn format_file_change(
         OldContent::Text(old) => {
             let old_lines: Vec<&str> = old.lines().collect();
             let new_lines: Vec<&str> = new_content.lines().collect();
-            let Some(diff) = build_diff_lines(&old_lines, &new_lines) else {
-                return format_large_diff(file_path, &old_lines, &new_lines);
+            let plan = build_diff_lines(&old_lines, &new_lines);
+            let diff = match plan {
+                DiffPlan::Hunks(diff) => diff,
+                DiffPlan::Unalignable => {
+                    return wholesale_change_receipt(
+                        file_path,
+                        "no line unique to either side to align on",
+                        old_lines.len(),
+                        new_lines.len(),
+                    );
+                }
+                DiffPlan::TooWide => {
+                    return wholesale_change_receipt(
+                        file_path,
+                        "it prints more than a receipt may hold",
+                        old_lines.len(),
+                        new_lines.len(),
+                    );
+                }
             };
 
             let mut result = format!("Changed: {file_path} (modified)\n");
@@ -305,11 +356,15 @@ struct ChangeWindow {
     /// region's net change — the stitcher's arithmetic depends on that.
     new: std::ops::Range<usize>,
 
-    /// The region's own diff: removed and inserted lines, in order.
+    /// The region's own diff: its changed lines, in order.
     ///
-    /// Never holds [`LineDiff::Unchanged`] entries: context belongs to the
-    /// gaps between regions, which is where it can be shared, elided, and
-    /// counted without being materialised once per region.
+    /// The region's middle is matched by an LCS, so a line both sides hold at
+    /// the same point in the region — `M`, `x`, `P` against `N`, `x`, `Q`
+    /// matches on the `x` — rides inside as [`LineDiff::Unchanged`], and the
+    /// renderer numbers it along with the rest. What the entries never carry is
+    /// the context *around* the region: that belongs to the gaps between
+    /// regions, where it can be shared, elided, and counted without being
+    /// materialised once per region.
     entries: Vec<LineDiff>,
 }
 
@@ -342,8 +397,8 @@ struct Segment {
 /// where they are spent rather than tallied at the end, because the point of a
 /// budget is to stop spending — a receipt found too large after the fact has
 /// already paid for itself. Exhausting either half fails the whole build, which
-/// is the caller's signal that this change is not hunkable and the bounded
-/// preview is its honest form.
+/// is the caller's signal that this change is not hunkable and the receipt it
+/// writes will say so, without hunks.
 struct DiffBudget {
     /// DP cells still available across every region.
     ///
@@ -351,6 +406,13 @@ struct DiffBudget {
     /// for a region one side of which is empty — a pure insertion or deletion
     /// is addressed directly, costing no matching whatever its width.
     cells_left: usize,
+
+    /// Whether a refusal came from the budget rather than from the content.
+    ///
+    /// Set by the two buy methods on the way out, and read once: it is what lets
+    /// the build tell [`DiffPlan::TooWide`] from [`DiffPlan::Unalignable`], since
+    /// both arrive as the same `None` from [`split_segment`].
+    over_budget: bool,
 
     /// Lines still available to print, both sides together.
     ///
@@ -379,6 +441,7 @@ impl Default for DiffBudget {
         Self {
             cells_left: MAX_TOTAL_LCS_CELLS,
             lines_left: MAX_DIFF_LINES,
+            over_budget: false,
         }
     }
 }
@@ -396,10 +459,11 @@ impl DiffBudget {
     /// Returns `None`, charging nothing, when `cells` exceeds what is left. The
     /// refusal is of the whole receipt rather than of the region — half a diff
     /// is not a renderable thing — and the `Option<()>` shape is what carries it
-    /// up the worklist with `?` to the caller, whose bounded preview is the
-    /// honest form of a change this receipt cannot pay for.
+    /// up the worklist with `?` to the caller, which answers a change this
+    /// receipt cannot pay for by naming it instead of printing it.
     fn buy_cells(&mut self, cells: usize) -> Option<()> {
         if cells > self.cells_left {
+            self.over_budget = true;
             return None;
         }
         self.cells_left = self.cells_left.saturating_sub(cells);
@@ -422,15 +486,48 @@ impl DiffBudget {
     ///
     /// Returns `None`, charging nothing, when the region would print past what
     /// is left, and does so for a receipt whose earlier regions were already
-    /// paid for: a change is rendered as all hunks or all preview, never as the
+    /// paid for: a change is rendered as all hunks or none, never as the
     /// first half of itself.
     fn buy_lines(&mut self, lines: usize) -> Option<()> {
         if lines > self.lines_left {
+            self.over_budget = true;
             return None;
         }
         self.lines_left = self.lines_left.saturating_sub(lines);
         Some(())
     }
+}
+
+/// What a diff attempt established about one change.
+///
+/// The two refusals are separate because the receipts differ: a change with
+/// nothing to align on and a change too wide to print are not the same fact about
+/// the edit, and the model reading the result decides what to do next on the
+/// difference. Both come with hunks omitted entirely — never a partial diff,
+/// which would carry addresses for material that was dropped.
+enum DiffPlan {
+    /// The change as a diff sequence, which the renderer numbers from file
+    /// positions.
+    ///
+    /// The one variant carrying a receipt body. Every entry is addressable
+    /// because [`build_diff_lines`] resolved it against real positions in both
+    /// files rather than against the span it was cut from, which is what lets an
+    /// elision of unchanged lines keep both sides' numbering honest.
+    Hunks(Vec<LineDiff>),
+
+    /// A region had no line unique to each side to cut it at.
+    ///
+    /// The two sides genuinely do not correspond — too wide to match
+    /// and with nothing to align on, so no hunk either side could
+    /// trust an address from.
+    Unalignable,
+
+    /// The change fits the matcher but not the receipt.
+    ///
+    /// Pricing every region's printed footprint exhausted
+    /// [`MAX_DIFF_LINES`] — the hunks exist, but printing them would
+    /// cost more receipt than the edit is worth.
+    TooWide,
 }
 
 /// Build the diff sequence between two files' lines at a cost the change sets.
@@ -447,12 +544,11 @@ impl DiffBudget {
 /// than the context margin — so `format_diff_with_context` numbers every hunk
 /// from real file positions.
 ///
-/// Returns `None` when the change is not hunkable: a region too wide to match
-/// with no line unique to each side to align on, or a change wide enough to
-/// exhaust [`DiffBudget`] — either way the caller renders the bounded
-/// before/after preview rather than a diff that would cost the file's square,
-/// print the file's length, or silently drop the lines it skipped.
-fn build_diff_lines(old_lines: &[&str], new_lines: &[&str]) -> Option<Vec<LineDiff>> {
+/// The [`DiffPlan`] is `Unalignable` or `TooWide` when the change cannot be
+/// hunked at all; the caller renders either as a receipt with no hunks rather
+/// than a diff that would cost the file's square, print the file's length, or
+/// silently drop the lines it skipped.
+fn build_diff_lines(old_lines: &[&str], new_lines: &[&str]) -> DiffPlan {
     build_diff_lines_within(&mut DiffBudget::default(), old_lines, new_lines)
 }
 
@@ -466,29 +562,48 @@ fn build_diff_lines_within(
     budget: &mut DiffBudget,
     old_lines: &[&str],
     new_lines: &[&str],
-) -> Option<Vec<LineDiff>> {
+) -> DiffPlan {
     let mut windows: Vec<ChangeWindow> = Vec::new();
-    budget.buy_lines(
-        CONTEXT_LINES
-            .saturating_mul(2)
-            .saturating_add(RECEIPT_SCAFFOLD_LINES),
-    )?;
+    if budget
+        .buy_lines(
+            CONTEXT_LINES
+                .saturating_mul(2)
+                .saturating_add(RECEIPT_SCAFFOLD_LINES),
+        )
+        .is_none()
+    {
+        // Only reachable if the bound is configured below a receipt's own
+        // scaffolding, which the assertion beside the constants refuses to
+        // compile; a bound that cannot hold a header prints no hunks.
+        return DiffPlan::TooWide;
+    }
     let mut work: Vec<Segment> = vec![Segment {
         old: 0..old_lines.len(),
         new: 0..new_lines.len(),
     }];
     while let Some(segment) = work.pop() {
-        split_segment(
+        if split_segment(
             old_lines,
             new_lines,
             &segment,
             &mut windows,
             &mut work,
             budget,
-        )?;
+        )
+        .is_none()
+        {
+            // The two refusals read differently, and only the budget knows which
+            // one happened: an unalignable region and a change that ran out of
+            // receipt look identical from the worklist.
+            return if budget.over_budget {
+                DiffPlan::TooWide
+            } else {
+                DiffPlan::Unalignable
+            };
+        }
     }
     if windows.is_empty() {
-        return Some(Vec::new());
+        return DiffPlan::Hunks(Vec::new());
     }
 
     let mut sequence: Vec<LineDiff> = Vec::new();
@@ -515,7 +630,7 @@ fn build_diff_lines_within(
         new_at,
         new_lines.len(),
     );
-    Some(sequence)
+    DiffPlan::Hunks(sequence)
 }
 
 /// Resolve one segment into a change region, or cut it into smaller ones.
@@ -531,7 +646,7 @@ fn build_diff_lines_within(
 ///    consecutive anchors go back on the worklist, each one strictly smaller
 ///    than the segment they came from.
 /// 3. The middle is wider and has nothing to align on — a rewrite with no
-///    surviving line. `None` sends the caller to the preview: no bound can be
+///    surviving line. `None` refuses the receipt: no bound can be
 ///    honoured, and eliding the middle would print numbers about lines the
 ///    diff never saw.
 ///
@@ -888,44 +1003,6 @@ fn eof_change_note(old: &str, new: &str) -> Option<String> {
     Some(format!("│ {note}\n"))
 }
 
-/// Format a diff for files too large for the LCS algorithm (product exceeds
-/// `MAX_LCS_PRODUCT`).
-///
-/// Shows a truncated before/after preview instead of computing the full
-/// diff: up to `LARGE_DIFF_PREVIEW_LINES` lines of old content (prefixed
-/// `- `) and the same number of new content (prefixed `+ `), with
-/// `... N more lines` summaries for each side.
-fn format_large_diff(file_path: &str, old_lines: &[&str], new_lines: &[&str]) -> String {
-    let mut result = format!("Changed: {file_path} (modified, large file)\n");
-    let old_preview = old_lines.len().min(LARGE_DIFF_PREVIEW_LINES);
-
-    result.push_str("Before:\n");
-
-    for line in old_lines.iter().take(old_preview) {
-        writeln!(result, "- {line}").ok();
-    }
-
-    if old_lines.len() > old_preview {
-        let more = old_lines.len().saturating_sub(old_preview);
-        writeln!(result, "... {more} more lines").ok();
-    }
-
-    let new_preview = new_lines.len().min(LARGE_DIFF_PREVIEW_LINES);
-    result.push_str("After:\n");
-
-    for line in new_lines.iter().take(new_preview) {
-        writeln!(result, "+ {line}").ok();
-    }
-
-    if new_lines.len() > new_preview {
-        let more = new_lines.len().saturating_sub(new_preview);
-        writeln!(result, "... {more} more lines").ok();
-    }
-
-    result
-}
-
-/// Read a cell from the flat DP table at row `i`, column `j`.
 ///
 /// The table is stored as a single `Vec<usize>` with row-major layout: cell
 /// `(i, j)` lives at index `i * stride + j`, where `stride` is the number of
@@ -1087,8 +1164,8 @@ fn is_new_line_inserted(dp: &[usize], stride: usize, i: usize, j: usize) -> bool
 /// are shown before and after each run of insertions/deletions, and
 /// runs of unchanged lines longer than `context` are elided into the
 /// next region's header. The numbers let a reader — model or display —
-/// address the change where it sits in the file, not only in the
-/// preview.
+/// address the change where it sits in the file, not only in the diff
+/// it was handed.
 ///
 /// A [`LineDiff::Skipped`] is never printed. It closes the run it follows and
 /// advances both counters by the lines it stands for, so the numbers on the
@@ -1146,18 +1223,40 @@ fn format_numbered_run(
     old_at: usize,
     new_at: usize,
 ) -> String {
-    /// One numbered diff entry: the kind, its text, and its 1-based
-    /// line number on whichever side it occupies.
+    /// One numbered diff entry.
+    ///
+    /// The kind, its text, and its 1-based line number on whichever
+    /// side it occupies — the renderer's atomic unit, already priced
+    /// against the budget by the time it exists.
     struct Numbered<'a> {
-        /// Set for a line only the old content holds — printed with `- `.
+        /// Whether the line exists only in the old content.
+        ///
+        /// Printed with the `- ` gutter. Mutually exclusive with
+        /// [`inserted`](Self::inserted); a line both sides hold sets neither.
         deleted: bool,
-        /// Set for a line only the new content holds — printed with `+ `.
+
+        /// Whether the line exists only in the new content.
+        ///
+        /// Printed with the `+ ` gutter. A line the two sides share sets neither
+        /// flag and reads as unchanged context.
         inserted: bool,
+
         /// The line's text, without the gutter prefix.
+        ///
+        /// Carried exactly as the file holds it, leading indentation included,
+        /// so the gutter is the only thing the renderer adds.
         text: &'a str,
+
         /// Its 1-based position in the old file, or `None` if it has none.
+        ///
+        /// `None` only for an inserted line, which the old file does not hold.
+        /// The numbers are what the `@@` header counts from.
         old_no: Option<usize>,
+
         /// Its 1-based position in the new file, or `None` if it has none.
+        ///
+        /// `None` only for a deleted line. Held beside [`old_no`](Self::old_no)
+        /// so one pass numbers both sides of a run.
         new_no: Option<usize>,
     }
 
@@ -1298,24 +1397,22 @@ mod tests {
     }
 
     #[test]
-    fn a_new_file_past_the_preview_bound_keeps_its_tail_note() {
-        // The bound is what stops a generated file from echoing itself into
-        // the reader's context, and the tail is what keeps the bound honest
-        // about how much it left out.
-        let content: String = (1..=1200).map(|i| format!("line {i}\n")).collect();
+    fn a_new_file_past_the_receipt_bound_keeps_its_tail_note() {
+        // A `Created:` block prints the file's additions — that is the change —
+        // but the receipt bound bounds every line a receipt prints, additions
+        // included, and the tail is what keeps that bound honest about how much
+        // it left out.
+        let content: String = (1..=2400).map(|i| format!("line {i}\n")).collect();
         let result = format_file_change("test.rs", OldContent::Absent, &content);
         let added = result.lines().filter(|line| line.starts_with("+ ")).count();
-        assert_eq!(
-            added, LARGE_DIFF_PREVIEW_LINES,
-            "the additions block stays bounded"
+        assert_eq!(added, MAX_DIFF_LINES, "the additions block stays bounded");
+        assert!(
+            result.contains(&format!("... +{} more lines", 2400 - MAX_DIFF_LINES)),
+            "the tail names what it hid: {result}"
         );
         assert!(
-            result.contains("... +200 more lines"),
-            "the tail names what it hid"
-        );
-        assert!(
-            !result.contains("+ line 1001"),
-            "nothing prints past the bound"
+            !result.contains("+ line 2001"),
+            "nothing prints past the bound: {result}"
         );
     }
 
@@ -1588,34 +1685,87 @@ mod tests {
     }
 
     #[test]
-    fn an_unalignable_large_rewrite_keeps_the_preview() {
-        // The fallback keeps its own pin. Interleaved filler shares no line
-        // that occurs once on each side, so there is nothing to align the
-        // region on; past the budget the honest answer is the bounded
-        // before/after block, labelled as such and readable as prose — never a
-        // hunk whose numbers would describe lines the diff never reached.
+    fn an_unalignable_large_rewrite_shows_nothing_and_says_why() {
+        // Interleaved filler shares no line that occurs once on each side, so
+        // there is nothing to align the region on. What the receipt can state
+        // honestly is two line counts and the reason no hunks follow.
         let old: String = (0..1200).map(|_| "a\nb\n").collect();
         let new: String = (0..1200).map(|_| "b\na\n").collect();
         let result = format_file_change("data.txt", OldContent::Text(&old), &new);
         assert!(
-            result.contains("Changed: data.txt (modified, large file)"),
+            result.contains("Changed: data.txt (modified, change not shown)"),
             "{result}"
         );
-        assert!(result.contains("Before:"), "{result}");
-        assert!(result.contains("After:"), "{result}");
+        assert!(
+            result.contains("2 400 lines before, 2 400 after")
+                || result.contains("2400 lines before, 2400 after"),
+            "the receipt carries the counts it can state exactly: {result}"
+        );
+        assert!(result.contains("no line unique to either side"), "{result}");
+        assert!(!result.contains("Before:"), "the echo is gone: {result}");
         assert!(
             !result.contains("@@"),
-            "no hunk may claim addresses the matcher did not reach: {result}"
+            "no hunk without a matcher behind it: {result}"
         );
-        assert_eq!(
-            result.lines().count(),
-            LARGE_DIFF_PREVIEW_LINES.saturating_mul(2).saturating_add(5),
-            "two bounded sides, two tails, one header: {result}"
+        assert_eq!(result.lines().count(), 2, "two lines, no file: {result}");
+    }
+
+    #[test]
+    fn an_unalignable_receipt_says_no_line_is_unique_to_both_sides() {
+        // The fixture shares every line it has: `a` and `b` both appear on both
+        // sides, thousands of times each. What the matcher lacks is therefore
+        // not a shared line but one occurring on one side alone — the reason a
+        // receipt claiming "no line to align on" would overstate what it knows.
+        let old: String = (0..1200).map(|_| "a\nb\n").collect();
+        let new: String = (0..1200).map(|_| "b\na\n").collect();
+        let result = format_file_change("data.txt", OldContent::Text(&old), &new);
+        assert!(
+            result.contains("unique"),
+            "the stated reason must be the one the matcher actually lacks: {result}"
         );
     }
 
     #[test]
-    fn a_rewritten_large_file_that_still_aligns_falls_back_to_the_preview() {
+    fn a_window_holds_a_line_both_sides_share() {
+        // The matched middle of a region is an LCS, so a line present on both
+        // sides rides inside the window — here the shared `x` between two
+        // changed neighbours. A window is the region's own diff, not a
+        // deletions-and-insertions-only list: the renderer numbers what it holds,
+        // and dropping the shared line would move every number after it.
+        let old = ["M", "x", "P"];
+        let new = ["N", "x", "Q"];
+        let segment = Segment {
+            old: 0..old.len(),
+            new: 0..new.len(),
+        };
+        let mut windows = Vec::new();
+        let mut work = Vec::new();
+        assert!(
+            split_segment(
+                &old,
+                &new,
+                &segment,
+                &mut windows,
+                &mut work,
+                &mut DiffBudget::default(),
+            )
+            .is_some(),
+            "a region this small resolves"
+        );
+        let entries = &windows
+            .first()
+            .expect("the region resolves into a window")
+            .entries;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry, LineDiff::Unchanged(text) if text == "x")),
+            "the line both sides hold must ride inside the region: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_large_file_that_still_aligns_is_refused_whole() {
         // The shape a per-region bound cannot see. Re-indenting a file leaves
         // every top-level signature unique and untouched, so there is plenty to
         // align on — each signature an anchor, every re-indented line a change —
@@ -1638,26 +1788,30 @@ mod tests {
         }
         let result = format_file_change("big.rs", OldContent::Text(&old), &new);
         assert!(
-            result.contains("Changed: big.rs (modified, large file)"),
-            "a change wider than a receipt may print is a rewrite, and the preview \
-             is its bounded form: {}",
+            result.contains("Changed: big.rs (modified, change not shown)"),
+            "a change wider than a receipt may print is refused whole, not trimmed: {}",
             result.chars().take(240).collect::<String>()
         );
         assert!(
-            !result.contains("@@"),
-            "no hunk may address lines the matcher did not reach: {result}"
+            result.contains("prints more than a receipt may hold"),
+            "{result}"
+        );
+        assert!(!result.contains("@@"), "never half a diff: {result}");
+        assert!(
+            !result.contains("Before:"),
+            "no echo to fall back to: {result}"
         );
         assert_eq!(
             result.lines().count(),
-            LARGE_DIFF_PREVIEW_LINES.saturating_mul(2).saturating_add(5),
-            "the receipt is bounded by the preview's own size, not by the 6 000 \
-             changed lines the aligned regions would have printed: {} lines",
+            2,
+            "the 6 000 changed lines the aligned regions would have printed are now \
+             two lines about the change: {} lines",
             result.lines().count()
         );
     }
 
     #[test]
-    fn scattered_one_line_changes_past_the_print_bound_render_the_preview() {
+    fn scattered_one_line_changes_past_the_print_bound_are_refused() {
         // The shape charging a region's own lines missed. 700 one-line edits in a
         // 20 000-line file: every changed line sits between neighbours unique on
         // both sides, so the anchor split cuts the work into 700 regions of 1 × 1
@@ -1674,17 +1828,17 @@ mod tests {
         let result =
             format_file_change("big.rs", OldContent::Text(&old.join("\n")), &new.join("\n"));
         assert!(
-            result.contains("Changed: big.rs (modified, large file)"),
+            result.contains("Changed: big.rs (modified, change not shown)"),
             "700 scattered changes print more than a receipt may hold, however \
              little each of them cost to match: {}",
             result.chars().take(200).collect::<String>()
         );
         assert!(!result.contains("@@"), "{result}");
+        assert!(!result.contains("Before:"), "{result}");
         assert_eq!(
             result.lines().count(),
-            LARGE_DIFF_PREVIEW_LINES.saturating_mul(2).saturating_add(5),
-            "the receipt is bounded by the preview's size, not by 6 300 lines of \
-             hunked context: {} lines",
+            2,
+            "6 300 lines of hunked context became two lines about the change: {} lines",
             result.lines().count()
         );
     }
@@ -1731,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_a_region_exhausts_returns_the_change_to_the_preview() {
+    fn a_budget_a_region_exhausts_refuses_the_change_whole() {
         // Both halves of the receipt-wide budget, on a fixture small enough to
         // read: 200 lines against 200, which no shared edge trims and no line
         // pairs up as an anchor — 40 000 DP cells, 400 printed lines. A budget
@@ -1746,27 +1900,37 @@ mod tests {
         let mut paid = DiffBudget {
             cells_left: 40_000,
             lines_left: MAX_DIFF_LINES,
+            ..DiffBudget::default()
         };
         assert!(
-            build_diff_lines_within(&mut paid, &old_refs, &new_refs).is_some(),
+            matches!(
+                build_diff_lines_within(&mut paid, &old_refs, &new_refs),
+                DiffPlan::Hunks(_)
+            ),
             "a region the budget can pay for is matched exactly as it always was"
         );
 
         let mut short_of_cells = DiffBudget {
             cells_left: 39_999,
-            lines_left: MAX_DIFF_LINES,
+            ..DiffBudget::default()
         };
         assert!(
-            build_diff_lines_within(&mut short_of_cells, &old_refs, &new_refs).is_none(),
+            matches!(
+                build_diff_lines_within(&mut short_of_cells, &old_refs, &new_refs),
+                DiffPlan::TooWide
+            ),
             "the cell half of the budget has to bite before the matcher runs"
         );
 
         let mut short_of_lines = DiffBudget {
-            cells_left: MAX_TOTAL_LCS_CELLS,
             lines_left: 399,
+            ..DiffBudget::default()
         };
         assert!(
-            build_diff_lines_within(&mut short_of_lines, &old_refs, &new_refs).is_none(),
+            matches!(
+                build_diff_lines_within(&mut short_of_lines, &old_refs, &new_refs),
+                DiffPlan::TooWide
+            ),
             "the print half has to bite too, or the bound is only about time"
         );
         assert_eq!(

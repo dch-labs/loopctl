@@ -882,12 +882,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wholesale_overwrite_of_a_large_file_keeps_the_preview() {
-        // The fallback receipts still need. Two interleaved halves of filler
-        // share no line that occurs once on each side, so nothing anchors an
-        // alignment and no hunk could honestly address the middle: the receipt
-        // says `large file` in its header and prints two bounded sides instead
-        // of inventing line numbers.
+    async fn a_wholesale_overwrite_of_a_large_file_shows_no_echo() {
+        // Two interleaved halves of filler share no line that occurs once on
+        // each side, so nothing anchors an alignment and no hunk could honestly
+        // address the middle. The old answer was the Before/After echo — up to
+        // 1 000 lines a side of a file the write had already replaced — and the
+        // reason it existed (inventing line numbers is worse than showing
+        // nothing) still holds. What changed is that showing nothing is now what
+        // the receipt does, in two lines, instead of echoing the file.
         let tmp = tempfile::TempDir::new().unwrap();
         let before: String = (0..1200).map(|_| "a\nb\n").collect();
         std::fs::write(tmp.path().join("data.txt"), &before).unwrap();
@@ -903,12 +905,17 @@ mod tests {
             .unwrap();
         let text = out.text_content();
         assert!(
-            text.contains("Changed: data.txt (modified, large file)"),
+            text.contains("Changed: data.txt (modified, change not shown)"),
             "{text}"
         );
         assert!(
-            text.contains("Before:") && text.contains("After:"),
-            "{text}"
+            !text.contains("Before:") && !text.contains("After:"),
+            "a write result is a receipt, not a copy of the file it wrote: {text}"
+        );
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "header and the reason there are no hunks: {text}"
         );
         assert!(
             !text.contains("@@"),

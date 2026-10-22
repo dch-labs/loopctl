@@ -6,3 +6,5 @@ Hints:
   - The file may have changed since you last read it — try re-reading with `Read`
   - Check for whitespace or Unicode differences
   - Use `Grep` to search for the text you want to replace
+
+<WORKSPACE>/a.rs has not been read in this session, so this tool writes only where the old text matches its current bytes exactly. Read it with Read, then re-issue the edit against the content it returns.

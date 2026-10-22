@@ -161,11 +161,25 @@ impl Tool for EditTool {
 /// Recoverable conditions (text not found, ambiguous match, a
 /// validator rejection, a file changed on disk since this call read
 /// it) are surfaced as soft [`ToolOutput`] errors; hard failures (bad
-/// args, missing file, I/O fault) become [`ToolError`]. A baseline
-/// whose only observation is resume-armed holds the edit — the same
-/// refusal Write applies — until a live read re-records the bytes. A
-/// successful write refreshes the path's recorded baseline, so the
-/// model's own edit never registers as a later external change.
+/// args, missing file, I/O fault) become [`ToolError`]. A successful
+/// write refreshes the path's recorded baseline, so the model's own
+/// edit never registers as a later external change.
+///
+/// The read-before-write guard is decided on the anchor, not on session
+/// bookkeeping: what an edit depends on is that the bytes on disk still
+/// hold the text it names, and matching settles that regardless of what
+/// a read log believes. A resume-armed baseline — or no baseline at all
+/// — therefore costs the edit its tolerance and nothing else: the
+/// whitespace-normalized rescue reconciles a model's recollection of
+/// text it has seen, so on bytes this session has never seen it is
+/// declined and the refusal says why
+/// ([`unverified_anchor_note`](super::conflict::unverified_anchor_note)).
+/// Refusing on the recorded flag instead taxed every edit of a resumed
+/// file with a full re-read of a file whose anchor was sitting intact on
+/// disk. Verification is not part of that trade: the content is read
+/// moments before the match, and
+/// [`check_content_unchanged`](super::conflict::check_content_unchanged)
+/// compares the file once more immediately before the rename.
 ///
 /// # Errors
 ///
@@ -193,20 +207,13 @@ async fn edit_inner(
         Some(session.anchor()),
     )
     .await?;
-    if session
-        .baseline_for(&full_path)
-        .is_some_and(|baseline| baseline.resumed)
-    {
-        return Ok(ToolOutput::error_text(conflict::resumed_baseline_message(
-            &full_path,
-        )));
-    }
+    let read_here = session.read_here(&full_path);
     let mut normalized_note = false;
     let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
         Ok(content) => content,
         Err(EditError::NotFound) => {
             match super::match_repair::classify_miss(&old_content, parsed.old_text) {
-                super::match_repair::MissKind::WhitespaceUnique(window) => {
+                super::match_repair::MissKind::WhitespaceUnique(window) if read_here => {
                     match super::match_repair::normalized_splice(
                         &old_content,
                         window,
@@ -227,11 +234,16 @@ async fn edit_inner(
                     }
                 }
                 kind => {
-                    return Ok(ToolOutput::error_text(format!(
+                    let mut message = format!(
                         "Old text not found in file.\n\n{}\n{}",
                         super::match_repair::render_miss(&kind, &old_content),
                         "Hints:\n  - The file may have changed since you last read it — try re-reading with `Read`\n  - Check for whitespace or Unicode differences\n  - Use `Grep` to search for the text you want to replace"
-                    )));
+                    );
+                    if !read_here {
+                        message.push_str("\n\n");
+                        message.push_str(&conflict::unverified_anchor_note(&full_path));
+                    }
+                    return Ok(ToolOutput::error_text(message));
                 }
             }
         }
@@ -482,7 +494,7 @@ async fn read_existing(
 /// The receipt's `│`-note channel sits between the `Changed:` header
 /// and the `@@` hunks; the disclosure rides exactly there, so the
 /// model sees *why* the edit applied without hunting the diff.
-fn insert_normalized_note(receipt: &mut String) {
+pub(super) fn insert_normalized_note(receipt: &mut String) {
     let note = format!("│ {}\n", super::match_repair::NORMALIZED_MATCH_NOTE);
     if let Some(position) = receipt.find("\n@@") {
         receipt.insert_str(position.saturating_add(1), &note);
@@ -610,6 +622,13 @@ mod tests {
         ctx
     }
 
+    // The tolerant match is withheld from a file the session has not read, so a
+    // fixture that only wrote the target has to be seen reading it.
+    fn read_here(session: &FileSession, path: &Path) {
+        let bytes = std::fs::read(path).expect("read fixture");
+        session.record_baseline(path, state::observe_bytes(&bytes));
+    }
+
     struct RejectBad;
 
     impl ContentValidator for RejectBad {
@@ -701,6 +720,7 @@ mod tests {
             "old_text": "      fn two() {}",
             "new_text": "      fn two() { todo!() }",
         });
+        read_here(&session, &dir.path().join("a.rs"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -737,6 +757,7 @@ mod tests {
             "old_text": "      fn two() {}",
             "new_text": "      fn two() { todo!() }",
         });
+        read_here(&session, &dir.path().join("a.rs"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -774,6 +795,7 @@ mod tests {
             "old_text": "def f(self):\n    return 1",
             "new_text": "def f(self):\n    return 2",
         });
+        read_here(&session, &dir.path().join("a.py"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -804,6 +826,7 @@ mod tests {
             "old_text": "        fn inner() {}",
             "new_text": "        fn inner() { todo!() }",
         });
+        read_here(&session, &dir.path().join("a.rs"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -833,6 +856,7 @@ mod tests {
             "old_text": "def f():\n    return 1",
             "new_text": "def f():\n    return 2",
         });
+        read_here(&session, &dir.path().join("a.py"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -863,6 +887,7 @@ mod tests {
             "old_text": "all:\n    echo a",
             "new_text": "all:\n    echo b",
         });
+        read_here(&session, &dir.path().join("Makefile"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -888,6 +913,7 @@ mod tests {
             "old_text": "        return 1",
             "new_text": "        return 2",
         });
+        read_here(&session, &dir.path().join("a.py"));
         let _ = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -914,6 +940,7 @@ mod tests {
             "old_text": "      fn two() {}",
             "new_text": "      fn two() { todo!() }\n      // replaced",
         });
+        read_here(&session, &dir.path().join("a.rs"));
         let _ = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -941,6 +968,7 @@ mod tests {
             "old_text": "def f():\n    return 1",
             "new_text": "def f():\n    if x:\n        return 2\n    return 1",
         });
+        read_here(&session, &dir.path().join("a.py"));
         let _ = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -964,6 +992,7 @@ mod tests {
             "old_text": "a:\n    b\nc",
             "new_text": "a:\nc",
         });
+        read_here(&session, &dir.path().join("a.yml"));
         let _ = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -987,6 +1016,7 @@ mod tests {
             "old_text": "all:\n    echo a",
             "new_text": "all:\n    @mkdir -p out\n    echo b",
         });
+        read_here(&session, &dir.path().join("Makefile"));
         let _ = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -1012,6 +1042,7 @@ mod tests {
             "old_text": "def f():\n    return 1",
             "new_text": "def f():\n        return 1",
         });
+        read_here(&session, &dir.path().join("a.py"));
         let _ = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -1036,6 +1067,7 @@ mod tests {
             "old_text": "a:\n    b\n        c",
             "new_text": "a:\n    b\nd",
         });
+        read_here(&session, &dir.path().join("a.yml"));
         let _ = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -1064,6 +1096,7 @@ mod tests {
             "old_text": "      fn two() {}",
             "new_text": "fn two() { todo!() }",
         });
+        read_here(&session, &dir.path().join("a.rs"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("soft refusal");
@@ -1097,6 +1130,7 @@ mod tests {
             "old_text": "    return 1",
             "new_text": "    if x:\n        return 2",
         });
+        read_here(&session, &dir.path().join("a.py"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("soft refusal");
@@ -1129,6 +1163,7 @@ mod tests {
             "old_text": "      fn inner() {}",
             "new_text": "      fn inner() { todo!() }\n          nested();",
         });
+        read_here(&session, &dir.path().join("a.rs"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the space-based apply stands");
@@ -1265,6 +1300,7 @@ mod tests {
             "old_text": "      unique anchor line",
             "new_text": "      replaced anchor",
         });
+        read_here(&session, &dir.path().join("big.rs"));
         let out = edit_inner(&EditTool::default(), input, &session)
             .await
             .expect("the normalized match applies");
@@ -1491,10 +1527,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resumed_baseline_holds_the_edit_until_a_live_read() {
+    async fn a_fresh_anchor_edits_without_a_re_read() {
+        // The round-trip tax the anchor rule removes. A resume-armed baseline says
+        // the model has not seen the file *in this session*, which is a fact about
+        // the session, not about the bytes the edit names — and the file has even
+        // changed since resume here, which the old guard treated as a reason to
+        // refuse while the anchor the edit names is sitting intact on disk. The
+        // edit applies; the receipt, not a re-read of the file, is what tells the
+        // model what its edit did.
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("held.rs");
-        std::fs::write(&target, "v1\n").unwrap();
+        std::fs::write(&target, "v1\nadded since resume\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let session = super::super::FileSession::new(PathBuf::from(cwd));
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string();
+        session.attach(&mut ctx);
+        session.record_baseline(&target, state::observe_resumed_bytes(b"v1\n"));
+
+        let out = EditTool::new()
+            .call(
+                json!({"file_path": "held.rs", "old_text": "v1", "new_text": "v2"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "v2\nadded since resume\n",
+            "the anchor matched the bytes on disk, which is all the edit depended on"
+        );
+        assert!(
+            out.text_content().contains("+ v2"),
+            "{}",
+            out.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drifted_anchor_still_refuses_with_the_mismatch_named() {
+        // The half that keeps the guard's safety: when the anchor no longer
+        // matches what is on disk, nothing writes and the result names the
+        // mismatch. The anchor note rides along because "not found" on its own
+        // sends a model back to the same edit, while a model told the file was
+        // never read here goes and reads it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("held.rs");
+        std::fs::write(&target, "drifted by an external writer\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
         let session = super::super::FileSession::new(PathBuf::from(cwd));
         let mut ctx = ToolContext::default();
@@ -1509,32 +1589,161 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(held.is_error, "a resume-armed baseline must hold the edit");
-        assert!(
-            held.text_content().contains("previous session"),
-            "{}",
-            held.text_content()
-        );
+        let text = held.text_content();
+        assert!(held.is_error, "an anchor that drifted must refuse: {text}");
+        assert!(text.contains("Old text not found"), "{text}");
+        assert!(text.contains("has not been read in this session"), "{text}");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
-            "v1\n",
-            "nothing may be written while held"
+            "drifted by an external writer\n",
+            "a stale anchor never writes onto bytes it did not verify"
         );
+    }
 
-        session.record_baseline(&target, state::observe_bytes(b"v1\n"));
-        let after = EditTool::new()
+    #[tokio::test]
+    async fn an_unverified_target_takes_no_whitespace_guess() {
+        // Tolerance resolves a model's recollection of text it has seen; on bytes
+        // it has never seen this session there is no recollection to reconcile, so
+        // a whitespace-only near match refuses here. The same edit against a
+        // live-read file applies and discloses
+        // (`a_whitespace_mismatched_old_text_applies_and_discloses`), which is the
+        // difference the resumed baseline has to keep making.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("held.rs");
+        let content = "one\n    fn two() {}\nthree\n";
+        std::fs::write(&target, content).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let session = super::super::FileSession::new(PathBuf::from(cwd));
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string();
+        session.attach(&mut ctx);
+        session.record_baseline(&target, state::observe_resumed_bytes(content.as_bytes()));
+
+        let held = EditTool::new()
             .call(
-                json!({"file_path": "held.rs", "old_text": "v1", "new_text": "v2"}),
+                json!({
+                    "file_path": "held.rs",
+                    "old_text": "      fn two() {}",
+                    "new_text": "      fn two() { todo!() }"
+                }),
                 &ctx,
             )
             .await
             .unwrap();
+        let text = held.text_content();
         assert!(
-            !after.is_error,
-            "a live read must release the guard: {}",
-            after.text_content()
+            held.is_error,
+            "only an exact match edits bytes the model has never seen: {text}"
         );
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2\n");
+        assert!(text.contains("exactly"), "{text}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn an_unread_target_takes_no_whitespace_guess() {
+        // The tolerance reconciles a recollection, so a target carrying no
+        // baseline at all — neither a live read nor a resume-time observation —
+        // is the least-informed case for a guess, not the most: the withheld set
+        // is every target the session has not seen, and bookkeeping that says
+        // nothing is not the same as bookkeeping that says "seen".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("unread.rs");
+        let content = "one\n    fn two() {}\nthree\n";
+        std::fs::write(&target, content).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = EditTool::new()
+            .call(
+                json!({
+                    "file_path": "unread.rs",
+                    "old_text": "      fn two() {}",
+                    "new_text": "      fn two() { todo!() }"
+                }),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(
+            out.is_error,
+            "a normalized match must not write bytes nothing here has read: {text}"
+        );
+        assert!(text.contains("has not been read in this session"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            content,
+            "a declined guess writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declined_rescue_says_why_rather_than_claiming_a_bug() {
+        // Declining the tolerant apply is the designed answer on bytes nobody
+        // here has read, so it has to read as a rule the model can act on. The
+        // classification this refusal inherits claimed the caller had "refused a
+        // match it should have applied" — the sentence a genuine bug earns.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("unread.rs");
+        std::fs::write(&target, "one\n    fn two() {}\nthree\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = EditTool::new()
+            .call(
+                json!({
+                    "file_path": "unread.rs",
+                    "old_text": "      fn two() {}",
+                    "new_text": "      fn two() { todo!() }"
+                }),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(out.is_error, "{text}");
+        assert!(
+            text.contains("matches its current bytes exactly"),
+            "the refusal states the rule it applied: {text}"
+        );
+        assert!(
+            !text.contains("should have applied"),
+            "a deliberate refusal must not report itself as a defect: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_result_costs_hunks_not_files() {
+        // The acceptance line for the first cost this closes: an `Edit` result is
+        // bounded by the change, never by the file. One line of a 2 000-line file
+        // is a header, a summary, one hunk and its context — a dozen lines where
+        // the whole-file echo printed thousands, and the reason an agent under
+        // context pressure reached for `sed` instead.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("big.rs");
+        let lines: Vec<String> = (1..=2000).map(|i| format!("fn item_{i}() {{}}")).collect();
+        std::fs::write(&target, format!("{}\n", lines.join("\n"))).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = EditTool::new()
+            .call(
+                json!({
+                    "file_path": "big.rs",
+                    "old_text": "fn item_1500() {}",
+                    "new_text": "fn renamed() {}"
+                }),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(!out.is_error, "{text}");
+        assert!(text.contains("@@ -1497,7 +1497,7 @@"), "{text}");
+        assert!(!text.contains("Before:"), "no echo anywhere: {text}");
+        assert!(
+            text.lines().count() <= 12,
+            "a one-line edit to a 2 000-line file costs a dozen lines, not the file: \
+             {} lines",
+            text.lines().count()
+        );
     }
 
     #[tokio::test]

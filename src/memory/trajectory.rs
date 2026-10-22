@@ -158,8 +158,9 @@ pub struct TrajectoryRecord {
 
     /// Token totals over the run's turns.
     ///
-    /// See [`TokenSummary`]; its detail fields are reserved and always
-    /// `null` in this version.
+    /// See [`TokenSummary`]; the live observer fills its detail fields
+    /// from the run's turns, so they read `null` only on records
+    /// deserialized from a ledger written before the detail existed.
     pub token_summary: TokenSummary,
 
     /// The run's turns, ordered by turn index.
@@ -993,9 +994,9 @@ impl LoopObserver for TrajectoryObserver {
                 duration_ms: done.duration_ms,
                 input_tokens: done.input_tokens,
                 output_tokens: done.output_tokens,
-                cached_input_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 0,
+                cached_input_tokens: done.cached_input_tokens,
+                cache_write_tokens: done.cache_write_tokens,
+                reasoning_tokens: done.reasoning_tokens,
             });
         } else {
             builder.current = Some(TurnBuilder::new(ctx.turn, ctx.query.clone()));
@@ -2976,6 +2977,96 @@ mod tests {
         assert_eq!(
             reopened.duration_ms, 4,
             "phase durations on both sides of the reopen sum"
+        );
+    }
+
+    #[test]
+    fn a_reopened_turn_keeps_its_usage_detail_when_no_new_end_arrives() {
+        // The salvage shape: a retried turn fires its start under the
+        // same index, reopening the closed slot. When no second
+        // turn-end ever arrives — the run ends with the retry still in
+        // flight — the slot closes on whatever the reopen carried. The
+        // reopen merges both phases' captures, so the closed phase's
+        // real spend must survive all five counts, not just input and
+        // output: a turn whose figures reach the run sums must not
+        // lose its detail classes on the way.
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "first attempt".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 0,
+            success: false,
+            error: Some("salvaged".to_string()),
+            duration_ms: 5,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 80,
+            cache_write_tokens: 20,
+            reasoning_tokens: 30,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
+            context_tokens: 10,
+            context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "retry attempt".to_string(),
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 1,
+            duration_ms: 10,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
+        });
+
+        let record = &observer.records()[0];
+        assert_eq!(record.turns.len(), 1, "one slot per turn index");
+        let turn = &record.turns[0];
+        assert_eq!(turn.query, "retry attempt", "the reopen owns the query");
+        assert_eq!(
+            (turn.input_tokens, turn.output_tokens),
+            (100, 50),
+            "the closed phase's base figures ride the reopen"
+        );
+        assert_eq!(
+            (
+                turn.cached_input_tokens,
+                turn.cache_write_tokens,
+                turn.reasoning_tokens
+            ),
+            (80, 20, 30),
+            "the closed phase's detail figures ride the reopen too — \
+             zeroing them loses a spend the provider really charged"
+        );
+        assert_eq!(
+            (
+                record.token_summary.input_tokens,
+                record.token_summary.output_tokens
+            ),
+            (100, 50),
+            "the run sums carry the base figures"
+        );
+        assert_eq!(
+            (
+                record.token_summary.cached_input_tokens,
+                record.token_summary.cache_write_tokens,
+                record.token_summary.reasoning_tokens
+            ),
+            (Some(80), Some(20), Some(30)),
+            "the run sums' detail classes match the same turn's figures"
         );
     }
 }

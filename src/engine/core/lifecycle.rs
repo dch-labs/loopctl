@@ -424,8 +424,11 @@ pub struct Turn {
     /// The 0-indexed position of this turn within its run.
     ///
     /// Counts from zero within the owning [`Run`]. Useful for
-    /// correlating a turn with observer events and logs.
-    pub turn: usize,
+    /// correlating a turn with observer events and logs. Serializes as
+    /// `turn`, the pre-rename field's wire name, so records written
+    /// before and after the rename share one format.
+    #[serde(rename = "turn")]
+    pub index: usize,
 
     /// What went into this turn's model call.
     ///
@@ -458,6 +461,32 @@ pub struct Turn {
     /// The completion-side token count — the size of the response the model
     /// produced for this turn.
     pub output_tokens: u64,
+
+    /// Input tokens this turn served from the provider's cache.
+    ///
+    /// The turn's cached share verbatim from the provider's usage report;
+    /// `0` when the provider reported no cached share — unreported, not
+    /// zero-known. Deserializes to `0` for runs serialized before this
+    /// field existed.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+
+    /// Tokens this turn wrote to the provider's cache.
+    ///
+    /// The turn's cache-creation spend, with the same unreported-at-zero
+    /// convention as [`cached_input_tokens`](Self::cached_input_tokens).
+    /// Deserializes to `0` for runs serialized before this field existed.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+
+    /// Reasoning tokens inside this turn's output.
+    ///
+    /// The turn's reasoning share — a subset of
+    /// [`output_tokens`](Self::output_tokens), never additional to it —
+    /// `0` when the provider reported no reasoning share. Deserializes to
+    /// `0` for runs serialized before this field existed.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 
     /// Why the model stopped producing output for this turn.
     ///

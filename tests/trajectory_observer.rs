@@ -485,3 +485,89 @@ async fn the_degenerate_config_combination_stays_consistent() {
     assert_eq!(record.outcome, TrajectoryOutcome::Success);
     std::fs::remove_dir_all(&dir).expect("cleanup succeeds");
 }
+
+fn detailed_loop_with_usage(
+    observer: Arc<TrajectoryObserver>,
+) -> BareLoop<loopctl::testing::MockApiClient> {
+    use loopctl::stream::Usage;
+    let client = loopctl::testing::MockApiClient::new("detail-model")
+        .with_responses(
+            vec![turn("calling", call("call_detail")), vec![terminal()]]
+                .into_iter()
+                .flatten()
+                .collect(),
+        )
+        .with_usage(
+            Usage::new(50, 25)
+                .with_cached_input(40)
+                .with_cache_write(5)
+                .with_reasoning(10),
+        );
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    BareLoop::new(Arc::new(client), registry, SessionConfig::default()).with_observer(observer)
+}
+
+#[tokio::test]
+async fn token_summary_populates_from_usage_detail() {
+    let observer = Arc::new(TrajectoryObserver::in_memory());
+    let mut loop_ = detailed_loop_with_usage(Arc::clone(&observer));
+
+    loop_
+        .run("with detail", &RunConfig::default())
+        .await
+        .expect("run completes");
+
+    let records = observer.records();
+    let summary = &records[0].token_summary;
+    assert_eq!(summary.input_tokens, 100, "both turns report 50 input each");
+    assert!(
+        summary.input_tokens > 0,
+        "anti-vacuity: the run really consumed tokens"
+    );
+    assert_eq!(summary.cached_input_tokens, Some(80));
+    assert_eq!(summary.cache_write_tokens, Some(10));
+    assert_eq!(summary.reasoning_tokens, Some(20));
+}
+
+#[tokio::test]
+async fn per_turn_records_carry_usage_detail() {
+    let observer = Arc::new(TrajectoryObserver::in_memory());
+    let mut loop_ = detailed_loop_with_usage(Arc::clone(&observer));
+
+    loop_
+        .run("with detail", &RunConfig::default())
+        .await
+        .expect("run completes");
+
+    let records = observer.records();
+    assert_eq!(records[0].turns.len(), 2, "both turns captured");
+    for turn in &records[0].turns {
+        assert_eq!(turn.cached_input_tokens, 40);
+        assert_eq!(turn.cache_write_tokens, 5);
+        assert_eq!(turn.reasoning_tokens, 10);
+    }
+}
+
+#[test]
+fn old_ledger_json_deserializes() {
+    let record: TrajectoryRecord = serde_json::from_str(
+        r#"{"session_id":"s","run_id":"r","outcome":"success","started_at":"2026-10-01T00:00:00Z","duration_ms":2100,"total_turns":1,"token_summary":{"input_tokens":60,"output_tokens":170,"cached_input_tokens":null,"cache_write_tokens":null,"reasoning_tokens":null},"turns":[{"turn":0,"query":"q","response_text":"a","tool_calls":[],"duration_ms":2100,"input_tokens":60,"output_tokens":170}]}"#,
+    )
+    .expect("a pre-widening ledger line parses");
+    assert_eq!(record.token_summary.input_tokens, 60);
+    assert_eq!(
+        record.token_summary.cached_input_tokens, None,
+        "the legacy null detail stays None — the Option shape reads old ledgers"
+    );
+    let turn = &record.turns[0];
+    assert_eq!(
+        (
+            turn.cached_input_tokens,
+            turn.cache_write_tokens,
+            turn.reasoning_tokens
+        ),
+        (0, 0, 0),
+        "a pre-widening turn record deserializes with unreported detail"
+    );
+}

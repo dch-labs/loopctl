@@ -815,6 +815,9 @@ mod tests {
             model: "m".into(),
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
         });
         assert_eq!(obs.stream_success.load(Ordering::SeqCst), 1);
     }
@@ -831,6 +834,9 @@ mod tests {
             model: "m".into(),
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
         });
         assert_eq!(obs1.stream_success.load(Ordering::SeqCst), 1);
         assert_eq!(obs2.stream_success.load(Ordering::SeqCst), 1);
@@ -953,6 +959,9 @@ mod tests {
             model: "m".into(),
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
         });
         assert_eq!(obs.stream_success.load(Ordering::SeqCst), 1);
         host.reset_all();

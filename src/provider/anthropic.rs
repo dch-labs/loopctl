@@ -439,13 +439,14 @@ fn extract_usage(raw: &Value) -> Option<Usage> {
 /// Anthropic's raw `input_tokens` **excludes** cache traffic, so
 /// `cache_read_input_tokens` and `cache_creation_input_tokens` are
 /// added into the reported input, with the read share kept as
-/// [`Usage::cached_input_tokens`] — the cached count stays a subset
-/// of the input, the documented invariant. Returns `None` when the
-/// normalized input and the output are both zero, so an all-zero
-/// report is indistinguishable from a missing one — the convention
-/// both response paths apply. Shared by the non-streaming `usage`
-/// field ([`extract_usage`]) and the streaming `message_start` latch
-/// in `on_message_start`.
+/// [`Usage::cached_input_tokens`] and the creation spend as
+/// [`Usage::cache_write_tokens`] — both stay subsets of the input, the
+/// documented invariant. Returns `None` when the normalized input and
+/// the output are both zero, so an all-zero report is
+/// indistinguishable from a missing one — the convention both response
+/// paths apply. Shared by the non-streaming `usage` field
+/// ([`extract_usage`]) and the streaming `message_start` latch in
+/// `on_message_start`.
 fn extract_usage_object(usage: &Value) -> Option<Usage> {
     let raw_input = usage
         .get("input_tokens")
@@ -464,7 +465,11 @@ fn extract_usage_object(usage: &Value) -> Option<Usage> {
         .and_then(Value::as_u64)
         .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
     let input = raw_input.saturating_add(cached).saturating_add(creation);
-    (input > 0 || output > 0).then(|| Usage::new(input, output).with_cached_input(cached))
+    (input > 0 || output > 0).then(|| {
+        Usage::new(input, output)
+            .with_cached_input(cached)
+            .with_cache_write(creation)
+    })
 }
 
 impl ApiClient for AnthropicClient {
@@ -2657,18 +2662,26 @@ impl StreamEmitter {
     /// unrecognized value) and `/usage/input_tokens` +
     /// `/usage/output_tokens`, each merged with the
     /// [`start_usage`](Self::start_usage) latch by taking the larger of the
-    /// two counts — `/usage/cache_read_input_tokens` merges the same way
-    /// into the cached share. The max matters because the two events split
-    /// the reporting: `message_start` carries the input count the terminal
-    /// delta omits, and a server-tools turn's delta may revise either count
-    /// upward from its start value. The merge is max-by-assumption, not
-    /// max-by-guarantee: a genuine downward revision by the terminal delta
-    /// (cache accounting adjustments) loses to the latched start value —
-    /// the cost of never under-reporting a count the earlier event already
-    /// claimed. The usage event is only attached when at least one
-    /// merged count is non-zero. Emits a single
-    /// [`StreamEvent::MessageDelta`] with both, so streaming and
-    /// non-streaming turns report identical usage.
+    /// two counts — `/usage/cache_read_input_tokens` and
+    /// `/usage/cache_creation_input_tokens` merge the same way into the
+    /// cached share and the cache-write spend. The max matters because
+    /// the two events split the reporting: `message_start` carries the
+    /// input count the terminal delta omits, and a server-tools turn's
+    /// delta may revise either count upward from its start value. A
+    /// delta that revises a cache share upward also folds that
+    /// revision into the input total, so the merged input keeps the
+    /// family's documented identity — raw + merged read + merged write
+    /// ([`Usage::cache_write_tokens`]). A delta that revises the raw
+    /// input while omitting the cache fields carries the latched shares
+    /// on top of that raw, holding the identity across that shape too.
+    /// The merge is max-by-assumption,
+    /// not max-by-guarantee: a genuine
+    /// downward revision by the terminal delta (cache accounting
+    /// adjustments) loses to the latched start value — the cost of never
+    /// under-reporting a count the earlier event already claimed. The
+    /// usage event is only attached when at least one merged count is
+    /// non-zero. Emits a single [`StreamEvent::MessageDelta`] with both,
+    /// so streaming and non-streaming turns report identical usage.
     ///
     /// This handler does not mark the stream finished — that is the job of
     /// [`on_message_stop`](Self::on_message_stop), which Anthropic sends
@@ -2705,12 +2718,25 @@ impl StreamEmitter {
         let delta_input_total = delta_in
             .saturating_add(delta_cached)
             .saturating_add(delta_creation);
-        let in_tok = delta_input_total.max(self.start_usage.input_tokens);
-        let out_tok = delta_out.max(self.start_usage.output_tokens);
         let cached_tok = delta_cached.max(self.start_usage.cached_input_tokens);
+        let write_tok = delta_creation.max(self.start_usage.cache_write_tokens);
+        let share_revision = cached_tok
+            .saturating_sub(self.start_usage.cached_input_tokens)
+            .saturating_add(write_tok.saturating_sub(self.start_usage.cache_write_tokens));
+        let latched_shares_on_delta = delta_in
+            .saturating_add(cached_tok)
+            .saturating_add(write_tok);
+        let in_tok = delta_input_total
+            .max(self.start_usage.input_tokens.saturating_add(share_revision))
+            .max(latched_shares_on_delta);
+        let out_tok = delta_out.max(self.start_usage.output_tokens);
 
         let usage = if in_tok > 0 || out_tok > 0 {
-            Some(Usage::new(in_tok, out_tok).with_cached_input(cached_tok))
+            Some(
+                Usage::new(in_tok, out_tok)
+                    .with_cached_input(cached_tok)
+                    .with_cache_write(write_tok),
+            )
         } else {
             None
         };
@@ -4899,6 +4925,51 @@ mod tests {
     }
 
     #[test]
+    fn build_response_reports_cache_write_tokens() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {
+                "input_tokens": 1500,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 1200,
+                "cache_creation_input_tokens": 300
+            }
+        });
+        let response = AnthropicClient::build_response(&raw);
+        let usage = response.usage.expect("usage");
+        assert_eq!(
+            usage.cache_write_tokens, 300,
+            "the cache-creation spend is its own pricing class, distinct from the cached read"
+        );
+        assert_eq!(
+            usage.reasoning_tokens, 0,
+            "the Messages usage object reports no reasoning class — unreported, not zero-known"
+        );
+    }
+
+    #[test]
+    fn anthropic_totals_compose_without_double_counting() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 50
+            }
+        });
+        let usage = AnthropicClient::build_response(&raw).usage.expect("usage");
+        assert_eq!(
+            usage.input_tokens, 1050,
+            "raw 100 + read 900 + creation 50 — the normalized input IS the conversation \
+             total; summing the detail fields on top of it would double-count"
+        );
+        assert_eq!(usage.cached_input_tokens, 900);
+        assert_eq!(usage.cache_write_tokens, 50);
+        assert_eq!(usage.total_tokens(), 1055);
+    }
+
+    #[test]
     fn build_response_maps_tool_use_block_and_tool_call() {
         let raw = serde_json::json!({
             "content": [{
@@ -5665,8 +5736,9 @@ mod tests {
         });
         let usage = usage.expect("MessageDelta must carry usage");
         assert_eq!(
-            usage.input_tokens, 2700,
-            "raw input excludes the cached read — the normalized input is 1500 + 1200"
+            usage.input_tokens, 2750,
+            "raw 1500 + revised read 1250 — the fold identity holds across the merge: \
+             the terminal delta's upward read revision rides the input total"
         );
         assert_eq!(
             usage.cached_input_tokens, 1250,
@@ -5703,6 +5775,271 @@ mod tests {
         assert_eq!(
             usage.cached_input_tokens, 1200,
             "a delta without cache fields must not erase the start event's cached share"
+        );
+    }
+
+    #[test]
+    fn emitter_merges_cache_write_across_start_and_delta() {
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {
+                    "input_tokens": 1500,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 1200,
+                    "cache_creation_input_tokens": 300
+                }
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {
+                "output_tokens": 15,
+                "cache_creation_input_tokens": 350
+            }
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(
+            usage.input_tokens, 3050,
+            "raw 1500 + read 1200 + revised creation 350 — the start-side normalized total \
+             with the delta's upward revision folded in, so the fold identity holds"
+        );
+        assert_eq!(
+            usage.cache_write_tokens, 350,
+            "the terminal delta's revised cache write wins over the latched start value"
+        );
+        assert_eq!(usage.cached_input_tokens, 1200);
+    }
+
+    #[test]
+    fn anthropic_stream_merge_folds_a_revised_share_into_the_input_total() {
+        // One delta revises both cache shares upward; the input total
+        // must carry raw + revised-read + revised-write, the same
+        // normalized figure the non-streaming reader produces for the
+        // identical report.
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {
+                    "input_tokens": 1500,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 1200,
+                    "cache_creation_input_tokens": 300
+                }
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {
+                "output_tokens": 15,
+                "cache_read_input_tokens": 1300,
+                "cache_creation_input_tokens": 400
+            }
+        })));
+        let usage = em.drain().iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(
+            usage.input_tokens, 3200,
+            "1500 raw + 1300 revised read + 400 revised write"
+        );
+        assert_eq!(usage.cached_input_tokens, 1300);
+        assert_eq!(usage.cache_write_tokens, 400);
+
+        let non_streamed = AnthropicClient::build_response(&serde_json::json!({
+            "id": "msg_1",
+            "content": [{"type": "text", "text": "x"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 1500,
+                "output_tokens": 15,
+                "cache_read_input_tokens": 1300,
+                "cache_creation_input_tokens": 400
+            }
+        }))
+        .usage
+        .expect("non-streaming usage");
+        assert_eq!(
+            non_streamed.input_tokens, usage.input_tokens,
+            "the streaming fold equals the non-streaming normalized input for the same report"
+        );
+    }
+
+    #[test]
+    fn a_generated_counts_sweep_holds_the_anthropic_fold_identity() {
+        // Deterministic xorshift (TESTING doctrine) over raw + read +
+        // write reports, both present and delta-revised: the merged
+        // input must equal the sum of the merged classes, and the
+        // classes must stay subsets of it. Terminal deltas also revise
+        // the raw input, sometimes without repeating the cache fields
+        // — the corner the latched-share carry defends.
+        let mut seed: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut revised_cases = 0usize;
+        let mut share_less_revisions = 0usize;
+        for _case in 0..40 {
+            let raw = u32::try_from(next() % 2_000).unwrap();
+            let read = u32::try_from(next() % 2_000).unwrap();
+            let write = u32::try_from(next() % 2_000).unwrap();
+            let read_delta = read.saturating_add(u32::try_from(next() % 500).unwrap());
+            let write_delta = write.saturating_add(u32::try_from(next() % 500).unwrap());
+            revised_cases += usize::from(read_delta > read || write_delta > write);
+            let raw_delta = raw.saturating_add(u32::try_from(next() % 500).unwrap());
+            let revise_input = next() % 4 == 0;
+            let omit_shares = revise_input && next() % 2 == 0;
+            share_less_revisions += usize::from(omit_shares);
+            let mut delta_usage = serde_json::json!({ "output_tokens": 15 });
+            if revise_input {
+                delta_usage["input_tokens"] = serde_json::json!(raw_delta);
+            }
+            if !omit_shares {
+                delta_usage["cache_read_input_tokens"] = serde_json::json!(read_delta);
+                delta_usage["cache_creation_input_tokens"] = serde_json::json!(write_delta);
+            }
+
+            let mut em = StreamEmitter::default();
+            em.on_message_start(Some(&serde_json::json!({
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-3",
+                    "usage": {
+                        "input_tokens": raw,
+                        "output_tokens": 1,
+                        "cache_read_input_tokens": read,
+                        "cache_creation_input_tokens": write
+                    }
+                }
+            })));
+            em.drain();
+            em.on_message_delta(Some(serde_json::json!({
+                "delta": {"stop_reason": "end_turn"},
+                "usage": delta_usage
+            })));
+            let usage = em.drain().iter().find_map(|e| match e {
+                StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+                _ => None,
+            });
+            let usage = usage.expect("MessageDelta must carry usage");
+            let merged_raw = if revise_input { raw_delta } else { raw };
+            let merged_read = if omit_shares { read } else { read_delta };
+            let merged_write = if omit_shares { write } else { write_delta };
+            assert_eq!(
+                usage.cached_input_tokens, merged_read,
+                "the read latch takes the larger report: {raw}/{read}/{write}"
+            );
+            assert_eq!(
+                usage.cache_write_tokens, merged_write,
+                "the write latch takes the larger report: {raw}/{read}/{write}"
+            );
+            assert_eq!(
+                usage.input_tokens,
+                merged_raw
+                    .saturating_add(merged_read)
+                    .saturating_add(merged_write),
+                "the fold identity holds on the merged input: {usage:?} for \
+                 raw {raw}->{merged_raw} + read {read}->{merged_read} + \
+                 write {write}->{merged_write}"
+            );
+            assert!(
+                usage.cached_input_tokens <= usage.input_tokens
+                    && usage.cache_write_tokens <= usage.input_tokens,
+                "the cache classes stay subsets of the folded input: {usage:?}"
+            );
+        }
+        assert!(
+            revised_cases > 0 && share_less_revisions > 0,
+            "anti-vacuity: the sweep really revised a share upward and drew \
+             input revisions without the cache fields"
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_delta_revising_input_carries_the_latched_shares_into_the_fold() {
+        // The server-tools shape the defensive delta-input path exists
+        // for: the terminal delta revises the raw input upward and does
+        // not repeat the cache fields. The merged input keeps the
+        // family identity — the delta's raw with the latched shares
+        // carried on top (raw 4 000 + latched 1 200 + 300 = 5 500).
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {
+                    "input_tokens": 1500,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 1200,
+                    "cache_creation_input_tokens": 300
+                }
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": 4000, "output_tokens": 15}
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(
+            usage.input_tokens, 5500,
+            "the delta's revised raw carries the latched shares: {usage:?}"
+        );
+        assert_eq!(usage.cached_input_tokens, 1200);
+        assert_eq!(usage.cache_write_tokens, 300);
+        assert_eq!(usage.output_tokens, 15);
+    }
+
+    #[test]
+    fn emitter_keeps_latched_cache_write_when_delta_omits_it() {
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {
+                    "input_tokens": 1500,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 1200,
+                    "cache_creation_input_tokens": 300
+                }
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 15, "cache_read_input_tokens": 1200}
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(
+            usage.cache_write_tokens, 300,
+            "a delta carrying only the read share must not erase the latched cache write"
         );
     }
 

@@ -315,30 +315,40 @@ fn normalize_function_args(func_call: &Value) -> Value {
 
 /// Extract token [`Usage`] from Gemini's native `usageMetadata` object.
 ///
-/// Reads `usageMetadata.promptTokenCount` for input tokens and sums
-/// `candidatesTokenCount` plus `thoughtsTokenCount` for output. Returns `None`
-/// when the `usageMetadata` object is absent or when all counts are zero,
-/// matching the convention used by the streaming emitter in
-/// `extract_finish_reason`.
+/// Reads `usageMetadata.promptTokenCount` for input tokens, sums
+/// `candidatesTokenCount` plus `thoughtsTokenCount` for output (the
+/// reasoning share rides inside the output, exposed separately as the
+/// reasoning class), and reads `cachedContentTokenCount` into the
+/// cached share — a subset of the prompt count Gemini already includes,
+/// so no normalization is needed. Counts above `u32::MAX` saturate,
+/// matching the streaming latch, so one wire value reads the same on
+/// both paths. Returns `None` when the `usageMetadata` object is absent
+/// or when all counts are zero, matching the convention used by the
+/// streaming emitter in `extract_finish_reason`.
 fn extract_usage(raw: &Value) -> Option<Usage> {
     let usage = raw.pointer("/usageMetadata")?;
     let input = usage
         .get("promptTokenCount")
         .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0);
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+    let cached = usage
+        .get("cachedContentTokenCount")
+        .and_then(Value::as_u64)
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
     let output = usage
         .get("candidatesTokenCount")
         .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0);
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
     let thoughts = usage
         .get("thoughtsTokenCount")
         .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0);
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
     let total_output = output.saturating_add(thoughts);
-    (input > 0 || total_output > 0).then(|| Usage::new(input, total_output))
+    (input > 0 || total_output > 0).then(|| {
+        Usage::new(input, total_output)
+            .with_cached_input(cached)
+            .with_reasoning(thoughts)
+    })
 }
 
 impl ApiClient for GeminiClient {
@@ -1149,13 +1159,23 @@ impl StreamEmitter {
 
     /// Latch the chunk's `usageMetadata` when it carries a non-empty one.
     ///
-    /// Reports are cumulative, so the latest non-empty report is the most
-    /// complete; `extract_finish_reason` consumes the latch when it emits
-    /// the terminal `MessageDelta`. Counts above `u32::MAX` saturate
-    /// rather than read as zero.
+    /// Base counts follow the latest non-empty report — Gemini's reports
+    /// are cumulative, so the newest carries the full totals. The detail
+    /// fields max-merge into the latch instead:
+    /// `cachedContentTokenCount` and `thoughtsTokenCount` are optional
+    /// on the wire, and a final report that omits one must not zero a
+    /// share an earlier report already claimed. The reasoning share
+    /// rides the output total at its high-water mark — a report that
+    /// omits `thoughtsTokenCount` still folds the latched share into
+    /// candidates, so `reasoning_tokens` stays inside `output_tokens`.
+    /// Counts above `u32::MAX` saturate rather than read as zero.
     fn note_usage(&mut self, json: &Value) {
         let input = json
             .pointer("/usageMetadata/promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cached = json
+            .pointer("/usageMetadata/cachedContentTokenCount")
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let output = json
@@ -1166,12 +1186,24 @@ impl StreamEmitter {
             .pointer("/usageMetadata/thoughtsTokenCount")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let total_output = output.saturating_add(thoughts);
-        if input > 0 || total_output > 0 {
-            self.pending_usage = Some(Usage::new(
-                u32::try_from(input).unwrap_or(u32::MAX),
-                u32::try_from(total_output).unwrap_or(u32::MAX),
-            ));
+        let latched = self.pending_usage.unwrap_or_default();
+        let reasoning = u32::try_from(thoughts)
+            .unwrap_or(u32::MAX)
+            .max(latched.reasoning_tokens);
+        if input > 0 || output > 0 || thoughts > 0 {
+            let total_output = output.saturating_add(u64::from(reasoning));
+            self.pending_usage = Some(
+                Usage::new(
+                    u32::try_from(input).unwrap_or(u32::MAX),
+                    u32::try_from(total_output).unwrap_or(u32::MAX),
+                )
+                .with_cached_input(
+                    u32::try_from(cached)
+                        .unwrap_or(u32::MAX)
+                        .max(latched.cached_input_tokens),
+                )
+                .with_reasoning(reasoning),
+            );
         }
     }
 
@@ -2549,6 +2581,235 @@ mod tests {
         assert_eq!(
             usage.output_tokens, 10,
             "candidatesTokenCount + thoughtsTokenCount, latched from the earlier chunk"
+        );
+    }
+
+    #[test]
+    fn extract_usage_reports_cached_and_reasoning_detail() {
+        let raw = serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 200,
+                "thoughtsTokenCount": 300,
+                "cachedContentTokenCount": 700
+            }
+        });
+        let response = GeminiClient::build_response(&raw);
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(
+            usage.cached_input_tokens, 700,
+            "cachedContentTokenCount is a subset of promptTokenCount — reported as-is"
+        );
+        assert_eq!(usage.reasoning_tokens, 300);
+        assert_eq!(
+            usage.output_tokens, 500,
+            "candidates 200 + thoughts 300 — reasoning inside the output count"
+        );
+    }
+
+    #[test]
+    fn streaming_latch_carries_cached_and_reasoning_detail() {
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "partial"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 200,
+                "thoughtsTokenCount": 300,
+                "cachedContentTokenCount": 700
+            }
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("the terminal delta must carry usage");
+        assert_eq!(usage.cached_input_tokens, 700);
+        assert_eq!(usage.reasoning_tokens, 300);
+        assert_eq!(usage.output_tokens, 500);
+    }
+
+    #[test]
+    fn reasoning_is_inside_output_not_added() {
+        let raw = serde_json::json!({
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 200,
+                "thoughtsTokenCount": 300
+            }
+        });
+        let usage = extract_usage(&raw).expect("usage");
+        assert_eq!(
+            usage.output_tokens, 500,
+            "the fold is the invariant: output = candidates + thoughts, unchanged by the \
+             reasoning field's arrival"
+        );
+        assert_eq!(usage.reasoning_tokens, 300);
+        assert_eq!(
+            usage.output_tokens.saturating_sub(usage.reasoning_tokens),
+            200,
+            "the visible-answer share is the output minus its reasoning share"
+        );
+    }
+
+    #[test]
+    fn a_final_gemini_report_omitting_detail_keeps_the_latched_share() {
+        // The detail keys are optional on the wire: a cumulative final
+        // report carrying only the prompt count must not zero the
+        // shares an earlier report established.
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "partial"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 200,
+                "thoughtsTokenCount": 300,
+                "cachedContentTokenCount": 700
+            }
+        }));
+        em.process_chunk(&serde_json::json!({
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 200
+            }
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("the terminal delta must carry usage");
+        assert_eq!(
+            usage.cached_input_tokens, 700,
+            "a final report without cachedContentTokenCount keeps the latched share"
+        );
+        assert_eq!(
+            usage.reasoning_tokens, 300,
+            "a final report without thoughtsTokenCount keeps the latched share"
+        );
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 500);
+    }
+
+    #[test]
+    fn oversized_gemini_counts_saturate_identically_on_both_paths() {
+        let oversized = serde_json::json!({
+            "usageMetadata": {
+                "promptTokenCount": 4_294_967_296_u64,
+                "candidatesTokenCount": 0,
+                "thoughtsTokenCount": 5_000_000_000_u64,
+                "cachedContentTokenCount": 4_294_967_296_u64
+            }
+        });
+        let non_streamed = extract_usage(&oversized).expect("usage");
+
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&oversized);
+        em.process_chunk(&serde_json::json!({"candidates": [{"finishReason": "STOP"}]}));
+        let events = em.drain();
+        let streamed = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+                _ => None,
+            })
+            .expect("the terminal delta must carry usage");
+
+        assert_eq!(
+            non_streamed, streamed,
+            "one wire value, one result: the non-streaming path reads {non_streamed:?} \
+             while the streaming latch reads {streamed:?}"
+        );
+        assert_eq!(non_streamed.input_tokens, u32::MAX);
+        assert_eq!(non_streamed.reasoning_tokens, u32::MAX);
+        assert_eq!(non_streamed.cached_input_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn a_generated_counts_sweep_holds_the_gemini_subset_invariants() {
+        // Deterministic xorshift over the counts' corner space (TESTING
+        // doctrine: fixed seed, same cases every run): a wire-valid
+        // report — cached a subset of the prompt — must parse to a
+        // Usage holding the subset relations, and both paths must
+        // agree on every draw.
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut oversize_cases = 0usize;
+        for _case in 0..48 {
+            let prompt = match next() % 4 {
+                0 => 0,
+                1 => next() % 2_000,
+                2 => u64::from(u32::MAX),
+                _ => u64::from(u32::MAX) + next() % 100_000 + 1,
+            };
+            let cached = if prompt == 0 {
+                0
+            } else {
+                next() % (prompt + 1)
+            };
+            let candidates = if prompt == 0 {
+                next() % 999 + 1
+            } else {
+                next() % 1_000
+            };
+            let thoughts = match next() % 4 {
+                3 => u64::from(u32::MAX) + next() % 100_000 + 1,
+                _ => next() % 1_000,
+            };
+            oversize_cases += usize::from(prompt > u64::from(u32::MAX));
+            let raw = serde_json::json!({
+                "usageMetadata": {
+                    "promptTokenCount": prompt,
+                    "candidatesTokenCount": candidates,
+                    "thoughtsTokenCount": thoughts,
+                    "cachedContentTokenCount": cached
+                }
+            });
+            let parsed = extract_usage(&raw).expect("a non-zero report parses");
+
+            let mut em = StreamEmitter::default();
+            em.process_chunk(&raw);
+            em.process_chunk(&serde_json::json!({"candidates": [{"finishReason": "STOP"}]}));
+            let events = em.drain();
+            let streamed = events
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+                    _ => None,
+                })
+                .expect("the terminal delta must carry usage");
+            assert_eq!(
+                parsed, streamed,
+                "draw agrees on both paths: {parsed:?} vs {streamed:?}"
+            );
+
+            assert!(
+                parsed.cached_input_tokens <= parsed.input_tokens,
+                "cached {cached} of prompt {prompt} must stay a subset: {parsed:?}"
+            );
+            assert!(
+                parsed.reasoning_tokens <= parsed.output_tokens,
+                "thoughts {thoughts} of output {candidates}+{thoughts} must stay a \
+                 subset: {parsed:?}"
+            );
+        }
+        assert!(
+            oversize_cases > 0,
+            "anti-vacuity: the sweep really drew above-u32 counts"
         );
     }
 

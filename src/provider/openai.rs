@@ -2,7 +2,8 @@
 //!
 //! Works with any provider that implements the OpenAI Chat Completions
 //! API with streaming: OpenAI itself, `DeepSeek`, `Grok`, Ollama (via
-//! the `ollama()` constructor in the parent module), vLLM, LM Studio, etc.
+//! the `ollama()` constructor in the parent module), vLLM, LM Studio,
+//! NVIDIA NIM, etc.
 //!
 //! # Construction
 //!
@@ -1767,6 +1768,14 @@ struct OpenAiUsage {
     /// cached share at zero.
     #[serde(default)]
     prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+
+    /// Breakdown of the output completion's token counts.
+    ///
+    /// Present only on thinking models that report their reasoning
+    /// spend; `None` leaves the reasoning share at zero — unreported,
+    /// not zero-known.
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
 }
 
 /// The `prompt_tokens_details` object inside an OpenAI usage report.
@@ -1787,11 +1796,32 @@ struct OpenAiPromptTokensDetails {
     /// OpenAI-compatible servers) reads as 0 rather than failing the
     /// enclosing usage object, so the prompt and completion counts
     /// survive.
-    #[serde(default, deserialize_with = "cached_tokens_or_zero")]
+    #[serde(default, deserialize_with = "count_or_zero")]
     cached_tokens: u64,
 }
 
-/// Deserialize the cached share leniently.
+/// The `completion_tokens_details` object inside an OpenAI usage report.
+///
+/// Carries the per-part breakdown of the completion token count. Only
+/// `reasoning_tokens` is read — the share of the completion a thinking
+/// model spent reasoning, a subset of `completion_tokens`. The object
+/// and the field both default when absent, so a non-thinking model's
+/// report (which carries no breakdown) deserializes with a zero
+/// reasoning share instead of failing the whole usage object.
+#[derive(Deserialize, Default)]
+struct OpenAiCompletionTokensDetails {
+    /// Number of completion tokens spent reasoning.
+    ///
+    /// Defaults to 0 when the details object omits it, and parses
+    /// leniently for the same reason as
+    /// [`cached_tokens`](OpenAiPromptTokensDetails::cached_tokens): an
+    /// unparseable placeholder from an OpenAI-compatible server reads
+    /// as 0 rather than dropping the counts it rides in with.
+    #[serde(default, deserialize_with = "count_or_zero")]
+    reasoning_tokens: u64,
+}
+
+/// Deserialize an advisory token count leniently.
 ///
 /// The count is optional and advisory; a server that emits a
 /// non-numeric placeholder reads as zero instead of dropping the
@@ -1802,7 +1832,7 @@ struct OpenAiPromptTokensDetails {
 /// Propagates the deserializer's own error only for a shape serde
 /// cannot hand over at all; a present-but-unparseable value is
 /// converted to zero, never an error.
-fn cached_tokens_or_zero<'de, D>(deserializer: D) -> Result<u64, D::Error>
+fn count_or_zero<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -1817,11 +1847,16 @@ impl From<&OpenAiUsage> for Usage {
             .prompt_tokens_details
             .as_ref()
             .map_or(0, |d| u32::try_from(d.cached_tokens).unwrap_or(u32::MAX));
+        let reasoning = u
+            .completion_tokens_details
+            .as_ref()
+            .map_or(0, |d| u32::try_from(d.reasoning_tokens).unwrap_or(u32::MAX));
         Usage::new(
             u32::try_from(u.prompt_tokens).unwrap_or(u32::MAX),
             u32::try_from(u.completion_tokens).unwrap_or(u32::MAX),
         )
         .with_cached_input(cached)
+        .with_reasoning(reasoning)
     }
 }
 
@@ -2831,6 +2866,99 @@ mod tests {
     }
 
     #[test]
+    fn a_generated_counts_sweep_holds_the_openai_subset_invariants() {
+        // Deterministic xorshift over the counts' corner space (TESTING
+        // doctrine: fixed seed, same cases every run). OpenAI reports
+        // cache traffic *inside* `prompt_tokens` — a detail, never a
+        // fold — so the invariants are containment and identity: the
+        // cached share stays a subset of the parsed input, input and
+        // output pass through the conversion unchanged, and any count
+        // beyond `u32` saturates to the cap rather than wrapping.
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut oversize_cases = 0usize;
+        for _case in 0..48 {
+            let prompt = match next() % 4 {
+                0 => 0,
+                1 => next() % 2_000,
+                2 => u64::from(u32::MAX),
+                _ => {
+                    oversize_cases += 1;
+                    u64::from(u32::MAX) + next() % 100_000 + 1
+                }
+            };
+            let cached = if prompt == 0 {
+                0
+            } else {
+                next() % (prompt + 1)
+            };
+            let completion = match next() % 4 {
+                3 => {
+                    oversize_cases += 1;
+                    u64::from(u32::MAX) + next() % 100_000 + 1
+                }
+                _ => next() % 1_000,
+            };
+            // Wire-valid draws: reasoning is a share of the completion,
+            // so the generated subset never exceeds it (a saturated
+            // completion caps the share at the cap).
+            let reasoning_cap = completion.min(u64::from(u32::MAX));
+            let reasoning = if reasoning_cap == 0 {
+                0
+            } else {
+                next() % (reasoning_cap + 1)
+            };
+            let data = serde_json::json!({
+                "id": "c1",
+                "model": "gpt-4o",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "prompt_tokens_details": {"cached_tokens": cached},
+                    "completion_tokens_details": {"reasoning_tokens": reasoning}
+                }
+            });
+            let chunk = OpenAiChunk::parse(&data.to_string()).unwrap();
+            let typed: Usage = chunk.usage.as_ref().expect("usage").into();
+
+            assert!(
+                typed.cached_input_tokens <= typed.input_tokens,
+                "cached {cached} of prompt {prompt} must stay a subset: {typed:?}"
+            );
+            assert!(
+                typed.reasoning_tokens <= typed.output_tokens,
+                "reasoning {reasoning} of completion {completion} must stay a subset: \
+                 {typed:?}"
+            );
+            assert_eq!(
+                typed.input_tokens,
+                u32::try_from(prompt).unwrap_or(u32::MAX),
+                "input passes through the conversion, saturating only at the cap"
+            );
+            assert_eq!(
+                typed.output_tokens,
+                u32::try_from(completion).unwrap_or(u32::MAX),
+                "output passes through the conversion, saturating only at the cap"
+            );
+            assert_eq!(
+                typed.reasoning_tokens,
+                u32::try_from(reasoning).unwrap_or(u32::MAX),
+                "reasoning rides as a detail, never folded into the output"
+            );
+        }
+        assert!(
+            oversize_cases > 0,
+            "anti-vacuity: the sweep really drew above-u32 counts"
+        );
+    }
+
+    #[test]
     fn a_non_numeric_cached_count_defaults_to_zero_without_dropping_usage() {
         let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":"many"}}}"#;
         let chunk = OpenAiChunk::parse(data).unwrap();
@@ -2852,6 +2980,70 @@ mod tests {
         let chunk = OpenAiChunk::parse(data).unwrap();
         let typed: Usage = chunk.usage.as_ref().expect("usage").into();
         assert_eq!(typed.cached_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_final_chunk_with_reasoning_tokens_detail() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":90,"completion_tokens_details":{"reasoning_tokens":64}}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        let typed: Usage = chunk.usage.as_ref().expect("usage").into();
+        assert_eq!(typed.reasoning_tokens, 64);
+        assert_eq!(
+            typed.output_tokens, 90,
+            "reasoning rides inside the completion count, never added to it"
+        );
+    }
+
+    #[test]
+    fn absent_completion_details_default_to_zero() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        let typed: Usage = chunk.usage.as_ref().expect("usage").into();
+        assert_eq!(typed.reasoning_tokens, 0);
+        assert_eq!(typed.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn a_non_numeric_reasoning_count_defaults_to_zero_without_dropping_usage() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"completion_tokens_details":{"reasoning_tokens":"lots"}}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        let typed: Usage = chunk.usage.as_ref().expect("usage").into();
+        assert_eq!(typed.input_tokens, 12);
+        assert_eq!(
+            typed.reasoning_tokens, 0,
+            "a non-numeric reasoning share parses as zero, never drops the report"
+        );
+    }
+
+    #[test]
+    fn non_streaming_usage_reports_reasoning_detail() {
+        let raw = serde_json::json!({
+            "choices": [
+                {"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 40,
+                "completion_tokens_details": {"reasoning_tokens": 25}
+            }
+        });
+        let response = OpenAiClient::build_response(&raw).expect("response parses");
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.reasoning_tokens, 25);
+        assert_eq!(usage.output_tokens, 40);
+    }
+
+    #[test]
+    fn openai_totals_compose_without_double_counting() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":900}}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        let typed: Usage = chunk.usage.as_ref().expect("usage").into();
+        assert_eq!(typed.cached_input_tokens, 900);
+        assert_eq!(
+            typed.input_tokens, 1000,
+            "the OpenAI family reports the cached share as a subset of prompt_tokens — the \
+             conversation total IS input_tokens; adding the cached share again double-counts"
+        );
     }
 
     #[test]

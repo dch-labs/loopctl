@@ -199,6 +199,16 @@ pub struct MockApiClient {
     /// calibration.
     reports_usage: bool,
 
+    /// The usage payload served when [`reports_usage`] is on.
+    ///
+    /// [`None`] serves the default fixed pair; a value set through
+    /// [`with_usage`](MockApiClient::with_usage) replaces it wholesale,
+    /// so fixtures can stage the cache and reasoning detail classes
+    /// alongside the totals.
+    ///
+    /// [`reports_usage`]: MockApiClient::reports_usage
+    custom_usage: Option<Usage>,
+
     /// When set, every call returns an [`ApiError`] instead of a normal
     /// response.
     ///
@@ -432,6 +442,7 @@ impl MockApiClient {
             with_options_calls: Arc::new(Mutex::new(0)),
             accept_tool_constraints: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reports_usage: true,
+            custom_usage: None,
         }
     }
 
@@ -456,6 +467,46 @@ impl MockApiClient {
     pub fn without_usage(mut self) -> Self {
         self.reports_usage = false;
         self
+    }
+
+    /// Serve a specific usage report on every response.
+    ///
+    /// Replaces the default fixed pair (`50` input, `25` output) with
+    /// the given [`Usage`] — the way a fixture stages the usage detail
+    /// classes (cached share, cache write, reasoning) alongside the
+    /// totals for propagation pins. Still gated by
+    /// [`without_usage`](Self::without_usage): a client configured with
+    /// both serves no usage at all.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::Usage;
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("test-model").with_usage(
+    ///     Usage::new(50, 25).with_cached_input(40).with_reasoning(10),
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.custom_usage = Some(usage);
+        self
+    }
+
+    /// The usage payload a served response carries, if any.
+    ///
+    /// Honors both the [`reports_usage`] gate and the
+    /// [`with_usage`](Self::with_usage) override: `None` when usage
+    /// reporting is off, otherwise the staged report or the default
+    /// fixed pair.
+    ///
+    /// [`reports_usage`]: MockApiClient::reports_usage
+    fn served_usage(&self) -> Option<Usage> {
+        if !self.reports_usage {
+            return None;
+        }
+        Some(self.custom_usage.unwrap_or(Usage::new(50, 25)))
     }
 
     /// Set the text response for the first (or only) turn.
@@ -866,7 +917,7 @@ impl MockApiClient {
             delta: MessageDeltaPayload {
                 stop_reason: Some(response.stop_reason),
             },
-            usage: self.reports_usage.then(|| Usage::new(50, 25)),
+            usage: self.served_usage(),
         })));
 
         events.push(Ok(StreamEvent::MessageStop));
@@ -934,9 +985,7 @@ impl MockApiClient {
         Ok(crate::api::NonStreamingResponse {
             message: Message::new(Role::Assistant, parts),
             stop_reason,
-            usage: self
-                .reports_usage
-                .then(|| crate::stream::Usage::new(50, 25)),
+            usage: self.served_usage(),
         })
     }
 }
@@ -2566,6 +2615,42 @@ mod tests {
             "one mock, one usage story: the streaming twin reports \
              {streamed_usage:?} while create_message reports {:?}",
             response.usage
+        );
+    }
+
+    #[tokio::test]
+    async fn with_usage_and_without_usage_together_serve_no_usage() {
+        use futures::StreamExt;
+
+        let staged = Usage::new(50, 25).with_cached_input(40);
+
+        let stream_client = MockApiClient::new("test-model")
+            .with_text_response("hi")
+            .with_usage(staged)
+            .without_usage();
+        let mut stream = stream_client.stream_messages(&crate::api::StreamRequest::new(vec![]));
+        let mut streamed_usage = Some(Usage::default());
+        while let Some(item) = stream.next().await {
+            if let Ok(crate::stream::StreamEvent::MessageDelta(delta)) = item {
+                streamed_usage = delta.usage;
+            }
+        }
+        assert_eq!(
+            streamed_usage, None,
+            "the without_usage gate wins over a staged report on the streaming path"
+        );
+
+        let create_client = MockApiClient::new("test-model")
+            .with_text_response("hi")
+            .with_usage(staged)
+            .without_usage();
+        let response = create_client
+            .create_message(&crate::api::StreamRequest::new(vec![]))
+            .await
+            .expect("mock must respond");
+        assert_eq!(
+            response.usage, None,
+            "the without_usage gate wins over a staged report on the create_message path"
         );
     }
 

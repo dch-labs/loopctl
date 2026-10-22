@@ -1377,6 +1377,9 @@ mod tests {
             duration_ms: 20,
             input_tokens: 5,
             output_tokens: 5,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
         }
     }
 
@@ -2400,6 +2403,11 @@ mod tests {
             error: None,
             total_turns: 3,
             duration_ms: 100,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,

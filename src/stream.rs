@@ -786,9 +786,32 @@ pub struct MessageDeltaPayload {
 /// Token usage statistics from an API response.
 ///
 /// Tracks input and output token counts for a single streaming
-/// request. Returned in the [`MessageDelta`] event at the end of
-/// the stream. Use [`total_tokens`](Self::total_tokens) for the
+/// request, plus the cache and reasoning detail classes providers
+/// report alongside them. Returned in the [`MessageDelta`] event at the
+/// end of the stream. Use [`total_tokens`](Self::total_tokens) for the
 /// combined count.
+///
+/// # Detail classes and where they come from
+///
+/// Every detail field uses `0` to mean *not reported* — a provider that
+/// reports nothing is indistinguishable from one that reports an empty
+/// class, and cost displays must treat `0` as "no data", never as a
+/// measured zero. Each class is a subset of its base count, never
+/// additional to it:
+///
+/// | Field | OpenAI-compatible | Anthropic | Gemini | Bedrock |
+/// |---|---|---|---|---|
+/// | [`cached_input_tokens`](Self::cached_input_tokens) | `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens` | `cachedContentTokenCount` | `cacheReadInputTokens` (Converse) / `cache_read_input_tokens` (Anthropic shape) |
+/// | [`cache_write_tokens`](Self::cache_write_tokens) | — | `cache_creation_input_tokens` | — | `cacheWriteInputTokens` (Converse) / `cache_creation_input_tokens` (Anthropic shape) |
+/// | [`reasoning_tokens`](Self::reasoning_tokens) | `completion_tokens_details.reasoning_tokens` | — | `thoughtsTokenCount` | — |
+///
+/// The Anthropic wire family reports its input count *excluding* cache
+/// traffic, so its conversions normalize `input_tokens` to raw input +
+/// cache read + cache write; the OpenAI and Gemini families already
+/// include the cached share in the prompt count, and their conversions
+/// report it as-is. Either way the conversation's prompt total **is**
+/// `input_tokens` — summing the detail fields on top of it
+/// double-counts.
 ///
 /// # Default
 ///
@@ -831,18 +854,53 @@ pub struct Usage {
     /// Providers that cache the prompt prefix report how much of
     /// [`input_tokens`](Self::input_tokens) was read from cache instead
     /// of re-processed (Anthropic's `cache_read_input_tokens`, OpenAI's
-    /// `prompt_tokens_details.cached_tokens`); providers that do not
-    /// report a cached share leave this at `0`. The count is a subset
-    /// of `input_tokens`, never additional to it — where a provider's
-    /// raw input count already includes cached traffic (OpenAI), it is
-    /// reported as-is, and where it excludes it (Anthropic's
+    /// `prompt_tokens_details.cached_tokens`, Gemini's
+    /// `cachedContentTokenCount`); providers that do not report a cached
+    /// share leave this at `0`. The count is a subset of
+    /// `input_tokens`, never additional to it — where a provider's raw
+    /// input count already includes cached traffic (OpenAI, Gemini), it
+    /// is reported as-is, and where it excludes it (Anthropic's
     /// `input_tokens` carries neither the cache reads nor the
-    /// cache-creation spend), the conversion normalizes the input
-    /// total before constructing this type, so the subset invariant
-    /// holds for every provider. Defaults to `0` when constructed via
-    /// [`Default::default`] or [`new`](Self::new).
+    /// cache-creation spend), the conversion normalizes the input total
+    /// before constructing this type, so the subset invariant holds for
+    /// every provider. Defaults to `0` when constructed via
+    /// [`Default::default`] or [`new`](Self::new); `0` also means
+    /// "not reported" — a provider that reports nothing is
+    /// indistinguishable from one that reports an empty cache, which is
+    /// the crate-wide convention for usage detail.
     #[serde(default)]
     pub cached_input_tokens: u32,
+
+    /// Number of tokens written to the provider's prompt cache this turn.
+    ///
+    /// The cache-creation pricing class (Anthropic's
+    /// `cache_creation_input_tokens`, Bedrock Converse's
+    /// `cacheWriteInputTokens`) — the spend of making the next turn's
+    /// reads cheap, distinct from the read share carried by
+    /// [`cached_input_tokens`](Self::cached_input_tokens). Like the read
+    /// share it is a subset of `input_tokens`, never additional to it:
+    /// conversions on the Anthropic wire family fold it into the
+    /// normalized input total. OpenAI and Gemini report no cache-write
+    /// class, so the field stays `0` there — unreported, not zero-known.
+    /// Defaults to `0` when constructed via [`Default::default`] or
+    /// [`new`](Self::new).
+    #[serde(default)]
+    pub cache_write_tokens: u32,
+
+    /// Number of reasoning ("thinking") tokens inside the output.
+    ///
+    /// Thinking models report the share of the completion they spent
+    /// reasoning before answering (OpenAI's
+    /// `completion_tokens_details.reasoning_tokens`, Gemini's
+    /// `thoughtsTokenCount`). The count is a subset of
+    /// [`output_tokens`](Self::output_tokens), never additional to it —
+    /// a turn that reports 90 output tokens of which 64 were reasoning
+    /// carries 90 here, not 154. The Anthropic Messages usage object
+    /// reports no reasoning class, so the field stays `0` there —
+    /// unreported, not zero-known. Defaults to `0` when constructed via
+    /// [`Default::default`] or [`new`](Self::new).
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 impl Usage {
@@ -875,6 +933,8 @@ impl Usage {
             input_tokens,
             output_tokens,
             cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
         }
     }
 
@@ -907,6 +967,70 @@ impl Usage {
     #[must_use]
     pub fn with_cached_input(mut self, cached_input_tokens: u32) -> Self {
         self.cached_input_tokens = cached_input_tokens;
+        self
+    }
+
+    /// Attach a cache-write spend to an existing usage instance.
+    ///
+    /// Sets [`cache_write_tokens`](Self::cache_write_tokens) — the
+    /// tokens the provider stored into its prompt cache this turn, a
+    /// subset of the input count already carried and the pricing class
+    /// that makes the next turn's reads cheap. Use after
+    /// [`new`](Self::new) when a response reports the creation spend
+    /// alongside the totals.
+    ///
+    /// # Parameters
+    ///
+    /// - `cache_write_tokens` — Input tokens written to the prompt
+    ///   cache.
+    ///
+    /// # Returns
+    ///
+    /// A [`Usage`] instance with the cache-write count set.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::Usage;
+    ///
+    /// let usage = Usage::new(1050, 20).with_cache_write(300);
+    /// assert_eq!(usage.cache_write_tokens, 300);
+    /// assert_eq!(usage.input_tokens, 1050);
+    /// ```
+    #[must_use]
+    pub fn with_cache_write(mut self, cache_write_tokens: u32) -> Self {
+        self.cache_write_tokens = cache_write_tokens;
+        self
+    }
+
+    /// Attach a reasoning share to an existing usage instance.
+    ///
+    /// Sets [`reasoning_tokens`](Self::reasoning_tokens) — the share of
+    /// the output the model spent reasoning before answering, a subset
+    /// of the output count already carried (never added to it). Use
+    /// after [`new`](Self::new) when a thinking model reports its
+    /// reasoning spend.
+    ///
+    /// # Parameters
+    ///
+    /// - `reasoning_tokens` — Output tokens spent reasoning.
+    ///
+    /// # Returns
+    ///
+    /// A [`Usage`] instance with the reasoning count set.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::Usage;
+    ///
+    /// let usage = Usage::new(100, 90).with_reasoning(64);
+    /// assert_eq!(usage.reasoning_tokens, 64);
+    /// assert_eq!(usage.output_tokens, 90);
+    /// ```
+    #[must_use]
+    pub fn with_reasoning(mut self, reasoning_tokens: u32) -> Self {
+        self.reasoning_tokens = reasoning_tokens;
         self
     }
 
@@ -1397,6 +1521,29 @@ impl StreamAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_serialized_usage_deserializes() {
+        let two_field: Usage =
+            serde_json::from_str(r#"{"input_tokens":3,"output_tokens":5}"#).expect("usage json");
+        assert_eq!((two_field.input_tokens, two_field.output_tokens), (3, 5));
+        assert_eq!(two_field.cached_input_tokens, 0);
+        assert_eq!(
+            (two_field.cache_write_tokens, two_field.reasoning_tokens),
+            (0, 0),
+            "a pre-detail usage blob deserializes with unreported detail"
+        );
+
+        let cached_era: Usage =
+            serde_json::from_str(r#"{"input_tokens":9,"output_tokens":2,"cached_input_tokens":7}"#)
+                .expect("cached-era usage json");
+        assert_eq!(cached_era.cached_input_tokens, 7);
+        assert_eq!(
+            (cached_era.cache_write_tokens, cached_era.reasoning_tokens),
+            (0, 0),
+            "a blob carrying only the cached share reads the newer detail fields as unreported"
+        );
+    }
 
     #[test]
     fn test_stream_stop_reason_from_api_str() {

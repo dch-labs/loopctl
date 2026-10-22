@@ -17,7 +17,7 @@
 //! nothing is written. It does **not** cover crashes mid-write-batch —
 //! see the "Atomicity scope" docs on the call body.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fmt::Write;
 use std::future::Future;
@@ -43,7 +43,7 @@ use super::atomic;
 use super::conflict::CheckFailure;
 use super::conflict::changed_message;
 use super::conflict::check_content_unchanged;
-use super::conflict::resumed_baseline_message;
+use super::conflict::unverified_anchor_note;
 use super::diff::OldContent;
 use super::diff::format_file_change;
 use super::edit::FindResult;
@@ -179,14 +179,20 @@ impl Tool for MultiEditTool {
 /// Body of [`Tool::call`].
 ///
 /// Orchestrates the pipeline: parse → dup-path → alias → read → symlink →
-/// resumed-hold → overlap-detect → locate+merge → validate → preview, then
+/// overlap-detect → locate+merge → validate → preview, then
 /// a per-file staleness check immediately before each write. Recoverable
 /// conditions (text not found, ambiguous match, overlap, symlink target,
-/// a validator rejection, a file changed on disk since the batch read it,
-/// a target whose only recorded observation is resume-armed) are surfaced
-/// as soft [`ToolOutput`] errors; hard failures (bad args, missing file,
-/// I/O fault) become [`ToolError`]. Each successful write refreshes the
-/// path's recorded baseline.
+/// a validator rejection, a file changed on disk since the batch read it)
+/// are surfaced as soft [`ToolOutput`] errors; hard failures (bad args,
+/// missing file, I/O fault) become [`ToolError`]. Each successful write
+/// refreshes the path's recorded baseline.
+///
+/// A target the session has not read is not one of those conditions. Like
+/// [`Edit`](super::edit::EditTool), the batch locates every edit in bytes read
+/// from disk moments ago and re-checks each file before its own rename, so the
+/// anchor the operation names decides the write; what such a target loses is the
+/// whitespace-normalized rescue, which reconciles a recollection the model does
+/// not have here (see [`unread_targets`]).
 ///
 /// # Atomicity scope
 ///
@@ -229,9 +235,7 @@ async fn multi_edit_inner(
         honor_symlink_targets(&mut operations)?;
     }
     let originals = read_files(&operations, session).await?;
-    if let Some(held) = resumed_target(&operations, session) {
-        return Ok(ToolOutput::error_text(resumed_baseline_message(held)));
-    }
+    let unread = unread_targets(&operations, session);
     if policy == ResolvePolicy::Contained
         && let Some(reason) = symlink_check(&operations, &cwd)
     {
@@ -242,7 +246,7 @@ async fn multi_edit_inner(
     }
 
     let mut normalized_files: Vec<String> = Vec::new();
-    let finals = match merge_per_file(&operations, &originals, &mut normalized_files) {
+    let finals = match merge_per_file(&operations, &originals, &mut normalized_files, &unread) {
         Ok(f) => f,
         Err(reason) => return Ok(reason.into_output()),
     };
@@ -290,9 +294,7 @@ async fn multi_edit_inner(
         WriteOutcome::Done => {}
     }
 
-    let applied: Vec<&str> = finals.keys().map(String::as_str).collect();
-    let message = apply_summary(&summary, &applied, &operations);
-    Ok(ToolOutput::text(message)
+    Ok(ToolOutput::text(summary)
         .with_hint(DisplayHint::Diff)
         .with_retention(Retention::Durable))
 }
@@ -310,12 +312,18 @@ enum WriteOutcome {
     /// The caller renders the apply summary over the finals map.
     Done,
 
-    /// A target changed on disk mid-batch; `applied` inside the
-    /// conflict lists the files written before it, in write order.
+    /// A target changed on disk mid-batch.
+    ///
+    /// `applied` inside the conflict lists the files written before
+    /// it, in write order — the batch is atomic, so the receipt owns
+    /// exactly how far it got.
     Conflict(BatchConflict),
 
-    /// A write-phase fault; `applied` lists the files written before
-    /// it, in write order.
+    /// A write-phase fault.
+    ///
+    /// `applied` lists the files written before it, in write order;
+    /// the fault itself is the error to surface, not a per-file
+    /// verdict.
     Fault(ToolError, Vec<String>),
 }
 
@@ -806,24 +814,29 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
     None
 }
 
-/// The first batch target whose only recorded observation is resume-armed,
-/// if any.
+/// The caller spellings of every batch target the model never read here.
 ///
-/// Write holds such a target for a live read; the batch applies the same
-/// rule to every distinct target before anything is written, so an edit
-/// can never land on bytes the model never saw in this session. Distinct
-/// physical paths are each checked once.
-fn resumed_target<'a>(operations: &'a [EditOperation], session: &FileSession) -> Option<&'a Path> {
+/// A target is here-unread either when its only recorded observation is the
+/// tool's own resume-time re-read or when nothing has ever been recorded for it:
+/// in both cases the model has not seen those bytes in this session. That does
+/// not refuse an edit — every edit is located in bytes read from disk moments
+/// ago, and each write re-checks its own file before renaming — but it does end
+/// the tolerance: on these files [`merge_per_file`] applies an exact anchor
+/// match and declines the whitespace-normalized rescue, because a near-match is
+/// a guess about where the model's recollection lands, and there is no
+/// recollection here to reconcile.
+///
+/// Distinct physical paths are each judged once; the returned spellings are the
+/// ones the merge keys on.
+fn unread_targets(operations: &[EditOperation], session: &FileSession) -> HashSet<String> {
     let mut seen = std::collections::HashSet::new();
     operations
         .iter()
-        .map(|op| op.full_path.as_path())
-        .filter(|path| seen.insert(*path))
-        .find(|path| {
-            session
-                .baseline_for(path)
-                .is_some_and(|baseline| baseline.resumed)
+        .filter(|op| {
+            seen.insert(op.full_path.as_path()) && !session.read_here(op.full_path.as_path())
         })
+        .map(|op| op.file_path.clone())
+        .collect()
 }
 
 /// Reject the batch if any target — or any of its in-workspace ancestor
@@ -1194,6 +1207,7 @@ fn merge_per_file(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
     normalized_files: &mut Vec<String>,
+    unread: &HashSet<String>,
 ) -> Result<BTreeMap<String, String>, AbortReason> {
     let mut finals: BTreeMap<String, String> = BTreeMap::new();
     for op in operations {
@@ -1202,7 +1216,9 @@ fn merge_per_file(
             .or_insert_with(|| originals.get(&op.file_path).cloned().unwrap_or_default());
         match locate_unique(entry, &op.old_text) {
             FindResult::NotFound => match super::match_repair::classify_miss(entry, &op.old_text) {
-                super::match_repair::MissKind::WhitespaceUnique(window) => {
+                super::match_repair::MissKind::WhitespaceUnique(window)
+                    if !unread.contains(&op.file_path) =>
+                {
                     match super::match_repair::normalized_splice(
                         entry,
                         window,
@@ -1225,11 +1241,16 @@ fn merge_per_file(
                     }
                 }
                 kind => {
-                    return Err(AbortReason::Locate(format!(
+                    let mut message = format!(
                         "Old text not found in file: {}\n\n{}",
                         op.file_path,
                         super::match_repair::render_miss(&kind, entry)
-                    )));
+                    );
+                    if unread.contains(&op.file_path) {
+                        message.push_str("\n\n");
+                        message.push_str(&unverified_anchor_note(Path::new(&op.file_path)));
+                    }
+                    return Err(AbortReason::Locate(message));
                 }
             },
             FindResult::Ambiguous { count } => {
@@ -1300,16 +1321,19 @@ async fn validate_all(
     None
 }
 
-/// Build the per-file diff preview block, with a header chosen by `dry_run`.
+/// The batch's result: one `Changed:` receipt per touched file, nothing else.
 ///
-/// Lists each distinct file once (in first-seen order across the batch),
-/// then the indented output of
-/// [`format_file_change`](super::diff::format_file_change) comparing that
-/// file's *original* content against its *fully merged* final content
-/// from `finals` — so multiple edits to one file render cumulatively,
-/// not as isolated fragments. The dry-run path appends a footer telling
-/// the caller how to apply; the apply path reuses this block as the
-/// summary header.
+/// This is the shape [`super::diff::format_file_change`] gives a single `Edit`,
+/// repeated per file in argument order — no banner, no `File N:` labels, no
+/// indentation. A receipt is a contract a diff display parses, so anything
+/// wrapped around it is something that has to be parsed *away* to read it, and a
+/// batch of two files was two contracts inside a wrapper.
+///
+/// `dry_run` and the applied run therefore share one format by construction: the
+/// hunks a preview shows are the hunks the same call would have written, byte for
+/// byte, which is what makes a preview worth asking for. The single difference is
+/// the trailing line — a run that wrote nothing has to say so on the wire rather
+/// than in a caller's memory of which flag it passed.
 fn build_preview(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
@@ -1317,64 +1341,33 @@ fn build_preview(
     dry_run: bool,
     normalized_files: &[String],
 ) -> String {
-    let mut lines = Vec::new();
-    if dry_run {
-        lines.push("Dry Run Preview — No files will be modified".to_string());
-    } else {
-        lines.push("Multi-File Edit Summary".to_string());
-    }
-    lines.push(String::new());
-
+    let mut receipts: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut index = 1usize;
     for op in operations {
         if !seen.insert(&op.file_path) {
             continue;
         }
-        lines.push(format!("File {index}: {}", op.file_path));
         let original = originals.get(&op.file_path).map_or("", String::as_str);
         let final_content = finals.get(&op.file_path).map_or("", String::as_str);
-        let diff = format_file_change(&op.file_path, OldContent::Text(original), final_content);
-        for line in diff.lines() {
-            lines.push(format!("  {line}"));
-        }
+        let mut receipt =
+            format_file_change(&op.file_path, OldContent::Text(original), final_content);
         if normalized_files.contains(&op.file_path) {
-            lines.push(format!(
-                "  │ {}",
-                super::match_repair::NORMALIZED_MATCH_NOTE
-            ));
+            super::edit::insert_normalized_note(&mut receipt);
         }
-        lines.push(String::new());
-        index = index.saturating_add(1);
+        receipts.push(receipt);
     }
-
     if dry_run {
-        lines.push("Use dry_run=false to apply these changes.".to_string());
+        receipts.push(DRY_RUN_NOTE.to_string());
     }
-    lines.join("\n")
+    receipts.join("\n")
 }
 
-/// Append the applied-files summary to the preview block.
+/// The one line that separates a dry run's hunks from an applied run's.
 ///
-/// Called only on the apply path (not dry-run). Lists each written file
-/// once, with its edit count when more than one edit targeted it.
-fn apply_summary(preview: &str, applied: &[&str], operations: &[EditOperation]) -> String {
-    let mut result = preview.to_string();
-    result.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-    writeln!(result, "Applied: {} file(s)", applied.len()).ok();
-    for path in applied {
-        let count = operations
-            .iter()
-            .filter(|o| &o.file_path.as_str() == path)
-            .count();
-        if count > 1 {
-            writeln!(result, "  + {path} ({count} edits)").ok();
-        } else {
-            writeln!(result, "  + {path}").ok();
-        }
-    }
-    result
-}
+/// Phrased as what did not happen, because the hunks above it are real and
+/// correctly addressed: a reader who mistook this output for an applied edit
+/// would find no diff to explain the difference.
+const DRY_RUN_NOTE: &str = "Nothing was written (dry run).";
 
 #[cfg(test)]
 #[allow(
@@ -1397,6 +1390,13 @@ mod tests {
         ctx.cwd = cwd.to_string();
         super::super::FileSession::new(PathBuf::from(cwd)).attach(&mut ctx);
         ctx
+    }
+
+    // The tolerant match is withheld from a file the session has not read, so a
+    // fixture that only wrote the target has to be seen reading it.
+    fn read_here(session: &FileSession, path: &Path) {
+        let bytes = std::fs::read(path).expect("read fixture");
+        session.record_baseline(path, state::observe_bytes(&bytes));
     }
 
     fn ctx_with_policy(cwd: &std::path::Path, policy: ResolvePolicy) -> ToolContext {
@@ -1460,9 +1460,20 @@ mod tests {
             "BETA\n"
         );
         let text = out.text_content();
-        assert!(text.contains("Applied: 2 file(s)"), "{text}");
-        assert!(text.contains("File 1: a.rs"), "{text}");
-        assert!(text.contains("File 2: b.rs"), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("Changed: "))
+                .count(),
+            2,
+            "one receipt per touched file, in argument order: {text}"
+        );
+        assert!(text.contains("Changed: a.rs (modified)"), "{text}");
+        assert!(text.contains("Changed: b.rs (modified)"), "{text}");
+        assert!(
+            !text.contains("File 1:") && !text.contains("Applied:"),
+            "the receipts are the whole result — a wrapper is something a consumer \
+             has to parse away before it can read a diff: {text}"
+        );
     }
 
     #[tokio::test]
@@ -1485,11 +1496,15 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("a.rs")).unwrap(),
             "ONE\ntwo\nTHREE\n"
         );
-        assert!(
-            out.text_content().contains("a.rs (2 edits)"),
-            "{}",
-            out.text_content()
+        let text = out.text_content();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("Changed: "))
+                .count(),
+            1,
+            "two edits to one file are one receipt carrying both changes: {text}"
         );
+        assert!(text.contains("+ ONE") && text.contains("+ THREE"), "{text}");
     }
 
     #[tokio::test]
@@ -1515,15 +1530,19 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         let text = out.text_content();
-        assert!(text.contains("File 1: a.rs"), "{text}");
-        assert!(!text.contains("File 2:"), "one file is one section: {text}");
+        assert!(text.contains("Changed: a.rs (modified)"), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("Changed: "))
+                .count(),
+            1,
+            "one file is one receipt, however many edits touched it: {text}"
+        );
         assert!(!text.contains("large file"), "{text}");
         assert!(text.contains("@@ -7,7 +7,7 @@"), "{text}");
         assert!(text.contains("@@ -1497,7 +1497,7 @@"), "{text}");
         assert_eq!(
-            text.lines()
-                .filter(|line| line.trim_start().starts_with("@@"))
-                .count(),
+            text.lines().filter(|line| line.starts_with("@@")).count(),
             2,
             "one section, two hunks, nothing echoed between them: {text}"
         );
@@ -1550,6 +1569,7 @@ mod tests {
                 {"file_path": "a.rs", "old_text": "      fn two() {}", "new_text": "      fn two() { todo!() }"},
             ]
         });
+        read_here(&session, &dir.path().join("a.rs"));
         let out = multi_edit_inner(&MultiEditTool::default(), input, &session)
             .await
             .expect("the normalized batch match applies");
@@ -1582,6 +1602,7 @@ mod tests {
                 {"file_path": "a.rs", "old_text": "      fn two() {}", "new_text": "      fn two() { todo!() }"},
             ]
         });
+        read_here(&session, &dir.path().join("a.rs"));
         let out = multi_edit_inner(&MultiEditTool::default(), input, &session)
             .await
             .expect("the normalized batch match applies");
@@ -1602,9 +1623,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_miss_carries_the_classification_and_echo() {
-        // The batch miss keeps its first line and gains the
-        // classification plus the bounded echo - the re-read the old
-        // hint used to demand.
+        // The batch miss keeps its first line and gains the classification
+        // plus a bounded excerpt of the nearest passage: the lines needed to
+        // re-anchor, in place of the re-read the retired hint asked for.
         let dir = tempfile::tempdir().expect("tempdir");
         let session = FileSession::new(dir.path().to_path_buf());
         std::fs::write(
@@ -1786,12 +1807,68 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         let text = out.text_content();
-        assert!(text.contains("Dry Run Preview"), "{text}");
-        assert!(text.contains("Use dry_run=false to apply"), "{text}");
+        assert!(text.contains("Changed: a.rs (modified)"), "{text}");
+        assert!(text.contains("+ ALPHA"), "{text}");
+        assert!(text.contains(DRY_RUN_NOTE), "{text}");
+        assert!(
+            !text.contains("Multi-File Edit Summary"),
+            "the receipt replaces the banner rather than sitting under it: {text}"
+        );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("a.rs")).unwrap(),
             "alpha\n",
             "a dry run must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_the_hunks_without_writing() {
+        // Preview and result are one shape, so the marker line is the only
+        // difference between them — the hunks a preview shows are the hunks the
+        // same call would have written, byte for byte. A preview in its own
+        // format costs a second read to check against the file; a preview in the
+        // result's format costs nothing extra to trust.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lines: Vec<String> = (1..=2000).map(|i| format!("fn item_{i}() {{}}")).collect();
+        let original = format!("{}\n", lines.join("\n"));
+        std::fs::write(tmp.path().join("a.rs"), &original).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = MultiEditTool::new();
+        let dry = tool
+            .call(
+                json!({"edits": [edit("a.rs", "fn item_10() {}", "fn first() {}")], "dry_run": true}),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        assert!(!dry.is_error);
+        let dry_text = dry.text_content();
+        assert!(
+            dry_text.ends_with(DRY_RUN_NOTE),
+            "the one line that says nothing was written: {dry_text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.rs")).unwrap(),
+            original,
+            "a dry run must not write"
+        );
+
+        let applied = tool
+            .call(
+                json!({"edits": [edit("a.rs", "fn item_10() {}", "fn first() {}")]}),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        assert!(!applied.is_error);
+        let applied_text = applied.text_content();
+        assert_eq!(
+            dry_text
+                .strip_suffix(DRY_RUN_NOTE)
+                .and_then(|rest| rest.strip_suffix('\n'))
+                .unwrap_or(&dry_text),
+            applied_text,
+            "the preview's hunks are the result's hunks, byte for byte"
         );
     }
 
@@ -1977,7 +2054,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resumed_baseline_holds_the_batch_until_a_live_read() {
+    async fn a_resumed_batch_whose_anchors_all_match_applies() {
+        // A resume-armed target says the model has not seen the file this
+        // session; every edit in the batch is located in bytes read from disk a
+        // moment ago, and each write re-checks its own file before renaming. So
+        // the batch applies — including the file the bookkeeping called held —
+        // and the tolerance the resumed target loses is the whitespace rescue, not
+        // the edit.
         let tmp = tempfile::TempDir::new().unwrap();
         let held_file = tmp.path().join("held.rs");
         let free_file = tmp.path().join("free.rs");
@@ -1990,40 +2073,140 @@ mod tests {
         session.attach(&mut ctx);
         session.record_baseline(&held_file, state::observe_resumed_bytes(b"alpha\n"));
 
-        let batch = json!({"edits": [
-            {"file_path": "held.rs", "old_text": "alpha", "new_text": "ALPHA"},
-            {"file_path": "free.rs", "old_text": "beta", "new_text": "BETA"}
-        ]});
-        let held = MultiEditTool::new()
-            .call(batch.clone(), &ctx)
+        let out = MultiEditTool::new()
+            .call(
+                json!({"edits": [
+                    {"file_path": "held.rs", "old_text": "alpha", "new_text": "ALPHA"},
+                    {"file_path": "free.rs", "old_text": "beta", "new_text": "BETA"}
+                ]}),
+                &ctx,
+            )
             .await
             .unwrap();
-        assert!(held.is_error, "a resume-armed baseline must hold the batch");
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(std::fs::read_to_string(&held_file).unwrap(), "ALPHA\n");
+        assert_eq!(std::fs::read_to_string(&free_file).unwrap(), "BETA\n");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_batch_with_one_drifted_anchor_refuses_the_batch() {
+        // The safety the task refuses to give up: one anchor that no longer
+        // matches the bytes on disk refuses the whole batch, names the file and
+        // the mismatch, and writes nothing — not even the edit whose anchor was
+        // fine. A batch is one intent, and half of an intent the model cannot see
+        // half-applied is worse than none.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let held_file = tmp.path().join("held.rs");
+        let free_file = tmp.path().join("free.rs");
+        std::fs::write(&held_file, "rewritten elsewhere\n").unwrap();
+        std::fs::write(&free_file, "beta\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let session = super::super::FileSession::new(PathBuf::from(cwd));
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string();
+        session.attach(&mut ctx);
+        session.record_baseline(&held_file, state::observe_resumed_bytes(b"alpha\n"));
+
+        let out = MultiEditTool::new()
+            .call(
+                json!({"edits": [
+                    {"file_path": "held.rs", "old_text": "alpha", "new_text": "ALPHA"},
+                    {"file_path": "free.rs", "old_text": "beta", "new_text": "BETA"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
         assert!(
-            held.text_content().contains("previous session"),
-            "{}",
-            held.text_content()
+            out.is_error,
+            "a drifted anchor must refuse the batch: {text}"
         );
-        assert_eq!(
-            std::fs::read_to_string(&held_file).unwrap(),
-            "alpha\n",
-            "nothing may be written while held"
-        );
+        assert!(text.contains("held.rs"), "{text}");
+        assert!(text.contains("has not been read in this session"), "{text}");
         assert_eq!(
             std::fs::read_to_string(&free_file).unwrap(),
             "beta\n",
-            "the whole batch is refused, not just the held file"
+            "the batch is refused whole, not half applied"
         );
+    }
 
-        session.record_baseline(&held_file, state::observe_bytes(b"alpha\n"));
-        let after = MultiEditTool::new().call(batch, &ctx).await.unwrap();
+    #[tokio::test]
+    async fn an_unread_batch_target_takes_no_whitespace_guess() {
+        // The batch holds the same line as `Edit`: tolerance reconciles a
+        // recollection, and a target with no baseline was never recollected at
+        // all. One guessed splice is refused, and with it the whole batch.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let unread_file = tmp.path().join("unread.rs");
+        let other_file = tmp.path().join("other.rs");
+        let unread_content = "one\n    fn two() {}\nthree\n";
+        std::fs::write(&unread_file, unread_content).unwrap();
+        std::fs::write(&other_file, "beta\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = MultiEditTool::new()
+            .call(
+                json!({"edits": [
+                    {"file_path": "unread.rs", "old_text": "      fn two() {}", "new_text": "      fn two() { todo!() }"},
+                    {"file_path": "other.rs", "old_text": "beta", "new_text": "BETA"}
+                ]}),
+                &ctx_in(cwd),
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
         assert!(
-            !after.is_error,
-            "a live read must release the guard: {}",
-            after.text_content()
+            out.is_error,
+            "a normalized match must not write bytes nothing here has read: {text}"
         );
-        assert_eq!(std::fs::read_to_string(&held_file).unwrap(), "ALPHA\n");
-        assert_eq!(std::fs::read_to_string(&free_file).unwrap(), "BETA\n");
+        assert!(text.contains("has not been read in this session"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&unread_file).unwrap(),
+            unread_content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&other_file).unwrap(),
+            "beta\n",
+            "the batch refuses whole, so the edit that could have applied waits too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_anchor_refusal_states_the_anchor_rule() {
+        // The batch does write resumed targets — on an exact anchor — so a
+        // refusal may not promise "not writing until it has been read here":
+        // the rule it applied is the anchor rule, and a model told the wrong
+        // rule re-issues the edit expecting a different answer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let held_file = tmp.path().join("held.rs");
+        std::fs::write(&held_file, "rewritten elsewhere\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let session = super::super::FileSession::new(PathBuf::from(cwd));
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string();
+        session.attach(&mut ctx);
+        session.record_baseline(&held_file, state::observe_resumed_bytes(b"alpha\n"));
+
+        let out = MultiEditTool::new()
+            .call(
+                json!({"edits": [
+                    {"file_path": "held.rs", "old_text": "alpha", "new_text": "ALPHA"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(out.is_error, "{text}");
+        assert!(
+            text.contains("writes only where"),
+            "the refusal names the rule that refused: {text}"
+        );
+        assert!(
+            !text.contains("not writing until it has been read"),
+            "a batch that writes resumed targets on an exact anchor cannot \
+             promise to hold one until it is read: {text}"
+        );
     }
 
     #[tokio::test]

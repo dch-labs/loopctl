@@ -180,15 +180,39 @@ pub(crate) fn changed_message(path: &Path) -> String {
 /// the model never saw the file's bytes in this session — so a hash
 /// compare cannot honestly clear the write: changes made while the
 /// session was inactive would pass it unseen. The text states that and
-/// directs the model to the same recovery path as a staleness
-/// refusal. Shared by every writing tool, so Write, Edit, and
-/// `MultiEdit` hold a resume-armed target with one uniform message.
+/// directs the model to the same recovery path as a staleness refusal.
+/// [`Write`](super::write::WriteTool) is its only user: with no prior text
+/// in the call to locate, a write offers nothing to verify against the
+/// file, so holding it for a live read is the whole guard. The edit tools
+/// hold nothing — they decide on the anchor the call names, under
+/// [`unverified_anchor_note`].
 pub(crate) fn resumed_baseline_message(path: &Path) -> String {
     format!(
         "{path} was last read in a previous session, so its current bytes \
          are not part of this session's context; not writing until it has \
          been read here.\n\nRead the file with Read, then re-issue the write \
          against the content it returns.",
+        path = path.display()
+    )
+}
+
+/// Format the addendum a refusal carries when this session has not read the target.
+///
+/// Two states say the same thing about the target's bytes: a `resumed` baseline is
+/// the tool's own observation, taken while re-arming on resume, and a path with no
+/// baseline was never read at all. Either way the model has not seen them in this
+/// session. So the tool writes on an exact anchor match and on nothing else: an
+/// exact anchor can only name bytes the tool has just read off the file, while a
+/// tolerant match would rewrite bytes nobody has seen in this session on a guess
+/// about where they line up — a guess with no recollection to reconcile against.
+/// The refusal carries that beside the mismatch because the recovery differs: a
+/// model told only "not found" re-issues the same edit, while one told the file
+/// was never read here goes and reads it.
+pub(crate) fn unverified_anchor_note(path: &Path) -> String {
+    format!(
+        "{path} has not been read in this session, so this tool writes only where \
+         the old text matches its current bytes exactly. Read it with Read, then \
+         re-issue the edit against the content it returns.",
         path = path.display()
     )
 }

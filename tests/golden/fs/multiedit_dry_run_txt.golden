@@ -1,10 +1,7 @@
-Dry Run Preview — No files will be modified
+Changed: a.txt (modified)
+│ 1 line removed, 1 line added
+@@ -1,1 +1,1 @@
+- alpha
++ ALPHA
 
-File 1: a.txt
-  Changed: a.txt (modified)
-  │ 1 line removed, 1 line added
-  @@ -1,1 +1,1 @@
-  - alpha
-  + ALPHA
-
-Use dry_run=false to apply these changes.
+Nothing was written (dry run).

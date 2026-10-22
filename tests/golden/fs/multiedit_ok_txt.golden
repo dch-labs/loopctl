@@ -1,19 +1,11 @@
-Multi-File Edit Summary
+Changed: a.txt (modified)
+│ 1 line removed, 1 line added
+@@ -1,1 +1,1 @@
+- alpha
++ ALPHA
 
-File 1: a.txt
-  Changed: a.txt (modified)
-  │ 1 line removed, 1 line added
-  @@ -1,1 +1,1 @@
-  - alpha
-  + ALPHA
-
-File 2: b.txt
-  Changed: b.txt (modified)
-  │ 1 line removed, 1 line added
-  @@ -1,1 +1,1 @@
-  - beta
-  + BETA
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Applied: 2 file(s)
-  + a.txt
-  + b.txt
+Changed: b.txt (modified)
+│ 1 line removed, 1 line added
+@@ -1,1 +1,1 @@
+- beta
++ BETA

@@ -397,13 +397,18 @@ use std::fmt::Write as _;
 /// ambiguity count inline), and the file's actual lines around the
 /// best candidate window with 1-based numbers. The caller owns the
 /// first line and any hints that follow.
+///
+/// A classification states what the matcher found, never what the caller did
+/// about it: whether a normalized match is *applied* turns on facts this
+/// module cannot see — chiefly whether the session has read the file — so a
+/// caller that declines one says so itself, in its own words.
 pub(crate) fn render_miss(kind: &MissKind, content: &str) -> String {
     let mut rendered = String::new();
     match kind {
         MissKind::WhitespaceUnique(_) => rendered.push_str(
-            "Classification: whitespace-only mismatch - a unique normalized \
-             match exists and applies; if this line appears, the caller \
-             refused a match it should have applied.\n",
+            "Classification: whitespace-only mismatch - the text matches one \
+             region of the file after normalizing indentation, line endings, \
+             and trailing whitespace.\n",
         ),
         MissKind::WhitespaceAmbiguous { count, first } => {
             writeln!(
@@ -688,6 +693,11 @@ pub(crate) fn normalized_splice(
 
 /// The disclosure line a whitespace-tolerant apply adds to the
 /// receipt.
+///
+/// The one signal that the model's text was not applied as sent —
+/// [`Edit`](super::Edit) inserts it into the receipt's `│`-note
+/// channel and [`MultiEdit`](super::MultiEditTool) appends it to
+/// the per-file block.
 pub(crate) const NORMALIZED_MATCH_NOTE: &str = "matched with normalized indentation";
 
 #[cfg(test)]

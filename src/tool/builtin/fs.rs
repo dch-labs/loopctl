@@ -419,6 +419,20 @@ impl FileSession {
         }
     }
 
+    /// Whether the model is known to have seen `path`'s bytes in this session.
+    ///
+    /// True only when a baseline exists *and* is a live observation: a resumed
+    /// baseline is the tool's own resume-time re-read, so its bytes entered no
+    /// model context, and a path with no baseline was never read at all. The
+    /// edit tools gate their whitespace-tolerant match on this — reconciling a
+    /// near-match means deciding where a recollection of the text lands, which
+    /// presupposes a recollection — while an exact anchor match stays available
+    /// either way, since it verifies the bytes it writes against the file.
+    pub(crate) fn read_here(&self, path: &Path) -> bool {
+        self.baseline_for(path)
+            .is_some_and(|baseline| !baseline.resumed)
+    }
+
     /// Record what a re-read of `file_path`'s current bytes observes,
     /// re-arming the read-before-write guard a resumed session would
     /// otherwise leave disarmed.

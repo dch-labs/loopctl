@@ -621,12 +621,7 @@ mod tests {
             turn: 0,
             query: "fix the bug".to_string(),
         });
-        hub.on_stream_success(&StreamContext {
-            turn: 0,
-            model: "test-model".to_string(),
-            input_tokens: 10,
-            output_tokens: 5,
-        });
+        hub.on_stream_success(&StreamContext::new(0, "test-model", 10, 5));
         hub.on_stream_failure(&StreamFailureContext {
             turn: 0,
             model: "test-model".to_string(),
@@ -726,6 +721,9 @@ mod tests {
             duration_ms: 5,
             input_tokens: 10,
             output_tokens: 5,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 12,
             context_window: None,
@@ -796,6 +794,9 @@ mod tests {
             duration_ms: 5,
             input_tokens: 10,
             output_tokens: 5,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 777,
             context_window: None,

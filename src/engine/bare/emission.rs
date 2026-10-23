@@ -112,6 +112,34 @@ pub(super) struct TurnEnd<'a> {
     /// rather than correlating across `on_response` and `on_turn_end`.
     pub output_tokens: u64,
 
+    /// Cached-share token count reported by the provider for the same
+    /// model call.
+    ///
+    /// Same provenance and forwarding semantics as
+    /// [`input_tokens`](Self::input_tokens): the turn's cached share on
+    /// the LLM phase, repeated verbatim from the recorded
+    /// [`Turn`](crate::engine::core::Turn) on the tool phase. `0` means
+    /// the provider reported no cached share — unreported, not
+    /// zero-known.
+    pub cached_input_tokens: u64,
+
+    /// Cache-write token count reported by the provider for the same
+    /// model call.
+    ///
+    /// The cache-creation spend, forwarded with the same provenance as
+    /// [`cached_input_tokens`](Self::cached_input_tokens); `0` means
+    /// unreported.
+    pub cache_write_tokens: u64,
+
+    /// Reasoning-share token count reported by the provider for the
+    /// same model call.
+    ///
+    /// The reasoning share inside [`output_tokens`](Self::output_tokens)
+    /// — a subset, never an addition — forwarded with the same
+    /// provenance as [`cached_input_tokens`](Self::cached_input_tokens);
+    /// `0` means unreported.
+    pub reasoning_tokens: u64,
+
     /// Why the model stopped producing output for this turn.
     ///
     /// The provider's stop field, forwarded onto
@@ -162,6 +190,111 @@ pub(super) struct TurnEnd<'a> {
     pub history: Arc<Vec<Message>>,
 }
 
+/// The provider-reported usage of one served turn, in observer units.
+///
+/// The five counts travel together from a turn's [`Usage`] report to
+/// every surface that forwards them — the
+/// [`StreamContext`](crate::observer::StreamContext) fired per request,
+/// the [`Turn`](crate::engine::core::Turn) record the run carries, and
+/// the [`TurnEnd`] built for the turn-end event — so no call site
+/// transposes a pair or drops a detail class along the way. The base
+/// counts arrive already normalized by the provider adapters (the
+/// Anthropic wire family folds its cache traffic into the input total;
+/// see [`Usage`] for the per-family rules), and every detail field
+/// follows the crate-wide convention: `0` means not reported.
+pub(super) struct TurnUsage {
+    /// Prompt-side token count of the turn's model call.
+    ///
+    /// The provider's after-the-fact count of the prompt it served
+    /// (from [`Usage::input_tokens`]), widened from the report's `u32`
+    /// into the observer contexts' `u64`. On the Anthropic wire family
+    /// this is the cache-aware total — raw input plus cache read plus
+    /// cache write — so it never reads as the shrinking uncached
+    /// remainder.
+    pub input_tokens: u64,
+
+    /// Completion-side token count of the turn's model call.
+    ///
+    /// Everything the model generated for the turn (from
+    /// [`Usage::output_tokens`]): answer text, tool calls, and any
+    /// reasoning share reported inside it. A host billing per turn
+    /// reads this together with [`input_tokens`](Self::input_tokens)
+    /// from one record rather than correlating events.
+    pub output_tokens: u64,
+
+    /// Cached share of the turn's input, `0` when unreported.
+    ///
+    /// The read share of the provider's prompt cache (from
+    /// [`Usage::cached_input_tokens`]); a subset of
+    /// [`input_tokens`](Self::input_tokens), never additional to it.
+    /// `0` means the provider reported no cached share — unreported,
+    /// not zero-known, so a hit-rate display treats it as no data.
+    pub cached_input_tokens: u64,
+
+    /// Cache-write spend of the turn's input, `0` when unreported.
+    ///
+    /// The tokens the turn stored into the provider's cache (from
+    /// [`Usage::cache_write_tokens`]) — the pricing class that makes
+    /// the next turn's reads cheap — with the same subset relationship
+    /// as [`cached_input_tokens`](Self::cached_input_tokens) and the
+    /// same `0`-means-unreported convention.
+    pub cache_write_tokens: u64,
+
+    /// Reasoning share of the turn's output, `0` when unreported.
+    ///
+    /// The thinking share inside [`output_tokens`](Self::output_tokens)
+    /// (from [`Usage::reasoning_tokens`]) — a subset, never an
+    /// addition. `0` covers both a non-thinking model and a wire that
+    /// reports no reasoning class; consumers computing a reasoning
+    /// share skip the row rather than divide by it.
+    pub reasoning_tokens: u64,
+}
+
+impl TurnUsage {
+    /// Map an optional provider [`Usage`] report into observer units.
+    ///
+    /// The single conversion between the wire-side `u32` counters and
+    /// the `u64` observer units every forwarding surface carries:
+    /// [`record_turn_success`](BareLoop::record_turn_success) builds
+    /// the per-request context from it and `handle_call_llm` builds the
+    /// turn record and turn-end event from it, so both paths report one
+    /// identical story. A missing report (`None`) maps to
+    /// [`zeros`](Self::zeros) — the shape of a backend that reports no
+    /// usage at all — rather than propagating an optionality every
+    /// consumer would have to re-handle.
+    pub(super) fn from_report(usage: Option<&Usage>) -> Self {
+        match usage {
+            Some(u) => Self {
+                input_tokens: u64::from(u.input_tokens),
+                output_tokens: u64::from(u.output_tokens),
+                cached_input_tokens: u64::from(u.cached_input_tokens),
+                cache_write_tokens: u64::from(u.cache_write_tokens),
+                reasoning_tokens: u64::from(u.reasoning_tokens),
+            },
+            None => Self::zeros(),
+        }
+    }
+
+    /// The all-zero report: no usage, no detail.
+    ///
+    /// The stand-in for a turn that never received a provider report —
+    /// the cancelled and salvage-failure arms of `handle_call_llm`,
+    /// which fire their failed turn-end without a response in hand, and
+    /// `handle_call_tools`' path for a turn whose record never landed.
+    /// Every forwarding surface still receives a complete five-count
+    /// record, so an observer never distinguishes "no usage" from
+    /// "absent event payload".
+    pub(super) fn zeros() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        }
+    }
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// Notify all observers and hooks that a run has started.
     ///
@@ -200,6 +333,7 @@ impl<C: ApiClient> BareLoop<C> {
         let unfinished_input = error
             .filter(|e| super::conversation_cannot_fit(e))
             .and_then(|_| self.session.current_run().map(|run| run.input.clone()));
+        let usage = Self::run_usage_totals(result);
         self.managers.observers().on_run_end(&RunEndContext {
             success: error.is_none(),
             error: error.map(std::string::ToString::to_string),
@@ -208,6 +342,11 @@ impl<C: ApiClient> BareLoop<C> {
             calibration_ratio_bp: self.calibration.report(),
             context_figure,
             unfinished_input,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
         });
     }
 
@@ -260,6 +399,9 @@ impl<C: ApiClient> BareLoop<C> {
             duration_ms: Self::millis_u64(data.duration),
             input_tokens: data.input_tokens,
             output_tokens: data.output_tokens,
+            cached_input_tokens: data.cached_input_tokens,
+            cache_write_tokens: data.cache_write_tokens,
+            reasoning_tokens: data.reasoning_tokens,
             stop_reason: data.stop_reason,
             context_tokens: data.context_tokens,
             context_window: data.context_window,
@@ -404,7 +546,14 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Result<(), LoopError> {
         let served = self.routed_or_client_model()?;
         self.managers.fallback().record_success()?;
-        let (in_tok, out_tok) = Self::usage_tokens(usage);
+        let usage = TurnUsage::from_report(usage);
+        let TurnUsage {
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            cached_input_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+        } = usage;
         let armed_prediction = self.calibration.prediction;
         if in_tok > 0
             && let Some(raw_payload) = armed_prediction
@@ -424,12 +573,13 @@ impl<C: ApiClient> BareLoop<C> {
         if let Some(gate) = &self.budget_gate {
             gate.observe_usage(in_tok, out_tok);
         }
-        self.managers.observers().on_stream_success(&StreamContext {
-            turn,
-            model: served,
-            input_tokens: in_tok,
-            output_tokens: out_tok,
-        });
+        self.managers.observers().on_stream_success(
+            &StreamContext::new(turn, served, in_tok, out_tok).with_usage_detail(
+                cached_input_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+            ),
+        );
         Ok(())
     }
 
@@ -504,14 +654,27 @@ impl<C: ApiClient> BareLoop<C> {
         Ok(e)
     }
 
-    /// Pull per-turn `(input_tokens, output_tokens)` from optional [`Usage`].
+    /// Sum a run's per-turn usage into the run-end totals.
     ///
-    /// Returns `(0, 0)` when the provider did not report usage for the turn.
-    pub(super) fn usage_tokens(usage: Option<&Usage>) -> (u64, u64) {
-        match usage {
-            Some(u) => (u64::from(u.input_tokens), u64::from(u.output_tokens)),
-            None => (0, 0),
+    /// Saturating sums over the recorded [`Turn`](crate::engine::core::Turn)
+    /// entries, so a run whose backend never reported usage totals zero and
+    /// a backend that did carries its detail classes through.
+    fn run_usage_totals(result: &Run) -> TurnUsage {
+        let mut totals = TurnUsage::zeros();
+        for turn in &result.turns {
+            totals.input_tokens = totals.input_tokens.saturating_add(turn.input_tokens);
+            totals.output_tokens = totals.output_tokens.saturating_add(turn.output_tokens);
+            totals.cached_input_tokens = totals
+                .cached_input_tokens
+                .saturating_add(turn.cached_input_tokens);
+            totals.cache_write_tokens = totals
+                .cache_write_tokens
+                .saturating_add(turn.cache_write_tokens);
+            totals.reasoning_tokens = totals
+                .reasoning_tokens
+                .saturating_add(turn.reasoning_tokens);
         }
+        totals
     }
 
     /// Convert a [`Duration`] to milliseconds as a `u64`.

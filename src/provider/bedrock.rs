@@ -1485,27 +1485,27 @@ fn indexed_text(index: usize, text: &str) -> StreamEvent {
 ///
 /// Converse reports camelCase token counts (`inputTokens`,
 /// `outputTokens`); missing or oversized values default to 0 rather
-/// than erroring mid-stream. Converse reports its cache reads as
-/// `cacheReadInputTokens` (and writes as `cacheWriteInputTokens`),
-/// which map onto the cached share the same way.
+/// than erroring mid-stream. Converse reports its cache traffic as
+/// `cacheReadInputTokens` (reads) and `cacheWriteInputTokens` (writes)
+/// **outside** `inputTokens` — the same shape as the Anthropic wire —
+/// so the input is normalized to raw input + cache read + cache write,
+/// keeping both cache classes subsets of the reported input total.
 fn converse_usage(usage: &serde_json::Value) -> crate::stream::Usage {
-    crate::stream::Usage {
-        input_tokens: usage
-            .get("inputTokens")
+    let count = |key: &str| {
+        usage
+            .get(key)
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(0),
-        output_tokens: usage
-            .get("outputTokens")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(0),
-        cached_input_tokens: usage
-            .get("cacheReadInputTokens")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(0),
-    }
+            .unwrap_or(0)
+    };
+    let cache_read = count("cacheReadInputTokens");
+    let cache_write = count("cacheWriteInputTokens");
+    let input = count("inputTokens")
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+    crate::stream::Usage::new(input, count("outputTokens"))
+        .with_cached_input(cache_read)
+        .with_cache_write(cache_write)
 }
 
 impl std::fmt::Debug for BedrockClient {
@@ -1818,32 +1818,20 @@ fn bedrock_non_streaming_response(
         return Ok(NonStreamingResponse {
             message: crate::message::Message::new(crate::message::Role::Assistant, parts),
             usage: usage.map(|u| {
-                let raw_input = u
-                    .get("input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0);
-                let cache_read = u
-                    .get("cache_read_input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0);
-                let cache_creation = u
-                    .get("cache_creation_input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0);
-                crate::stream::Usage {
-                    input_tokens: raw_input
-                        .saturating_add(cache_read)
-                        .saturating_add(cache_creation),
-                    output_tokens: u
-                        .get("output_tokens")
+                let count = |key: &str| {
+                    u.get(key)
                         .and_then(serde_json::Value::as_u64)
                         .and_then(|v| u32::try_from(v).ok())
-                        .unwrap_or(0),
-                    cached_input_tokens: cache_read,
-                }
+                        .unwrap_or(0)
+                };
+                let cache_read = count("cache_read_input_tokens");
+                let cache_creation = count("cache_creation_input_tokens");
+                let input = count("input_tokens")
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_creation);
+                crate::stream::Usage::new(input, count("output_tokens"))
+                    .with_cached_input(cache_read)
+                    .with_cache_write(cache_creation)
             }),
             stop_reason: anthropic_stop_to_engine(stop),
         });
@@ -2279,14 +2267,7 @@ mod tests {
             "the bedrock anthropic path must emit PartStart/IndexedDelta/PartStop, \
              not bare deltas the engine accumulator drops"
         );
-        assert_eq!(
-            usage,
-            Some(crate::stream::Usage {
-                input_tokens: 4,
-                output_tokens: 6,
-                cached_input_tokens: 0,
-            })
-        );
+        assert_eq!(usage, Some(crate::stream::Usage::new(4, 6)));
     }
 
     #[test]
@@ -2425,6 +2406,222 @@ mod tests {
         let usage = response.usage.unwrap();
         assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn anthropic_shape_usage_reports_cache_write() {
+        let json = serde_json::json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 50
+            }
+        });
+        let response = bedrock_non_streaming_response(&json, "m").unwrap();
+        let usage = response.usage.expect("usage");
+        assert_eq!(
+            usage.input_tokens, 1050,
+            "raw 100 + read 900 + creation 50 — the Anthropic-shape arm normalizes like the \
+             direct client"
+        );
+        assert_eq!(usage.cached_input_tokens, 900);
+        assert_eq!(usage.cache_write_tokens, 50);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "testing")]
+    async fn cached_converse_usage_charges_the_budget_gate_the_normalized_total() {
+        // The budget gate must spend the Converse-normalized input —
+        // raw + cache read + cache write — not an uncached remainder.
+        // Driven from the real transform: `converse_usage` maps a
+        // cached camelCase report, and the engine charges exactly the
+        // figure it returns. 120 raw + 900 read + 50 write = 1 070
+        // normalized input, 20 output: the 1 000-token line crosses at
+        // the first check with 1 090 spent. A charge of any narrower
+        // reading (140 or 190 per turn) would sail past the line and
+        // this pin would watch it — on this provider's seam, not a
+        // hand-built stand-in for it.
+        use crate::engine::core::Loop as _;
+        let normalized = converse_usage(&serde_json::json!({
+            "inputTokens": 120,
+            "outputTokens": 20,
+            "cacheReadInputTokens": 900,
+            "cacheWriteInputTokens": 50,
+        }));
+        assert_eq!(
+            normalized.input_tokens, 1_070,
+            "the transform normalizes the cached converse report"
+        );
+        let client = crate::testing::MockApiClient::new("converse-shaped")
+            .with_usage(normalized)
+            .with_responses(vec![
+                crate::testing::MockResponse {
+                    text: "calling".to_string(),
+                    tool_call: Some(crate::testing::MockToolCall {
+                        id: "call-b".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({}),
+                    }),
+                    stop_reason: "tool_use".to_string(),
+                },
+                crate::testing::MockResponse {
+                    text: "never asked".to_string(),
+                    tool_call: None,
+                    stop_reason: "end_turn".to_string(),
+                },
+            ]);
+        let registry = crate::tool::ToolRegistry::new();
+        registry.register(crate::testing::MockTool::new("echo", "echoes"));
+        let mut agent = crate::engine::BareLoop::new(
+            std::sync::Arc::new(client),
+            registry,
+            crate::config::SessionConfig::default(),
+        )
+        .with_budget_gate(crate::budget::BudgetGate::new(
+            crate::budget::BudgetLimits {
+                tokens: Some(1_000),
+                ..crate::budget::BudgetLimits::new()
+            },
+        ));
+        let err = agent
+            .run("spend it", &crate::engine::core::RunConfig::default())
+            .await
+            .expect_err("the normalized total crosses the budget line");
+        match err {
+            crate::error::LoopError::BudgetExhausted { spent, limit, .. } => {
+                assert_eq!(
+                    (spent, limit),
+                    (1_090, 1_000),
+                    "the gate charges the normalized input total (cache classes inside) plus output"
+                );
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converse_usage_reports_cache_classes() {
+        let usage = converse_usage(&serde_json::json!({
+            "inputTokens": 100,
+            "outputTokens": 5,
+            "cacheReadInputTokens": 900,
+            "cacheWriteInputTokens": 50
+        }));
+        assert_eq!(
+            usage.input_tokens, 1050,
+            "Converse reports cache traffic outside inputTokens — the normalized total adds \
+             the read and write classes back, keeping the cached share a subset"
+        );
+        assert_eq!(usage.cached_input_tokens, 900);
+        assert_eq!(usage.cache_write_tokens, 50);
+    }
+
+    #[test]
+    fn a_generated_counts_sweep_holds_the_bedrock_fold_identity() {
+        // Deterministic xorshift over the counts' corner space (TESTING
+        // doctrine: fixed seed, same cases every run). Both Bedrock
+        // arms fold cache traffic — reported outside the input figure
+        // — back into the input: the fold identity is
+        // `input == raw + read + write` in clamped arithmetic, it must
+        // hold on the camelCase Converse arm and the Anthropic-shape
+        // arm alike, and unfolding the fold returns the raw count.
+        // Above-`u32` counts read as zero on this seam (the counts'
+        // `try_from` refuses them), a saturation the identity honors.
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let count = |v: u64| u32::try_from(v).unwrap_or(0);
+        let mut oversize_cases = 0usize;
+        for _case in 0..48 {
+            let raw = match next() % 4 {
+                0 => 0,
+                1 => next() % 2_000,
+                2 => u64::from(u32::MAX),
+                _ => {
+                    oversize_cases += 1;
+                    u64::from(u32::MAX) + next() % 100_000 + 1
+                }
+            };
+            let read = match next() % 4 {
+                3 => {
+                    oversize_cases += 1;
+                    u64::from(u32::MAX) + next() % 100_000 + 1
+                }
+                _ => next() % 1_000,
+            };
+            let write = next() % 1_000;
+            let folded = u32::try_from(
+                u64::from(count(raw)) + u64::from(count(read)) + u64::from(count(write)),
+            )
+            .unwrap_or(u32::MAX);
+
+            let camel = converse_usage(&serde_json::json!({
+                "inputTokens": raw,
+                "outputTokens": 7u64,
+                "cacheReadInputTokens": read,
+                "cacheWriteInputTokens": write
+            }));
+            assert_eq!(
+                camel.input_tokens, folded,
+                "the Converse arm folds raw {raw} + read {read} + write {write}"
+            );
+
+            let snake = bedrock_non_streaming_response(
+                &serde_json::json!({
+                    "content": [{"type": "text", "text": "x"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": raw,
+                        "output_tokens": 7u64,
+                        "cache_read_input_tokens": read,
+                        "cache_creation_input_tokens": write
+                    }
+                }),
+                "m",
+            )
+            .unwrap()
+            .usage
+            .expect("usage");
+            assert_eq!(
+                snake.input_tokens, camel.input_tokens,
+                "one wire value, one fold: the Anthropic-shape arm agrees \
+                 with the Converse arm"
+            );
+
+            assert!(
+                camel.cached_input_tokens <= camel.input_tokens
+                    && camel.cache_write_tokens <= camel.input_tokens,
+                "both cache classes stay subsets of the folded input: {camel:?}"
+            );
+            if u32::try_from(
+                u64::from(count(raw)) + u64::from(count(read)) + u64::from(count(write)),
+            )
+            .is_ok()
+            {
+                assert_eq!(
+                    camel.input_tokens.saturating_sub(camel.cache_write_tokens),
+                    count(raw).saturating_add(camel.cached_input_tokens),
+                    "unfolding the write class returns raw-plus-read — the fold is exact"
+                );
+            } else {
+                assert_eq!(
+                    camel.input_tokens,
+                    u32::MAX,
+                    "the fold saturates at the cap rather than wrapping"
+                );
+            }
+        }
+        assert!(
+            oversize_cases > 0,
+            "anti-vacuity: the sweep really drew above-u32 counts"
+        );
     }
 
     #[test]
@@ -2647,14 +2844,7 @@ mod tests {
         let usage = acc.usage().copied();
         let message = acc.build();
         assert_eq!(message.text_content(), "hello");
-        assert_eq!(
-            usage,
-            Some(crate::stream::Usage {
-                input_tokens: 3,
-                output_tokens: 5,
-                cached_input_tokens: 0,
-            })
-        );
+        assert_eq!(usage, Some(crate::stream::Usage::new(3, 5)));
     }
 
     #[test]
@@ -2948,11 +3138,7 @@ mod tests {
         assert!(
             events.first().is_some_and(|e| matches!(e,
             StreamEvent::MessageDelta(d)
-                if d.usage == Some(crate::stream::Usage {
-                    input_tokens: 7,
-                    output_tokens: 0,
-                cached_input_tokens: 0,
-                }))),
+                if d.usage == Some(crate::stream::Usage::new(7, 0)))),
             "a usage object reporting only one side zeroes the other: {events:?}"
         );
     }
@@ -3187,14 +3373,7 @@ mod tests {
         let usage = acc.usage().copied();
         let message = acc.build();
         assert_eq!(message.text_content(), "hello");
-        assert_eq!(
-            usage,
-            Some(crate::stream::Usage {
-                input_tokens: 3,
-                output_tokens: 5,
-                cached_input_tokens: 0,
-            })
-        );
+        assert_eq!(usage, Some(crate::stream::Usage::new(3, 5)));
     }
 
     #[test]
@@ -3240,14 +3419,7 @@ mod tests {
             vec![("t1", "echo", &serde_json::json!({"a": 1}))],
             "the full frame wire reassembles the tool call"
         );
-        assert_eq!(
-            usage,
-            Some(crate::stream::Usage {
-                input_tokens: 4,
-                output_tokens: 6,
-                cached_input_tokens: 0,
-            })
-        );
+        assert_eq!(usage, Some(crate::stream::Usage::new(4, 6)));
     }
 
     #[test]
@@ -3288,11 +3460,7 @@ mod tests {
         assert!(
             events.first().is_some_and(|e| matches!(e,
             StreamEvent::MessageDelta(d)
-                if d.usage == Some(crate::stream::Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                cached_input_tokens: 0,
-                }))),
+                if d.usage == Some(crate::stream::Usage::new(0, 0)))),
             "counts beyond u32 clamp to 0 rather than truncating: {events:?}"
         );
     }

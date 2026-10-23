@@ -138,6 +138,47 @@ impl MockClient {
         crate::error::recover_guard(self.responses.lock()).push(events);
     }
 
+    /// Queue a response that carries only reasoning and ends at the
+    /// output limit — the wire shape of a context with no generation
+    /// room left.
+    #[cfg(feature = "streaming")]
+    fn add_truncated_thinking(&self, thought: &str) {
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_test".into(),
+                    role: "assistant".into(),
+                    model: crate::error::recover_guard(self.model_name.lock()).clone(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::Thinking {
+                    text: thought.to_string(),
+                    signature: None,
+                    redacted: None,
+                }),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Thinking {
+                    text: thought.to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+            }),
+            StreamEvent::PartStop { index: None },
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("max_tokens".to_string()),
+                },
+                usage: self.staged_usage(10, 20),
+            }),
+            StreamEvent::MessageStop,
+        ];
+        crate::error::recover_guard(self.responses.lock()).push(events);
+    }
+
     fn add_tool_then_text(
         &self,
         tool_id: &str,
@@ -3379,6 +3420,1199 @@ async fn the_salvage_pass_lands_under_the_refused_payload_with_the_default_compa
 
 #[cfg(feature = "streaming")]
 #[tokio::test]
+async fn a_length_cut_completion_compacts_and_retries_the_turn() {
+    // A reply that ends at the output limit carrying only reasoning is
+    // the wire shape of a context with no generation room — taken
+    // whole, it would end the run silently on a truncated thought.
+    // The salvage compacts, retries, and the scripted real answer
+    // lands instead.
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_truncated_thinking("the answer is almost within reach, let me just ");
+    scripted.add_text_response("the recovered answer");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(CountingTruncatingCompactor {
+            calls: Arc::clone(&compactions),
+        })),
+    ));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        managers,
+    );
+    let outcome = agent.run("drive it", &RunConfig::default()).await;
+    let run = outcome.expect("the truncated turn is salvaged and the run completes");
+    assert_eq!(
+        run.output.as_deref(),
+        Some("the recovered answer"),
+        "the retry's scripted answer is the run's output"
+    );
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the salvage forced a real compaction pass - the pin is not vacuous"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_second_length_cut_completion_ends_the_run() {
+    // One salvage is a rescue; two length-cut completions on the same
+    // turn mean compaction could not free generation room, and the
+    // run fails naming the context figure instead of looping or
+    // ending silently.
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_truncated_thinking("first truncated thought ");
+    scripted.add_truncated_thinking("second truncated thought ");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(CountingTruncatingCompactor {
+            calls: Arc::clone(&compactions),
+        })),
+    ));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        managers,
+    );
+    let result = agent.run("drive it", &RunConfig::default()).await;
+    let err = result.expect_err("the second truncation fails the run");
+    assert!(
+        err.to_string().contains("exceed"),
+        "the failure names the context ceiling: {err}"
+    );
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "one salvage ran before the failure"
+    );
+}
+
+/// One observer row for a fired turn-end: `(turn, success, input, output)`.
+#[cfg(feature = "streaming")]
+type TurnEndRow = (usize, bool, u64, u64);
+
+/// The terminal events of every fired turn-end, in event order:
+/// `(turn, success, input_tokens, output_tokens)`.
+#[cfg(feature = "streaming")]
+struct TurnEndReporter {
+    /// One row per `on_turn_end`, in event order.
+    ends: Arc<Mutex<Vec<TurnEndRow>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::observer::LoopObserver for TurnEndReporter {
+    fn name(&self) -> &'static str {
+        "turn-end-reporter"
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        crate::error::recover_guard(self.ends.lock()).push((
+            ctx.turn,
+            ctx.success,
+            ctx.input_tokens,
+            ctx.output_tokens,
+        ));
+    }
+}
+
+/// The events of a healthy terminal turn reporting an explicit usage
+/// pair, for fixtures that need the retry's figures to differ from
+/// the mocked default.
+#[cfg(feature = "streaming")]
+fn recovered_turn_events(text: &str, input: u32, output: u32) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_recovered".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text(text)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: text.to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(input, output)),
+        }),
+        StreamEvent::MessageStop,
+    ]
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_salvaged_length_cut_pairs_every_turn_start_with_a_turn_end() {
+    // The salvage arms a second request on the same turn index, so the
+    // retried turn-start lands on an index that already fired one. The
+    // emission contract — every start that fires has a corresponding
+    // end, exactly once — holds only if the truncated attempt closes
+    // with a failed end first: silently arming would leave observers
+    // watching a turn that never ends, the same stall signal a hung
+    // provider produces, on the salvage's most common path. The failed
+    // end also carries the attempt's real spend — that request
+    // succeeded and its tokens were burned — while the turn's record
+    // stays the salvaged retry's figures: the two surfaces are
+    // deliberately different readings, pinned apart so neither drifts
+    // onto the other by accident.
+    let scripted = MockClient::new("test-model");
+    scripted.add_truncated_thinking("the answer is almost within reach, let me just ");
+    scripted.add_events(recovered_turn_events("the recovered answer", 777, 66));
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(TurnEventCounter {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        }))
+        .with_observer(Arc::new(TurnEndReporter {
+            ends: Arc::clone(&reported),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            CountingTruncatingCompactor {
+                calls: Arc::clone(&compactions),
+            },
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        managers,
+    );
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("the truncated turn is salvaged and the run completes");
+    assert_eq!(run.output.as_deref(), Some("the recovered answer"));
+    assert_eq!(
+        *crate::error::recover_guard(starts.lock()),
+        vec![0, 0],
+        "the truncated attempt and the retry each fired a turn-start"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(ends.lock()),
+        vec![0, 0],
+        "every fired turn-start is paired by an end — failed turn-end first, success end last"
+    );
+    let recs_failed_first = crate::error::recover_guard(reported.lock()).clone();
+    assert!(
+        matches!(recs_failed_first.first(), Some((_, false, _, _))),
+        "the first close is the truncated attempt's failed end: {recs_failed_first:?}"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn a_length_cut_salvage_reports_the_truncated_attempt_s_usage_at_its_failed_turn_end() {
+    // Salvage × usage-on: the truncated request succeeded and its
+    // tokens were burned, so the failed turn-end carries the real
+    // figures — while the run's aggregate stays the salvaged retry's
+    // numbers alone. That split across surfaces is the contract: the
+    // observer sees every attempt's spend; `RunEndContext`, the turn
+    // records, and the ledger report only what was recorded.
+    let scripted = MockClient::new("test-model");
+    scripted.add_truncated_thinking("the answer is almost within reach, let me just ");
+    scripted.add_events(recovered_turn_events("the recovered answer", 777, 66));
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let capture = Arc::new(UsageDetailCapture::new());
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(TurnEndReporter {
+            ends: Arc::clone(&reported),
+        }))
+        .with_observer(capture.clone())
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            CountingTruncatingCompactor {
+                calls: Arc::new(Mutex::new(0usize)),
+            },
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        managers,
+    );
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("the salvage completes on the retry");
+    assert_eq!(
+        *crate::error::recover_guard(reported.lock()),
+        vec![(0, false, 10, 20), (0, true, 777, 66)],
+        "the failed end carries the attempt's real spend (10/20), and only \
+         the salvaged retry arrives as success"
+    );
+    assert_eq!(
+        (run.turns[0].input_tokens, run.turns[0].output_tokens),
+        (777, 66),
+        "the recorded turn is the salvaged retry's, not the dropped attempt's"
+    );
+    let totals = *crate::error::recover_guard(capture.run_end.lock());
+    assert_eq!(
+        totals,
+        Some((777, 66, 0, 0, 0)),
+        "RunEndContext totals stay the recorded turn's figures — the failed \
+         salvage attempt never enters the run's sums"
+    );
+}
+
+/// Compactor for the non-streaming salvage pin: shrinks to a tiny
+/// window and counts its passes. The streaming salvage pins have
+/// `CountingTruncatingCompactor`; this twin exists so the
+/// non-streaming pin compiles with no `streaming` feature at all.
+#[cfg(feature = "testing")]
+struct NonStreamShrinkCompactor {
+    calls: Arc<Mutex<usize>>,
+}
+
+#[cfg(feature = "testing")]
+impl crate::compact::ContextCompactor for NonStreamShrinkCompactor {
+    fn compact(
+        &self,
+        _messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        let mut calls = crate::error::recover_guard(self.calls.lock());
+        *calls = calls.saturating_add(1);
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::compacted(
+                vec![Message::user("r".repeat(40))],
+                context.tokens_before,
+                1,
+            ),
+        ))
+    }
+}
+
+/// Counts turn-start and turn-end events by turn index, in event
+/// order, with no `streaming` feature required — the twin of
+/// `TurnEventCounter` for the non-streaming pins.
+#[cfg(feature = "testing")]
+struct NonStreamPairRecorder {
+    starts: Arc<Mutex<Vec<usize>>>,
+    ends: Arc<Mutex<Vec<usize>>>,
+}
+
+#[cfg(feature = "testing")]
+impl crate::observer::LoopObserver for NonStreamPairRecorder {
+    fn name(&self) -> &'static str {
+        "non-stream-pair-recorder"
+    }
+    fn on_turn_start(&self, ctx: &crate::observer::TurnStartContext) {
+        crate::error::recover_guard(self.starts.lock()).push(ctx.turn);
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        crate::error::recover_guard(self.ends.lock()).push(ctx.turn);
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "testing")]
+async fn a_length_cut_on_the_non_streaming_path_compacts_and_retries_the_turn() {
+    // The salvage trigger reads the finish reason, not the transport:
+    // a non-streaming host whose provider returns empty content with
+    // the length stop reason runs the same compact-and-retry arms on
+    // `create_message`, and the retry completes the run. Without the
+    // salvage the empty completion would end the run as-is — the
+    // retry's text and the compaction count below are what make this
+    // pin non-vacuous.
+    use crate::testing::{MockApiClient, MockResponse};
+
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let compactions = Arc::new(Mutex::new(0usize));
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let client = MockApiClient::new("test-model").with_responses(vec![
+        MockResponse {
+            text: String::new(),
+            tool_call: None,
+            stop_reason: "max_tokens".to_string(),
+        },
+        MockResponse {
+            text: "recovered".to_string(),
+            tool_call: None,
+            stop_reason: "end_turn".to_string(),
+        },
+    ]);
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(NonStreamPairRecorder {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            NonStreamShrinkCompactor {
+                calls: Arc::clone(&compactions),
+            },
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(client.clone()),
+        ToolRegistry::new(),
+        managers,
+    );
+    agent.set_turn_mode(TurnMode::NonStreaming);
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("the non-streaming salvage completes the turn on the retry");
+
+    assert_eq!(
+        run.output.as_deref(),
+        Some("recovered"),
+        "the retry's text completes the run — without the salvage the run \
+         would end on the empty completion"
+    );
+    assert_eq!(run.turn_count(), 1, "both attempts share one turn");
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the salvage forced a compaction pass"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(starts.lock()),
+        vec![0, 0],
+        "the non-streaming salvage fires both turn-starts"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(ends.lock()),
+        vec![0, 0],
+        "the non-streaming salvage pairs both attempts"
+    );
+    assert_eq!(
+        client.create_message_calls() + client.with_options_calls(),
+        2,
+        "both attempts rode the create_message transport — the mock's plain \
+         and with-options counters are disjoint and together prove the pin \
+         really ran the non-streaming path, not a stream"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_third_length_cut_on_one_turn_ends_the_run() {
+    // The terminal arm carries three promises at once. The run fails
+    // with the machine's context figure floored just above the window
+    // — deliberate, never measured: the wire cannot tell an over-full
+    // context from a too-small output cap, so the salvage names the
+    // reading its remedy acts on; pinning the floor keeps a future
+    // change to "report the true smaller count" from silently
+    // altering what the operator sees. The turn's start is paired by
+    // exactly one failed end, and that end reports the truncated
+    // attempt's real spend — the request succeeded; the zeros of a
+    // silent drop would be a lie about burned tokens.
+    let scripted = MockClient::new("test-model");
+    scripted.add_truncated_thinking("first truncated thought ");
+    scripted.add_truncated_thinking("second truncated thought ");
+    scripted.add_truncated_thinking("third thought the run never reaches ");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(TurnEventCounter {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        }))
+        .with_observer(Arc::new(TurnEndReporter {
+            ends: Arc::clone(&reported),
+        }));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        managers,
+    );
+    let Err(err) = agent.run("drive it", &RunConfig::default()).await else {
+        panic!("the second truncation on the same turn ends the run");
+    };
+    match err {
+        LoopError::ContextExceeded { used, limit } => assert!(
+            used > limit,
+            "the refusal floors the figure above the window, never a measured fit: \
+             used {used}, limit {limit}"
+        ),
+        other => panic!("expected ContextExceeded, got {other:?}"),
+    }
+    assert_eq!(
+        *crate::error::recover_guard(starts.lock()),
+        vec![0, 0],
+        "the truncated attempt and the retry each fired a turn-start"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(ends.lock()),
+        vec![0, 0],
+        "both fired starts are paired — the terminal arm's failure included"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(reported.lock()),
+        vec![(0, false, 10, 20), (0, false, 10, 20)],
+        "both attempts close as failed turns carrying their real spend"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_single_message_length_cut_fails_at_once_and_floors_the_reported_figure() {
+    // The salvage's remedy is compaction, and compaction needs a
+    // history that can shrink: a conversation of a single prompt has
+    // nothing to give back, so the length cut is terminal on the
+    // first completion — no compactor is even consulted — and must
+    // still fail as a paired turn, once. The reported figure is the
+    // deliberate floor: `used` above `limit` with no pretence of a
+    // measurement, the same reading both salvages share (the wire
+    // cannot distinguish the two causes, so the salvage names the
+    // reading its remedy would have acted on).
+    let scripted = MockClient::new("test-model");
+    scripted.add_truncated_thinking("a thought that runs past the cap ");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let compactions = Arc::new(Mutex::new(0usize));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        make_config(),
+        crate::managers::LoopManagers::new()
+            .with_observer(Arc::new(TurnEventCounter {
+                starts: Arc::clone(&starts),
+                ends: Arc::clone(&ends),
+            }))
+            .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+                CountingTruncatingCompactor {
+                    calls: Arc::clone(&compactions),
+                },
+            )))),
+    );
+    let Err(err) = agent.run("drive it", &RunConfig::default()).await else {
+        panic!("a length cut with nothing to compact fails the run");
+    };
+    match err {
+        LoopError::ContextExceeded { used, limit } => assert!(
+            used > limit,
+            "the refusal reports the floor, never a measured fit: used {used}, limit {limit}"
+        ),
+        other => panic!("expected ContextExceeded, got {other:?}"),
+    }
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "an unshrinkable history consults no compactor"
+    );
+    assert_eq!(
+        crate::error::recover_guard(starts.lock()).as_slice(),
+        &[0],
+        "the turn started exactly once — no retry was armed"
+    );
+    assert_eq!(
+        crate::error::recover_guard(ends.lock()).as_slice(),
+        &[0],
+        "and the single start is paired by the terminal failed end"
+    );
+}
+
+/// A client that refuses one numbered request as oversized and serves
+/// everything else from the scripted inner — the shape that puts an
+/// overflow rejection between two length cuts.
+#[cfg(feature = "streaming")]
+struct RefuseOneRequestClient {
+    /// The scripted responses, served on every non-refused request.
+    inner: MockClient,
+
+    /// The one-based request index this client refuses.
+    refuse_request: usize,
+
+    /// Requests seen, in arrival order.
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for RefuseOneRequestClient {
+    fn model(&self) -> String {
+        self.inner.model()
+    }
+    fn set_model(&self, model: &str) -> bool {
+        self.inner.set_model(model)
+    }
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let count = self
+            .seen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        if count == self.refuse_request {
+            return Box::pin(futures::stream::iter(vec![Err(ApiError::api(
+                "this model's maximum context length is small and the prompt is too long",
+            ))]));
+        }
+        self.inner.stream_messages(request)
+    }
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        Box::pin(async {
+            Err(ApiError::api(
+                "this model's maximum context length is small and the prompt is too long",
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_length_cut_then_an_overflow_rejection_salvages_both_and_completes() {
+    // The two salvages are independent one-per-turn slots, and a turn
+    // can genuinely meet both remedies in either order: a length cut
+    // arms the truncation slot, its retried request then gets refused
+    // oversized (the compacted estimate still over the real limit),
+    // which arms the overflow slot with its own forced target — the
+    // last writer wins the compaction landing — and the second retry
+    // completes. The run must not confuse one slot for the other and
+    // die claiming a spent retry.
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_truncated_thinking("the answer is almost within reach, let me just ");
+    scripted.add_text_response("the recovered answer");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(TurnEventCounter {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            CountingTruncatingCompactor {
+                calls: Arc::clone(&compactions),
+            },
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(RefuseOneRequestClient {
+            inner: scripted,
+            refuse_request: 2,
+            seen: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        ToolRegistry::new(),
+        managers,
+    );
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("both salvages fire in sequence and the run completes");
+    assert_eq!(
+        run.output.as_deref(),
+        Some("the recovered answer"),
+        "the third request — after both salvages — is the served answer"
+    );
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the sequential salvages drove at least one real compaction pass"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(starts.lock()),
+        *crate::error::recover_guard(ends.lock()),
+        "the start/end pairing survives the interleaved salvages"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_overflow_salvage_then_a_length_cut_still_completes_the_turn() {
+    // The reverse order: the provider refuses the opening request
+    // oversized, the forced pass shrinks the history enough to be
+    // served — and the answer that comes back still ends at the
+    // output limit carrying only reasoning. The overflow slot is
+    // spent, the truncation slot is not, so the turn gets its second
+    // remedy too and completes; each slot is spent exactly once and
+    // the run reports the served answer. The compactor is the real
+    // truncating one — a double that collapses the history whole
+    // would leave the second salvage with nothing to compact, which
+    // is its own (differently-pinned) terminal shape, not this one.
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_truncated_thinking("a thought cut by the cap ");
+    scripted.add_text_response("the recovered answer");
+    let trails = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(TurnEventCounter {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        }))
+        .with_observer(Arc::new(StageTrailRecorder {
+            trails: Arc::clone(&trails),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new(),
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..24)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(80))
+            } else {
+                Message::assistant("a".repeat(80))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(HardWindowClient {
+            inner: scripted,
+            window: 300,
+        }),
+        ToolRegistry::new(),
+        managers,
+    );
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("the overflow refusal and the later length cut each get their remedy");
+    assert_eq!(
+        run.output.as_deref(),
+        Some("the recovered answer"),
+        "after both remedies the served answer is the run's output"
+    );
+    assert!(
+        crate::error::recover_guard(trails.lock()).len() >= 2,
+        "both salvages drove their own compaction pass"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(starts.lock()),
+        *crate::error::recover_guard(ends.lock()),
+        "every attempt across both salvages has its paired end"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn length_cut_salvage_on_consecutive_turns_spends_one_slot_each() {
+    // The retry slot names a turn index, and a fresh turn must not be
+    // denied by a prior turn's spent slot: turn 0 truncates, is
+    // salvaged, and completes with a tool call; turn 1 truncates too
+    // and must get its own rescue — the slot overwrite from turn 0 to
+    // turn 1 is the accounting that makes that true. Both turns close
+    // paired throughout.
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_truncated_thinking("turn zero cut short ");
+    scripted.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_tool".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call(
+                "call_1",
+                "echo",
+                json!({"message": "hi"}),
+            )),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: json!({"message": "hi"}).to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("tool_call".to_string()),
+            },
+            usage: None,
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    scripted.add_truncated_thinking("turn one cut short ");
+    scripted.add_text_response("both turns rescued");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(TurnEventCounter {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            CountingTruncatingCompactor {
+                calls: Arc::clone(&compactions),
+            },
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        registry,
+        managers,
+    );
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("both turns get their own truncation rescue");
+    assert_eq!(
+        run.output.as_deref(),
+        Some("both turns rescued"),
+        "the run completes on the turn-1 retry's answer"
+    );
+    assert_eq!(run.turns.len(), 2, "one tool turn, one text turn");
+    assert_eq!(
+        *crate::error::recover_guard(starts.lock()),
+        vec![0, 0, 1, 1],
+        "each turn started twice: the truncated attempt and its rescue"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(ends.lock()),
+        vec![0, 0, 1, 1],
+        "every one of those starts is paired"
+    );
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 2,
+        "each turn's salvage drove its own pass"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_declined_salvage_compaction_ends_the_run() {
+    // A salvage can arm and still not rescue: the compaction it
+    // forces may be unable to make progress — here the overflow
+    // salvage's forced pass first lands the history at its floor, so
+    // when the length cut later arms a pass under that floor, the
+    // truncator cannot shrink it further. The run must surface the
+    // stall the no-progress guard actually raises (`CompactionStalled`,
+    // naming the figure it could not move), not a salvage-invented
+    // `ContextExceeded`, and the turn events fired up to the stall
+    // must close honestly — every start that fired before the run
+    // died has its end.
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_truncated_thinking("a thought cut by the cap ");
+    scripted.add_text_response("never reached");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(TurnEventCounter {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new(),
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(HardWindowClient {
+            inner: scripted,
+            window: 160,
+        }),
+        ToolRegistry::new(),
+        managers,
+    );
+    let Err(err) = agent.run("drive it", &RunConfig::default()).await else {
+        panic!("the no-progress forced pass must end the run");
+    };
+    assert!(
+        matches!(err, LoopError::CompactionStalled { .. }),
+        "the salvage's forced pass surfaces its own stall, got {err}"
+    );
+    let started = crate::error::recover_guard(starts.lock()).clone();
+    let ended = crate::error::recover_guard(ends.lock()).clone();
+    assert_eq!(
+        started, ended,
+        "no start may be orphaned by the stall — the emission contract \
+         holds across the salvage's mid-transition failure"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_tool_carrying_length_cut_is_an_ordinary_tool_turn_not_a_salvage() {
+    // The salvage arms on a completion that stopped at the output
+    // limit with nothing usable to show — but a request that stops at
+    // the limit *after emitting a tool call* produced exactly what it
+    // was asked for: the call. Boundary of the salvage's trigger: it
+    // must not mistake a tool-carrying cut for a truncated sentence,
+    // must not compact, must not retry, and must run the tool.
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_cut_tool".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::ToolCall {
+                id: "call_cut".into(),
+                name: "echo".into(),
+                input: serde_json::Value::Null,
+            }),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: "{}".into(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("max_tokens".to_string()),
+            },
+            usage: None,
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    scripted.add_text_response("the tool ran; done");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let compactions = Arc::new(Mutex::new(0usize));
+    let registry = ToolRegistry::new();
+    registry.register(crate::testing::MockTool::new("echo", "echoes"));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(scripted),
+        registry,
+        make_config().with_context_window(4_000),
+        crate::managers::LoopManagers::new()
+            .with_observer(Arc::new(TurnEventCounter {
+                starts: Arc::clone(&starts),
+                ends: Arc::clone(&ends),
+            }))
+            .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+                CountingTruncatingCompactor {
+                    calls: Arc::clone(&compactions),
+                },
+            )))),
+    );
+    let run = agent
+        .run("cut but useful", &RunConfig::default())
+        .await
+        .expect("a tool-carrying length cut is an ordinary tool turn");
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "the salvage never engages — the cut carried its payload"
+    );
+    assert_eq!(
+        crate::error::recover_guard(starts.lock()).as_slice(),
+        &[0, 1],
+        "one start per turn — no same-index retry was armed"
+    );
+    assert_eq!(
+        crate::error::recover_guard(ends.lock()).as_slice(),
+        &[0, 1],
+        "and both turns close in order"
+    );
+    assert_eq!(run.turns.len(), 2, "tool turn plus closing turn");
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_length_cut_without_a_context_manager_ends_the_run() {
+    // Every `BareLoop` constructor seeds a default context manager
+    // when the caller supplies none, so a length-cut run can never
+    // actually meet a managerless state — the salvage always has a
+    // compactor to consult. What the configuration *does* produce is
+    // the seeded default driving the same honest termination: with an
+    // unshrinkable history the forced pass declines and the run ends
+    // with the floored figure, once, paired.
+    let managers = crate::managers::LoopManagers::new();
+    assert!(
+        managers.context_manager().is_none(),
+        "the bare manager set carries no context manager before construction"
+    );
+    let scripted = MockClient::new("test-model");
+    scripted.add_truncated_thinking("a thought past the cap ");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        make_config(),
+        managers.with_observer(Arc::new(TurnEventCounter {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        })),
+    );
+    let Err(err) = agent.run("drive it", &RunConfig::default()).await else {
+        panic!("a length cut an unshrinkable history cannot rescue ends the run");
+    };
+    match err {
+        LoopError::ContextExceeded { used, limit } => assert!(
+            used > limit,
+            "the seeded default still reports the floor, never a measured fit: \
+             used {used}, limit {limit}"
+        ),
+        other => panic!("expected ContextExceeded, got {other:?}"),
+    }
+    assert_eq!(
+        crate::error::recover_guard(starts.lock()).as_slice(),
+        &[0],
+        "exactly one start — the declined remedy armed no retry"
+    );
+    assert_eq!(
+        crate::error::recover_guard(ends.lock()).as_slice(),
+        &[0],
+        "and the terminal failed end closes it"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_empty_completion_at_end_turn_still_completes_the_run() {
+    // An empty completion is a completion: the model stopped by
+    // decision, not by the cap. The salvage keys on the stop reason,
+    // never on the text being empty — silence at `end_turn` must
+    // sail through as a finished run with nothing compacted and
+    // nothing retried.
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_empty".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: None,
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let compactions = Arc::new(Mutex::new(0usize));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        make_config().with_context_window(4_000),
+        crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+            crate::compact::ContextManager::new(Arc::new(CountingTruncatingCompactor {
+                calls: Arc::clone(&compactions),
+            })),
+        )),
+    );
+    let run = agent
+        .run("say nothing", &RunConfig::default())
+        .await
+        .expect("an empty end_turn completion completes the run");
+    assert_eq!(
+        run.output.as_deref(),
+        Some(""),
+        "the empty completion is the output, not a failure"
+    );
+    assert_eq!(run.turns.len(), 1, "one turn, recorded as asked");
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "the salvage never engages on a decision to stop"
+    );
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn a_failed_run_reports_only_the_recorded_turns_in_its_totals() {
+    // Run-end totals promise the sum of the *recorded* turns. When a
+    // later request fails outright, its turn still closes — pairing
+    // holds — but it recorded nothing: no usage arrives at all, so the
+    // failed run's aggregate must stay exactly the completed turn's
+    // figures, with a zero row for the call that never returned.
+    let client = crate::testing::MockApiClient::new("partial-model")
+        .with_usage(
+            Usage::new(50, 25)
+                .with_cached_input(40)
+                .with_cache_write(5)
+                .with_reasoning(10),
+        )
+        .with_responses(vec![
+            crate::testing::MockResponse {
+                text: "calling".to_string(),
+                tool_call: Some(crate::testing::MockToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+            crate::testing::MockResponse {
+                text: "never served".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            },
+        ])
+        .with_errors(vec![None, Some("boom".to_string())]);
+    let registry = ToolRegistry::new();
+    registry.register(crate::testing::MockTool::new("echo", "echoes"));
+    let capture = Arc::new(NonStreamDetailCapture::default());
+    let mut agent = BareLoop::new_with_managers(
+        std::sync::Arc::new(client),
+        registry,
+        make_config(),
+        crate::managers::LoopManagers::new().with_observer(capture.clone()),
+    );
+    agent.set_turn_mode(TurnMode::NonStreaming);
+    let err = agent
+        .run("fail after one turn", &RunConfig::default())
+        .await
+        .expect_err("the scripted second-call failure fails the run");
+    assert!(
+        matches!(err, LoopError::Api(_)),
+        "the provider failure surfaces as the API error, got {err:?}"
+    );
+    assert_eq!(
+        crate::error::recover_guard(capture.turn_detail.lock()).as_slice(),
+        &[(40, 5, 10), (0, 0, 0)],
+        "the failed request still closes its turn — with nothing to report"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(capture.run_totals.lock()),
+        Some((50, 25, 5, 10, 40)),
+        "the failed run's totals are exactly the recorded turn's figures"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
 async fn a_second_overflow_rejection_ends_the_run() {
     let scripted = MockClient::new("test-model").without_usage();
     scripted.add_text_response("never reached");
@@ -5375,6 +6609,36 @@ impl crate::compact::ContextCompactor for ShrinkingPassCompactor {
         _target_tokens: u64,
         context: crate::compact::types::CompactionContext,
     ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::compacted(
+                vec![Message::user("r".repeat(40))],
+                context.tokens_before,
+                1,
+            ),
+        ))
+    }
+}
+
+/// A truncating compactor that counts its passes.
+///
+/// The truncation-salvage pins need to know the forced pass really
+/// ran, and need it to land small enough that the retried turn has
+/// generation room again.
+#[cfg(feature = "streaming")]
+struct CountingTruncatingCompactor {
+    calls: Arc<Mutex<usize>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::compact::ContextCompactor for CountingTruncatingCompactor {
+    fn compact(
+        &self,
+        _messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        let mut calls = crate::error::recover_guard(self.calls.lock());
+        *calls = calls.saturating_add(1);
         Box::pin(std::future::ready(
             crate::compact::types::CompactionOutcome::compacted(
                 vec![Message::user("r".repeat(40))],
@@ -9316,22 +10580,28 @@ async fn run_end_reason_complete() {
     // Normal completion: success true, not cancelled, under max_turns.
     loop_.session.current_run_mut().unwrap().turns = vec![
         crate::engine::core::Turn {
-            turn: 0,
+            index: 0,
             input: String::new(),
             output: String::new(),
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             transport_fallback: false,
         },
         crate::engine::core::Turn {
-            turn: 1,
+            index: 1,
             input: String::new(),
             output: String::new(),
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             transport_fallback: false,
         },
@@ -9353,22 +10623,28 @@ async fn run_end_reason_cancelled() {
     // Cancel signal fired — success is true (not Failed) but cancelled.
     loop_.session.current_run_mut().unwrap().turns = vec![
         crate::engine::core::Turn {
-            turn: 0,
+            index: 0,
             input: String::new(),
             output: String::new(),
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             transport_fallback: false,
         },
         crate::engine::core::Turn {
-            turn: 1,
+            index: 1,
             input: String::new(),
             output: String::new(),
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             transport_fallback: false,
         },
@@ -9441,12 +10717,15 @@ async fn run_end_reason_complete_on_max_turn_boundary() {
     let (mut loop_, hook) = loop_with_reason_hook();
     loop_.session.current_run_mut().unwrap().turns = (0..5)
         .map(|i| crate::engine::core::Turn {
-            turn: i,
+            index: i,
             input: String::new(),
             output: String::new(),
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             transport_fallback: false,
         })
@@ -15651,4 +16930,399 @@ async fn a_post_compaction_request_is_legal_on_a_strict_provider() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+use crate::observer::{RunEndContext, StreamContext, TurnEndContext};
+
+/// The canned usage every detail-propagation pin runs with.
+///
+/// The mock's fixed pair plus all three detail classes, so each observer
+/// tier sees the same figures to forward.
+#[cfg(all(feature = "streaming", feature = "testing"))]
+fn detailed_usage() -> Usage {
+    Usage::new(50, 25)
+        .with_cached_input(40)
+        .with_cache_write(5)
+        .with_reasoning(10)
+}
+
+/// The five usage figures a stream-success or run-end context carries.
+#[cfg(all(feature = "streaming", feature = "testing"))]
+type UsageDetailRow = (u64, u64, u64, u64, u64);
+
+/// The three detail classes a turn-end context carries.
+#[cfg(all(feature = "streaming", feature = "testing"))]
+type TurnDetailRow = (u64, u64, u64);
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+struct UsageDetailCapture {
+    stream: Mutex<Vec<UsageDetailRow>>,
+    turn_end: Mutex<Vec<TurnDetailRow>>,
+    run_end: Mutex<Option<UsageDetailRow>>,
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+impl UsageDetailCapture {
+    fn new() -> Self {
+        Self {
+            stream: Mutex::new(Vec::new()),
+            turn_end: Mutex::new(Vec::new()),
+            run_end: Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+impl LoopObserver for UsageDetailCapture {
+    fn name(&self) -> &'static str {
+        "usage-detail-capture"
+    }
+    fn on_stream_success(&self, ctx: &StreamContext) {
+        crate::error::recover_guard(self.stream.lock()).push((
+            ctx.input_tokens,
+            ctx.output_tokens,
+            ctx.cached_input_tokens,
+            ctx.cache_write_tokens,
+            ctx.reasoning_tokens,
+        ));
+    }
+    fn on_turn_end(&self, ctx: &TurnEndContext) {
+        crate::error::recover_guard(self.turn_end.lock()).push((
+            ctx.cached_input_tokens,
+            ctx.cache_write_tokens,
+            ctx.reasoning_tokens,
+        ));
+    }
+    fn on_run_end(&self, ctx: &RunEndContext) {
+        *crate::error::recover_guard(self.run_end.lock()) = Some((
+            ctx.input_tokens,
+            ctx.output_tokens,
+            ctx.cached_input_tokens,
+            ctx.cache_write_tokens,
+            ctx.reasoning_tokens,
+        ));
+    }
+}
+
+/// A two-turn mock run (tool call, then terminal) whose every response
+/// reports the same detailed usage, wired through the capture observer.
+#[cfg(all(feature = "streaming", feature = "testing"))]
+fn detailed_loop(observer: Arc<UsageDetailCapture>) -> BareLoop<crate::testing::MockApiClient> {
+    let client = crate::testing::MockApiClient::new("detail-model")
+        .with_responses(vec![
+            crate::testing::MockResponse {
+                text: "calling".to_string(),
+                tool_call: Some(crate::testing::MockToolCall {
+                    id: "call-detail".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+            crate::testing::MockResponse {
+                text: "finished".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            },
+        ])
+        .with_usage(detailed_usage());
+    let registry = ToolRegistry::new();
+    registry.register(crate::testing::MockTool::new("echo", "echoes"));
+    BareLoop::new_with_managers(
+        Arc::new(client),
+        registry,
+        make_config(),
+        crate::managers::LoopManagers::new().with_observer(observer),
+    )
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn turn_end_carries_usage_detail() {
+    let capture = Arc::new(UsageDetailCapture::new());
+    let mut agent = detailed_loop(Arc::clone(&capture));
+    let run = agent.run("show me the detail", &RunConfig::default()).await;
+    assert!(run.is_ok(), "the scripted run completes: {run:?}");
+    let turn_ends = crate::error::recover_guard(capture.turn_end.lock()).clone();
+    assert_eq!(turn_ends.len(), 2, "one turn-end per served turn");
+    assert!(
+        turn_ends
+            .iter()
+            .all(|&(cached, write, reasoning)| (cached, write, reasoning) == (40, 5, 10)),
+        "every turn-end carries the provider's usage detail verbatim: {turn_ends:?}"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn stream_context_carries_the_detail() {
+    let capture = Arc::new(UsageDetailCapture::new());
+    let mut agent = detailed_loop(Arc::clone(&capture));
+    let run = agent.run("show me the detail", &RunConfig::default()).await;
+    assert!(run.is_ok(), "the scripted run completes: {run:?}");
+    let streams = crate::error::recover_guard(capture.stream.lock()).clone();
+    assert!(!streams.is_empty(), "the run served at least one request");
+    assert!(
+        streams
+            .iter()
+            .all(|&(input, output, cached, write, reasoning)| {
+                (input, output, cached, write, reasoning) == (50, 25, 40, 5, 10)
+            }),
+        "every stream-success context carries the per-request detail: {streams:?}"
+    );
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn run_end_reports_usage_totals() {
+    let capture = Arc::new(UsageDetailCapture::new());
+    let mut agent = detailed_loop(Arc::clone(&capture));
+    let run = agent.run("show me the detail", &RunConfig::default()).await;
+    assert!(run.is_ok(), "the scripted run completes: {run:?}");
+    let totals = *crate::error::recover_guard(capture.run_end.lock());
+    let (input, output, cached, write, reasoning) =
+        totals.expect("the run-end event carries the usage totals");
+    assert!(
+        input > 0 && output > 0,
+        "anti-vacuity: the run really consumed tokens ({input}, {output})"
+    );
+    assert_eq!(
+        (input, output, cached, write, reasoning),
+        (100, 50, 80, 10, 20),
+        "the run totals are the saturating sums of both turns' detail"
+    );
+}
+
+/// The five run figures a run-end context folds, in capture order.
+#[cfg(feature = "testing")]
+type RunFiguresRow = (u64, u64, u64, u64, u64);
+
+/// Turn and run-end detail capture compiling under any feature set —
+/// the streaming-gated `UsageDetailCapture` cannot serve a pin written
+/// for the no-`streaming` configuration.
+#[cfg(feature = "testing")]
+#[derive(Default)]
+struct NonStreamDetailCapture {
+    turn_detail: Arc<Mutex<Vec<(u64, u64, u64)>>>,
+    run_totals: Arc<Mutex<Option<RunFiguresRow>>>,
+}
+
+#[cfg(feature = "testing")]
+impl crate::observer::LoopObserver for NonStreamDetailCapture {
+    fn name(&self) -> &'static str {
+        "non-stream-detail"
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        crate::error::recover_guard(self.turn_detail.lock()).push((
+            ctx.cached_input_tokens,
+            ctx.cache_write_tokens,
+            ctx.reasoning_tokens,
+        ));
+    }
+    fn on_run_end(&self, ctx: &crate::observer::RunEndContext) {
+        *crate::error::recover_guard(self.run_totals.lock()) = Some((
+            ctx.input_tokens,
+            ctx.output_tokens,
+            ctx.cache_write_tokens,
+            ctx.reasoning_tokens,
+            ctx.cached_input_tokens,
+        ));
+    }
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn usage_detail_propagates_on_the_non_streaming_path() {
+    // Every other detail pin drives the streaming transport; the
+    // create_message path shares the propagation code but no pin in a
+    // no-`streaming` configuration asserted it — CI's `--all-features`
+    // cannot see that world. This test compiles with and without the
+    // streaming feature and drives the non-streaming turn mode
+    // explicitly, so the cache-write and reasoning classes reaching
+    // the `Turn` record is pinned on the transport that never streams.
+    let client = crate::testing::MockApiClient::new("detail-model")
+        .with_usage(
+            Usage::new(50, 25)
+                .with_cached_input(40)
+                .with_cache_write(5)
+                .with_reasoning(10),
+        )
+        .with_responses(vec![crate::testing::MockResponse {
+            text: "assembled detail".to_string(),
+            tool_call: None,
+            stop_reason: "end_turn".to_string(),
+        }]);
+    let capture = Arc::new(NonStreamDetailCapture::default());
+    let mut agent = BareLoop::new_with_managers(
+        std::sync::Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        crate::managers::LoopManagers::new().with_observer(capture.clone()),
+    );
+    agent.set_turn_mode(TurnMode::NonStreaming);
+    let run = agent
+        .run("detail without the stream", &RunConfig::default())
+        .await
+        .expect("the non-streaming turn completes");
+    assert_eq!(run.turns.len(), 1);
+    let turn = &run.turns[0];
+    assert_eq!(
+        (
+            turn.input_tokens,
+            turn.output_tokens,
+            turn.cached_input_tokens,
+            turn.cache_write_tokens,
+            turn.reasoning_tokens,
+        ),
+        (50, 25, 40, 5, 10),
+        "the create path carries every usage class into the turn record"
+    );
+    assert_eq!(
+        crate::error::recover_guard(capture.turn_detail.lock()).as_slice(),
+        &[(40, 5, 10)],
+        "TurnEndContext carries the detail to observers on this path"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(capture.run_totals.lock()),
+        Some((50, 25, 5, 10, 40)),
+        "RunEndContext totals fold the non-streaming turn's figures"
+    );
+}
+
+/// A client stamping each non-streaming response's usage report from a
+/// staged list — the cached-then-uncached heterogeneity no
+/// single-usage fixture can produce.
+#[cfg(all(feature = "streaming", feature = "testing"))]
+struct StagedUsageClient {
+    /// The scripted responses the inner mock serves.
+    inner: crate::testing::MockApiClient,
+
+    /// The usage to stamp on request `n` (zero-based), if staged.
+    stage: Vec<Usage>,
+
+    /// Requests served so far, in arrival order.
+    served: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+impl ApiClient for StagedUsageClient {
+    fn model(&self) -> String {
+        self.inner.model()
+    }
+    fn set_model(&self, model: &str) -> bool {
+        self.inner.set_model(model)
+    }
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        self.inner.stream_messages(request)
+    }
+    fn create_message(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        let index = self
+            .served
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let inner = self.inner.create_message(request);
+        let staged = self.stage.get(index).copied();
+        Box::pin(async move {
+            let mut response = inner.await?;
+            if let (Some(usage), Some(carried)) = (staged, response.usage.as_mut()) {
+                *carried = usage;
+            }
+            Ok(response)
+        })
+    }
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn run_end_totals_sum_heterogeneous_turn_usage() {
+    // Every detail fixture so far stages one constant `Usage` for all
+    // turns — the shape run-end sums actually vary on was never
+    // exercised. Turn 0 reports the full detail, turn 1 reports none:
+    // the per-turn records keep their own figures, the run totals are
+    // the exact sum (not the last turn's, not the maximum's), and the
+    // turn-end events agree — the totals-soundness property checked
+    // where the money is reported.
+    let inner = crate::testing::MockApiClient::new("hetero-model")
+        .with_responses(vec![
+            crate::testing::MockResponse {
+                text: "calling".to_string(),
+                tool_call: Some(crate::testing::MockToolCall {
+                    id: "call-h".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+            crate::testing::MockResponse {
+                text: "finished".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            },
+        ])
+        .with_usage(Usage::new(1, 1));
+    let client = StagedUsageClient {
+        inner,
+        stage: vec![
+            Usage::new(50, 25)
+                .with_cached_input(40)
+                .with_cache_write(5)
+                .with_reasoning(10),
+            Usage::new(60, 30),
+        ],
+        served: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let capture = Arc::new(UsageDetailCapture::new());
+    let registry = ToolRegistry::new();
+    registry.register(crate::testing::MockTool::new("echo", "echoes"));
+    let mut agent = BareLoop::new_with_managers(
+        std::sync::Arc::new(client),
+        registry,
+        make_config(),
+        crate::managers::LoopManagers::new().with_observer(capture.clone()),
+    );
+    agent.set_turn_mode(TurnMode::NonStreaming);
+    let run = agent
+        .run("vary the detail", &RunConfig::default())
+        .await
+        .expect("the two-turn heterogeneous run completes");
+    assert_eq!(run.turns.len(), 2);
+    assert_eq!(
+        (
+            run.turns[0].cached_input_tokens,
+            run.turns[1].cached_input_tokens
+        ),
+        (40, 0),
+        "the cached share belongs to its own turn — never smeared, never dropped"
+    );
+    let totals = *crate::error::recover_guard(capture.run_end.lock());
+    let (input, output, cached, write, reasoning) =
+        totals.expect("the run-end event carries the usage totals");
+    assert_eq!(
+        (input, output, cached, write, reasoning),
+        (110, 55, 40, 5, 10),
+        "the run totals sum both turns exactly, detail included"
+    );
+    let summed = run
+        .turns
+        .iter()
+        .fold((0u64, 0u64, 0u64, 0u64, 0u64), |mut acc, turn| {
+            acc.0 += turn.input_tokens;
+            acc.1 += turn.output_tokens;
+            acc.2 += turn.cached_input_tokens;
+            acc.3 += turn.cache_write_tokens;
+            acc.4 += turn.reasoning_tokens;
+            acc
+        });
+    assert_eq!(
+        (input, output, cached, write, reasoning),
+        summed,
+        "the reported totals are exactly the sum of the turn records"
+    );
 }

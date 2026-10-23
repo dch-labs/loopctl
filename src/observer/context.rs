@@ -95,6 +95,40 @@ pub struct RunEndContext {
     /// heuristic's own calibration, and the honest reading is "no
     /// data", not "ratio of one".
     pub calibration_ratio_bp: Option<u64>,
+
+    /// Total input tokens the run's turns consumed.
+    ///
+    /// Saturating sum of the per-turn figures the provider reported —
+    /// the run-level base for the usage-detail ratios below. Zero on a
+    /// run whose backend never reported usage.
+    pub input_tokens: u64,
+
+    /// Total output tokens the run's turns produced.
+    ///
+    /// Saturating sum of the per-turn figures, matching
+    /// [`input_tokens`](Self::input_tokens).
+    pub output_tokens: u64,
+
+    /// Total input tokens served from the provider's cache across the run.
+    ///
+    /// Saturating sum of the per-turn cached shares. `0` means no turn
+    /// reported a cached share — unreported, not zero-known (the
+    /// crate-wide usage-detail convention).
+    pub cached_input_tokens: u64,
+
+    /// Total tokens written to the provider's cache across the run.
+    ///
+    /// Saturating sum of the per-turn cache-write spends, with the same
+    /// `0`-means-unreported convention as
+    /// [`cached_input_tokens`](Self::cached_input_tokens).
+    pub cache_write_tokens: u64,
+
+    /// Total reasoning tokens inside the run's output.
+    ///
+    /// Saturating sum of the per-turn reasoning shares — a subset of
+    /// [`output_tokens`](Self::output_tokens), never additional to it.
+    /// `0` means no turn reported a reasoning share.
+    pub reasoning_tokens: u64,
 }
 
 impl RunEndContext {
@@ -128,7 +162,48 @@ impl RunEndContext {
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
         }
+    }
+
+    /// Attach run usage totals to a synthetic run-end context.
+    ///
+    /// The engine fills the five usage fields by summing the current
+    /// run's turn records; this builder exists for observers exercising
+    /// their run-end handling against staged totals (the same reason
+    /// [`new`](Self::new) exists at all). Each detail figure follows the
+    /// crate-wide convention: `0` means not reported.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::observer::RunEndContext;
+    ///
+    /// let ctx = RunEndContext::new(true, None, 2, 90)
+    ///     .with_usage_totals(2_000, 300, 1_600, 100, 120);
+    /// assert_eq!(ctx.input_tokens, 2_000);
+    /// assert_eq!(ctx.cached_input_tokens, 1_600);
+    /// assert_eq!(ctx.reasoning_tokens, 120);
+    /// ```
+    #[must_use]
+    pub fn with_usage_totals(
+        mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> Self {
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.cached_input_tokens = cached_input_tokens;
+        self.cache_write_tokens = cache_write_tokens;
+        self.reasoning_tokens = reasoning_tokens;
+        self
     }
 
     /// Attach a calibration ratio to a synthetic run-end context.
@@ -404,13 +479,51 @@ pub struct TurnEndContext {
     /// unable to make while
     /// [`run`](crate::engine::core::Loop::run) holds the loop.
     pub history: Arc<Vec<Message>>,
+
+    /// Input tokens this turn served from the provider's cache.
+    ///
+    /// The turn's cached share verbatim from the provider's usage
+    /// report (see [`Usage::cached_input_tokens`](crate::stream::Usage::cached_input_tokens)).
+    /// `0` means the provider reported no cached share — unreported,
+    /// not zero-known.
+    pub cached_input_tokens: u64,
+
+    /// Tokens this turn wrote to the provider's cache.
+    ///
+    /// The turn's cache-creation spend verbatim from the provider's
+    /// usage report (see
+    /// [`Usage::cache_write_tokens`](crate::stream::Usage::cache_write_tokens)),
+    /// with the same `0`-means-unreported convention.
+    pub cache_write_tokens: u64,
+
+    /// Reasoning tokens inside this turn's output.
+    ///
+    /// The turn's reasoning share verbatim from the provider's usage
+    /// report (see
+    /// [`Usage::reasoning_tokens`](crate::stream::Usage::reasoning_tokens)) —
+    /// a subset of [`output_tokens`](Self::output_tokens), never
+    /// additional to it. `0` means unreported.
+    pub reasoning_tokens: u64,
 }
 
 /// Context for [`LoopObserver::on_stream_success`](crate::observer::LoopObserver::on_stream_success).
 ///
-/// Provides the model name and input/output token counts for
-/// a successful streaming response.
+/// Provides the model name, the input/output token counts for a
+/// successful streaming response, and the cache/reasoning detail the
+/// provider reported with them.
+///
+/// `input_tokens` is the **cache-aware prompt total**: adapters on
+/// wire families that report their raw input excluding cache traffic
+/// (the Anthropic family) normalize it before it reaches this context,
+/// so the figure is the size of the prompt actually served — it never
+/// shrinks turn over turn as an uncached remainder would. The detail
+/// fields are the per-request shares; `0` means not reported.
+///
+/// `#[non_exhaustive]` so fields can be added in minor releases —
+/// construct through [`new`](Self::new); struct literals compile only
+/// inside the crate.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamContext {
     /// Turn number.
     ///
@@ -425,13 +538,109 @@ pub struct StreamContext {
 
     /// Input tokens consumed.
     ///
-    /// Tokens in the prompt sent to the model for this request.
+    /// Tokens in the prompt sent to the model for this request — the
+    /// cache-aware total, including any share the provider served from
+    /// its prompt cache.
     pub input_tokens: u64,
 
     /// Output tokens generated.
     ///
-    /// Tokens in the model's streamed response.
+    /// Tokens in the model's streamed response, including any
+    /// reasoning share reported inside it.
     pub output_tokens: u64,
+
+    /// Input tokens this request served from the provider's cache.
+    ///
+    /// The per-request cached share (see
+    /// [`Usage::cached_input_tokens`](crate::stream::Usage::cached_input_tokens));
+    /// `0` means the provider reported no cached share — unreported,
+    /// not zero-known, so a hit-rate display treats it as no data.
+    pub cached_input_tokens: u64,
+
+    /// Tokens this request wrote to the provider's cache.
+    ///
+    /// The per-request cache-creation spend (see
+    /// [`Usage::cache_write_tokens`](crate::stream::Usage::cache_write_tokens));
+    /// `0` means unreported.
+    pub cache_write_tokens: u64,
+
+    /// Reasoning tokens inside this request's output.
+    ///
+    /// The per-request reasoning share (see
+    /// [`Usage::reasoning_tokens`](crate::stream::Usage::reasoning_tokens)) —
+    /// a subset of [`output_tokens`](Self::output_tokens), never
+    /// additional to it. `0` means unreported.
+    pub reasoning_tokens: u64,
+}
+
+impl StreamContext {
+    /// Create a stream-success context from its per-request facts.
+    ///
+    /// The construction path for code outside the crate — the type is
+    /// `#[non_exhaustive]`, so struct literals compile only inside the
+    /// crate. Hosts testing their observers build synthetic events
+    /// through this constructor, which leaves the usage detail at zero;
+    /// attach it with
+    /// [`with_usage_detail`](Self::with_usage_detail) when a synthetic
+    /// event needs it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::observer::StreamContext;
+    ///
+    /// let ctx = StreamContext::new(0, "claude-3", 1_200, 40);
+    /// assert_eq!(ctx.input_tokens, 1_200);
+    /// assert_eq!(ctx.cached_input_tokens, 0);
+    /// ```
+    #[must_use]
+    pub fn new(
+        turn: usize,
+        model: impl Into<String>,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Self {
+        Self {
+            turn,
+            model: model.into(),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        }
+    }
+
+    /// Attach usage detail to a synthetic stream-success context.
+    ///
+    /// The engine fills the three detail fields from the provider's
+    /// usage report; this builder exists for observers exercising their
+    /// stream-success handling against staged shares (the same reason
+    /// [`new`](Self::new) exists at all). Each figure follows the
+    /// crate-wide convention: `0` means not reported.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::observer::StreamContext;
+    ///
+    /// let ctx = StreamContext::new(1, "gpt-4o", 1_000, 90)
+    ///     .with_usage_detail(900, 0, 64);
+    /// assert_eq!(ctx.cached_input_tokens, 900);
+    /// assert_eq!(ctx.reasoning_tokens, 64);
+    /// ```
+    #[must_use]
+    pub fn with_usage_detail(
+        mut self,
+        cached_input_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> Self {
+        self.cached_input_tokens = cached_input_tokens;
+        self.cache_write_tokens = cache_write_tokens;
+        self.reasoning_tokens = reasoning_tokens;
+        self
+    }
 }
 
 /// Context for [`LoopObserver::on_stream_failure`](crate::observer::LoopObserver::on_stream_failure).

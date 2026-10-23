@@ -120,7 +120,7 @@ mod tests;
 
 pub use steering::Steering;
 
-use emission::TurnEnd;
+use emission::{TurnEnd, TurnUsage};
 pub use model_switch::ModelSwitch;
 
 /// The framework's default agent loop implementation.
@@ -451,6 +451,15 @@ pub struct BareLoop<C: ApiClient> {
     /// salvage, not collide with the previous run's.
     overflow_retry: Option<usize>,
 
+    /// The turn that already spent its truncation salvage, if any.
+    ///
+    /// A length-cut completion gets one compact-and-retry; a second
+    /// truncation on the same turn fails with
+    /// [`ContextExceeded`](LoopError::ContextExceeded) instead of
+    /// looping. Turn numbers restart every run, so the spent retry is
+    /// cleared at run start alongside the overflow retry's.
+    truncation_retry: Option<usize>,
+
     /// The landing target the overflow salvage forced on the next
     /// compaction pass, in the counter's raw units.
     ///
@@ -614,6 +623,29 @@ struct TurnAccounting {
     /// [`Turn`]: crate::engine::core::Turn
     /// [`dispatch_and_record`]: BareLoop::dispatch_and_record
     output_tokens: u64,
+
+    /// Cached share of the turn's input, from the recorded [`Turn`].
+    ///
+    /// Same provenance as the token pair; `0` means the provider reported
+    /// no cached share — unreported, not zero-known.
+    ///
+    /// [`Turn`]: crate::engine::core::Turn
+    cached_input_tokens: u64,
+
+    /// Cache-write spend of the turn's input, from the recorded [`Turn`].
+    ///
+    /// Same provenance as the token pair; `0` means unreported.
+    ///
+    /// [`Turn`]: crate::engine::core::Turn
+    cache_write_tokens: u64,
+
+    /// Reasoning share of the turn's output, from the recorded [`Turn`].
+    ///
+    /// Same provenance as the token pair; a subset of `output_tokens` and
+    /// `0` when unreported.
+    ///
+    /// [`Turn`]: crate::engine::core::Turn
+    reasoning_tokens: u64,
 
     /// Why the model stopped producing output for the turn being accounted.
     ///
@@ -992,6 +1024,7 @@ impl<C: ApiClient> BareLoop<C> {
             anchor: None,
             prune: None,
             overflow_retry: None,
+            truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
@@ -1551,6 +1584,7 @@ impl<C: ApiClient> BareLoop<C> {
             anchor: None,
             prune: None,
             overflow_retry: None,
+            truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
@@ -1677,6 +1711,7 @@ impl<C: ApiClient> BareLoop<C> {
             anchor: None,
             prune: None,
             overflow_retry: None,
+            truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
@@ -1961,6 +1996,9 @@ impl<C: ApiClient> BareLoop<C> {
                     duration: turn_duration,
                     input_tokens: accounting.input_tokens,
                     output_tokens: accounting.output_tokens,
+                    cached_input_tokens: accounting.cached_input_tokens,
+                    cache_write_tokens: accounting.cache_write_tokens,
+                    reasoning_tokens: accounting.reasoning_tokens,
                     stop_reason: accounting.stop_reason,
                     context_tokens: self.machine.context_tokens(),
                     context_window: self.turn_end_context_window(),
@@ -2225,7 +2263,7 @@ impl<C: ApiClient> BareLoop<C> {
         turn: usize,
         error: &str,
         turn_start: Instant,
-        tokens: (u64, u64),
+        usage: &TurnUsage,
         stop_reason: StreamStopReason,
     ) {
         self.notify_turn_end(&TurnEnd {
@@ -2233,8 +2271,11 @@ impl<C: ApiClient> BareLoop<C> {
             success: false,
             error: Some(error),
             duration: self.managers.clock().elapsed_since(turn_start),
-            input_tokens: tokens.0,
-            output_tokens: tokens.1,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
             stop_reason,
             context_tokens: self.machine.context_tokens(),
             context_window: self.turn_end_context_window(),
@@ -2341,7 +2382,7 @@ impl<C: ApiClient> BareLoop<C> {
                     turn,
                     &failed,
                     turn_start,
-                    (0, 0),
+                    &TurnUsage::zeros(),
                     StreamStopReason::EndTurn,
                 );
                 return Err(e);
@@ -2349,7 +2390,8 @@ impl<C: ApiClient> BareLoop<C> {
         };
 
         let text = msg.text_content();
-        let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
+        let turn_usage = TurnUsage::from_report(usage.as_ref());
+        let (turn_in, turn_out) = (turn_usage.input_tokens, turn_usage.output_tokens);
 
         let tool_calls: Vec<ToolCall> = msg
             .tool_call_parts()
@@ -2361,8 +2403,13 @@ impl<C: ApiClient> BareLoop<C> {
             })
             .collect();
 
-        // Only terminal responses feed convergence: an acting turn's
-        // preamble is by definition not a converged final answer.
+        if tool_calls.is_empty()
+            && text.trim().is_empty()
+            && stream_stop == StreamStopReason::MaxTokens
+        {
+            return self.truncation_salvage(turn, turn_start, &turn_usage);
+        }
+
         let pattern = if tool_calls.is_empty()
             && !self
                 .detection_disabled
@@ -2371,8 +2418,6 @@ impl<C: ApiClient> BareLoop<C> {
             match self.managers.detection().record_response(&text) {
                 Ok(pattern) => pattern,
                 Err(crate::error::LoopError::LockPoisoned { what }) => {
-                    // Detection is advisory: skip it for the rest of the
-                    // session rather than failing the run.
                     self.disable_detection_once(&what);
                     DetectedPattern::NoPattern
                 }
@@ -2385,7 +2430,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         if let Some(e) = self.apply_loop_detection(turn, &pattern) {
             let failed = e.to_string();
-            self.notify_failed_turn(turn, &failed, turn_start, (turn_in, turn_out), stream_stop);
+            self.notify_failed_turn(turn, &failed, turn_start, &turn_usage, stream_stop);
             return Err(e);
         }
 
@@ -2408,34 +2453,62 @@ impl<C: ApiClient> BareLoop<C> {
         self.machine.model_response(model_response, context_tokens);
 
         let turn_index = turn;
-        if let Some(run) = self.session.current_run_mut() {
-            run.turns.push(crate::engine::core::Turn {
-                turn: turn_index,
-                input: turn_input,
-                output: text,
-                tool_calls,
-                input_tokens: turn_in,
-                output_tokens: turn_out,
-                stop_reason: stream_stop,
-                transport_fallback,
-            });
-        }
+        let record = crate::engine::core::Turn {
+            index: turn_index,
+            input: turn_input,
+            output: text,
+            tool_calls,
+            input_tokens: turn_in,
+            output_tokens: turn_out,
+            cached_input_tokens: turn_usage.cached_input_tokens,
+            cache_write_tokens: turn_usage.cache_write_tokens,
+            reasoning_tokens: turn_usage.reasoning_tokens,
+            stop_reason: stream_stop,
+            transport_fallback,
+        };
+        self.commit_served_turn(record, turn_start);
+        Ok(())
+    }
 
-        if is_empty {
+    /// Record a served turn on the run and fire its LLM-phase turn-end.
+    ///
+    /// The record carries everything the run's audit trail and the
+    /// turn-end event need — the exchange's text, its tool calls, the
+    /// provider-reported usage with detail, and the stop shape — so a
+    /// tool-free response (no calls to dispatch) reports its turn-end
+    /// here, while a tool-carrying one waits for the tool phase's
+    /// event, which covers the whole attempt.
+    fn commit_served_turn(&mut self, record: crate::engine::core::Turn, turn_start: Instant) {
+        let fires_turn_end = record.tool_calls.is_empty();
+        let usage = TurnUsage {
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            cached_input_tokens: record.cached_input_tokens,
+            cache_write_tokens: record.cache_write_tokens,
+            reasoning_tokens: record.reasoning_tokens,
+        };
+        let turn = record.index;
+        let stop_reason = record.stop_reason;
+        if let Some(run) = self.session.current_run_mut() {
+            run.turns.push(record);
+        }
+        if fires_turn_end {
             self.notify_turn_end(&TurnEnd {
                 turn,
                 success: true,
                 error: None,
                 duration: self.managers.clock().elapsed_since(turn_start),
-                input_tokens: turn_in,
-                output_tokens: turn_out,
-                stop_reason: stream_stop,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                stop_reason,
                 context_tokens: self.machine.context_tokens(),
                 context_window: self.turn_end_context_window(),
                 history: Arc::new(self.machine.full_history()),
             });
         }
-        Ok(())
     }
 
     /// Retrieve relevant memories for the current turn and append them to
@@ -2671,17 +2744,29 @@ impl<C: ApiClient> BareLoop<C> {
         let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(calls.len());
         let mut slots: Vec<Option<MessagePart>> = vec![None; calls.len()];
         let mut dispatch_calls: Vec<ToolCall> = Vec::new();
-        let (turn_in, turn_out, turn_stop) = self
+        let usage = self
             .session
             .current_run()
-            .and_then(|r| r.turns.iter().rev().find(|t| t.turn == turn))
-            .map_or((0, 0, StreamStopReason::EndTurn), |t| {
-                (t.input_tokens, t.output_tokens, t.stop_reason)
+            .and_then(|r| r.turns.iter().rev().find(|t| t.index == turn))
+            .map_or_else(TurnUsage::zeros, |t| TurnUsage {
+                input_tokens: t.input_tokens,
+                output_tokens: t.output_tokens,
+                cached_input_tokens: t.cached_input_tokens,
+                cache_write_tokens: t.cache_write_tokens,
+                reasoning_tokens: t.reasoning_tokens,
             });
+        let turn_stop = self
+            .session
+            .current_run()
+            .and_then(|r| r.turns.iter().rev().find(|t| t.index == turn))
+            .map_or(StreamStopReason::EndTurn, |t| t.stop_reason);
         let accounting = TurnAccounting {
             start: turn_start,
-            input_tokens: turn_in,
-            output_tokens: turn_out,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
             stop_reason: turn_stop,
         };
 
@@ -2739,6 +2824,9 @@ impl<C: ApiClient> BareLoop<C> {
             duration: turn_duration,
             input_tokens: accounting.input_tokens,
             output_tokens: accounting.output_tokens,
+            cached_input_tokens: accounting.cached_input_tokens,
+            cache_write_tokens: accounting.cache_write_tokens,
+            reasoning_tokens: accounting.reasoning_tokens,
             stop_reason: accounting.stop_reason,
             context_tokens: self.machine.context_tokens(),
             context_window: self.turn_end_context_window(),
@@ -2905,6 +2993,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
             self.overflow_retry = None;
+            self.truncation_retry = None;
             self.salvage_target = None;
             self.turn_wall_start = None;
             let cancelled = Arc::clone(&self.cancelled);
@@ -3127,6 +3216,108 @@ fn conversation_cannot_fit(error: &LoopError) -> bool {
 }
 
 impl<C: ApiClient> BareLoop<C> {
+    /// Salvage a length-cut completion: compact, retry the turn once.
+    ///
+    /// The mirror of [`Self::overflow_salvage`] for the case the
+    /// provider cannot report: the response ended at the output limit
+    /// carrying no visible text — what a context with no generation
+    /// room looks like from the wire, and indistinguishable on it from
+    /// an output cap too small for the answer. The truncated message is
+    /// never recorded; the history is compacted toward the salvage
+    /// target and the turn re-issued. The attempt's real usage rides
+    /// the failed-turn event that pairs its turn-start — the request
+    /// succeeded and its spend was real — while the turn's record and
+    /// the run's totals stay the salvaged retry's figures. A second
+    /// truncation on the same turn, an unshrinkable history, or a
+    /// declined compaction step fails the run with
+    /// [`LoopError::ContextExceeded`] carrying the machine's figure
+    /// floored just above the window rather than measured: the wire
+    /// cannot tell an over-full context from a too-small output cap,
+    /// so the salvage always names the reading its remedy acts on —
+    /// the same deliberate floor as [`Self::overflow_salvage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ContextExceeded`] when the retry was
+    /// already spent on this turn or the history cannot be compacted —
+    /// both mean the conversation does not fit even reduced; `Ok(())`
+    /// when the compaction pass was armed and the turn will be
+    /// re-issued by the next machine step.
+    fn truncation_salvage(
+        &mut self,
+        turn: usize,
+        turn_start: Instant,
+        usage: &TurnUsage,
+    ) -> Result<(), LoopError> {
+        if self.truncation_retry == Some(turn) {
+            return Err(self.length_cut_exhausted(turn, turn_start, usage));
+        }
+        self.truncation_retry = Some(turn);
+        let shrinkable = self.machine.full_history().len() > 1;
+        if shrinkable {
+            let truncated_payload = self
+                .count_context(&self.machine.full_history())
+                .saturating_add(self.request_overhead_tokens());
+            let half = truncated_payload / 2;
+            let target = match self.managers.context_manager() {
+                Some(manager) => half.min(manager.compact_target_tokens()),
+                None => half,
+            };
+            self.salvage_target = Some(target);
+            self.machine
+                .set_context_tokens(self.effective_context_window().saturating_add(1));
+        }
+        let compacted = shrinkable
+            && matches!(
+                self.machine.next_step(self.machine_policy()),
+                MachineStep::Compact { .. }
+            );
+        if compacted {
+            self.notify_failed_turn(
+                turn,
+                "the completion ended at the output limit with no visible text — \
+                 compacting and retrying the turn",
+                turn_start,
+                usage,
+                StreamStopReason::MaxTokens,
+            );
+            self.anchor = None;
+            Ok(())
+        } else {
+            Err(self.length_cut_exhausted(turn, turn_start, usage))
+        }
+    }
+
+    /// The terminal failure and paired turn-end for a length cut the
+    /// salvage cannot rescue.
+    ///
+    /// Reports the machine's context figure floored just above the
+    /// window — deliberate, never measured, per
+    /// [`truncation_salvage`](Self::truncation_salvage) — and fires the
+    /// failed turn-end pairing this turn's start, carrying the
+    /// truncated attempt's real usage.
+    fn length_cut_exhausted(
+        &mut self,
+        turn: usize,
+        turn_start: Instant,
+        usage: &TurnUsage,
+    ) -> LoopError {
+        let limit = self.effective_context_window();
+        let exhausted = LoopError::ContextExceeded {
+            used: self.machine.context_tokens().max(limit.saturating_add(1)),
+            limit,
+        };
+        let failed = exhausted.to_string();
+        self.notify_failed_turn(
+            turn,
+            &failed,
+            turn_start,
+            usage,
+            StreamStopReason::MaxTokens,
+        );
+        exhausted
+    }
+
     /// Run the compact-and-retry salvage for a provider-reported
     /// oversized prompt.
     ///
@@ -3167,7 +3358,13 @@ impl<C: ApiClient> BareLoop<C> {
                 limit,
             };
             let failed = exhausted.to_string();
-            self.notify_failed_turn(turn, &failed, turn_start, (0, 0), StreamStopReason::EndTurn);
+            self.notify_failed_turn(
+                turn,
+                &failed,
+                turn_start,
+                &TurnUsage::zeros(),
+                StreamStopReason::EndTurn,
+            );
             return Some(Err(exhausted));
         }
         self.overflow_retry = Some(turn);
@@ -3200,7 +3397,13 @@ impl<C: ApiClient> BareLoop<C> {
             self.machine.set_context_tokens(self.context_figure(raw));
         }
         let failed = error.to_string();
-        self.notify_failed_turn(turn, &failed, turn_start, (0, 0), StreamStopReason::EndTurn);
+        self.notify_failed_turn(
+            turn,
+            &failed,
+            turn_start,
+            &TurnUsage::zeros(),
+            StreamStopReason::EndTurn,
+        );
         self.anchor = None;
         Some(Ok(()))
     }

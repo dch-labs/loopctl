@@ -600,6 +600,29 @@ pub use grammar::{JsonSchemaGrammar, ToolGrammarProvider};
 #[cfg(feature = "ollama")]
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 
+/// A self-hosted OpenAI-compatible server's default endpoint.
+///
+/// llama.cpp's server listens here by default; a `SELF_HOSTED_BASE_URL`
+/// variable repoints the preset at vLLM, LM Studio, or any other
+/// deployment.
+#[cfg(feature = "self_hosted")]
+const SELF_HOSTED_BASE_URL: &str = "http://localhost:8080/v1";
+
+/// The key a self-hosted request carries when the caller configures
+/// none.
+///
+/// The `Authorization` header rides every OpenAI-wire request, so
+/// something must fill it; self-hosted servers ignore the content.
+/// The preset sends this and nothing else — an ambient credential for
+/// another host (an exported `OPENAI_API_KEY`) must never ride to an
+/// endpoint the user points the preset at — while the shipped
+/// [`self_hosted`] constructor keeps honoring `OPENAI_API_KEY` as it
+/// has since 0.4.1.
+///
+/// [`self_hosted`]: self_hosted()
+#[cfg(feature = "openai")]
+const SELF_HOSTED_PLACEHOLDER_KEY: &str = "self-hosted";
+
 /// `DeepSeek`'s OpenAI-compatible API endpoint.
 ///
 /// Seeded by the `DeepSeek` profile constructors; the base URL is fixed
@@ -679,6 +702,25 @@ const MOONSHOT_DEFAULT_MODEL: &str = "kimi-k3";
 ))]
 fn env_or_default(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
+}
+
+/// The [`self_hosted`] constructor's key rule — `OPENAI_API_KEY` when
+/// set, else the placeholder.
+///
+/// No API key is required for self-hosted use: the server ignores the
+/// header, and the placeholder exists only because the
+/// `Authorization` header rides every request — it need only be
+/// present for the wire. Callers behind a gateway that checks one pass
+/// a real key instead. The [`self_hosted_builder`] preset deliberately
+/// does not consult this rule: an exported `OPENAI_API_KEY` is a
+/// credential for another host, and the preset sends the placeholder
+/// alone — ambient credentials never ride to arbitrary endpoints.
+///
+/// [`self_hosted`]: self_hosted()
+/// [`self_hosted_builder`]: self_hosted_builder()
+#[cfg(feature = "openai")]
+fn self_hosted_key() -> String {
+    env_or_default("OPENAI_API_KEY", SELF_HOSTED_PLACEHOLDER_KEY)
 }
 
 /// Read a primary env var, falling back to a secondary if unset.
@@ -880,6 +922,50 @@ pub fn ollama_builder(model: &str) -> OpenAiClientBuilder {
     OpenAiClient::builder()
         .with_api_key(env_or_default("OLLAMA_API_KEY", "ollama"))
         .with_base_url(env_or_default("OLLAMA_BASE_URL", OLLAMA_BASE_URL))
+        .with_model(model)
+        .with_stream_usage(false)
+}
+
+/// Builder for an OpenAI-compatible client pointed at a self-hosted
+/// server.
+///
+/// One preset for the bring-your-own-server deployments — llama.cpp,
+/// vLLM, LM Studio, NVIDIA NIM, and any other endpoint that speaks the
+/// OpenAI chat-completions wire. Seeds:
+/// - base URL `http://localhost:8080/v1` (llama.cpp's default port);
+///   `SELF_HOSTED_BASE_URL` overrides it, as does
+///   [`with_base_url`](OpenAiClientBuilder::with_base_url).
+/// - An API key the server does not require — the placeholder
+///   `"self-hosted"`, always. The preset reads no key from the
+///   environment: an exported `OPENAI_API_KEY` is a credential for
+///   another host, and it never rides to a self-hosted endpoint by
+///   accident. Pass a real key through
+///   [`with_api_key`](OpenAiClientBuilder::with_api_key) only when a
+///   gateway in front of the server checks one.
+/// - `stream_usage(false)` — self-hosted servers reject the
+///   `stream_options.include_usage` parameter more often than they
+///   honor it (see [`with_stream_usage`](OpenAiClientBuilder::with_stream_usage));
+///   flip it back on for a server that reports usage.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::provider;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let client = provider::self_hosted_builder("qwen3-coder-30b")
+///     .with_base_url("http://gpu-box:8000/v1")
+///     .with_timeout(std::time::Duration::from_secs(120))
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "self_hosted")]
+#[must_use]
+pub fn self_hosted_builder(model: &str) -> OpenAiClientBuilder {
+    OpenAiClient::builder()
+        .with_api_key(SELF_HOSTED_PLACEHOLDER_KEY)
+        .with_base_url(env_or_default("SELF_HOSTED_BASE_URL", SELF_HOSTED_BASE_URL))
         .with_model(model)
         .with_stream_usage(false)
 }
@@ -1284,8 +1370,11 @@ pub fn zai() -> Result<AnthropicClient, ApiError> {
 /// Use this for `vLLM`, `LM Studio`, `text-generation-inference`, or any
 /// other server that exposes an OpenAI-compatible API.
 ///
-/// For servers that require an API key, set it via the `OPENAI_API_KEY`
-/// environment variable or use [`OpenAiClient::builder`] directly.
+/// A self-hosted server requires no API key: with `OPENAI_API_KEY`
+/// unset the client sends the placeholder `"self-hosted"`, which the
+/// server ignores — the header is wire furniture. For a gateway that
+/// does check one, set `OPENAI_API_KEY` or pass a real key through
+/// [`OpenAiClient::builder`] directly.
 ///
 /// # Example
 ///
@@ -1300,7 +1389,7 @@ pub fn zai() -> Result<AnthropicClient, ApiError> {
 /// Returns [`ApiError`] if the HTTP client cannot be built.
 #[cfg(feature = "openai")]
 pub fn self_hosted(base_url: &str, model: &str) -> Result<OpenAiClient, ApiError> {
-    let api_key = env_or_default("OPENAI_API_KEY", "self-hosted");
+    let api_key = self_hosted_key();
 
     OpenAiClient::builder()
         .with_api_key(api_key)
@@ -1741,6 +1830,191 @@ mod tests {
         env.set("OLLAMA_API_KEY", "cloud-key");
         let cloud = ollama_builder("llama3").build().unwrap();
         assert_eq!(cloud.base_url(), "https://api.ollama.com/v1");
+    }
+
+    #[cfg(all(feature = "self_hosted", feature = "testing"))]
+    #[test]
+    fn self_hosted_builder_seeds_defaults_and_env_override() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["SELF_HOSTED_BASE_URL", "OPENAI_API_KEY"]);
+        env.remove("SELF_HOSTED_BASE_URL");
+        env.remove("OPENAI_API_KEY");
+        let client = self_hosted_builder("qwen3-coder-30b").build().unwrap();
+        assert_eq!(
+            client.base_url(),
+            "http://localhost:8080/v1",
+            "llama.cpp's default port is the seed; vLLM and LM Studio override via \
+             SELF_HOSTED_BASE_URL or the builder"
+        );
+        assert_eq!(client.model(), "qwen3-coder-30b");
+
+        env.set("SELF_HOSTED_BASE_URL", "http://10.0.0.9:8000/v1");
+        let client = self_hosted_builder("qwen3-coder-30b").build().unwrap();
+        assert_eq!(
+            client.base_url(),
+            "http://10.0.0.9:8000/v1",
+            "SELF_HOSTED_BASE_URL overrides the seed"
+        );
+    }
+
+    #[cfg(all(feature = "self_hosted", feature = "testing"))]
+    #[test]
+    fn self_hosted_builder_overrides_beat_the_seeded_environment() {
+        // Precedence has three layers on this seam — seed, environment,
+        // explicit builder call — and the top one is the caller's
+        // word: with `SELF_HOSTED_BASE_URL` pointing somewhere else, an
+        // explicit `with_base_url` on the builder still wins. A
+        // reversed layering would silently relocate a deliberately
+        // placed endpoint to whatever the ambient shell happened to
+        // carry.
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["SELF_HOSTED_BASE_URL", "OPENAI_API_KEY"]);
+        env.remove("OPENAI_API_KEY");
+        env.set("SELF_HOSTED_BASE_URL", "http://10.0.0.9:8000/v1");
+        let client = self_hosted_builder("qwen3-coder-30b")
+            .with_base_url("http://explicit:9000/v1")
+            .with_timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.base_url(),
+            "http://explicit:9000/v1",
+            "the explicit builder call outranks the ambient environment"
+        );
+        assert_eq!(
+            client.model(),
+            "qwen3-coder-30b",
+            "layering knobs leaves the seeding untouched"
+        );
+    }
+
+    #[cfg(all(feature = "openai", feature = "testing"))]
+    #[test]
+    fn self_hosted_key_prefers_the_environment_and_falls_back_to_the_placeholder() {
+        // The shipped constructor's key rule: the placeholder fills
+        // the header when nothing is configured, a real key in the
+        // environment wins. The preset deliberately does not consult
+        // this rule — its placeholder-only contract is pinned on the
+        // wire by the capture tests below.
+        let env = EnvGuard::acquire(&["OPENAI_API_KEY"]);
+        env.remove("OPENAI_API_KEY");
+        assert_eq!(
+            self_hosted_key(),
+            "self-hosted",
+            "the placeholder seeds a key that need only be present"
+        );
+        env.set("OPENAI_API_KEY", "gpu-room-key");
+        assert_eq!(
+            self_hosted_key(),
+            "gpu-room-key",
+            "a real key in the environment wins over the placeholder"
+        );
+    }
+
+    /// Bind a one-shot server that returns the verbatim request text
+    /// after answering 500, so a client's headers land in the test.
+    #[cfg(all(feature = "self_hosted", feature = "testing"))]
+    async fn capture_request_server() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    #[cfg(all(feature = "self_hosted", feature = "testing"))]
+    #[tokio::test]
+    async fn the_preset_sends_the_placeholder_key_on_the_wire() {
+        // The call-site half of the one-seeding-site property: not the
+        // helper's value but the bytes on the wire. With no key
+        // configured, the preset's request must carry the placeholder
+        // in `Authorization` — proof the builder seeds what the rule
+        // says it seeds.
+        use crate::api::ApiClient as _;
+        let env = EnvGuard::acquire(&["OPENAI_API_KEY", "SELF_HOSTED_BASE_URL"]);
+        env.remove("OPENAI_API_KEY");
+        env.remove("SELF_HOSTED_BASE_URL");
+
+        let (url, server) = capture_request_server().await;
+        let client = self_hosted_builder("m")
+            .with_base_url(&url)
+            .build()
+            .unwrap();
+        {
+            use futures::StreamExt as _;
+            let mut stream = client.stream_messages_with_options(
+                &crate::api::StreamRequest::new(vec![]),
+                crate::structured::RequestOptions::default(),
+            );
+            let _ = stream.next().await;
+        }
+        let request = server.await.unwrap();
+        let auth = request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        assert_eq!(
+            auth,
+            format!("authorization: bearer {SELF_HOSTED_PLACEHOLDER_KEY}"),
+            "the unconfigured preset must carry the placeholder: {request}"
+        );
+    }
+
+    #[cfg(all(feature = "self_hosted", feature = "testing"))]
+    #[tokio::test]
+    async fn the_preset_never_carries_the_ambient_openai_key_to_a_self_hosted_endpoint() {
+        // The security contract of the placeholder-only decision,
+        // pinned at the header: a user with `OPENAI_API_KEY` exported
+        // — the common case — who points the preset at any
+        // self-hosted endpoint must transmit the placeholder, never
+        // the ambient credential. Red under the fold's first shape,
+        // which seeded the env key onto user-chosen hosts.
+        use crate::api::ApiClient as _;
+        let env = EnvGuard::acquire(&["OPENAI_API_KEY", "SELF_HOSTED_BASE_URL"]);
+        env.set("OPENAI_API_KEY", "sk-real-openai-credential");
+        env.remove("SELF_HOSTED_BASE_URL");
+
+        let (url, server) = capture_request_server().await;
+        let client = self_hosted_builder("m")
+            .with_base_url(&url)
+            .build()
+            .unwrap();
+        {
+            use futures::StreamExt as _;
+            let mut stream = client.stream_messages_with_options(
+                &crate::api::StreamRequest::new(vec![]),
+                crate::structured::RequestOptions::default(),
+            );
+            let _ = stream.next().await;
+        }
+        let request = server.await.unwrap();
+        let auth = request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        assert_eq!(
+            auth,
+            format!("authorization: bearer {SELF_HOSTED_PLACEHOLDER_KEY}"),
+            "the configured-elsewhere preset must still carry only the placeholder: {request}"
+        );
+        assert!(
+            !request.contains("sk-real-openai-credential"),
+            "the ambient OpenAI credential must never ride to a self-hosted endpoint: {request}"
+        );
     }
 
     #[cfg(all(feature = "zai", feature = "testing"))]

@@ -158,8 +158,9 @@ pub struct TrajectoryRecord {
 
     /// Token totals over the run's turns.
     ///
-    /// See [`TokenSummary`]; its detail fields are reserved and always
-    /// `null` in this version.
+    /// See [`TokenSummary`]; the live observer fills its detail fields
+    /// from the run's turns, so they read `null` only on records
+    /// deserialized from a ledger written before the detail existed.
     pub token_summary: TokenSummary,
 
     /// The run's turns, ordered by turn index.
@@ -203,13 +204,12 @@ pub enum TrajectoryOutcome {
     Partial,
 }
 
-/// Token totals over a run's turns, with reserved usage-detail fields.
+/// Token totals over a run's turns, with the provider's usage detail.
 ///
-/// The sums aggregate every captured turn. The detail fields are reserved
-/// for the provider's per-run usage breakdown, which does not yet reach
-/// the observer: they are always `None` in this version and carry no
-/// information. The `Option` shape keeps the interchange schema stable
-/// for the version that starts forwarding the figures.
+/// The sums aggregate every captured turn. The detail fields carry the
+/// run's cache and reasoning classes as saturating sums of the per-turn
+/// figures; `None` appears only when deserializing a ledger written
+/// before the detail existed — the live observer always fills them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenSummary {
     /// Total input tokens across the run's turns.
@@ -226,20 +226,21 @@ pub struct TokenSummary {
 
     /// Input tokens served from the provider's cache.
     ///
-    /// Reserved and always `None` in this version: the provider's usage
-    /// detail does not yet reach the observer.
+    /// Saturating sum of the per-turn cached shares; `None` only on
+    /// records deserialized from a pre-detail ledger.
     pub cached_input_tokens: Option<u64>,
 
     /// Tokens written to the provider's cache.
     ///
-    /// Reserved and always `None` in this version, like
-    /// [`cached_input_tokens`](Self::cached_input_tokens).
+    /// Saturating sum of the per-turn cache-write spends; `None` only on
+    /// records deserialized from a pre-detail ledger.
     pub cache_write_tokens: Option<u64>,
 
-    /// Reasoning tokens the provider charges separately.
+    /// Reasoning tokens inside the run's output.
     ///
-    /// Reserved and always `None` in this version, like
-    /// [`cached_input_tokens`](Self::cached_input_tokens).
+    /// Saturating sum of the per-turn reasoning shares — a subset of
+    /// [`output_tokens`](Self::output_tokens); `None` only on records
+    /// deserialized from a pre-detail ledger.
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -248,7 +249,12 @@ pub struct TokenSummary {
 /// `query` carries the user-visible input of the turn. On continuation
 /// turns after tool dispatch it carries the tool-result text, so each
 /// turn is self-contained within the record.
+///
+/// `#[non_exhaustive]` so fields can be added in minor releases —
+/// construct through [`new`](Self::new); struct literals compile only
+/// inside the crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TrajectoryTurn {
     /// Turn number, 0-indexed within the run.
     ///
@@ -298,6 +304,142 @@ pub struct TrajectoryTurn {
     ///
     /// From the turn's end event; zero when the turn closed without one.
     pub output_tokens: u64,
+
+    /// Input tokens the turn served from the provider's cache.
+    ///
+    /// From the turn's end event; zero when the provider reported no
+    /// cached share — unreported, not zero-known.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+
+    /// Tokens the turn wrote to the provider's cache.
+    ///
+    /// From the turn's end event; zero when the provider reported no
+    /// cache-write spend.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+
+    /// Reasoning tokens inside the turn's output.
+    ///
+    /// From the turn's end event — a subset of
+    /// [`output_tokens`](Self::output_tokens); zero when the provider
+    /// reported no reasoning share.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+impl TrajectoryTurn {
+    /// Create a turn record from its captured identity.
+    ///
+    /// The construction path for code outside the crate — the type is
+    /// `#[non_exhaustive]`, so struct literals compile only inside the
+    /// crate. The measurable fields start at zero; attach them with the
+    /// `with_*` builders as the turn's events supply figures.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::memory::trajectory::TrajectoryTurn;
+    ///
+    /// let turn = TrajectoryTurn::new(0, "fix the bug", "done");
+    /// assert_eq!(turn.query, "fix the bug");
+    /// assert_eq!(turn.input_tokens, 0);
+    /// ```
+    #[must_use]
+    pub fn new(turn: usize, query: impl Into<String>, response_text: impl Into<String>) -> Self {
+        Self {
+            turn,
+            query: query.into(),
+            response_text: response_text.into(),
+            tool_calls: Vec::new(),
+            duration_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        }
+    }
+
+    /// Attach the turn's completed tool calls.
+    ///
+    /// Replaces the captured list the constructor left empty; the calls
+    /// ride in completion order as captured, each entry pairing its
+    /// `tool_call_id` with its outcome (see [`TrajectoryToolCall`]),
+    /// so a ledger reader reconstructs the dispatch sequence exactly as
+    /// the run produced it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::memory::trajectory::TrajectoryTurn;
+    ///
+    /// let turn = TrajectoryTurn::new(0, "fix the bug", "done")
+    ///     .with_tool_calls(Vec::new());
+    /// assert!(turn.tool_calls.is_empty());
+    /// ```
+    #[must_use]
+    pub fn with_tool_calls(mut self, tool_calls: Vec<TrajectoryToolCall>) -> Self {
+        self.tool_calls = tool_calls;
+        self
+    }
+
+    /// Attach the turn's wall-clock duration in milliseconds.
+    ///
+    /// Mirrors the [`duration_ms`](crate::observer::TurnEndContext::duration_ms)
+    /// the turn's end event reported: one end event per serving attempt,
+    /// so a turn that received more than one (an overflow-salvage retry
+    /// firing its rejected attempt and its retry under the same index)
+    /// sums them at capture time and the attached figure is already the
+    /// whole attempt's span. Zero stays zero for a turn that closed
+    /// without an end event.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::memory::trajectory::TrajectoryTurn;
+    ///
+    /// let turn = TrajectoryTurn::new(0, "fix the bug", "done")
+    ///     .with_duration_ms(2_100);
+    /// assert_eq!(turn.duration_ms, 2_100);
+    /// ```
+    #[must_use]
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = duration_ms;
+        self
+    }
+
+    /// Attach the turn's provider-reported usage.
+    ///
+    /// The five counts as the turn's end event reported them; each detail
+    /// class follows the crate-wide convention — `0` means not reported.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::memory::trajectory::TrajectoryTurn;
+    ///
+    /// let turn = TrajectoryTurn::new(1, "continue", "ok")
+    ///     .with_usage(1_050, 20, 900, 50, 0);
+    /// assert_eq!(turn.cached_input_tokens, 900);
+    /// assert_eq!(turn.cache_write_tokens, 50);
+    /// ```
+    #[must_use]
+    pub fn with_usage(
+        mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> Self {
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.cached_input_tokens = cached_input_tokens;
+        self.cache_write_tokens = cache_write_tokens;
+        self.reasoning_tokens = reasoning_tokens;
+        self
+    }
 }
 
 /// One tool call within a turn.
@@ -433,15 +575,18 @@ impl RecordBuilder {
     fn close_current(&mut self) {
         if let Some(turn) = self.current.take() {
             let response_text = truncate_chars(&turn.response_text, self.capture_limit);
-            self.turns.push(TrajectoryTurn {
-                turn: turn.turn,
-                query: turn.query,
-                response_text,
-                tool_calls: turn.tool_calls,
-                duration_ms: turn.duration_ms,
-                input_tokens: turn.input_tokens,
-                output_tokens: turn.output_tokens,
-            });
+            self.turns.push(
+                TrajectoryTurn::new(turn.turn, turn.query, response_text)
+                    .with_tool_calls(turn.tool_calls)
+                    .with_duration_ms(turn.duration_ms)
+                    .with_usage(
+                        turn.input_tokens,
+                        turn.output_tokens,
+                        turn.cached_input_tokens,
+                        turn.cache_write_tokens,
+                        turn.reasoning_tokens,
+                    ),
+            );
         }
     }
 
@@ -516,6 +661,21 @@ struct TurnBuilder {
     ///
     /// Zero until a matching end event supplies the figure.
     output_tokens: u64,
+
+    /// Turn cached share, filled at turn end.
+    ///
+    /// Zero until a matching end event supplies the figure.
+    cached_input_tokens: u64,
+
+    /// Turn cache-write spend, filled at turn end.
+    ///
+    /// Zero until a matching end event supplies the figure.
+    cache_write_tokens: u64,
+
+    /// Turn reasoning share, filled at turn end.
+    ///
+    /// Zero until a matching end event supplies the figure.
+    reasoning_tokens: u64,
 }
 
 impl TurnBuilder {
@@ -532,6 +692,9 @@ impl TurnBuilder {
             duration_ms: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
         }
     }
 }
@@ -831,6 +994,9 @@ impl LoopObserver for TrajectoryObserver {
                 duration_ms: done.duration_ms,
                 input_tokens: done.input_tokens,
                 output_tokens: done.output_tokens,
+                cached_input_tokens: done.cached_input_tokens,
+                cache_write_tokens: done.cache_write_tokens,
+                reasoning_tokens: done.reasoning_tokens,
             });
         } else {
             builder.current = Some(TurnBuilder::new(ctx.turn, ctx.query.clone()));
@@ -927,6 +1093,9 @@ impl LoopObserver for TrajectoryObserver {
             turn.duration_ms = turn.duration_ms.saturating_add(ctx.duration_ms);
             turn.input_tokens = ctx.input_tokens;
             turn.output_tokens = ctx.output_tokens;
+            turn.cached_input_tokens = ctx.cached_input_tokens;
+            turn.cache_write_tokens = ctx.cache_write_tokens;
+            turn.reasoning_tokens = ctx.reasoning_tokens;
             builder.close_current();
         } else if let Some(done) = builder
             .turns
@@ -937,16 +1106,21 @@ impl LoopObserver for TrajectoryObserver {
             done.duration_ms = done.duration_ms.saturating_add(ctx.duration_ms);
             done.input_tokens = ctx.input_tokens;
             done.output_tokens = ctx.output_tokens;
+            done.cached_input_tokens = ctx.cached_input_tokens;
+            done.cache_write_tokens = ctx.cache_write_tokens;
+            done.reasoning_tokens = ctx.reasoning_tokens;
         } else {
-            builder.turns.push(TrajectoryTurn {
-                turn: ctx.turn,
-                query: String::new(),
-                response_text: String::new(),
-                tool_calls: Vec::new(),
-                duration_ms: ctx.duration_ms,
-                input_tokens: ctx.input_tokens,
-                output_tokens: ctx.output_tokens,
-            });
+            builder.turns.push(
+                TrajectoryTurn::new(ctx.turn, String::new(), String::new())
+                    .with_duration_ms(ctx.duration_ms)
+                    .with_usage(
+                        ctx.input_tokens,
+                        ctx.output_tokens,
+                        ctx.cached_input_tokens,
+                        ctx.cache_write_tokens,
+                        ctx.reasoning_tokens,
+                    ),
+            );
         }
     }
 
@@ -986,9 +1160,15 @@ impl LoopObserver for TrajectoryObserver {
 
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
+        let mut cached_input_tokens = 0u64;
+        let mut cache_write_tokens = 0u64;
+        let mut reasoning_tokens = 0u64;
         for turn in &builder.turns {
             input_tokens = input_tokens.saturating_add(turn.input_tokens);
             output_tokens = output_tokens.saturating_add(turn.output_tokens);
+            cached_input_tokens = cached_input_tokens.saturating_add(turn.cached_input_tokens);
+            cache_write_tokens = cache_write_tokens.saturating_add(turn.cache_write_tokens);
+            reasoning_tokens = reasoning_tokens.saturating_add(turn.reasoning_tokens);
         }
 
         let record = TrajectoryRecord {
@@ -1001,9 +1181,9 @@ impl LoopObserver for TrajectoryObserver {
             token_summary: TokenSummary {
                 input_tokens,
                 output_tokens,
-                cached_input_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
+                cached_input_tokens: Some(cached_input_tokens),
+                cache_write_tokens: Some(cache_write_tokens),
+                reasoning_tokens: Some(reasoning_tokens),
             },
             turns: builder.turns,
         };
@@ -1349,6 +1529,9 @@ mod tests {
             duration_ms: 20,
             input_tokens: 10,
             output_tokens: 5,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1359,6 +1542,11 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 25,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1413,6 +1601,11 @@ mod tests {
             error: Some("cancelled".to_string()),
             total_turns: 1,
             duration_ms: 50,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1463,6 +1656,11 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 9,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1511,6 +1709,11 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 5,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1536,6 +1739,11 @@ mod tests {
             error: None,
             total_turns: 0,
             duration_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1571,6 +1779,11 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1598,6 +1811,11 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1637,6 +1855,9 @@ mod tests {
             duration_ms: 1,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1647,6 +1868,11 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1688,6 +1914,11 @@ mod tests {
                 error: None,
                 total_turns: 1,
                 duration_ms: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
                 calibration_ratio_bp: None,
                 context_figure: None,
                 unfinished_input: None,
@@ -1736,6 +1967,11 @@ mod tests {
             error: None,
             total_turns: 6,
             duration_ms: 40,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1776,6 +2012,9 @@ mod tests {
             duration_ms: 42,
             input_tokens: 7,
             output_tokens: 9,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1786,6 +2025,11 @@ mod tests {
             error: None,
             total_turns: 5,
             duration_ms: 60,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1835,6 +2079,9 @@ mod tests {
             duration_ms: 10,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1851,6 +2098,9 @@ mod tests {
             duration_ms: 11,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1864,6 +2114,9 @@ mod tests {
             duration_ms: 42,
             input_tokens: 7,
             output_tokens: 9,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1874,6 +2127,11 @@ mod tests {
             error: None,
             total_turns: 6,
             duration_ms: 90,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1914,6 +2172,9 @@ mod tests {
             duration_ms: 33,
             input_tokens: 4,
             output_tokens: 6,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1929,6 +2190,11 @@ mod tests {
             error: None,
             total_turns: 4,
             duration_ms: 50,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -1967,6 +2233,9 @@ mod tests {
             duration_ms: 20,
             input_tokens: 10,
             output_tokens: 5,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1979,6 +2248,9 @@ mod tests {
             duration_ms: 22,
             input_tokens: 30,
             output_tokens: 15,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -1989,6 +2261,11 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 50,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -2080,6 +2357,9 @@ mod tests {
                     duration_ms: *duration,
                     input_tokens: *input,
                     output_tokens: *output,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
                     stop_reason: crate::stream::StreamStopReason::EndTurn,
                     context_tokens: 10,
                     context_window: None,
@@ -2132,6 +2412,11 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 12,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -2179,6 +2464,9 @@ mod tests {
             duration_ms: 5,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -2199,6 +2487,11 @@ mod tests {
             error: None,
             total_turns: 3,
             duration_ms: 30,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -2236,6 +2529,9 @@ mod tests {
             duration_ms: 5,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -2260,6 +2556,11 @@ mod tests {
             error: None,
             total_turns: 2,
             duration_ms: 20,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -2295,6 +2596,9 @@ mod tests {
             duration_ms: 5,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -2309,6 +2613,11 @@ mod tests {
             error: Some("cancelled".to_string()),
             total_turns: 9,
             duration_ms: 25,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -2376,6 +2685,11 @@ mod tests {
                 error: None,
                 total_turns: 6,
                 duration_ms: 10,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
                  calibration_ratio_bp: None,
                  context_figure: None,
                  unfinished_input: None,
@@ -2492,6 +2806,9 @@ mod tests {
                                 duration_ms,
                                 input_tokens: input,
                                 output_tokens: output,
+                                cached_input_tokens: 0,
+                                cache_write_tokens: 0,
+                                reasoning_tokens: 0,
                             }
                         },
                     )
@@ -2553,6 +2870,11 @@ mod tests {
             error: None,
             total_turns: 3,
             duration_ms: 12,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -2582,6 +2904,9 @@ mod tests {
             duration_ms: 1,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -2598,6 +2923,9 @@ mod tests {
             duration_ms: 2,
             input_tokens: 1,
             output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -2614,6 +2942,9 @@ mod tests {
             duration_ms: 3,
             input_tokens: 2,
             output_tokens: 2,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
@@ -2624,6 +2955,11 @@ mod tests {
             error: None,
             total_turns: 5,
             duration_ms: 10,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
             calibration_ratio_bp: None,
             context_figure: None,
             unfinished_input: None,
@@ -2641,6 +2977,96 @@ mod tests {
         assert_eq!(
             reopened.duration_ms, 4,
             "phase durations on both sides of the reopen sum"
+        );
+    }
+
+    #[test]
+    fn a_reopened_turn_keeps_its_usage_detail_when_no_new_end_arrives() {
+        // The salvage shape: a retried turn fires its start under the
+        // same index, reopening the closed slot. When no second
+        // turn-end ever arrives — the run ends with the retry still in
+        // flight — the slot closes on whatever the reopen carried. The
+        // reopen merges both phases' captures, so the closed phase's
+        // real spend must survive all five counts, not just input and
+        // output: a turn whose figures reach the run sums must not
+        // lose its detail classes on the way.
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "first attempt".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 0,
+            success: false,
+            error: Some("salvaged".to_string()),
+            duration_ms: 5,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 80,
+            cache_write_tokens: 20,
+            reasoning_tokens: 30,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
+            context_tokens: 10,
+            context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "retry attempt".to_string(),
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 1,
+            duration_ms: 10,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
+        });
+
+        let record = &observer.records()[0];
+        assert_eq!(record.turns.len(), 1, "one slot per turn index");
+        let turn = &record.turns[0];
+        assert_eq!(turn.query, "retry attempt", "the reopen owns the query");
+        assert_eq!(
+            (turn.input_tokens, turn.output_tokens),
+            (100, 50),
+            "the closed phase's base figures ride the reopen"
+        );
+        assert_eq!(
+            (
+                turn.cached_input_tokens,
+                turn.cache_write_tokens,
+                turn.reasoning_tokens
+            ),
+            (80, 20, 30),
+            "the closed phase's detail figures ride the reopen too — \
+             zeroing them loses a spend the provider really charged"
+        );
+        assert_eq!(
+            (
+                record.token_summary.input_tokens,
+                record.token_summary.output_tokens
+            ),
+            (100, 50),
+            "the run sums carry the base figures"
+        );
+        assert_eq!(
+            (
+                record.token_summary.cached_input_tokens,
+                record.token_summary.cache_write_tokens,
+                record.token_summary.reasoning_tokens
+            ),
+            (Some(80), Some(20), Some(30)),
+            "the run sums' detail classes match the same turn's figures"
         );
     }
 }

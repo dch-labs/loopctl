@@ -218,6 +218,7 @@ async fn demo(
 | `openai` | No | `providers`, `streaming` | OpenAI-compatible API client (`provider::openai`); with `vector_index`, `provider::embeddings::OpenAiEmbedder` — the `/v1/embeddings` `EmbeddingProvider` (`text-embedding-3-small`, Matryoshka truncation, batch splitting, index-keyed reassembly) |
 | `anthropic` | No | `providers`, `streaming` | Anthropic Claude API client (`provider::anthropic`) |
 | `ollama` | No | `providers`, `openai` | Ollama local model client (OpenAI-compatible); with `vector_index`, `provider::embeddings::OllamaEmbedder` — the native `/api/embed` `EmbeddingProvider` (`nomic-embed-text`, local and key-free) |
+| `self_hosted` | No | `providers`, `openai` | Self-hosted OpenAI-compatible server preset (`provider::self_hosted_builder`) — llama.cpp default endpoint (`SELF_HOSTED_BASE_URL` overrides), no API key required (placeholder always sent — the preset never reads `OPENAI_API_KEY`; pass `with_api_key` for a checking gateway), usage-chunk off; serves llama.cpp, vLLM, LM Studio, NVIDIA NIM, and any OpenAI-wire endpoint |
 | `deepseek` | No | `providers`, `openai` | DeepSeek API client (OpenAI-compatible) |
 | `grok` | No | `providers`, `openai` | Grok (xAI) API client (OpenAI-compatible) |
 | `xai` | No | `grok` | Alias for `grok` (xAI API client) |

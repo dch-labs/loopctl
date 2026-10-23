@@ -200,3 +200,21 @@ fn derive_tool_still_compiles() {
     assert_eq!(schema.description, "Pins the generated schema");
     assert_eq!(schema.input_schema["type"], "object");
 }
+
+#[test]
+fn old_turn_json_deserializes_with_zero_detail() {
+    let turn: Turn = serde_json::from_str(
+        r#"{"turn":2,"input":"q","output":"a","tool_calls":[],"input_tokens":10,"output_tokens":20}"#,
+    )
+    .expect("turn json");
+    assert_eq!((turn.input_tokens, turn.output_tokens), (10, 20));
+    assert_eq!(
+        (
+            turn.cached_input_tokens,
+            turn.cache_write_tokens,
+            turn.reasoning_tokens
+        ),
+        (0, 0, 0),
+        "a pre-detail turn record deserializes with unreported usage detail"
+    );
+}

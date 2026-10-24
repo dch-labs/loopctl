@@ -240,11 +240,10 @@ fn names_planning_prose(line: &str) -> bool {
             .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'));
         before_free && after_free && !lower[index..].starts_with("dch-labs")
     });
-    let issue_id = line.match_indices("TX-").any(|(index, _)| {
-        let word_start = index == 0 || !line.as_bytes()[index - 1].is_ascii_alphanumeric();
+    let issue_id = lower.match_indices("tx-").any(|(index, _)| {
+        let word_start = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
         word_start
-            && line
-                .as_bytes()
+            && bytes
                 .get(index + 3)
                 .is_some_and(|byte| byte.is_ascii_digit())
     });
@@ -458,6 +457,15 @@ fn changelog_ships_changes_not_planning_metadata() {
     assert!(
         names_planning_prose(&round_pin),
         "development-round numbering trips the probe: {round_pin}"
+    );
+    let lowercase_issue = format!("issue {}-7 tracked the fix.", "tx");
+    assert!(
+        names_planning_prose(&lowercase_issue),
+        "a lowercase issue id trips the probe as surely as the spelled one: {lowercase_issue}"
+    );
+    assert!(
+        !names_planning_prose("the `postx-9` fixture id names a fixture, not an issue"),
+        "a lowercase tx- inside a word keeps the boundary exemption"
     );
     assert!(
         !names_planning_prose(

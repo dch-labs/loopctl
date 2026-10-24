@@ -2,13 +2,12 @@
 //! the file's actual lines, and apply unique whitespace-normalized
 //! matches.
 //!
-//! Session-history mining (2026-10-18, 70 failed Edit/MultiEdit calls
-//! across 22 sessions) shows the misses cluster into three root
-//! causes the tools can distinguish: a stale read (the file changed
-//! since the model last saw it), a whitespace-only mismatch (the
-//! text is right but for indentation width, trailing whitespace, or
-//! line endings), and no similar passage (the model paraphrased or
-//! hallucinated text that was never there). Every miss costs a full
+//! Misses cluster into three root causes the tools can
+//! distinguish: a stale read (the file changed since the model last
+//! saw it), a whitespace-only mismatch (the text is right but for
+//! indentation width, trailing whitespace, or line endings), and no
+//! similar passage (the model paraphrased or hallucinated text that
+//! was never there). Every miss costs a full
 //! round-trip — usually a `Read` repeating what the error could have
 //! carried — so the miss path here classifies the cause and echoes
 //! the file's actual lines around the best candidate window, and a

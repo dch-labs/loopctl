@@ -120,10 +120,10 @@ const DUPLEX_BUFFER: usize = 4096;
 /// A live, initialized connection to an MCP server.
 ///
 /// This is the transport-agnostic boundary for the adapter. [`Self::in_process`]
-/// is the only constructor shipped here: it connects a client to a server over
-/// an in-memory channel. Transport constructors for real servers (a stdio
-/// child process, HTTP/SSE) arrive in a later release and will build the same
-/// handle via rmcp's transport APIs.
+/// connects a client to a server bundled in the same process, over an
+/// in-memory channel; [`Self::stdio`] and [`Self::http_sse`] connect real
+/// servers — a spawned child process or an HTTP/SSE endpoint — to the same
+/// handle.
 ///
 /// The rmcp running client service is held behind an [`Arc`]: rmcp's
 /// [`RunningService`] is not itself [`Clone`] (it owns a background task and a
@@ -174,8 +174,8 @@ impl McpClient {
     /// the two sides — no manual split, no second duplex.
     ///
     /// Intended for the test suite and for callers who bundle an rmcp server
-    /// in-process. It is **not** the path for real-world servers — use a
-    /// transport constructor for those (a later release).
+    /// in-process. Real-world servers connect through [`Self::stdio`] (a
+    /// spawned child process) or [`Self::http_sse`] (an HTTP endpoint).
     ///
     /// # Runtime requirement
     ///

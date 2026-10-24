@@ -68,12 +68,12 @@ mod tests {
 
     /// Minimal [`ContentSource`] standing in for a real backend.
     ///
-    /// The census asks tools for their names, never for content, so a
-    /// source whose every read fails is enough to construct `ReadTool`
-    /// without a filesystem or fixture map.
-    struct CensusSource;
+    /// Tool construction consults only the name accessor, never
+    /// content, so a source whose every read fails is enough to
+    /// construct `ReadTool` without a filesystem or fixture map.
+    struct NameOnlySource;
 
-    impl ContentSource for CensusSource {
+    impl ContentSource for NameOnlySource {
         fn read<'a>(
             &'a self,
             path: &'a str,
@@ -95,7 +95,7 @@ mod tests {
 
     /// Assert the wire-name convention for one builtin tool.
     ///
-    /// Thin wrapper so census call sites state the violated contract in
+    /// Thin wrapper so every call site states the violated contract in
     /// one place.
     fn assert_camel_case(name: &str) {
         assert!(
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn builtin_tool_names_are_camel_case() {
         assert_camel_case(ThinkTool::new().name());
-        assert_camel_case(ReadTool::new(CensusSource).name());
+        assert_camel_case(ReadTool::new(NameOnlySource).name());
         #[cfg(feature = "fs_tools")]
         {
             assert_camel_case(super::fs::WriteTool::new().name());
@@ -147,14 +147,14 @@ mod tests {
     }
 
     #[test]
-    fn the_census_predicate_rejects_non_ascii_lookalikes() {
+    fn the_name_convention_predicate_rejects_non_ascii_lookalikes() {
         for name in ["Read", "Think", "FileViewer", "MultiEdit"] {
             assert!(is_camel_case(name), "{name} is the convention's shape");
         }
         for lookalike in ["Ｒead", "Édit", "read", "Read_file", "read-tool", ""] {
             assert!(
                 !is_camel_case(lookalike),
-                "the census predicate is ASCII CamelCase and rejects {lookalike:?}"
+                "the convention is ASCII CamelCase and rejects {lookalike:?}"
             );
         }
     }

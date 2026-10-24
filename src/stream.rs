@@ -399,9 +399,8 @@ pub struct IndexedDelta {
 /// appropriate in-progress part.
 ///
 /// `#[non_exhaustive]` so the framework can add content kinds (e.g.
-/// `Image`/`Audio`) in a later minor release without breaking downstream
-/// `match`es. Downstream code that matches on `DeltaPart` MUST include a
-/// wildcard arm.
+/// `Image`/`Audio`) without breaking downstream `match`es. Downstream code
+/// that matches on `DeltaPart` MUST include a wildcard arm.
 ///
 /// # Variants
 ///

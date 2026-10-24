@@ -146,6 +146,15 @@ pub struct BedrockClient {
     ///
     /// Reused across requests for connection pooling.
     http: reqwest::Client,
+
+    /// The rate-limit snapshot from the most recent response.
+    ///
+    /// Advisory state refreshed per response (both invoke paths, open of
+    /// a stream included); read through
+    /// [`last_rate_limit`](Self::last_rate_limit). Bedrock answers the
+    /// `x-amzn-requestid` id header; its rate-limit headers appear on
+    /// some deployment shapes and are captured when present.
+    rate_limit: crate::provider::RateLimitSlot,
 }
 
 /// Builder for [`BedrockClient`].
@@ -416,6 +425,7 @@ impl BedrockClientBuilder {
             model: Mutex::new(model),
             path: self.path,
             http,
+            rate_limit: crate::provider::RateLimitSlot::default(),
         })
     }
 }
@@ -808,6 +818,16 @@ struct AwsEvent {
     /// often empty.
     exception_type: String,
 
+    /// A request id carried in the frame's own headers, if present.
+    ///
+    /// AWS frames normally carry no id (the HTTP response's
+    /// `x-amzn-requestid` is the real one), but exception frames
+    /// occasionally do — when this is `Some` it identifies the failing
+    /// frame itself and outranks the response-level id in the typed
+    /// error's [`ProviderMeta`](crate::api::error::ProviderMeta).
+    /// Bounded at capture like every other id.
+    request_id: Option<String>,
+
     /// The frame's payload bytes.
     ///
     /// The JSON chunk for `chunk` events; empty for `initial-response`.
@@ -917,9 +937,31 @@ impl AwsEventStreamDecoder {
                 .find(|(k, _)| k == ":message-type")
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default(),
+            request_id: frame_request_id(&headers),
             payload,
         })
     }
+}
+
+/// The request id carried in one decoded frame's headers, if any.
+///
+/// Frame-header names are matched case-insensitively against the AWS
+/// spellings (`x-amzn-requestid`, `x-amzn-request-id`, and the legacy
+/// `requestid`), and the value goes through the crate-wide header
+/// bounding. Absent — the common case — reads `None`, and the response
+/// header's id stands.
+fn frame_request_id(headers: &[(String, String)]) -> Option<String> {
+    headers.iter().find_map(|(k, v)| {
+        let lowered = k.to_ascii_lowercase();
+        matches!(
+            lowered.as_str(),
+            "x-amzn-requestid" | "x-amzn-request-id" | "requestid"
+        )
+        .then(|| {
+            crate::api::error::bounded_header_value(v, crate::api::error::MAX_REQUEST_ID_CHARS)
+        })
+        .flatten()
+    })
 }
 
 /// Read a big-endian `u16` from `buf` at `offset`.
@@ -1386,6 +1428,15 @@ struct BedrockStreamState {
     ///
     /// Idle when `path` is [`Anthropic`](BedrockPath::Anthropic).
     converse_emitter: ConverseStreamEmitter,
+
+    /// The response-level forensics for this stream.
+    ///
+    /// Captured from the HTTP response's headers when the stream opens;
+    /// exception frames and mid-stream failures surface it in the typed
+    /// error's [`ProviderMeta`](crate::api::error::ProviderMeta) — an
+    /// id on the frame itself overrides it. Default for streams built
+    /// without a response (unit tests drive the state directly).
+    provider_meta: crate::api::error::ProviderMeta,
 }
 
 impl BedrockStreamState {
@@ -1399,7 +1450,15 @@ impl BedrockStreamState {
             path,
             anthropic_emitter: crate::provider::anthropic::StreamEmitter::default(),
             converse_emitter: ConverseStreamEmitter::default(),
+            provider_meta: crate::api::error::ProviderMeta::new(),
         }
+    }
+
+    /// Attach the response-level forensics captured when the stream
+    /// opened, so mid-stream failures name the request they happened in.
+    fn with_provider_meta(mut self, meta: crate::api::error::ProviderMeta) -> Self {
+        self.provider_meta = meta;
+        self
     }
 
     /// Feed raw response-body bytes; returns the decoded engine events.
@@ -1423,15 +1482,22 @@ impl BedrockStreamState {
                 } else {
                     event.exception_type.as_str()
                 };
+                let mut meta = self.provider_meta.clone();
+                if event.request_id.is_some() {
+                    meta.request_id = event.request_id;
+                }
                 return Err(ApiError::api(format!(
                     "bedrock: model stream error ({name}): {detail}"
-                )));
+                ))
+                .with_provider_meta(meta));
             }
             if event.event_type != "chunk" {
                 continue;
             }
-            let json: serde_json::Value = serde_json::from_slice(&event.payload)
-                .map_err(|e| ApiError::api(format!("bedrock: chunk parse: {e}")))?;
+            let json: serde_json::Value = serde_json::from_slice(&event.payload).map_err(|e| {
+                ApiError::api(format!("bedrock: chunk parse: {e}"))
+                    .with_provider_meta(self.provider_meta.clone())
+            })?;
             match self.path {
                 BedrockPath::Anthropic => {
                     let kind = json
@@ -1457,12 +1523,21 @@ impl BedrockStreamState {
     /// the `metadata` event or is truncated, which the missing
     /// [`StreamEvent::MessageStop`] already signals.
     ///
+    /// A surfaced error is a mid-stream failure like the ones
+    /// [`process_bytes`](Self::process_bytes) raises, so it carries the
+    /// same response-level [`ProviderMeta`](crate::api::error::ProviderMeta)
+    /// the state was opened with — an emitter error recorded without any
+    /// captured headers keeps the shape it had before the attach.
+    ///
     /// # Errors
     ///
     /// Returns the Anthropic emitter's recorded terminal error, if any.
     fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
         match self.path {
-            BedrockPath::Anthropic => self.anthropic_emitter.finish(),
+            BedrockPath::Anthropic => self
+                .anthropic_emitter
+                .finish()
+                .map_err(|e| e.with_provider_meta(self.provider_meta.clone())),
             BedrockPath::Converse => Ok(Vec::new()),
         }
     }
@@ -1570,6 +1645,36 @@ impl BedrockClient {
         crate::error::recover_guard(self.model.lock()).clone()
     }
 
+    /// The rate-limit snapshot from the most recent response, if the
+    /// service sent one.
+    ///
+    /// Advisory only, refreshed per response — including failed ones —
+    /// and cleared to `None` by the next response that reports no
+    /// family. `None` is **unreported**, never a measured zero. Bedrock
+    /// deployments send the rate-limit family inconsistently; the
+    /// request id (`x-amzn-requestid`) is the reliable Bedrock forensic
+    /// and rides every failed typed error regardless.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use loopctl::provider::BedrockClient;
+    ///
+    /// let client = BedrockClient::builder()
+    ///     .region("us-east-1")
+    ///     .access_key_id("AKIA-test")
+    ///     .secret_access_key("test-secret")
+    ///     .model("anthropic.claude-sonnet-4-5-20250929-v1:0")
+    ///     .build()
+    ///     .expect("the builder needs only static fields");
+    /// // Before any response: unreported — None, never a zero figure.
+    /// assert!(client.last_rate_limit().is_none());
+    /// ```
+    #[must_use]
+    pub fn last_rate_limit(&self) -> Option<crate::api::error::RateLimitSnapshot> {
+        self.rate_limit.last()
+    }
+
     /// Swap the `SigV4` credential triple on a live client.
     ///
     /// For short-lived credentials (STS assumed roles, EKS IRSA, SSO
@@ -1645,11 +1750,10 @@ impl BedrockClient {
             credentials.session_token.as_deref(),
             body,
         )?;
-        request
-            .body(body.to_vec())
-            .send()
-            .await
-            .map_err(|e| ApiError::api(format!("bedrock: request failed: {e}")))
+        request.body(body.to_vec()).send().await.map_err(|e| {
+            super::forensics::log_transport_failure(&e.to_string());
+            ApiError::api(format!("bedrock: request failed: {e}"))
+        })
     }
 }
 
@@ -1697,6 +1801,7 @@ impl ApiClient for BedrockClient {
         let client = self.http.clone();
         let region = self.region.clone();
         let credentials = self.credentials();
+        let rate_limit = self.rate_limit.clone();
 
         Box::pin(async_stream::try_stream! {
             let bytes = serde_json::to_vec(&body)
@@ -1714,21 +1819,29 @@ impl ApiClient for BedrockClient {
                 .body(bytes)
                 .send()
                 .await
-                .map_err(|e| ApiError::api(format!("bedrock: request failed: {e}")))?;
+                .map_err(|e| {
+                    super::forensics::log_transport_failure(&e.to_string());
+                    ApiError::api(format!("bedrock: request failed: {e}"))
+                })?;
             use futures::StreamExt as _;
             let status = response.status();
+            let meta = super::forensics::capture_provider_meta(response.headers());
+            rate_limit.record(response.headers());
             let mut byte_stream = if status.is_success() {
                 response.bytes_stream()
             } else {
+                super::forensics::log_wire_failure(status.as_u16(), &meta);
                 let text = response.text().await.unwrap_or_default();
                 Err(ApiError::api(format!(
                     "bedrock: HTTP {status}: {text}"
-                )))?
+                ))
+                .with_provider_meta(meta.clone()))?
             };
-            let mut state = BedrockStreamState::new(path);
+            let mut state = BedrockStreamState::new(path).with_provider_meta(meta.clone());
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = chunk.map_err(|e| {
                     ApiError::api(format!("bedrock: stream read: {e}"))
+                        .with_provider_meta(meta.clone())
                 })?;
                 for ev in state.process_bytes(bytes.as_ref())? {
                     yield ev;
@@ -1760,16 +1873,19 @@ impl ApiClient for BedrockClient {
                 .map_err(|e| ApiError::api(format!("bedrock: serialize: {e}")))?;
             let response = self.signed_post(&url, &bytes).await?;
             let status = response.status();
+            let meta = super::forensics::capture_provider_meta(response.headers());
+            self.rate_limit.record(response.headers());
             if !status.is_success() {
+                super::forensics::log_wire_failure(status.as_u16(), &meta);
                 let text = response.text().await.unwrap_or_default();
-                return Err(ApiError::api(format!("bedrock: HTTP {status}: {text}")));
+                return Err(ApiError::api(format!("bedrock: HTTP {status}: {text}"))
+                    .with_provider_meta(meta));
             }
             // Non-streaming invoke: the response body is the model's JSON
             // directly (no event framing).
-            let json: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| ApiError::api(format!("bedrock: response parse: {e}")))?;
+            let json: serde_json::Value = response.json().await.map_err(|e| {
+                ApiError::api(format!("bedrock: response parse: {e}")).with_provider_meta(meta)
+            })?;
             bedrock_non_streaming_response(&json, &model)
         })
     }
@@ -3622,6 +3738,44 @@ mod tests {
         );
     }
 
+    /// The emitter's recorded mid-stream `error` is a mid-stream failure
+    /// like the other two arms, so it names its request: the id and quota
+    /// captured when the stream opened ride the error `finish` surfaces.
+    #[test]
+    fn mid_stream_emitter_error_carries_the_response_meta() {
+        let wire = build_frame(
+            "chunk",
+            br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        let mut state =
+            BedrockStreamState::new(BedrockPath::Anthropic).with_provider_meta(response_meta());
+        state.process_bytes(&wire).unwrap();
+        let err = state
+            .finish()
+            .expect_err("a recorded error ends the stream as a failure");
+        assert!(
+            matches!(err, ApiError::RateLimit { .. }),
+            "the wire's overload error keeps its rate-limit class: {err:?}"
+        );
+        let meta = err.provider_meta();
+        assert_eq!(
+            meta.request_id.as_deref(),
+            Some("resp-level"),
+            "the id captured when the stream opened names the mid-stream failure"
+        );
+        assert_eq!(
+            meta.rate_limit
+                .as_ref()
+                .and_then(|quota| quota.remaining.as_deref()),
+            Some("0"),
+            "the quota state the stream opened under survives into the error it hit"
+        );
+        assert!(
+            err.to_string().ends_with(" [req resp-level]"),
+            "the Display suffix carries the id: {err}"
+        );
+    }
+
     #[test]
     fn stream_state_surfaces_exception_frames() {
         let mut state = BedrockStreamState::new(BedrockPath::Converse);
@@ -3636,6 +3790,150 @@ mod tests {
         assert!(
             err.to_string().contains("throttlingException"),
             "the error names the exception: {err}"
+        );
+    }
+
+    /// Build one exception frame carrying its own request id header (for
+    /// tests) — the shape AWS sends when it includes the id on the frame
+    /// rather than only on the HTTP response.
+    fn build_exception_frame_with_id(
+        exception_type: &str,
+        request_id: &str,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut headers = Vec::new();
+        // Header wire form: name len (u8), name, value type (u8, 7 =
+        // string), value len (u16 BE), value.
+        headers.extend_from_slice(b"\x10x-amzn-requestid\x07");
+        headers.extend_from_slice(
+            &u16::try_from(request_id.len())
+                .expect("request id exceeds the u16 header length limit")
+                .to_be_bytes(),
+        );
+        headers.extend_from_slice(request_id.as_bytes());
+        headers.extend_from_slice(b"\x0d:message-type\x07");
+        headers.extend_from_slice(&9u16.to_be_bytes());
+        headers.extend_from_slice(b"exception");
+        headers.extend_from_slice(b"\x0f:exception-type\x07");
+        headers.extend_from_slice(
+            &u16::try_from(exception_type.len())
+                .expect("exception type exceeds the u16 header length limit")
+                .to_be_bytes(),
+        );
+        headers.extend_from_slice(exception_type.as_bytes());
+
+        let total = 12usize
+            .saturating_add(headers.len())
+            .saturating_add(payload.len())
+            .saturating_add(4);
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(
+            &u32::try_from(total)
+                .expect("frame total exceeds the u32 length limit")
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(
+            &u32::try_from(headers.len())
+                .expect("header block exceeds the u32 length limit")
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&headers);
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out
+    }
+
+    /// A response-level meta for stream-state tests: an id plus the
+    /// quota family the throttle happened against.
+    fn response_meta() -> crate::api::error::ProviderMeta {
+        crate::api::error::ProviderMeta {
+            request_id: Some("resp-level".to_string()),
+            rate_limit: Some(crate::api::error::RateLimitSnapshot {
+                limit: Some("100".to_string()),
+                remaining: Some("0".to_string()),
+                reset: Some("1780000000".to_string()),
+            }),
+        }
+    }
+
+    /// The failing frame's own id outranks the response's, and the
+    /// response's quota state survives into the same error — "what was
+    /// the remaining quota at that moment" answers itself even for a
+    /// mid-stream throttle.
+    #[test]
+    fn bedrock_exception_frame_id_threaded() {
+        let mut state =
+            BedrockStreamState::new(BedrockPath::Anthropic).with_provider_meta(response_meta());
+        let frame = build_exception_frame_with_id("throttlingException", "frame-level", br#"{}"#);
+        let err = state
+            .process_bytes(&frame)
+            .expect_err("an exception frame must fail the stream");
+        let meta = err.provider_meta();
+        assert_eq!(
+            meta.request_id.as_deref(),
+            Some("frame-level"),
+            "the id on the failing frame names the request the frame failed"
+        );
+        let quota = meta
+            .rate_limit
+            .expect("the response's quota state rides the frame failure");
+        assert_eq!(quota.remaining.as_deref(), Some("0"));
+        assert_eq!(quota.limit.as_deref(), Some("100"));
+        assert_eq!(quota.reset.as_deref(), Some("1780000000"));
+        assert!(
+            err.to_string().ends_with(" [req frame-level]"),
+            "the Display suffix carries the frame's id: {err}"
+        );
+    }
+
+    /// The common AWS shape — exception frames carrying no id of their
+    /// own — leaves the response-level id standing.
+    #[test]
+    fn exception_frame_without_id_keeps_the_response_id() {
+        let mut state =
+            BedrockStreamState::new(BedrockPath::Converse).with_provider_meta(response_meta());
+        let frame = build_exception_frame("modelStreamErrorException", br#"{"x":1}"#);
+        let err = state
+            .process_bytes(&frame)
+            .expect_err("an exception frame must fail the stream");
+        assert_eq!(
+            err.provider_meta().request_id.as_deref(),
+            Some("resp-level"),
+            "no frame id means the response's id identifies the request"
+        );
+    }
+
+    /// A meta-less stream (the unit-test default) stays clean: no id
+    /// appears and the error text is the pre-forensics shape.
+    #[test]
+    fn exception_frame_without_any_id_is_clean() {
+        let mut state = BedrockStreamState::new(BedrockPath::Converse);
+        let frame = build_exception_frame("throttlingException", br#"{"message":"too fast"}"#);
+        let err = state
+            .process_bytes(&frame)
+            .expect_err("an exception frame must fail the stream");
+        assert!(err.provider_meta().is_empty(), "nothing was captured");
+        assert!(
+            !err.to_string().contains("[req "),
+            "no id, no suffix: {err}"
+        );
+    }
+
+    /// A malformed chunk mid-stream is also a request-attributable
+    /// failure: it carries the response-level meta too.
+    #[test]
+    fn chunk_parse_failure_carries_the_response_meta() {
+        let mut state =
+            BedrockStreamState::new(BedrockPath::Converse).with_provider_meta(response_meta());
+        let frame = build_frame("chunk", b"{ not json");
+        let err = state
+            .process_bytes(&frame)
+            .expect_err("a malformed chunk must fail the stream");
+        assert_eq!(
+            err.provider_meta().request_id.as_deref(),
+            Some("resp-level"),
+            "the chunk failure names the request it failed in"
         );
     }
 

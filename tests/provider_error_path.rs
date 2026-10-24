@@ -200,7 +200,7 @@ mod contracts {
             .expect_err("a permanent client error must surface an error");
         server.task.await.unwrap();
         assert!(
-            matches!(err, ApiError::Auth(_)),
+            matches!(err, ApiError::Auth(..)),
             "an HTTP {status} must surface as ApiError::Auth, got {err:?} ({err})"
         );
         assert!(

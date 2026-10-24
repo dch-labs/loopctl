@@ -197,9 +197,8 @@ impl ToolSchema {
 /// to plain-text rendering — `None` and [`DisplayHint::Text`] are equivalent.
 ///
 /// `#[non_exhaustive]` so loopctl can add rendering strategies (e.g. `Table`,
-/// `Image`) in a later minor release without breaking downstream `match`es
-/// that carry a `_ =>` arm. Downstream code that matches on `DisplayHint`
-/// MUST include a wildcard arm.
+/// `Image`) without breaking downstream `match`es that carry a `_ =>` arm.
+/// Downstream code that matches on `DisplayHint` MUST include a wildcard arm.
 ///
 /// # Serialization
 ///

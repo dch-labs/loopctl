@@ -180,6 +180,15 @@ pub struct OpenAiClient {
     /// not re-asked on every run. [`ApiClient::set_model`] clears the
     /// cache, because the Ollama-shaped answer is per-model.
     context_window_probe: std::sync::Mutex<ProbeCache>,
+
+    /// The rate-limit snapshot from the most recent response.
+    ///
+    /// Advisory state refreshed per response by
+    /// [`post_json_checked`](super::post_json_checked); read through
+    /// [`last_rate_limit`](Self::last_rate_limit). A clone of this slot
+    /// rides each streaming task so a stream's response updates the
+    /// accessor on the client itself.
+    rate_limit: super::RateLimitSlot,
 }
 
 impl OpenAiClient {
@@ -204,6 +213,35 @@ impl OpenAiClient {
     #[must_use]
     pub fn builder() -> OpenAiClientBuilder {
         OpenAiClientBuilder::default()
+    }
+
+    /// The rate-limit snapshot from the most recent response, if the
+    /// provider sent one.
+    ///
+    /// Advisory only, refreshed per response — including failed ones, so
+    /// a 429's `x-ratelimit-remaining` is readable right after the error
+    /// — and cleared to `None` by the next response that reports no
+    /// family. `None` is **unreported**, never a measured zero: a local
+    /// server that sends no rate-limit headers leaves this `None` forever
+    /// and that is the normal, healthy shape. See
+    /// [`RateLimitSnapshot`](crate::api::error::RateLimitSnapshot) for
+    /// why the values are verbatim strings.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use loopctl::provider::OpenAiClient;
+    ///
+    /// let client = OpenAiClient::builder()
+    ///     .with_api_key("sk-test")
+    ///     .build()
+    ///     .expect("the builder needs only static fields");
+    /// // Before any response: unreported — None, never a zero figure.
+    /// assert!(client.last_rate_limit().is_none());
+    /// ```
+    #[must_use]
+    pub fn last_rate_limit(&self) -> Option<crate::api::error::RateLimitSnapshot> {
+        self.rate_limit.last()
     }
 
     /// Create a client from environment variables.
@@ -338,7 +376,9 @@ impl OpenAiClient {
     /// [`ApiClient::create_message`]. Delegates to
     /// [`post_json_checked`](super::post_json_checked), which classifies
     /// non-success responses (auth rejections, rate limits with their
-    /// server-advised delay) into structured [`ApiError`] variants.
+    /// server-advised delay) into structured [`ApiError`] variants and
+    /// reads the forensics headers (request id, rate-limit family) from
+    /// every response into `rate_limit` when given.
     ///
     /// # Errors
     ///
@@ -349,9 +389,17 @@ impl OpenAiClient {
         url: &str,
         api_key: &str,
         body: &Value,
+        rate_limit: Option<&super::RateLimitSlot>,
     ) -> Result<reqwest::Response, ApiError> {
         let bearer = bearer_header(api_key)?;
-        super::post_json_checked(http, url, &[(reqwest::header::AUTHORIZATION, bearer)], body).await
+        super::post_json_checked(
+            http,
+            url,
+            &[(reqwest::header::AUTHORIZATION, bearer)],
+            body,
+            rate_limit,
+        )
+        .await
     }
 
     /// The server root the metadata probes address.
@@ -628,13 +676,26 @@ impl ApiClient for OpenAiClient {
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
+        let rate_limit = self.rate_limit.clone();
 
         Box::pin(async_stream::try_stream! {
-            let resp = Self::post_completions(&http, &url, &api_key, &body.to_json(true)).await?;
+            let resp = Self::post_completions(
+                &http,
+                &url,
+                &api_key,
+                &body.to_json(true),
+                Some(&rate_limit),
+            )
+            .await?;
+            let meta = crate::provider::forensics::capture_provider_meta(resp.headers());
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
-            while let Some(data) = sse.next_openai_data().await? {
+            while let Some(data) = sse
+                .next_openai_data()
+                .await
+                .map_err(|e| e.with_provider_meta(meta.clone()))?
+            {
                 let Some(chunk) = OpenAiChunk::parse(&data) else {
                     if let Some(err) = OpenAiStreamError::parse(&data) {
                         emitter.record_error(&err);
@@ -651,7 +712,10 @@ impl ApiClient for OpenAiClient {
                 emitter.mark_done();
             }
 
-            for ev in emitter.finish()? {
+            for ev in emitter
+                .finish()
+                .map_err(|e| e.with_provider_meta(meta.clone()))?
+            {
                 yield ev;
             }
         })
@@ -678,12 +742,20 @@ impl ApiClient for OpenAiClient {
         let url = self.completions_url();
 
         Box::pin(async move {
-            let resp =
-                Self::post_completions(&self.http, &url, &self.api_key, &body.to_json(false))
-                    .await?;
-            let resp = super::read_bounded_body(resp).await?;
+            let resp = Self::post_completions(
+                &self.http,
+                &url,
+                &self.api_key,
+                &body.to_json(false),
+                Some(&self.rate_limit),
+            )
+            .await?;
+            let meta = crate::provider::forensics::capture_provider_meta(resp.headers());
+            let resp = super::read_bounded_body(resp)
+                .await
+                .map_err(|e| e.with_provider_meta(meta.clone()))?;
             let raw = serde_json::from_slice::<Value>(&resp)
-                .map_err(|e| ApiError::http(e.to_string()))?;
+                .map_err(|e| ApiError::http(e.to_string()).with_provider_meta(meta))?;
             Self::build_response(&raw)
         })
     }
@@ -714,13 +786,26 @@ impl ApiClient for OpenAiClient {
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
+        let rate_limit = self.rate_limit.clone();
 
         Box::pin(async_stream::try_stream! {
-            let resp = Self::post_completions(&http, &url, &api_key, &body.to_json(true)).await?;
+            let resp = Self::post_completions(
+                &http,
+                &url,
+                &api_key,
+                &body.to_json(true),
+                Some(&rate_limit),
+            )
+            .await?;
+            let meta = crate::provider::forensics::capture_provider_meta(resp.headers());
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
-            while let Some(data) = sse.next_openai_data().await? {
+            while let Some(data) = sse
+                .next_openai_data()
+                .await
+                .map_err(|e| e.with_provider_meta(meta.clone()))?
+            {
                 let Some(chunk) = OpenAiChunk::parse(&data) else {
                     if let Some(err) = OpenAiStreamError::parse(&data) {
                         emitter.record_error(&err);
@@ -737,7 +822,10 @@ impl ApiClient for OpenAiClient {
                 emitter.mark_done();
             }
 
-            for ev in emitter.finish()? {
+            for ev in emitter
+                .finish()
+                .map_err(|e| e.with_provider_meta(meta.clone()))?
+            {
                 yield ev;
             }
         })
@@ -769,12 +857,20 @@ impl ApiClient for OpenAiClient {
         let url = self.completions_url();
 
         Box::pin(async move {
-            let resp =
-                Self::post_completions(&self.http, &url, &self.api_key, &body.to_json(false))
-                    .await?;
-            let resp = super::read_bounded_body(resp).await?;
+            let resp = Self::post_completions(
+                &self.http,
+                &url,
+                &self.api_key,
+                &body.to_json(false),
+                Some(&self.rate_limit),
+            )
+            .await?;
+            let meta = crate::provider::forensics::capture_provider_meta(resp.headers());
+            let resp = super::read_bounded_body(resp)
+                .await
+                .map_err(|e| e.with_provider_meta(meta.clone()))?;
             let raw = serde_json::from_slice::<Value>(&resp)
-                .map_err(|e| ApiError::http(e.to_string()))?;
+                .map_err(|e| ApiError::http(e.to_string()).with_provider_meta(meta))?;
             Self::build_response(&raw)
         })
     }
@@ -1107,6 +1203,7 @@ impl OpenAiClientBuilder {
             thinking_effort: self.thinking_effort,
             replay_reasoning: self.replay_reasoning,
             context_window_probe: std::sync::Mutex::new(ProbeCache::Unprobed),
+            rate_limit: super::RateLimitSlot::default(),
         })
     }
 }
@@ -1708,6 +1805,7 @@ impl OpenAiStreamError {
             ApiError::RateLimit {
                 retry_after: None,
                 message: detail,
+                meta: None,
             }
         } else {
             ApiError::api(detail)
@@ -1792,8 +1890,8 @@ struct OpenAiPromptTokensDetails {
     /// Number of prompt tokens served from the provider's prompt cache.
     ///
     /// Defaults to 0 when the details object omits it, and parses
-    /// leniently — a non-numeric value (seen in the wild from
-    /// OpenAI-compatible servers) reads as 0 rather than failing the
+    /// leniently — a non-numeric value (some OpenAI-compatible
+    /// servers send one) reads as 0 rather than failing the
     /// enclosing usage object, so the prompt and completion counts
     /// survive.
     #[serde(default, deserialize_with = "count_or_zero")]

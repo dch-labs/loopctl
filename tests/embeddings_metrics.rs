@@ -146,16 +146,37 @@ async fn every_batch_settles_one_event_and_a_mismatch_warns() {
     let failed = ollama.embed_texts(&["one text"]).await;
     assert!(failed.is_err(), "the failure scenario must fail the embed");
     let delta = capture.events()[before..].to_vec();
+    let settled: Vec<&String> = delta
+        .iter()
+        .filter(|event| event.contains("metric=loopctl.embed.batch"))
+        .collect();
     assert_eq!(
-        delta.len(),
+        settled.len(),
         1,
-        "one batch, one event — the failure path settles exactly one: {delta:?}"
+        "one batch, one settle event — the failure path settles exactly one: {delta:?}"
     );
     assert!(
-        delta[0].contains("metric=loopctl.embed.batch")
-            && delta[0].contains("provider=ollama")
-            && delta[0].contains("outcome=error"),
+        settled[0].contains("metric=loopctl.embed.batch")
+            && settled[0].contains("provider=ollama")
+            && settled[0].contains("outcome=error"),
         "the failed batch's event names its provider and outcome: {delta:?}"
+    );
+    // The failed wire request additionally narrates itself — one
+    // wire-failure event classifying the 500. The batch metric and this
+    // forensic are separate concerns; the settle invariant above counts
+    // only the batch event.
+    let wire: Vec<&String> = delta
+        .iter()
+        .filter(|event| event.contains("provider wire failure"))
+        .collect();
+    assert_eq!(
+        wire.len(),
+        1,
+        "the 500 answers with exactly one wire-failure event: {delta:?}"
+    );
+    assert!(
+        wire[0].contains("status=500") && wire[0].contains("class=server"),
+        "the wire-failure event names the status and its class: {wire:?}"
     );
 
     let mismatch_server = httpmock::MockServer::start_async().await;

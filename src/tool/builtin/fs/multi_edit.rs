@@ -1986,10 +1986,10 @@ mod tests {
 
     #[test]
     fn the_schema_admits_the_root_default_shape() {
-        // R3-2: the runtime accepts a target-less edit under a
-        // top-level file_path default - the advertised schema must
-        // not forbid the shape the feature exists to serve. The
-        // nested path alias stays runtime-only (L-159's rule).
+        // The runtime accepts a target-less edit under a top-level
+        // file_path default - the advertised schema must not forbid
+        // the shape the feature exists to serve. The nested path
+        // alias stays runtime-only.
         let schema = MultiEditTool::new().schema();
         let root = &schema.input_schema["properties"]["file_path"];
         assert!(

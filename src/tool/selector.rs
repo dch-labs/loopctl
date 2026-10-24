@@ -127,7 +127,7 @@ pub trait AsyncToolSelector: Send + Sync {
 /// (MCP-mounted surfaces, fifty-plus tools): "look up rust news"
 /// lands near "search the web" because the embeddings say so, not the
 /// vocabulary. The tool corpus is embedded once and cached against
-/// the ordered name list — a registry mutation (L-95's runtime
+/// the ordered name list — a registry mutation (the runtime
 /// surface) changes the list and re-embeds on the next turn — and the
 /// query embeds fresh every turn. Any embed failure fails open to the
 /// full surface with a warning: selection must never strand the
@@ -169,7 +169,7 @@ struct EmbeddingCache {
     ///
     /// A registry generation's identity: each text is the
     /// `"{tool} {description}"` the selection built, so a membership
-    /// change **and** a same-name description overwrite (the L-95
+    /// change **and** a same-name description overwrite (the
     /// `changed` surface) both invalidate the corpus on the next
     /// selection — the semantic position always follows the tool's
     /// current text.

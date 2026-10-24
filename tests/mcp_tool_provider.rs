@@ -582,8 +582,7 @@ async fn schema_passed_through_preserves_properties() {
 #[tokio::test]
 async fn output_schema_carried_through_accessor() {
     // `plain` declares an outputSchema; the adapter carries it verbatim and
-    // exposes it via McpTool::output_schema(). Pins the round-1 accessor that
-    // had no coverage.
+    // exposes it via McpTool::output_schema().
     let (client, _server) = connect_in_process(AnnotatedServer::new()).await;
     let provider = McpToolProvider::connect(client, None)
         .await

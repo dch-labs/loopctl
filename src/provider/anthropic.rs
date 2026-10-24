@@ -207,9 +207,45 @@ pub struct AnthropicClient {
     /// agentic loop's turns. See
     /// [`AnthropicClientBuilder::prompt_caching`].
     prompt_caching: bool,
+
+    /// The rate-limit snapshot from the most recent response.
+    ///
+    /// Advisory state refreshed per response by
+    /// [`post_json_checked`](super::post_json_checked); read through
+    /// [`last_rate_limit`](Self::last_rate_limit). A clone of this slot
+    /// rides each streaming task so a stream's response updates the
+    /// accessor on the client itself. Anthropic answers the
+    /// `rate-limit-*` spelling; both families are read.
+    rate_limit: super::RateLimitSlot,
 }
 
 impl AnthropicClient {
+    /// The rate-limit snapshot from the most recent response, if the
+    /// provider sent one.
+    ///
+    /// Advisory only, refreshed per response — including failed ones, so
+    /// a 429's `rate-limit-remaining` is readable right after the error
+    /// — and cleared to `None` by the next response that reports no
+    /// family. `None` is **unreported**, never a measured zero. See
+    /// [`RateLimitSnapshot`](crate::api::error::RateLimitSnapshot).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use loopctl::provider::AnthropicClient;
+    ///
+    /// let client = AnthropicClient::builder()
+    ///     .with_api_key("sk-ant-test")
+    ///     .build()
+    ///     .expect("the builder needs only static fields");
+    /// // Before any response: unreported — None, never a zero figure.
+    /// assert!(client.last_rate_limit().is_none());
+    /// ```
+    #[must_use]
+    pub fn last_rate_limit(&self) -> Option<crate::api::error::RateLimitSnapshot> {
+        self.rate_limit.last()
+    }
+
     /// Create a builder for configuring an [`AnthropicClient`].
     ///
     /// Returns an [`AnthropicClientBuilder`] with sensible defaults. The only
@@ -273,6 +309,11 @@ impl AnthropicClient {
     /// classifies non-success responses (auth rejections, rate limits with
     /// their server-advised delay) into structured [`ApiError`] variants.
     ///
+    /// Sends the JSON body with `x-api-key` and `anthropic-version`
+    /// headers, and reads the forensics headers (the native `request-id`
+    /// and the `rate-limit-*` family) from every response into
+    /// `rate_limit` when given.
+    ///
     /// # Errors
     ///
     /// Returns [`ApiError::http`] if the HTTP request fails, or the
@@ -282,6 +323,7 @@ impl AnthropicClient {
         url: &str,
         api_key: &str,
         body: &Value,
+        rate_limit: Option<&super::RateLimitSlot>,
     ) -> Result<reqwest::Response, ApiError> {
         let mut key_header = reqwest::header::HeaderValue::from_str(api_key)
             .map_err(|e| ApiError::auth_invalid_key(format!("invalid api key header: {e}")))?;
@@ -300,6 +342,7 @@ impl AnthropicClient {
                 ),
             ],
             body,
+            rate_limit,
         )
         .await
     }
@@ -553,6 +596,7 @@ impl ApiClient for AnthropicClient {
         let url = self.messages_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
+        let rate_limit = self.rate_limit.clone();
         let probe = effort.is_some().then(|| self.thinking_probe(&model));
 
         Box::pin(async_stream::try_stream! {
@@ -561,11 +605,17 @@ impl ApiClient for AnthropicClient {
                 let wire = probe.resolve(effort).await?;
                 apply_model_thinking(&mut body, wire, probe.configured_max_tokens);
             }
-            let resp = Self::post_messages(&http, &url, &api_key, &body).await?;
+            let resp =
+                Self::post_messages(&http, &url, &api_key, &body, Some(&rate_limit)).await?;
+            let meta = crate::provider::forensics::capture_provider_meta(resp.headers());
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
-            while let Some((event_type, data)) = sse.next_event().await? {
+            while let Some((event_type, data)) = sse
+                .next_event()
+                .await
+                .map_err(|e| e.with_provider_meta(meta.clone()))?
+            {
                 emitter.process_event(&event_type, data);
                 if emitter.error_recorded() {
                     break;
@@ -575,7 +625,10 @@ impl ApiClient for AnthropicClient {
                 }
             }
 
-            for ev in emitter.finish()? {
+            for ev in emitter
+                .finish()
+                .map_err(|e| e.with_provider_meta(meta.clone()))?
+            {
                 yield ev;
             }
         })
@@ -626,10 +679,20 @@ impl ApiClient for AnthropicClient {
                 let wire = probe.resolve(effort).await?;
                 apply_model_thinking(&mut body, wire, probe.configured_max_tokens);
             }
-            let resp = Self::post_messages(&self.http, &url, &self.api_key, &body).await?;
-            let resp = super::read_bounded_body(resp).await?;
+            let resp = Self::post_messages(
+                &self.http,
+                &url,
+                &self.api_key,
+                &body,
+                Some(&self.rate_limit),
+            )
+            .await?;
+            let meta = crate::provider::forensics::capture_provider_meta(resp.headers());
+            let resp = super::read_bounded_body(resp)
+                .await
+                .map_err(|e| e.with_provider_meta(meta.clone()))?;
             let raw = serde_json::from_slice::<Value>(&resp)
-                .map_err(|e| ApiError::http(e.to_string()))?;
+                .map_err(|e| ApiError::http(e.to_string()).with_provider_meta(meta))?;
             Ok(Self::build_response(&raw))
         })
     }
@@ -986,6 +1049,7 @@ impl AnthropicClientBuilder {
             )),
             replay_reasoning: self.replay_reasoning,
             prompt_caching: self.prompt_caching,
+            rate_limit: super::RateLimitSlot::default(),
         })
     }
 }
@@ -2823,6 +2887,7 @@ impl StreamEmitter {
                 ApiError::RateLimit {
                     retry_after: None,
                     message: detail,
+                    meta: None,
                 }
             } else {
                 ApiError::api(detail)

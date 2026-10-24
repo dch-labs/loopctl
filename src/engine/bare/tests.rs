@@ -773,7 +773,7 @@ async fn emergency_compaction_fires_with_auto_compact_disabled() {
         events: Arc::clone(&events),
     }));
 
-    // The census expected the emergency line to compact here. The
+    // The emergency line might be expected to compact here. The
     // engine's window gate refuses the oversized request first instead:
     // with the toggle off, overflow is a hard error, not an implicit
     // compaction. The machine-level emergency check itself is pinned
@@ -11603,6 +11603,7 @@ async fn escalation_trips_from_primary_state() {
                 Err(ApiError::RateLimit {
                     retry_after: None,
                     message: "slow down".into(),
+                    meta: None,
                 })
             }))
         }
@@ -11664,6 +11665,7 @@ async fn escalation_trips_from_primary_state() {
                 Err(ApiError::RateLimit {
                     retry_after: None,
                     message: "slow down".into(),
+                    meta: None,
                 })
             }))
         }
@@ -15173,7 +15175,7 @@ impl Tool for SwapTool {
 /// A tool whose dispatch removes a named victim from the live
 /// registry it shares with the engine.
 ///
-/// The mid-run shed double — the small-model flow L-95 exists for:
+/// The mid-run shed double — the small-model flow this exists for:
 /// dropping tools once the phase that needed them ends.
 #[cfg(feature = "streaming")]
 struct ShedTool {
@@ -15865,8 +15867,6 @@ async fn a_cancelled_run_does_not_wait_for_the_async_selection() {
     );
 }
 
-// --- L-162 rewind seam -----------------------------------------------------
-
 #[tokio::test]
 #[cfg(feature = "streaming")]
 async fn rewind_history_to_prunes_the_next_provider_request() {
@@ -16423,7 +16423,7 @@ async fn take_all_collects_sealed_and_waiting_at_shutdown() {
 async fn leftovers_never_ride_turn_zero_of_the_next_run() {
     // Guidance the run never reached must not be auto-drained as
     // turn 0 of the next run — between runs the host may have
-    // rewound (L-162) or cancelled, and advice about a turn that no
+    // rewound or cancelled, and advice about a turn that no
     // longer stands is not advice. It stays collectable instead.
     let (client, requests) = WireCaptureClient::new();
     client.push_named_tool_turn("thinking ", "steer_1", "steer_here", &json!({}));
@@ -16475,7 +16475,7 @@ async fn leftovers_never_ride_turn_zero_of_the_next_run() {
 #[cfg(feature = "streaming")]
 #[tokio::test]
 async fn an_aborted_run_task_closes_the_steering_slot() {
-    // R3-1: a host wrapping run() in a select!/timeout can drop the
+    // A host wrapping run() in a select!/timeout can drop the
     // future before finalize ever runs — the slot must close with the
     // drop, or push() would tell the host a dead run accepted its
     // guidance. The abort is the crate-invisible exit path.

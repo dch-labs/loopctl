@@ -6,7 +6,8 @@
 //! banned from every file by the contribution rules; the corpus predates
 //! the strictest reading, so this ratchet fails on any *new* leak: the
 //! scan covers the core crate's sources and tests, every workspace
-//! companion crate, build and CI artifacts, and the testing policy —
+//! companion crate, build and CI artifacts, the testing policy, and the
+//! changelog —
 //! loudly, so a directory the scan cannot open fails the ratchet rather
 //! than vanishing from it — and the patterns it hunts are assembled from
 //! pieces at runtime so this file stays free of the tokens it hunts.
@@ -118,12 +119,19 @@ fn has_task_id(line: &str) -> bool {
 /// Structure in this codebase comes from module, `impl`, and function
 /// boundaries and from blank lines — never from a hand-drawn rule — so
 /// a comment whose opening run of decoration characters is long enough
-/// to read as one is a divider and is flagged.
+/// to read as one is a divider and is flagged. The full comment marker
+/// comes off first: docs draw rules too, and leaving the `///` or `//!`
+/// marker's third character in front of the decoration would let
+/// exactly those spellings — where a real divider hides most naturally —
+/// walk past the check reading as ordinary text.
 fn is_separator(line: &str) -> bool {
-    let Some(rest) = line.trim().strip_prefix("//").map(str::trim_start) else {
+    let Some(markerless) = line.trim().strip_prefix("//") else {
         return false;
     };
-    // A comment whose opening run of decoration makes it a divider.
+    let rest = markerless
+        .strip_prefix(['/', '!'])
+        .unwrap_or(markerless)
+        .trim_start();
     let leading_run =
         |chars: &[char], min: usize| rest.chars().take_while(|c| chars.contains(c)).count() >= min;
     leading_run(&['-', '=', '*', '#', '+', '~'], 3)
@@ -164,6 +172,89 @@ fn names_future_shipping(line: &str) -> bool {
     future_shipping_phrases()
         .iter()
         .any(|phrase| lower.contains(phrase))
+}
+
+/// Phrases that betray development-process provenance in a changelog.
+///
+/// A changelog entry states what changed between versions; which review
+/// surfaced a change or which planning artifact decided it is metadata
+/// that rides the commit record, never the release log. Joined from
+/// pieces at runtime, like the id prefixes, so this file stays free of
+/// the phrases it hunts.
+fn banned_changelog_phrases() -> &'static [String] {
+    static PHRASES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    PHRASES.get_or_init(|| {
+        [
+            ("Road", "map"),
+            ("planning", " docs"),
+            ("review", "-round"),
+            ("pr", " round"),
+            ("pr", " review"),
+            ("hostile", " review"),
+            ("hostile", "-review"),
+            ("review", " pins"),
+            ("review", "'s"),
+            ("follow-up", " review"),
+            ("external", " review"),
+            ("DCH-", "DESIGN"),
+            ("LOOPCTL-", "DESIGN"),
+            ("review", " round"),
+            ("sk", "etch"),
+            ("task", "-named"),
+            ("task", " locked"),
+            ("locked", " names"),
+            ("task", " later"),
+        ]
+        .iter()
+        .map(|(head, tail)| format!("{head}{tail}").to_lowercase())
+        .collect()
+    })
+}
+
+/// `true` when `line` narrates planning provenance, not a change.
+///
+/// The changelog's characteristic relapses beyond the id shape
+/// [`has_task_id`] already hunts: roadmap references, planning-doc
+/// inventories, review-round attribution, task-or-sketch process prose,
+/// and internal consumer references, matched case-insensitively. The
+/// numbered markers (gap analysis, development round, external issue)
+/// count only in their exact shapes, and the consumer-product token
+/// only as a standalone word — so real shipped spellings, underscored
+/// test names, and the repository URL itself stay clean.
+fn names_planning_prose(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    let bytes = lower.as_bytes();
+    let numbered = |prefix: &str, offset: usize| {
+        lower.match_indices(prefix).any(|(index, _)| {
+            bytes[index + offset..]
+                .first()
+                .is_some_and(u8::is_ascii_digit)
+        })
+    };
+    let consumer_ref = lower.match_indices("dch").any(|(index, _)| {
+        let before_free = index
+            .checked_sub(1)
+            .is_none_or(|i| !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_'));
+        let after_free = bytes
+            .get(index + 3)
+            .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'));
+        before_free && after_free && !lower[index..].starts_with("dch-labs")
+    });
+    let issue_id = line.match_indices("TX-").any(|(index, _)| {
+        let word_start = index == 0 || !line.as_bytes()[index - 1].is_ascii_alphanumeric();
+        word_start
+            && line
+                .as_bytes()
+                .get(index + 3)
+                .is_some_and(|byte| byte.is_ascii_digit())
+    });
+    numbered("gap-", 4)
+        || numbered("round-", 6)
+        || consumer_ref
+        || issue_id
+        || banned_changelog_phrases()
+            .iter()
+            .any(|phrase| lower.contains(phrase))
 }
 
 /// `true` when `line` is a comment — `//`, `///`, or `//!` spellings.
@@ -328,6 +419,72 @@ fn testing_md_is_clean() {
     );
 }
 
+#[test]
+fn changelog_ships_changes_not_planning_metadata() {
+    // Sensitivity first: lines assembled from the same pieces must trip
+    // the probes, or the silent scan below proves nothing.
+    let id = format!("{}-9", ID_PREFIXES[0]);
+    let roadmap_tail = format!("the wire moved. ({}{} {id} rider, v0.5.0.)", "Road", "map:");
+    let provenance = format!("{} {} named it; decided at the sketch.", "Review", "round");
+    let gap_marker = format!("the {}-1 disease, on the wire", "Gap");
+    assert!(
+        has_task_id(&roadmap_tail) && names_planning_prose(&roadmap_tail),
+        "a tagged tail trips both probes by construction: {roadmap_tail}"
+    );
+    assert!(
+        names_planning_prose(&provenance),
+        "review-and-sketch provenance trips the prose probe: {provenance}"
+    );
+    assert!(
+        names_planning_prose(&gap_marker),
+        "the numbered gap marker trips the prose probe: {gap_marker}"
+    );
+    let doc_inventory = format!(
+        "Reconciled the {} ({}{}).",
+        concat!("planning", " docs"),
+        "DCH-",
+        "DESIGN"
+    );
+    assert!(
+        names_planning_prose(&doc_inventory),
+        "a planning-doc inventory trips the prose probe: {doc_inventory}"
+    );
+    let consumer_ref = format!("no {}-side change, per {}-42.", "dch", "TX");
+    assert!(
+        names_planning_prose(&consumer_ref),
+        "consumer-product references and external issue ids trip the probe: {consumer_ref}"
+    );
+    let round_pin = format!("{}-5 pins: `a_contract_holds`", "Round");
+    assert!(
+        names_planning_prose(&round_pin),
+        "development-round numbering trips the probe: {round_pin}"
+    );
+    assert!(
+        !names_planning_prose(
+            "`echo_round_trip_returns_text`, `.dchignore`, `like_dch_v1`, github.com/dch-labs/loopctl"
+        ),
+        "shipped spellings, real identifiers, and the repository URL are not provenance"
+    );
+    assert!(
+        !names_planning_prose(
+            "- **Edit results stop echoing files** — no result echoes a file now; \
+             vocabulary gaps close in the descriptions."
+        ),
+        "a change stated as a change must not read as provenance"
+    );
+
+    let mut leaks = Vec::new();
+    scan(&root().join("CHANGELOG.md"), &mut leaks, &|line| {
+        has_task_id(line) || names_planning_prose(line)
+    });
+    assert!(
+        leaks.is_empty(),
+        "planning metadata shipped into the changelog — it records the changes \
+         between versions, never the task, review, or planning artifact behind one:\n{}",
+        leaks.join("\n")
+    );
+}
+
 /// A fresh scratch tree named for `name`, guarded by the process pid.
 ///
 /// Recreated empty on every call — a prior aborted run's residue
@@ -465,5 +622,46 @@ fn allowlisted_files_still_scan_comment_lines() {
     assert!(
         !scanned_for_ids(true, ordinary),
         "ordinary non-comment lines of allowlisted files keep their exemption"
+    );
+}
+
+#[test]
+fn doc_comment_dividers_are_detected() {
+    // A divider drawn inside a doc comment is still a divider; a probe
+    // that stripped only `//` left the marker's third character ahead
+    // of the decoration, and the run check read those spellings as
+    // ordinary text.
+    assert!(
+        is_separator("// ---- plain rule"),
+        "the plain spelling was never the hole, but it must stay caught"
+    );
+    assert!(
+        is_separator("/// ==== section ===="),
+        "a divider drawn in a doc comment is still a divider"
+    );
+    assert!(
+        is_separator("//! ###### module rule ######"),
+        "a divider drawn in a module doc is still a divider"
+    );
+    assert!(
+        is_separator("    /// --- indented rule"),
+        "indentation is no hiding place either"
+    );
+    assert!(
+        is_separator("/// ——— unicode rule"),
+        "the em-dash arm reads doc comments too"
+    );
+    // Doc prose is not a rule: bullets, slashes, and short runs stay clean.
+    assert!(
+        !is_separator("/// - a single dash is a list marker"),
+        "one dash is prose, not decoration"
+    );
+    assert!(
+        !is_separator("// -- short run below the divider bound"),
+        "a decoration run below the minimum is not a divider"
+    );
+    assert!(
+        !is_separator("/// reads as ordinary doc prose"),
+        "doc text without a decoration run stays unflagged"
     );
 }

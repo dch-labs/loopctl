@@ -528,7 +528,7 @@ mod tests {
         }
 
         // Now 1 minute has passed in real time. Normally 1 min of refill
-        // would restore tokens. After the fix, take_at should succeed
+        // would restore tokens. take_at must succeed here
         // because the bucket must not allow a future instant to freeze
         // the refill clock.
         let result = bucket.take_at(one_min_later);

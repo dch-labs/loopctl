@@ -1,0 +1,16 @@
+- when:
+    method: POST
+    path: /v1/chat/completions
+    header:
+    - name: content-type
+      value: application/json
+    - name: accept
+      value: '*/*'
+    body: '{"messages":[{"content":"Say hello in exactly 3 words.","role":"user"}],"model":"loopctl-conformance-missing","stream":true,"stream_options":{"include_usage":true}}'
+  then:
+    status: 404
+    header:
+    - name: content-type
+      value: application/json
+    body: |
+      {"error":{"message":"model 'loopctl-conformance-missing' not found","type":"not_found_error","param":null,"code":null}}

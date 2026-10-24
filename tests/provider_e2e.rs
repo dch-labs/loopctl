@@ -145,9 +145,6 @@ async fn run_streamed_usage_test(client: &dyn ApiClient, name: &str) {
     );
 }
 
-/// Live check of streamed usage on OpenAI: the client requests
-/// `stream_options.include_usage` by default, so the final chunk's usage
-/// must reach the terminal `MessageDelta` with non-zero counts.
 #[cfg(feature = "openai")]
 #[tokio::test]
 async fn openai_streamed_usage_test() {
@@ -161,9 +158,6 @@ async fn openai_streamed_usage_test() {
     run_streamed_usage_test(&client, "OpenAI streamed usage").await;
 }
 
-/// Live check of the streamed usage latch: Anthropic reports input tokens on
-/// `message_start`, and the terminal `MessageDelta` must carry them — a
-/// regression returns to `input_tokens: 0` on every turn.
 #[cfg(feature = "anthropic")]
 #[tokio::test]
 async fn anthropic_streamed_usage_test() {
@@ -177,9 +171,6 @@ async fn anthropic_streamed_usage_test() {
     run_streamed_usage_test(&client, "Anthropic streamed usage").await;
 }
 
-/// Live check of streamed usage on Gemini: the final chunk carries
-/// `usageMetadata`, and the terminal `MessageDelta` must report it with
-/// non-zero counts.
 #[cfg(feature = "gemini")]
 #[tokio::test]
 async fn gemini_streamed_usage_test() {
@@ -193,9 +184,6 @@ async fn gemini_streamed_usage_test() {
     run_streamed_usage_test(&client, "Gemini streamed usage").await;
 }
 
-/// Live check of streamed usage on Grok: xAI's OpenAI-compatible server
-/// honors `stream_options.include_usage`, so the final chunk's usage must
-/// reach the terminal `MessageDelta`.
 #[cfg(feature = "grok")]
 #[tokio::test]
 async fn grok_streamed_usage_test() {
@@ -209,9 +197,6 @@ async fn grok_streamed_usage_test() {
     run_streamed_usage_test(&client, "Grok streamed usage").await;
 }
 
-/// Live check of streamed usage on DeepSeek: the OpenAI-compatible server
-/// honors `stream_options.include_usage`, so the final chunk's usage must
-/// reach the terminal `MessageDelta`.
 #[cfg(feature = "deepseek")]
 #[tokio::test]
 async fn deepseek_streamed_usage_test() {
@@ -225,9 +210,6 @@ async fn deepseek_streamed_usage_test() {
     run_streamed_usage_test(&client, "DeepSeek streamed usage").await;
 }
 
-/// Live check of streamed usage on Z.ai: the Anthropic-compatible server
-/// reports input tokens on `message_start`, exercising the same usage
-/// latch as the Anthropic test against a different endpoint.
 #[cfg(feature = "zai")]
 #[tokio::test]
 async fn zai_streamed_usage_test() {
@@ -241,9 +223,6 @@ async fn zai_streamed_usage_test() {
     run_streamed_usage_test(&client, "Z.ai streamed usage").await;
 }
 
-/// Live check of streamed usage on Azure OpenAI via the v1 API profile:
-/// the resource name comes from `LOOPCTL_AZURE_RESOURCE` (it is an
-/// argument, not an env var, in `provider::azure`).
 #[cfg(feature = "azure")]
 #[tokio::test]
 async fn azure_streamed_usage_test() {
@@ -260,9 +239,6 @@ async fn azure_streamed_usage_test() {
     run_streamed_usage_test(&client, "Azure streamed usage").await;
 }
 
-/// Live check of streamed usage on Moonshot AI (Kimi): the
-/// OpenAI-compatible server reports streamed usage like the other
-/// profiles.
 #[cfg(feature = "moonshot")]
 #[tokio::test]
 async fn moonshot_streamed_usage_test() {
@@ -276,10 +252,6 @@ async fn moonshot_streamed_usage_test() {
     run_streamed_usage_test(&client, "Moonshot streamed usage").await;
 }
 
-/// Live check of streamed usage on AWS Bedrock: exercises whichever
-/// invoke path the configured `AWS_BEDROCK_MODEL` selects (native
-/// Anthropic or Converse), the SigV4 chain, and the event-stream
-/// decoder against the real runtime.
 #[cfg(feature = "bedrock")]
 #[tokio::test]
 async fn bedrock_streamed_usage_test() {
@@ -366,6 +338,11 @@ async fn record_openai_compat_cassettes() {
     for scenario in cassette::scenarios()
         .into_iter()
         .filter(|s| s.provider == "openai-compat")
+        // model_override needs per-request options and
+        // missing_model_error is a gated attempt — neither is a plain
+        // driven recording, same reason the cloud loops exclude their
+        // rate-limit scenarios.
+        .filter(|s| !matches!(s.name, "model_override" | "missing_model_error"))
     {
         let server = httpmock::MockServer::start_async().await;
         let session = cassette::CassetteSession::start(
@@ -386,6 +363,102 @@ async fn record_openai_compat_cassettes() {
             .build()
             .unwrap();
         drive_scenario_and_save(&client, &scenario, session).await;
+    }
+}
+
+#[cfg(feature = "openai")]
+#[tokio::test]
+async fn record_openai_compat_model_override_cassette() {
+    if !cassette_recording_enabled() {
+        eprintln!("{DIM}skip{RESET}  cassette recording (openai-compat model_override)");
+        return;
+    }
+    let scenario = cassette::scenarios()
+        .into_iter()
+        .find(|s| s.provider == "openai-compat" && s.name == "model_override")
+        .unwrap();
+    let real_base_url = std::env::var("LOOPCTL_CASSETTE_UPSTREAM")
+        .unwrap_or_else(|_| "http://localhost:11434".into());
+    let server = httpmock::MockServer::start_async().await;
+    let session =
+        cassette::CassetteSession::start(scenario.provider, scenario.name, &real_base_url, &server)
+            .await;
+    let client = loopctl::provider::OpenAiClient::builder()
+        .with_api_key("ollama")
+        .with_base_url(cassette::client_base_url(
+            scenario.provider,
+            &session.base_url(),
+        ))
+        .with_model("qwen2.5:7b")
+        .with_stream_usage(scenario.stream_usage)
+        .build()
+        .unwrap();
+    let options = loopctl::structured::RequestOptions::new().with_model(scenario.model);
+    let request =
+        loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(scenario.prompt)]);
+    let stream = client.stream_messages_with_options(&request, options);
+    let mut stream = std::pin::pin!(stream);
+    let mut events = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(event) => events.push(event),
+            Err(e) => panic!("{} recording failed mid-stream: {e}", scenario.name),
+        }
+    }
+    let has_stop = events
+        .iter()
+        .any(|e| matches!(e, loopctl::stream::StreamEvent::MessageStop));
+    assert!(
+        has_stop,
+        "{}: the recorded exchange must end with MessageStop, or the cassette is junk",
+        scenario.name
+    );
+    let path = session.finish().await;
+    println!("{GREEN}CASSETTE{RESET} {} → {path:?}", scenario.name);
+}
+
+#[cfg(feature = "openai")]
+#[tokio::test]
+async fn attempt_openai_compat_missing_model_cassette() {
+    if !cassette_recording_enabled() {
+        eprintln!("{DIM}skip{RESET}  missing-model attempt (openai-compat)");
+        return;
+    }
+    let scenario = cassette::scenarios()
+        .into_iter()
+        .find(|s| s.provider == "openai-compat" && s.name == "missing_model_error")
+        .unwrap();
+    let real_base_url = std::env::var("LOOPCTL_CASSETTE_UPSTREAM")
+        .unwrap_or_else(|_| "http://localhost:11434".into());
+    let server = httpmock::MockServer::start_async().await;
+    let session =
+        cassette::CassetteSession::start(scenario.provider, scenario.name, &real_base_url, &server)
+            .await;
+    let client = loopctl::provider::OpenAiClient::builder()
+        .with_api_key("ollama")
+        .with_base_url(cassette::client_base_url(
+            scenario.provider,
+            &session.base_url(),
+        ))
+        .with_model(scenario.model)
+        .with_stream_usage(scenario.stream_usage)
+        .build()
+        .unwrap();
+    let request =
+        loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(scenario.prompt)]);
+    let stream = client.stream_messages(&request);
+    let mut stream = std::pin::pin!(stream);
+    while let Some(result) = stream.next().await {
+        if let Err(e) = result {
+            eprintln!("missing-model attempt ({}): {e}", scenario.name);
+        }
+    }
+    match session.finish_errored().await {
+        Some(path) => println!("{GREEN}CASSETTE{RESET} {} → {path:?}", scenario.name),
+        None => eprintln!(
+            "{DIM}no error{RESET}  {} — cassette not written",
+            scenario.name
+        ),
     }
 }
 
@@ -461,9 +534,6 @@ async fn record_gemini_cassette() {
     }
 }
 
-/// Cloud-OpenAI recordings: the openai-compat corpus's local Ollama
-/// truth, backed by the real OpenAI wire — including the fragmented
-/// tool-argument streaming Ollama emits as one delta.
 #[cfg(feature = "openai")]
 #[tokio::test]
 async fn record_openai_cassettes() {
@@ -497,11 +567,6 @@ async fn record_openai_cassettes() {
     }
 }
 
-/// DeepSeek cloud recording: the shared OpenAI-compat converter
-/// against DeepSeek's own response shapes.
-///
-/// One scenario per run of the driver table's DeepSeek entries; skips
-/// without the deliberate-act environment or the credential.
 #[cfg(feature = "deepseek")]
 #[tokio::test]
 async fn record_deepseek_cassettes() {
@@ -534,11 +599,6 @@ async fn record_deepseek_cassettes() {
     }
 }
 
-/// Grok cloud recording: the shared OpenAI-compat converter against
-/// xAI's own response shapes.
-///
-/// One scenario per run of the driver table's Grok entries; skips
-/// without the deliberate-act environment or the credential.
 #[cfg(feature = "grok")]
 #[tokio::test]
 async fn record_grok_cassettes() {
@@ -572,12 +632,6 @@ async fn record_grok_cassettes() {
     }
 }
 
-/// Z.ai cloud recording: the Anthropic-compatible dialect on its own
-/// endpoint.
-///
-/// Runs the driver table's Z.ai entries through the shared
-/// Anthropic wire shape; skips without the deliberate-act
-/// environment or the credential.
 #[cfg(feature = "zai")]
 #[tokio::test]
 async fn record_zai_cassette() {
@@ -609,12 +663,6 @@ async fn record_zai_cassette() {
     drive_scenario_and_save(&client, &scenario, session).await;
 }
 
-/// One rate-limit recording attempt: the minimal request against the
-/// real provider, with the session's gate deciding what is true.
-///
-/// A 429 cannot be ordered from the provider, so the attempt runs once
-/// — no bursts — and [`finish_rate_limited`](cassette::CassetteSession::finish_rate_limited)
-/// writes the cassette only when every recorded response is a 429.
 async fn attempt_rate_limit_recording<C: ApiClient>(
     scenario: &cassette::Scenario,
     real_base_url: &str,
@@ -701,10 +749,6 @@ async fn attempt_gemini_rate_limit_cassette() {
     .await;
 }
 
-/// Record the model-override cassette: the same minimal request, but
-/// the loop carries a per-request model override, so the recorded body
-/// pins the override on the wire — the one request-shape dimension no
-/// other cassette exercises.
 #[cfg(feature = "openai")]
 #[tokio::test]
 async fn record_openai_model_override_cassette() {

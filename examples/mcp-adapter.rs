@@ -25,7 +25,10 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::{tool, tool_handler, tool_router};
 use serde_json::json;
 
-/// An rmcp server exposing one `greet` tool.
+/// A minimal rmcp server exposing one `greet` tool.
+///
+/// Its whole job is to be the other side of the adapter: a real `rmcp`
+/// server whose tools loopctl can list and call once adapted.
 #[derive(Clone)]
 struct GreetServer {
     router: ToolRouter<Self>,
@@ -51,8 +54,8 @@ impl ServerHandler for GreetServer {}
 #[tokio::main]
 async fn main() {
     // 1. Connect an rmcp client to the in-process server and run the MCP
-    //    initialize handshake. This is the only constructor L-12 ships; real
-    //    transports (stdio, HTTP/SSE) arrive in a later release.
+    //    initialize handshake. In-process is the only constructor shipped;
+    //    a real server speaks through rmcp's own transport APIs.
     let client = McpClient::in_process(GreetServer::new())
         .await
         .expect("client initialize");

@@ -119,9 +119,44 @@ pub struct GeminiClient {
     /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort).
     /// Set via [`GeminiClientBuilder::thinking_effort`].
     thinking_effort: Option<crate::structured::ThinkingEffort>,
+
+    /// The rate-limit snapshot from the most recent response.
+    ///
+    /// Advisory state refreshed per response by
+    /// [`post_json_checked`](super::post_json_checked); read through
+    /// [`last_rate_limit`](Self::last_rate_limit). A clone of this slot
+    /// rides each streaming task so a stream's response updates the
+    /// accessor on the client itself.
+    rate_limit: super::RateLimitSlot,
 }
 
 impl GeminiClient {
+    /// The rate-limit snapshot from the most recent response, if the
+    /// provider sent one.
+    ///
+    /// Advisory only, refreshed per response — including failed ones, so
+    /// a 429's `x-ratelimit-remaining` is readable right after the error
+    /// — and cleared to `None` by the next response that reports no
+    /// family. `None` is **unreported**, never a measured zero. See
+    /// [`RateLimitSnapshot`](crate::api::error::RateLimitSnapshot).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use loopctl::provider::GeminiClient;
+    ///
+    /// let client = GeminiClient::builder()
+    ///     .with_api_key("test-key")
+    ///     .build()
+    ///     .expect("the builder needs only static fields");
+    /// // Before any response: unreported — None, never a zero figure.
+    /// assert!(client.last_rate_limit().is_none());
+    /// ```
+    #[must_use]
+    pub fn last_rate_limit(&self) -> Option<crate::api::error::RateLimitSnapshot> {
+        self.rate_limit.last()
+    }
+
     /// Create a builder for configuring a [`GeminiClient`].
     ///
     /// Returns a [`GeminiClientBuilder`] with sensible defaults. The only
@@ -270,7 +305,9 @@ impl GeminiClient {
     /// [`ApiClient::create_message`]. Delegates to
     /// [`post_json_checked`](super::post_json_checked), which classifies
     /// non-success responses (auth rejections, rate limits with their
-    /// server-advised delay) into structured [`ApiError`] variants.
+    /// server-advised delay) into structured [`ApiError`] variants and
+    /// reads the forensics headers (request id, rate-limit family) from
+    /// every response into `rate_limit` when given.
     ///
     /// # Errors
     ///
@@ -281,6 +318,7 @@ impl GeminiClient {
         url: &str,
         api_key: &str,
         body: &Value,
+        rate_limit: Option<&super::RateLimitSlot>,
     ) -> Result<reqwest::Response, ApiError> {
         let mut key_header = reqwest::header::HeaderValue::from_str(api_key)
             .map_err(|e| ApiError::auth_invalid_key(format!("invalid api key header: {e}")))?;
@@ -293,6 +331,7 @@ impl GeminiClient {
                 key_header,
             )],
             body,
+            rate_limit,
         )
         .await
     }
@@ -398,7 +437,14 @@ impl ApiClient for GeminiClient {
         let url = self.generate_url();
 
         Box::pin(async move {
-            let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
+            let resp = Self::post_content(
+                &self.http,
+                &url,
+                &self.api_key,
+                &body,
+                Some(&self.rate_limit),
+            )
+            .await?;
             let resp = super::read_bounded_body(resp).await?;
             let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
@@ -441,13 +487,20 @@ impl ApiClient for GeminiClient {
         let url = self.stream_url_for_model(&model);
         let http = self.http.clone();
         let api_key = self.api_key.clone();
+        let rate_limit = self.rate_limit.clone();
 
         Box::pin(async_stream::try_stream! {
-            let resp = Self::post_content(&http, &url, &api_key, &body).await?;
+            let resp =
+                Self::post_content(&http, &url, &api_key, &body, Some(&rate_limit)).await?;
+            let meta = crate::provider::forensics::capture_provider_meta(resp.headers());
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
-            while let Some(data) = sse.next_gemini_data().await? {
+            while let Some(data) = sse
+                .next_gemini_data()
+                .await
+                .map_err(|e| e.with_provider_meta(meta.clone()))?
+            {
                 emitter.process_chunk(&data);
                 if emitter.error_recorded() {
                     break;
@@ -457,7 +510,10 @@ impl ApiClient for GeminiClient {
                 }
             }
 
-            for ev in emitter.finish()? {
+            for ev in emitter
+                .finish()
+                .map_err(|e| e.with_provider_meta(meta.clone()))?
+            {
                 yield ev;
             }
         })
@@ -494,7 +550,14 @@ impl ApiClient for GeminiClient {
             .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
         let url = self.generate_url_for_model(&model);
         Box::pin(async move {
-            let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
+            let resp = Self::post_content(
+                &self.http,
+                &url,
+                &self.api_key,
+                &body,
+                Some(&self.rate_limit),
+            )
+            .await?;
             let resp = super::read_bounded_body(resp).await?;
             let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
@@ -732,6 +795,7 @@ impl GeminiClientBuilder {
             model: std::sync::Mutex::new(self.model),
             include_thoughts: self.include_thoughts,
             thinking_effort: self.thinking_effort,
+            rate_limit: super::RateLimitSlot::default(),
         })
     }
 }
@@ -1241,6 +1305,7 @@ impl StreamEmitter {
             ApiError::RateLimit {
                 retry_after: None,
                 message: detail,
+                meta: None,
             }
         } else {
             ApiError::api(detail)

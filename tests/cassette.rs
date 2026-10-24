@@ -430,6 +430,37 @@ impl<'s> CassetteSession<'s> {
         }
     }
 
+    /// Close an error-shaped recording attempt, gating on a real failure.
+    ///
+    /// The gate mirror of [`finish_rate_limited`](Self::finish_rate_limited)
+    /// for error-taxonomy fixtures: a missing-model (or any rejection)
+    /// attempt records truth only when the provider actually answered
+    /// with an error status. If the provider unexpectedly served the
+    /// request, nothing is written — a success masquerading as an error
+    /// scenario would teach the taxonomy the wrong table. Replay mode
+    /// behaves like [`finish`](Self::finish): the committed error
+    /// cassette is consumed exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Same panic surface as [`finish`](Self::finish) in replay mode.
+    pub async fn finish_errored(self) -> Option<PathBuf> {
+        match self.mode {
+            CassetteMode::Replay => Some(self.finish().await),
+            CassetteMode::Record => {
+                let (provider, scenario, interactions) = self.export_raw().await;
+                let rejected = interactions
+                    .iter()
+                    .all(|interaction| interaction.then.status.is_some_and(|s| s >= 400));
+                let non_empty = !interactions.is_empty();
+                if !non_empty || !rejected {
+                    return None;
+                }
+                Some(write_cassette(&provider, &scenario, interactions))
+            }
+        }
+    }
+
     /// Export the recording into parsed, unscrubbed interactions.
     ///
     /// The shared front half of every writer: the recording exports
@@ -1037,6 +1068,34 @@ pub fn scenarios() -> Vec<Scenario> {
             prompt: "Say hello in exactly 3 words.",
             tools: false,
             stream_usage: false,
+        },
+        // Local Ollama conformance fixtures: recorded without any cloud
+        // credential, so every contract family has ground truth that a
+        // contributor can re-record. Each exists to give a family a
+        // fixture, not just a request-shape pin.
+        Scenario {
+            provider: "openai-compat",
+            name: "minimal_text_no_usage",
+            model: "qwen2.5:7b",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: false,
+        },
+        Scenario {
+            provider: "openai-compat",
+            name: "model_override",
+            model: "qwen3.5:2b",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: true,
+        },
+        Scenario {
+            provider: "openai-compat",
+            name: "missing_model_error",
+            model: "loopctl-conformance-missing",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: true,
         },
     ]
 }

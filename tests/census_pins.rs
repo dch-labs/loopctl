@@ -1,7 +1,5 @@
-//! Census coverage pins: deliberate behaviors the round-3 census
-//! (CODE-REVIEW-ROUND3.md §2–3) flagged as tested-nowhere, locked as
-//! rows 1–5 of the L-88 test plan. Each test's name is the behavior
-//! sentence it pins.
+//! Coverage pins: behaviors that no other test exercised, one row per
+//! behavior. Each test's name is the behavior sentence it pins.
 //!
 //! Requires `testing`, `tool_health`, and `redaction`.
 

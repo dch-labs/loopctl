@@ -1056,7 +1056,7 @@ mod tests {
             .collect();
         assert!(
             !emitted.is_empty(),
-            "the census must find the emitted kinds in the enum"
+            "the scan must find the emitted kinds in the enum"
         );
 
         let mut table: Vec<&str> = source
@@ -1064,7 +1064,7 @@ mod tests {
             .filter_map(|line| line.trim_start().strip_prefix("//! | `"))
             .filter_map(|rest| rest.split('`').next())
             .collect();
-        assert!(!table.is_empty(), "the census must find the kinds table");
+        assert!(!table.is_empty(), "the scan must find the kinds table");
 
         emitted.sort_unstable();
         table.sort_unstable();

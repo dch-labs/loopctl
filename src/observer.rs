@@ -922,14 +922,14 @@ mod tests {
             .collect();
         assert!(
             !names.is_empty(),
-            "the census must find the re-exported context types"
+            "the scan must find the re-exported context types"
         );
 
         let header: Vec<&str> = source
             .lines()
             .take_while(|line| line.starts_with("//!"))
             .collect();
-        assert!(!header.is_empty(), "the census must find the module doc");
+        assert!(!header.is_empty(), "the scan must find the module doc");
         for name in names {
             assert!(
                 header.iter().any(|line| line.contains(name)),

@@ -606,6 +606,7 @@ impl DetectedRateLimit {
             ApiError::RateLimit {
                 retry_after,
                 message,
+                ..
             } => Some(Self {
                 kind: match http_status_from_message(message) {
                     Some(503 | 529) => RateLimitKind::Overloaded,
@@ -614,7 +615,7 @@ impl DetectedRateLimit {
                 retry_after: *retry_after,
                 message: message.clone(),
             }),
-            ApiError::Api(msg) => {
+            ApiError::Api(msg, _) => {
                 let lower = msg.to_lowercase();
                 if lower.contains("rate limit") || lower.contains("429") {
                     Some(Self {
@@ -626,7 +627,7 @@ impl DetectedRateLimit {
                     None
                 }
             }
-            ApiError::Http(msg) => {
+            ApiError::Http(msg, _) => {
                 let kind = match http_status_from_message(msg) {
                     Some(429) => RateLimitKind::RateLimited,
                     Some(503 | 529) => RateLimitKind::Overloaded,
@@ -3830,6 +3831,7 @@ mod tests {
                     Err(ApiError::RateLimit {
                         retry_after: None,
                         message: "slow down".into(),
+                        meta: None,
                     })
                 }))
             }
@@ -4734,6 +4736,7 @@ mod tests {
         let err = ApiError::RateLimit {
             retry_after: Some(Duration::from_secs(7)),
             message: "slow down".into(),
+            meta: None,
         };
         let detected = DetectedRateLimit::detect(&err).expect("RateLimit variant should detect");
         assert_eq!(detected.kind, RateLimitKind::RateLimited);
@@ -4745,6 +4748,7 @@ mod tests {
         let err = ApiError::RateLimit {
             retry_after: None,
             message: "slow down".into(),
+            meta: None,
         };
         let detected = DetectedRateLimit::detect(&err).expect("RateLimit variant should detect");
         assert_eq!(detected.retry_after, None);
@@ -4775,6 +4779,7 @@ mod tests {
             ApiError::RateLimit {
                 retry_after: None,
                 message: "x".into(),
+                meta: None,
             },
             ApiError::http_with_status(503, "overloaded"),
             ApiError::http_with_status(500, "boom"),
@@ -5103,6 +5108,7 @@ mod tests {
                         Err(ApiError::RateLimit {
                             retry_after: None,
                             message: "slow down".into(),
+                            meta: None,
                         })
                     }))
                 } else {
@@ -5180,6 +5186,7 @@ mod tests {
                     Err(ApiError::RateLimit {
                         retry_after: Some(Duration::from_millis(1)),
                         message: "slow down".into(),
+                        meta: None,
                     })
                 }))
             }
@@ -5249,6 +5256,7 @@ mod tests {
                     Err(ApiError::RateLimit {
                         retry_after: None,
                         message: "slow down".into(),
+                        meta: None,
                     })
                 }))
             }
@@ -5339,6 +5347,7 @@ mod tests {
                     Err(ApiError::RateLimit {
                         retry_after: None,
                         message: "slow down".into(),
+                        meta: None,
                     }),
                 ];
                 Box::pin(futures::stream::iter(events))
@@ -5594,6 +5603,7 @@ mod tests {
                     Err(ApiError::RateLimit {
                         retry_after: Some(Duration::from_millis(1)),
                         message: "slow down".into(),
+                        meta: None,
                     })
                 };
                 Box::pin(futures::stream::once(async { result }))
@@ -5674,6 +5684,7 @@ mod tests {
                     Err(ApiError::RateLimit {
                         retry_after: None,
                         message: "slow down".into(),
+                        meta: None,
                     })
                 }))
             }
@@ -5752,6 +5763,7 @@ mod tests {
                         Err(ApiError::RateLimit {
                             retry_after: None,
                             message: "slow down".into(),
+                            meta: None,
                         })
                     }))
                 } else {
@@ -5888,6 +5900,7 @@ mod tests {
                     Err(ApiError::RateLimit {
                         retry_after: Some(Duration::from_mins(10)),
                         message: "slow down".into(),
+                        meta: None,
                     })
                 }))
             }

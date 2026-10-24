@@ -98,6 +98,54 @@ fn construction_still_possible_via_constructors() {
 }
 
 #[test]
+fn provider_forensics_surface_builds_externally() {
+    // The wire-failure forensics types are `#[non_exhaustive]` —
+    // the external-legitimate construction paths are the constructors.
+    use loopctl::api::error::{ApiError, ProviderMeta, RateLimitSnapshot};
+
+    let err = ApiError::rate_limited("slow down", Some(std::time::Duration::from_secs(2)));
+    // `RateLimit` is a marked variant: patterns bind through `..`, and
+    // meta defaults to None through the constructor.
+    match &err {
+        ApiError::RateLimit {
+            retry_after,
+            message,
+            ..
+        } => {
+            assert_eq!(*retry_after, Some(std::time::Duration::from_secs(2)));
+            assert_eq!(message, "slow down");
+        }
+        other => panic!("constructed RateLimit, got {other:?}"),
+    }
+    assert!(err.provider_meta().is_empty(), "no wire, no forensics");
+
+    let snapshot = RateLimitSnapshot::new(
+        Some("500".to_string()),
+        Some("42".to_string()),
+        None::<String>,
+    );
+    assert_eq!(snapshot.remaining.as_deref(), Some("42"));
+    let meta = ProviderMeta::with_rate_limit(snapshot.clone());
+    assert_eq!(meta.rate_limit.as_ref(), Some(&snapshot));
+    let ided = ProviderMeta::with_request_id("req_ext_1");
+    assert_eq!(ided.request_id.as_deref(), Some("req_ext_1"));
+
+    // Attaching an external meta to a wire failure is the documented
+    // bridge for replay tooling.
+    let attached = ApiError::http("HTTP 500: boom")
+        .with_provider_meta(ProviderMeta::with_request_id("req_ext_2"));
+    assert!(
+        attached.to_string().ends_with(" [req req_ext_2]"),
+        "the suffix carries an externally attached id: {attached}"
+    );
+    // Tuple wire variants bind through wildcard fields.
+    assert!(matches!(
+        attached,
+        ApiError::Http(_, _) | ApiError::Api(_, _) | ApiError::Auth(_, _)
+    ));
+}
+
+#[test]
 fn old_serialized_data_deserializes() {
     let usage: Usage =
         serde_json::from_str(r#"{"input_tokens":3,"output_tokens":5}"#).expect("usage json");

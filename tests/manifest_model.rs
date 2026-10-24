@@ -1,4 +1,4 @@
-//! Integration pins for the v1 manifest model (L-122).
+//! Integration pins for the v1 manifest model.
 //!
 //! Each test exercises the public pipeline end to end — parse, profile
 //! merge, validation, interpolation, schema export — against small in-file

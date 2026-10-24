@@ -671,10 +671,11 @@ impl OllamaEmbedder {
             &self.endpoint(),
             &[],
             &serde_json::to_value(body)?,
+            None,
         )
         .await
         .map_err(|error| match error {
-            ApiError::Http(message)
+            ApiError::Http(message, ..)
                 if crate::api::error::http_status_from_message(&message).is_none() =>
             {
                 ApiError::http(format!(
@@ -1243,6 +1244,7 @@ impl OpenAiEmbedder {
             &self.endpoint(),
             &headers,
             &serde_json::to_value(body)?,
+            None,
         )
         .await?;
         let bytes = read_body_bounded(response, response_budget(self.dim)).await?;

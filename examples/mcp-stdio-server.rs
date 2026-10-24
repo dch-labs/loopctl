@@ -1,4 +1,4 @@
-//! A minimal MCP server over stdio — the subprocess target for the L-13 stdio
+//! A minimal MCP server over stdio — the subprocess target for the stdio
 //! transport tests.
 //!
 //! Built with rmcp's `#[tool_router]` / `#[tool]` macros, exposing one `greet`
@@ -23,7 +23,10 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::{tool, tool_handler, tool_router};
 
-/// A server exposing one `greet` tool.
+/// The example's server: one `greet` tool behind rmcp's tool router.
+///
+/// Deliberately minimal, so the stdio wiring in `main` is the only thing a
+/// reader has to follow.
 #[derive(Clone)]
 struct StdioServer {
     router: ToolRouter<Self>,

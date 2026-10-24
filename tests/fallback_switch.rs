@@ -102,10 +102,10 @@ impl ApiClient for ScriptedClient {
                 )]));
             }
             Step::RateLimit => {
-                return Box::pin(futures::stream::iter(vec![Err(ApiError::RateLimit {
-                    retry_after: None,
-                    message: "scripted rate limit".into(),
-                })]));
+                return Box::pin(futures::stream::iter(vec![Err(ApiError::rate_limited(
+                    "scripted rate limit",
+                    None,
+                ))]));
             }
             Step::Text(text) => text_events(&text),
         };

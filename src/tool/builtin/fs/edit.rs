@@ -778,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tolerant_apply_re_indents_the_whole_replacement() {
-        // The review's Python shape: the model matched with shallower
+        // The Python-IndentationError shape: the model matched with shallower
         // indentation, and the replacement's interior lines keep that
         // shallow spelling - applied verbatim they would produce an
         // IndentationError. The whole block shifts by the window's

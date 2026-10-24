@@ -3,9 +3,7 @@
 //! Pins two invariants: a memoize cache hit carries the *requesting*
 //! call's id (not the cached first call's), and the engine stamps ids
 //! authoritatively after the pipeline (a middleware returning a bogus
-//! non-empty id cannot corrupt `tool_use`↔`tool_result` pairing). Recreated
-//! 2026-08-26 per the L-74 re-assessment — the original proof-of-gap
-//! test was lost with an unmerged branch.
+//! non-empty id cannot corrupt `tool_use`↔`tool_result` pairing).
 //!
 //! Requires the `testing` feature.
 

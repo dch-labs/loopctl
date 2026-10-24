@@ -62,6 +62,41 @@
 //! );
 //! let result = agent.run("Hello!", &RunConfig::default()).await?;
 //! ```
+//!
+//! # Debugging a provider incident
+//!
+//! When a provider 429s or 500s, two things the support desk will ask
+//! for ride the very response that failed: the **request id** and the
+//! **rate-limit state** at that moment. The clients read both at HTTP
+//! time and preserve them, so nothing needs reconstructing from a log
+//! afterwards:
+//!
+//! - [`ApiError::provider_meta`](crate::api::error::ApiError::provider_meta)
+//!   on any wire failure carries the
+//!   [`ProviderMeta`](crate::api::error::ProviderMeta) — the request id
+//!   (from `x-amzn-requestid`, `x-request-id`, `openai-request-id`,
+//!   `apiproxy-id`, `cf-ray`, … first present wins) and the verbatim
+//!   `x-ratelimit-*` / `rate-limit-*` family. A failed error's `Display`
+//!   ends with `[req <id>]` when an id was captured, so the id survives
+//!   into whatever text the incident leaves behind. **Paste the id.**
+//! - Every HTTP client ([`OpenAiClient`], [`AnthropicClient`],
+//!   [`GeminiClient`], [`BedrockClient`]) answers `last_rate_limit()`
+//!   with the snapshot from its most recent response — successes
+//!   included, because the interesting question is often what the quota
+//!   said on the 200 next to the 429. The accessor is advisory and
+//!   per-response: `None` means **unreported**, never a measured zero
+//!   (local servers rarely send any of these headers, and for them
+//!   everything here stays `None`).
+//! - Mid-stream failures name their request too: the id captured when
+//!   the stream opened rides the error a mid-stream error frame or a
+//!   dropped connection produces, and a Bedrock frame carrying its own
+//!   `x-amzn-requestid` outranks the response-level one — that id names
+//!   the frame that actually failed.
+//!
+//! The capture is observability only: it changes no classification, no
+//! retry decision, and nothing about error text when the provider sends
+//! no headers. Remaining quota is *reported* here, never *acted on* —
+//! a `remaining: 1` does not preempt the retry ladder.
 
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 use crate::api::error::ApiError;
@@ -77,6 +112,15 @@ use std::time::Duration;
 // `from_response`, `take_line`, and the buffer-overflow guard live here.
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 mod sse;
+
+// Provider response-header forensics: request-id and rate-limit
+// capture at HTTP time, the advisory per-client snapshot slot, and the
+// failure telemetry events. One implementation, every provider inherits.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+mod forensics;
+
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+pub(crate) use forensics::RateLimitSlot;
 
 /// Extract the payload of an SSE `data:` field line, or `None` for any other
 /// line.
@@ -239,8 +283,32 @@ pub(super) async fn read_error_body(resp: reqwest::Response) -> String {
 /// server sent one), and everything else stays a status-tagged
 /// [`ApiError::Http`]. The body text is preserved in the message for
 /// diagnostics, prefixed with the status.
+///
+/// The `meta` captured from the same response's headers (request id and
+/// rate-limit family) rides the error it came from — an all-`None`
+/// meta attaches nothing, so a provider that sent no forensics yields the
+/// exact error shape it yielded before this existed. Meta is observability
+/// only: the variant choice and every predicate
+/// ([`is_retryable`](ApiError::is_retryable), [`code`](ApiError::code))
+/// read status and message, never meta.
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
-fn classify_error_response(status: u16, body: String, retry_after: Option<Duration>) -> ApiError {
+fn classify_error_response(
+    status: u16,
+    body: String,
+    retry_after: Option<Duration>,
+    meta: crate::api::error::ProviderMeta,
+) -> ApiError {
+    classify_error_response_inner(status, body, retry_after).with_provider_meta(meta)
+}
+
+/// The pure status→variant decision, shared by the meta-attaching entry
+/// point and the unit pins that exercise the shape without headers.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+fn classify_error_response_inner(
+    status: u16,
+    body: String,
+    retry_after: Option<Duration>,
+) -> ApiError {
     match status {
         401 => ApiError::auth_invalid_key(format!("HTTP {status}: {body}")),
         403 => ApiError::auth(format!("HTTP {status}: {body}")),
@@ -265,6 +333,18 @@ fn classify_error_response(status: u16, body: String, retry_after: Option<Durati
 /// so they are redacted in debug output and never indexed into HTTP/2's
 /// header-compression table.
 ///
+/// This is also the single provider-forensics site: every response,
+/// success or failure, has its request-id and `x-ratelimit-*` headers read
+/// here while it is in hand — the diagnostic-body read below consumes the
+/// response, and these headers are never reachable again. A failure error
+/// carries the captured
+/// [`ProviderMeta`](crate::api::error::ProviderMeta); when `rate_limit` is
+/// given, its slot records the snapshot from every response (cleared when a
+/// response reports no family, rearmed for the bounded low-water event).
+/// None of it changes what gets returned to the caller. Embedders pass
+/// `None` for `rate_limit` — the snapshot accessor is the chat clients'
+/// surface — while failures there still capture request-id forensics.
+///
 /// # Errors
 ///
 /// Returns [`ApiError::http`] when the request fails at the transport level,
@@ -275,17 +355,20 @@ pub(super) async fn post_json_checked(
     url: &str,
     headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
     body: &serde_json::Value,
+    rate_limit: Option<&RateLimitSlot>,
 ) -> Result<reqwest::Response, ApiError> {
     let request = headers.iter().fold(client.post(url), |req, (name, value)| {
         req.header(name.clone(), value.clone())
     });
-    let resp = request
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| ApiError::http(e.to_string()))?;
+    let resp = request.json(body).send().await.map_err(|e| {
+        forensics::log_transport_failure(&e.to_string());
+        ApiError::http(e.to_string())
+    })?;
     let status = resp.status();
     if status.is_success() {
+        if let Some(slot) = rate_limit {
+            slot.record(resp.headers());
+        }
         return Ok(resp);
     }
     let retry_after = resp
@@ -293,11 +376,17 @@ pub(super) async fn post_json_checked(
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(crate::api::error::parse_retry_after);
+    let meta = forensics::capture_provider_meta(resp.headers());
+    if let Some(slot) = rate_limit {
+        slot.record(resp.headers());
+    }
+    forensics::log_wire_failure(status.as_u16(), &meta);
     let body_text = read_error_body(resp).await;
     Err(classify_error_response(
         status.as_u16(),
         body_text,
         retry_after,
+        meta,
     ))
 }
 
@@ -2746,6 +2835,94 @@ mod tests {
             client.model(),
             "glm-4.7",
             "the deliberate default is glm-4.7; the doc was corrected to match"
+        );
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    #[test]
+    fn the_status_table_types_a_failure_without_headers() {
+        let delay = std::time::Duration::from_secs(12);
+
+        let unauthorized = classify_error_response_inner(401, "bad key".to_string(), None);
+        assert!(
+            matches!(
+                &unauthorized,
+                ApiError::Auth(msg, None) if msg == "Invalid API key: HTTP 401: bad key"
+            ),
+            "401 is a permanent rejection carrying the invalid-key wording: {unauthorized:?}"
+        );
+        let forbidden = classify_error_response_inner(403, "forbidden".to_string(), None);
+        assert!(
+            matches!(
+                &forbidden,
+                ApiError::Auth(msg, None) if msg == "HTTP 403: forbidden"
+            ),
+            "403 is the other permanent rejection, without the key prefix: {forbidden:?}"
+        );
+
+        for status in [429_u16, 503, 529] {
+            let limited =
+                classify_error_response_inner(status, "slow down".to_string(), Some(delay));
+            let ApiError::RateLimit {
+                retry_after,
+                message,
+                ..
+            } = &limited
+            else {
+                panic!("{status} must classify as RateLimit, got {limited:?}");
+            };
+            assert_eq!(
+                *retry_after,
+                Some(delay),
+                "the rate-limit family carries the server-advised delay"
+            );
+            assert_eq!(
+                message,
+                &format!("HTTP {status}: slow down"),
+                "the status stays readable in the message the retry ladder logs"
+            );
+        }
+
+        for status in [400_u16, 404, 408, 500] {
+            let other = classify_error_response_inner(status, "nope".to_string(), None);
+            assert!(
+                matches!(&other, ApiError::Http(msg, None) if msg == &format!("HTTP {status}: nope")),
+                "{status} stays a status-tagged transport failure, never auth or rate limit: {other:?}"
+            );
+        }
+        let mistyped = classify_error_response_inner(428, "away".to_string(), Some(delay));
+        assert!(
+            matches!(&mistyped, ApiError::Http(..)),
+            "a delay on a status outside the rate-limit family does not retype it: {mistyped:?}"
+        );
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    #[test]
+    fn the_pure_classifier_carries_no_forensics() {
+        for status in [401_u16, 403, 429, 500, 503, 529] {
+            let error = classify_error_response_inner(status, "body".to_string(), None);
+            assert!(
+                error.provider_meta().is_empty(),
+                "the header-free path captured nothing, so no error may claim an \
+                 id or a quota state: {error:?}"
+            );
+        }
+
+        let carried = classify_error_response(
+            500,
+            "boom".to_string(),
+            None,
+            crate::api::error::ProviderMeta::with_request_id("req-7"),
+        );
+        assert_eq!(
+            carried.provider_meta().request_id.as_deref(),
+            Some("req-7"),
+            "the entry point attaches the meta captured from the same response"
+        );
+        assert!(
+            carried.to_string().ends_with(" [req req-7]"),
+            "the id the response carried surfaces in the diagnostic text: {carried}"
         );
     }
 }

@@ -1,4 +1,4 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama conformance check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check
 
 ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check client-check
 
@@ -150,6 +150,9 @@ digest-canonical:
 	CARGO_TARGET_DIR="$(CURDIR)/target/digest-canonical" cargo run --quiet --manifest-path "$$tmp/Cargo.toml"
 
 e2e: e2e-providers e2e-ollama
+
+conformance:
+	cargo test --features openai,anthropic,gemini --test provider_conformance -- --test-threads=1
 
 e2e-providers:
 	LOOPCTL_E2E=1 cargo test --features ollama,openai,anthropic,gemini,grok,deepseek,zai --test provider_e2e -- --nocapture --test-threads=1

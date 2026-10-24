@@ -6,6 +6,7 @@
 //! See the sub-modules for detailed documentation.
 
 pub mod error;
+pub mod probe;
 use crate::message::Message;
 use crate::stream::{StreamEvent, StreamStopReason, Usage};
 use crate::tool::ToolSchema;
@@ -14,6 +15,17 @@ use futures::Stream;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+/// The refusal a client answers when it has no model-listing endpoint.
+///
+/// One spelling for two sites: the [`ApiClient::list_models`] default
+/// and the testing mock's unscripted state, so a consumer's error path
+/// — and the [`Unsupported`](probe::ProbeClass::Unsupported)
+/// classification hanging off it — reads identically against mock and
+/// reality. Both sites pin the rendered message by exact text, so
+/// rewording this const moves the two pins together or CI says so.
+pub(crate) const UNSUPPORTED_LISTING_MESSAGE: &str =
+    "this client does not expose a model listing (list_models)";
 
 /// A request to an LLM provider — the conversation, system prompt, and tools.
 ///
@@ -273,6 +285,117 @@ pub trait ApiClient: Send + Sync {
     /// consult this once per run without paying a request per call.
     fn model_context_window(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
         Box::pin(async { None })
+    }
+
+    /// List the models this endpoint actually serves.
+    ///
+    /// The discovery half of the provider-truth surface: what a
+    /// health check or a model picker asks before spending a
+    /// completion. Each entry carries
+    /// [`ModelInfo::metadata`](probe::ModelInfo::metadata) with its
+    /// provenance marked — provider-disclosed facts (Gemini's listing
+    /// `inputTokenLimit`) win over the crate's
+    /// [`curated_model_metadata`](probe::curated_model_metadata)
+    /// opinions, which fill only the gaps.
+    ///
+    /// The default answers [`ApiError::Config`] — "this client kind has no
+    /// listing endpoint" — classified as
+    /// [`ProbeClass::Unsupported`](probe::ProbeClass::Unsupported), never
+    /// an empty list: a client that cannot answer says so instead of
+    /// pretending the endpoint had no models. Overrides:
+    ///
+    /// - `openai`: `GET {base}/models`; on a genuine `404` (no OpenAI-style
+    ///   route) falls back to Ollama's `GET /api/tags`, so one client
+    ///   covers both spellings of the self-hosted wire. Failures keep the
+    ///   providers' own classification ([`ProbeClass`](probe::ProbeClass)
+    ///   reads them); if the fallback also fails, the original error
+    ///   surfaces with its forensics intact. The `ping` verb shares this
+    ///   route and its fallback, so a tags-only server pings as live.
+    /// - `anthropic`: `GET {base}/v1/models` with the credential headers;
+    ///   `has_more` continuation is not followed — page one is the bound.
+    /// - `gemini`: `GET {base}/models`, entries carrying their disclosed
+    ///   input-token limit; `nextPageToken` continuation is not followed,
+    ///   the same first-page bound.
+    /// - `bedrock`: `GET` the SigV4-signed control-plane
+    ///   `/foundation-models` — catalog truth, not account entitlement;
+    ///   `nextToken` continuation is not followed, the same first-page
+    ///   bound.
+    ///
+    /// The two outcomes stay exact: either a classified failure, or a
+    /// listing stating exactly what the endpoint answered within this
+    /// surface's documented bound — **the endpoint's own first page**.
+    /// Paginated catalogs (Anthropic's `has_more`, Gemini's
+    /// `nextPageToken`, Bedrock's `nextToken`) answer page one;
+    /// continuation chaining is deliberately unshipped and the bound
+    /// carries it, with no flag on the result. What a caller can always
+    /// rely on: a success is complete within the bound, and a failure is
+    /// never a short list wearing a success's face.
+    fn list_models(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<probe::ModelInfo>, ApiError>> + Send + '_>> {
+        Box::pin(async { Err(ApiError::config(UNSUPPORTED_LISTING_MESSAGE)) })
+    }
+
+    /// Liveness-probe the endpoint without spending a completion.
+    ///
+    /// The health half of the provider-truth surface: a cheap request to
+    /// a metadata route (listing endpoints are the universal choice —
+    /// every client that overrides this has one, and each takes its
+    /// listing's full route set, fallbacks included) returning the
+    /// [`probe::PingReport`] evidence a caller reports instead of a bare
+    /// boolean: latency, the rate-limit headers the answer carried, the
+    /// request id a support desk could look up.
+    ///
+    /// The default sends one minimal non-streaming request
+    /// ([`create_message`](Self::create_message) with a single "ping"
+    /// user message) so every client is probeable even without a
+    /// metadata route; callers on a metered hosted API should prefer the
+    /// clients whose override uses the listing route instead of tokens.
+    /// A probe that failed returns the classified [`ApiError`] — the
+    /// auth / throttle / network distinction a health check exists to
+    /// make survives the probe path ([`ProbeClass::from_error`]
+    /// reads it), and a default-path failure carries the full response
+    /// forensics ([`provider_meta`](ApiError::provider_meta)) exactly
+    /// like a completion failure.
+    ///
+    /// [`ProbeClass::from_error`]: probe::ProbeClass::from_error
+    fn ping(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<probe::PingReport, ApiError>> + Send + '_>> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let request = StreamRequest::new(vec![Message::user("ping")]);
+            self.create_message(&request)
+                .await
+                .map(|_| probe::PingReport::new(started.elapsed()))
+        })
+    }
+
+    /// What the client knows about one model id — window, modalities,
+    /// capabilities, and who said so.
+    ///
+    /// The metadata half of the discovery surface and the single funnel
+    /// a context-window planner or capability-gated request shaping
+    /// asks through. The default consults only the crate's
+    /// [`curated_model_metadata`](probe::curated_model_metadata) table:
+    /// a known family answers with the published values marked
+    /// [`MetadataSource::Curated`](probe::MetadataSource::Curated), an
+    /// unknown id answers fully unreported — never a plausible zero.
+    ///
+    /// The `openai` client additionally folds in the wire-probed window
+    /// (the same cached probe behind
+    /// [`model_context_window`](Self::model_context_window)) when asked
+    /// about *its own* model, merged per
+    /// [`ModelMetadata::merged`](probe::ModelMetadata::merged) so the
+    /// disclosed number wins and the provenance says so. It performs no
+    /// request for any other model id, keeping the metadata path
+    /// probe-budget-neutral for callers that enumerate listings.
+    fn model_metadata(
+        &self,
+        model: &str,
+    ) -> Pin<Box<dyn Future<Output = probe::ModelMetadata> + Send + '_>> {
+        let curated = probe::curated_model_metadata(model);
+        Box::pin(async move { curated.unwrap_or_else(probe::ModelMetadata::unreported) })
     }
 
     /// Stream messages from the LLM provider.
@@ -883,6 +1006,95 @@ mod tests {
         assert!(
             matches!(&first, Some(Err(crate::api::error::ApiError::Config(_)))),
             "doc: unsupported option fields yield an ApiError::config error as the first item; got {first:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_listing_refuses_loudly_and_metadata_stays_honest() {
+        use crate::api::probe::{MetadataSource, ModelMetadata, ProbeClass};
+
+        let client = MockClient::new("test-model");
+
+        let err = client
+            .list_models()
+            .await
+            .expect_err("the trait default must refuse, never fabricate an empty catalog");
+        assert_eq!(
+            ProbeClass::from_error(&err),
+            ProbeClass::Unsupported,
+            "a client kind with no listing answers as a capability statement: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Configuration error: this client does not expose a model listing (list_models)",
+            "the refusal is the shared message rendered once — the mock's \
+             unscripted refusal must read byte-identical to this"
+        );
+
+        let known = client.model_metadata("gpt-4o").await;
+        assert_eq!(known.source, MetadataSource::Curated);
+        assert_eq!(known.context_window, Some(128_000));
+
+        let unknown = client.model_metadata("no-such-family").await;
+        assert_eq!(
+            unknown,
+            ModelMetadata::unreported(),
+            "an id outside the curated families answers unreported, never plausible"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_ping_answers_through_create_message() {
+        let client = MockClient::new("test-model");
+        let report = client
+            .ping()
+            .await
+            .expect("the default ping rides create_message, which every client implements");
+        assert_eq!(
+            report.rate_limit, None,
+            "a mock answer carries no forensics; the report must not invent any"
+        );
+        assert_eq!(report.request_id, None);
+        assert!(
+            report.latency.as_secs() < 5,
+            "the latency is the measured round trip, not a fabricated constant"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_ping_forwards_the_wire_failure_untouched() {
+        use crate::api::probe::ProbeClass;
+
+        struct FailingClient;
+
+        impl ApiClient for FailingClient {
+            fn model(&self) -> String {
+                "failing".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send>> {
+                Box::pin(futures::stream::empty())
+            }
+            fn create_message(
+                &self,
+                _request: &StreamRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>>
+            {
+                Box::pin(async { Err(ApiError::auth_invalid_key("listed for the probe")) })
+            }
+        }
+
+        let err = FailingClient
+            .ping()
+            .await
+            .expect_err("a failing completion path must fail the default ping too");
+        assert_eq!(
+            ProbeClass::from_error(&err),
+            ProbeClass::Auth,
+            "the auth-vs-throttle-vs-network distinction a health check exists to \
+             make must survive the default probe path: {err}"
         );
     }
 }

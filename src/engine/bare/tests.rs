@@ -4356,7 +4356,7 @@ async fn a_declined_salvage_compaction_ends_the_run() {
     );
 }
 
-#[cfg(feature = "streaming")]
+#[cfg(all(feature = "streaming", feature = "testing"))]
 #[tokio::test]
 async fn a_tool_carrying_length_cut_is_an_ordinary_tool_turn_not_a_salvage() {
     // The salvage arms on a completion that stopped at the output
@@ -7942,7 +7942,7 @@ async fn a_double_retry_numbers_attempts_consecutively() {
 }
 
 #[tokio::test]
-#[cfg(feature = "streaming")]
+#[cfg(all(feature = "streaming", feature = "testing"))]
 async fn a_clean_stream_fires_no_attempt_reset() {
     let capture = Arc::new(ResetCapture {
         log: Arc::new(Mutex::new(Vec::new())),

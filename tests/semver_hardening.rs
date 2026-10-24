@@ -266,3 +266,87 @@ fn old_turn_json_deserializes_with_zero_detail() {
         "a pre-detail turn record deserializes with unreported usage detail"
     );
 }
+
+#[test]
+fn probe_types_build_through_their_constructors() {
+    use loopctl::api::error::ApiError;
+    use loopctl::api::probe::{
+        MetadataSource, Modality, ModelCapabilities, ModelInfo, ModelMetadata, PingReport,
+        ProbeClass, curated_model_metadata,
+    };
+
+    let info = ModelInfo::new("gpt-4o")
+        .with_owned_by("openai")
+        .with_created("1721172744")
+        .with_size_bytes(1)
+        .with_metadata(ModelMetadata::disclosed_context_window(128_000));
+    assert_eq!(info.id, "gpt-4o");
+    assert_eq!(info.created.as_deref(), Some("1721172744"));
+
+    let caps = ModelCapabilities::unreported()
+        .with_tool_calling(true)
+        .with_structured_output(false);
+    assert_eq!(caps.tool_calling, Some(true));
+    assert_eq!(caps.structured_output, Some(false));
+
+    let curated = curated_model_metadata("gpt-4o").expect("the gpt-4o family is curated");
+    let merged = ModelMetadata::merged(
+        Some(&ModelMetadata::disclosed_context_window(9)),
+        Some(&curated),
+    );
+    assert_eq!(merged.context_window, Some(9), "disclosure wins");
+    assert_eq!(
+        merged.capabilities.tool_calling, curated.capabilities.tool_calling,
+        "curation fills the gap"
+    );
+    assert_eq!(merged.source, MetadataSource::DisclosedAndCurated);
+
+    assert_eq!(Modality::from_wire_token("AUDIO"), Some(Modality::Audio));
+    assert_eq!(
+        ProbeClass::from_error(&ApiError::auth("x")),
+        ProbeClass::Auth
+    );
+    let report = PingReport::new(std::time::Duration::from_millis(3));
+    assert_eq!(report.request_id, None);
+    assert_eq!(report.rate_limit, None);
+}
+
+#[test]
+fn probe_enums_carry_their_growth_marker() {
+    // Compile pin: every new probe enum is `#[non_exhaustive]`, so an
+    // outside matcher needs a wildcard arm. Enumerating every variant
+    // *and* a wildcard compiles quietly only while the marker holds:
+    // drop it, the wildcard arm becomes unreachable, and
+    // `unreachable_patterns` fails the build under CI's `-D warnings`.
+    use loopctl::api::probe::{MetadataSource, Modality, ProbeClass};
+
+    let modality = match Modality::Text {
+        Modality::Text
+        | Modality::Image
+        | Modality::Audio
+        | Modality::Video
+        | Modality::Embedding
+        | _ => true,
+    };
+    let source = match MetadataSource::Unreported {
+        MetadataSource::Unreported
+        | MetadataSource::Disclosed
+        | MetadataSource::Curated
+        | MetadataSource::DisclosedAndCurated
+        | _ => true,
+    };
+    let class = match ProbeClass::Auth {
+        ProbeClass::Auth
+        | ProbeClass::RateLimited
+        | ProbeClass::Server
+        | ProbeClass::Answered
+        | ProbeClass::Network
+        | ProbeClass::Unsupported
+        | ProbeClass::Other
+        | _ => true,
+    };
+    assert!(
+        modality && source && class,
+        "the marker sweep is a compile pin, not a behavior sweep"
+    );
+}

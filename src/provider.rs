@@ -98,13 +98,23 @@
 //! no headers. Remaining quota is *reported* here, never *acted on* —
 //! a `remaining: 1` does not preempt the retry ladder.
 
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
 use crate::api::error::ApiError;
 #[cfg(any(feature = "anthropic", feature = "gemini"))]
 use crate::message::{MessagePart, Role};
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 use futures::StreamExt;
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
 use std::time::Duration;
 
 // SSE line-framing shared by every streaming provider. Each provider keeps
@@ -116,10 +126,20 @@ mod sse;
 // Provider response-header forensics: request-id and rate-limit
 // capture at HTTP time, the advisory per-client snapshot slot, and the
 // failure telemetry events. One implementation, every provider inherits.
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
 mod forensics;
 
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
 pub(crate) use forensics::RateLimitSlot;
 
 /// Extract the payload of an SSE `data:` field line, or `None` for any other
@@ -291,7 +311,12 @@ pub(super) async fn read_error_body(resp: reqwest::Response) -> String {
 /// only: the variant choice and every predicate
 /// ([`is_retryable`](ApiError::is_retryable), [`code`](ApiError::code))
 /// read status and message, never meta.
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
 fn classify_error_response(
     status: u16,
     body: String,
@@ -303,7 +328,12 @@ fn classify_error_response(
 
 /// The pure status→variant decision, shared by the meta-attaching entry
 /// point and the unit pins that exercise the shape without headers.
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
 fn classify_error_response_inner(
     status: u16,
     body: String,
@@ -315,6 +345,110 @@ fn classify_error_response_inner(
         429 | 503 | 529 => ApiError::rate_limited(format!("HTTP {status}: {body}"), retry_after),
         _ => ApiError::http_with_status(status, body),
     }
+}
+
+/// Total deadline for one metadata or discovery probe request.
+///
+/// The probes ride the clients' pooled HTTP layer but override its
+/// read-idleness timeout with this shorter per-request deadline — a
+/// total bound that covers connecting through body completion, so an
+/// endpoint that accepts the connection and never answers costs probe
+/// seconds, not the conversational timeout's minutes. The metadata
+/// probes answer `None` (fail-soft) when it fires; the discovery and
+/// liveness probes surface it as a transport-classified
+/// [`ApiError::Http`] (no response ever arrived, so the classification
+/// says "never answered", never a guessed status).
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build the classified [`ApiError`] for a non-success response.
+///
+/// The failure half of [`post_json_checked`], extracted so the probe
+/// GETs share one classification site: reads the `Retry-After` advice
+/// while the response is in hand, captures the response forensics,
+/// records the rate-limit slot, logs the wire-failure telemetry, reads
+/// the capped diagnostic body, and maps the status through
+/// [`classify_error_response`] — in that exact order, identical to
+/// what the POST path did inline before the extraction. A probe failure
+/// therefore carries the same variant, the same `Retry-After`, and the
+/// same [`ProviderMeta`](crate::api::error::ProviderMeta) as a
+/// completion failure off the same endpoint.
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
+async fn response_failure_error(
+    resp: reqwest::Response,
+    rate_limit: Option<&RateLimitSlot>,
+) -> ApiError {
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::api::error::parse_retry_after);
+    let meta = forensics::capture_provider_meta(resp.headers());
+    if let Some(slot) = rate_limit {
+        slot.record(resp.headers());
+    }
+    forensics::log_wire_failure(status.as_u16(), &meta);
+    let body_text = read_error_body(resp).await;
+    classify_error_response(status.as_u16(), body_text, retry_after, meta)
+}
+
+/// Send a credentialed GET and hand back a success response, classifying
+/// every other outcome through the same path as the POST clients.
+///
+/// The shared transport for the discovery and liveness surface
+/// ([`list_models`](crate::api::ApiClient::list_models),
+/// [`ping`](crate::api::ApiClient::ping)): applies `headers` verbatim,
+/// caps the request at [`PROBE_TIMEOUT`] (probes must never inherit the
+/// conversational timeout), records the rate-limit slot from a
+/// successful answer, and on any non-success runs
+/// [`response_failure_error`] — auth, throttle, and server failures
+/// reach a probe caller with exactly the variants and forensics a
+/// completion failure carries. A transport failure (or the deadline
+/// firing) maps to [`ApiError::http`] with the wire-failure transport
+/// telemetry logged, preserving the "never answered" classification the
+/// probe caller must be able to tell from a credential rejection.
+///
+/// # Errors
+///
+/// Returns [`ApiError::http`] on transport failure or deadline elapse,
+/// or the classified variant for any non-success status.
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
+pub(super) async fn get_checked(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
+    rate_limit: Option<&RateLimitSlot>,
+) -> Result<reqwest::Response, ApiError> {
+    let request = headers.iter().fold(client.get(url), |req, (name, value)| {
+        req.header(name.clone(), value.clone())
+    });
+    let resp = request.timeout(PROBE_TIMEOUT).send().await.map_err(|e| {
+        forensics::log_transport_failure(&e.to_string());
+        ApiError::http(e.to_string())
+    })?;
+    if resp.status().is_success() {
+        if let Some(slot) = rate_limit {
+            slot.record(resp.headers());
+        }
+        return Ok(resp);
+    }
+    Err(response_failure_error(resp, rate_limit).await)
 }
 
 /// Send a JSON POST and classify non-success responses into structured
@@ -371,23 +505,7 @@ pub(super) async fn post_json_checked(
         }
         return Ok(resp);
     }
-    let retry_after = resp
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(crate::api::error::parse_retry_after);
-    let meta = forensics::capture_provider_meta(resp.headers());
-    if let Some(slot) = rate_limit {
-        slot.record(resp.headers());
-    }
-    forensics::log_wire_failure(status.as_u16(), &meta);
-    let body_text = read_error_body(resp).await;
-    Err(classify_error_response(
-        status.as_u16(),
-        body_text,
-        retry_after,
-        meta,
-    ))
+    Err(response_failure_error(resp, rate_limit).await)
 }
 
 /// Shared HTTP-client configuration embedded by every provider builder.
@@ -2413,6 +2531,12 @@ mod tests {
     }
 
     /// Build a `Role::System` message carrying the given text parts.
+    ///
+    /// Test helper for the request-shaping pins on the Anthropic and
+    /// Gemini paths, where the system lane arrives as text parts rather
+    /// than a plain string; the feature gate mirrors the two providers
+    /// whose builders it feeds. Production code builds system lanes
+    /// through the request builders directly.
     #[cfg(any(feature = "anthropic", feature = "gemini"))]
     fn sys_msg(texts: &[&str]) -> crate::message::Message {
         use crate::message::{MessagePart, Role};
@@ -2924,5 +3048,218 @@ mod tests {
             carried.to_string().ends_with(" [req req-7]"),
             "the id the response carried surfaces in the diagnostic text: {carried}"
         );
+    }
+
+    #[cfg(feature = "openai")]
+    fn client_at(base_url: &str) -> OpenAiClient {
+        OpenAiClient::builder()
+            .with_api_key("probe-key")
+            .with_base_url(base_url)
+            .with_model("probe-model")
+            .build()
+            .expect("a builder pointed at a local URL builds")
+    }
+
+    #[cfg(feature = "openai")]
+    async fn refused_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn list_models_classifies_auth_vs_rate_limit_vs_network() {
+        use crate::api::ApiClient;
+        use crate::api::error::ErrorCode;
+        use crate::api::probe::ProbeClass;
+
+        let cases = [
+            (401_u16, ErrorCode::AuthInvalidKey, ProbeClass::Auth),
+            (403, ErrorCode::AuthFailed, ProbeClass::Auth),
+            (429, ErrorCode::ApiRateLimited, ProbeClass::RateLimited),
+            (500, ErrorCode::HttpResponseError, ProbeClass::Server),
+            (404, ErrorCode::HttpRequestError, ProbeClass::Answered),
+        ];
+        for (status, expected_code, expected_class) in cases {
+            let headers = if status == 429 {
+                "Retry-After: 7".to_string()
+            } else {
+                String::new()
+            };
+            let (url, handle) = serve_once(status, headers, b"nope".to_vec()).await;
+            let err = client_at(&url)
+                .list_models()
+                .await
+                .expect_err("a failing listing must return the classified error");
+            assert_eq!(
+                err.code(),
+                expected_code,
+                "{status} must classify to {expected_code:?} on the listing path, got {err:?}"
+            );
+            assert_eq!(
+                ProbeClass::from_error(&err),
+                expected_class,
+                "{status} must read as {expected_class:?} through the probe classifier, got {err:?}"
+            );
+            if status == 429 {
+                match &err {
+                    ApiError::RateLimit { retry_after, .. } => assert_eq!(
+                        retry_after,
+                        &Some(std::time::Duration::from_secs(7)),
+                        "the throttle's advice reaches the probe caller intact"
+                    ),
+                    other => panic!("429 must classify as RateLimit, got {other:?}"),
+                }
+            }
+            handle.await.unwrap();
+        }
+
+        let err = client_at(&refused_url().await)
+            .list_models()
+            .await
+            .expect_err("a dead endpoint must fail the listing, never an empty success");
+        assert_eq!(
+            err.code(),
+            ErrorCode::HttpConnectionError,
+            "no response means a transport failure: {err:?}"
+        );
+        assert_eq!(
+            ProbeClass::from_error(&err),
+            ProbeClass::Network,
+            "an endpoint that never answered must read as Network, never as a credential problem: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn the_ping_probe_classifies_the_same_three_ways() {
+        use crate::api::ApiClient;
+        use crate::api::probe::ProbeClass;
+
+        for (status, expected_class) in [
+            (401_u16, ProbeClass::Auth),
+            (429, ProbeClass::RateLimited),
+            (500, ProbeClass::Server),
+        ] {
+            let (url, handle) = serve_once(status, String::new(), b"nope".to_vec()).await;
+            let err = client_at(&url)
+                .ping()
+                .await
+                .expect_err("a failing endpoint must fail the ping");
+            assert_eq!(
+                ProbeClass::from_error(&err),
+                expected_class,
+                "{status} must reach the same probe class through ping as through any wire call, got {err:?}"
+            );
+            handle.await.unwrap();
+        }
+
+        let err = client_at(&refused_url().await)
+            .ping()
+            .await
+            .expect_err("a refused connection must fail the ping as Network");
+        assert_eq!(
+            ProbeClass::from_error(&err),
+            ProbeClass::Network,
+            "the auth-vs-429-vs-network distinction must survive the probe path: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn probe_failures_carry_the_response_forensics() {
+        use crate::api::ApiClient;
+
+        let (url, handle) = serve_once(
+            401,
+            "x-request-id: probe-req-1".to_string(),
+            b"bad key".to_vec(),
+        )
+        .await;
+        let err = client_at(&url)
+            .ping()
+            .await
+            .expect_err("the rejection must surface as an error");
+        assert_eq!(
+            err.provider_meta().request_id.as_deref(),
+            Some("probe-req-1"),
+            "a probe rejection carries the id a support desk would ask for, exactly like a completion failure"
+        );
+        assert!(
+            err.to_string().ends_with(" [req probe-req-1]"),
+            "the id rides the human-readable diagnostic text: {err}"
+        );
+        handle.await.unwrap();
+    }
+
+    #[cfg(feature = "openai")]
+    #[test]
+    fn the_three_wire_classifiers_agree_on_every_status() {
+        use crate::api::probe::ProbeClass;
+
+        // Provider classification, the rate-limit telemetry vocabulary, and
+        // the probe surface must read the same wire failure the same way —
+        // a divergence would make a health report contradict its own
+        // metrics. The sweep is exhaustive over the status band providers
+        // answer probes with, not a sample of it, and it runs twice: once
+        // over the classified shapes the clients build, once over the
+        // plain-`Http` shape a hand-built or legacy error carries.
+        for status in 400_u16..=529 {
+            let error = classify_error_response_inner(status, String::new(), None);
+            let probe = ProbeClass::from_error(&error);
+            let wire = forensics::wire_failure_class(status);
+            let expected = match wire {
+                "auth" => ProbeClass::Auth,
+                "rate_limit" => ProbeClass::RateLimited,
+                "server" => ProbeClass::Server,
+                // The telemetry's "other" bucket holds exactly the
+                // answered refusals the probe surface calls Answered.
+                _ if (400..500).contains(&status) => ProbeClass::Answered,
+                _ => ProbeClass::Other,
+            };
+            assert_eq!(
+                probe, expected,
+                "status {status}: probe classified {probe:?} where telemetry says {wire:?}"
+            );
+
+            // The unclassified leg: a status riding a plain `Http` reads
+            // by its family — the throttle statuses exception included,
+            // because 429/503/529 spell "retry later" whoever carries
+            // them. (401/403 answer here rather than as Auth on purpose:
+            // the Auth *class* tracks the Auth *variant*, which only the
+            // classifier builds — an unclassified 401 on the wire is the
+            // endpoint refusing, exactly as any other answered 4xx.)
+            let plain = ApiError::http_with_status(status, "swept");
+            let plain_probe = ProbeClass::from_error(&plain);
+            let plain_expected = match status {
+                429 | 503 | 529 => ProbeClass::RateLimited,
+                500..=599 => ProbeClass::Server,
+                _ => ProbeClass::Answered,
+            };
+            assert_eq!(
+                plain_probe, plain_expected,
+                "status {status}: a plain Http leg classified {plain_probe:?}"
+            );
+        }
+
+        // The throttle agreement is the one the vocabularies must never
+        // lose: whether the status rode the typed variant or a plain
+        // Http leg, "am I throttled?" answers the same way everywhere.
+        for status in [429_u16, 503, 529] {
+            let plain = ApiError::http_with_status(status, "throttled");
+            assert_eq!(
+                plain.is_rate_limited(),
+                matches!(ProbeClass::from_error(&plain), ProbeClass::RateLimited),
+                "status {status}: is_rate_limited and ProbeClass disagree on a plain Http leg"
+            );
+            let typed = classify_error_response_inner(status, String::new(), None);
+            assert!(
+                typed.is_rate_limited()
+                    && matches!(ProbeClass::from_error(&typed), ProbeClass::RateLimited),
+                "status {status}: the typed throttle shape must agree with itself"
+            );
+        }
     }
 }

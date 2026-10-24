@@ -209,6 +209,14 @@ pub struct MockApiClient {
     /// [`reports_usage`]: MockApiClient::reports_usage
     custom_usage: Option<Usage>,
 
+    /// The scripted model listing this mock serves, when configured.
+    ///
+    /// Set via [`with_models`](MockApiClient::with_models). `None`
+    /// keeps the trait default's loud "this client kind has no listing
+    /// endpoint" failure, so the unset mock is a faithful stand-in for
+    /// a client that cannot list.
+    models: Arc<Mutex<Option<Vec<crate::api::probe::ModelInfo>>>>,
+
     /// When set, every call returns an [`ApiError`] instead of a normal
     /// response.
     ///
@@ -443,7 +451,35 @@ impl MockApiClient {
             accept_tool_constraints: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reports_usage: true,
             custom_usage: None,
+            models: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Script the model listing this mock serves.
+    ///
+    /// [`list_models`](crate::api::ApiClient::list_models) then answers
+    /// exactly this vector — fixtures for probe-style callers get a
+    /// deterministic catalog, including metadata entries the curated
+    /// table would never invent on its own (an unknown id carrying a
+    /// disclosed window, say).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::api::ApiClient;
+    /// use loopctl::api::probe::ModelInfo;
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("test")
+    ///     .with_models(vec![ModelInfo::new("unit-test-model")]);
+    /// # let rt = tokio::runtime::Runtime::new().unwrap();
+    /// # let models = rt.block_on(client.list_models()).unwrap();
+    /// assert_eq!(models[0].id, "unit-test-model");
+    /// ```
+    #[must_use]
+    pub fn with_models(self, models: Vec<crate::api::probe::ModelInfo>) -> Self {
+        *crate::error::recover_guard(self.models.lock()) = Some(models);
+        self
     }
 
     /// Serve responses without any usage report.
@@ -1083,6 +1119,26 @@ impl ApiClient for MockApiClient {
     fn supports_tool_constraints(&self) -> bool {
         self.accept_tool_constraints
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Serve the scripted listing, or the trait default's loud refusal.
+    ///
+    /// Unscripted, the message matches the trait default verbatim: the
+    /// mock's unset state is meant to be indistinguishable from a
+    /// client kind that has no listing endpoint, so callers' error
+    /// paths (and the [`Unsupported`](crate::api::probe::ProbeClass::Unsupported)
+    /// classification) exercise identically against the mock and the
+    /// real world.
+    fn list_models(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<crate::api::probe::ModelInfo>, ApiError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            crate::error::recover_guard(self.models.lock())
+                .clone()
+                .ok_or_else(|| ApiError::config(crate::api::UNSUPPORTED_LISTING_MESSAGE))
+        })
     }
 
     /// Stream a canned sequence of [`StreamEvent`]s for the next response.
@@ -2774,6 +2830,43 @@ mod tests {
         assert!(!client.set_model(""));
         assert!(!client.set_model("   "));
         assert_eq!(client.model(), "model-a");
+    }
+
+    #[tokio::test]
+    async fn the_mock_serves_a_scripted_model_listing() {
+        use crate::api::probe::ModelInfo;
+
+        // Unscripted, the mock refuses exactly like the trait default —
+        // the stand-in for a client kind with no listing endpoint.
+        let unscripted = MockApiClient::new("mock");
+        let err = unscripted
+            .list_models()
+            .await
+            .expect_err("an unset mock has no listing to invent");
+        assert_eq!(
+            err.to_string(),
+            "Configuration error: this client does not expose a model listing (list_models)",
+            "the mock's refusal is the trait default's refusal byte for byte — \
+             a reworded default must move this pin with it"
+        );
+
+        let scripted = MockApiClient::new("mock")
+            .with_models(vec![ModelInfo::new("first"), ModelInfo::new("second")]);
+        let models = scripted
+            .list_models()
+            .await
+            .expect("the scripted catalog arrives verbatim");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "first");
+        assert_eq!(models[1].id, "second");
+
+        // The default ping rides the mock's own create_message — green
+        // when the scripted turn is green.
+        let pingeable = MockApiClient::new("mock").with_text_response("pong");
+        pingeable
+            .ping()
+            .await
+            .expect("the scripted turn answers the default ping");
     }
 }
 

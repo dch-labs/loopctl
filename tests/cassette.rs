@@ -72,7 +72,12 @@ const RESPONSE_HEADER_ALLOWLIST: [&str; 2] = ["content-type", "retry-after"];
 const SENSITIVE_QUERY_PARAMS: [&str; 3] = ["key", "api_key", "token"];
 
 /// Prefixes of provider-generated ids replaced with deterministic
-/// placeholders, so replay matching stays stable across recordings.
+/// placeholders during recording.
+///
+/// Message, call, and completion ids differ between two recordings of
+/// the same exchange, so replay matching would drift on every re-take;
+/// substituting a stable placeholder per prefix keeps a re-recorded
+/// cassette answering the same interactions without a hand-edit pass.
 const GENERATED_ID_PREFIXES: [&str; 5] = ["msg_", "call_", "cmpl-", "chatcmpl-", "resp_"];
 
 /// Whether this session records or replays.

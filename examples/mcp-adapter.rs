@@ -54,8 +54,9 @@ impl ServerHandler for GreetServer {}
 #[tokio::main]
 async fn main() {
     // 1. Connect an rmcp client to the in-process server and run the MCP
-    //    initialize handshake. In-process is the only constructor shipped;
-    //    a real server speaks through rmcp's own transport APIs.
+    //    initialize handshake. A real server connects through
+    //    McpClient::stdio (a spawned child) or McpClient::http_sse (an
+    //    HTTP endpoint).
     let client = McpClient::in_process(GreetServer::new())
         .await
         .expect("client initialize");

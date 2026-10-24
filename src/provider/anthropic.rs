@@ -687,9 +687,12 @@ impl ApiClient for AnthropicClient {
                 Some(&self.rate_limit),
             )
             .await?;
-            let resp = super::read_bounded_body(resp).await?;
+            let meta = crate::provider::forensics::capture_provider_meta(resp.headers());
+            let resp = super::read_bounded_body(resp)
+                .await
+                .map_err(|e| e.with_provider_meta(meta.clone()))?;
             let raw = serde_json::from_slice::<Value>(&resp)
-                .map_err(|e| ApiError::http(e.to_string()))?;
+                .map_err(|e| ApiError::http(e.to_string()).with_provider_meta(meta))?;
             Ok(Self::build_response(&raw))
         })
     }

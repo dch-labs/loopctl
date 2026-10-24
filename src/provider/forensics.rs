@@ -244,8 +244,12 @@ impl RateLimitSlot {
     /// `x-ratelimit-remaining: 0` is exactly the state the accessor and
     /// the event exist to preserve, and the 200-with-3-remaining is the
     /// interesting neighbor of the 429. Every response that carries the
-    /// family therefore narrates itself once at `DEBUG`; a
-    /// disabled-interest subscriber pays a callsite check, nothing more.
+    /// family therefore narrates its state once at `DEBUG`, and one below
+    /// the low-water line additionally **warns** at `WARN` — the visible
+    /// level of the documented "warns once per window" promise, hosts
+    /// filtering at `WARN` or above included; the latch bounds it, so it
+    /// cannot flood. A disabled-interest subscriber pays a callsite
+    /// check, nothing more.
     pub(crate) fn record(&self, headers: &HeaderMap) {
         let snapshot = capture_rate_limit(headers);
         if let Some(seen) = snapshot.as_ref() {
@@ -261,7 +265,7 @@ impl RateLimitSlot {
         match snapshot.as_ref().and_then(below_low_water) {
             Some((remaining, limit)) => {
                 if !state.warned {
-                    tracing::debug!(
+                    tracing::warn!(
                         target: "loopctl::provider::forensics",
                         remaining,
                         limit,

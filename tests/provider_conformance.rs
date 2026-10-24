@@ -35,8 +35,12 @@ use conformance::{CellStatus, ClientBundle, ProviderProfile, Violation};
 use futures::StreamExt;
 use loopctl::api::ApiClient;
 
-/// Corpus default for the local OpenAI-compatible dialect; the
-/// `model_override` fixture must prove the wire left it behind.
+/// Corpus default for the local OpenAI-compatible dialect.
+///
+/// The client seeds it the way every vendor client seeds its own
+/// default; the `model_override` fixture must prove the per-request
+/// override left it behind on the wire, or the scenario proves
+/// nothing and is rejected as evidence.
 #[cfg(feature = "openai")]
 const DEFAULT_OPENAI_COMPAT: &str = "qwen2.5:7b";
 
@@ -127,6 +131,12 @@ fn build_gemini(mock_base_url: &str, scenario: &Scenario) -> ClientBundle {
 }
 
 /// Every compiled profile, in matrix column order.
+///
+/// Assembled under the same feature gates as the clients themselves, so
+/// a build carries exactly the vendors it can actually drive; the
+/// artifact's column order and the completeness check both read this
+/// list, which is what makes a missing profile a finding rather than an
+/// omission.
 pub fn profiles() -> Vec<&'static ProviderProfile> {
     let mut profiles: Vec<&'static ProviderProfile> = Vec::new();
     #[cfg(feature = "openai")]
@@ -186,8 +196,12 @@ pub fn profiles() -> Vec<&'static ProviderProfile> {
     profiles
 }
 
-/// Providers the matrix lists even without a compiled profile, each
-/// with the reason its cells are not yet runnable.
+/// Providers the matrix lists even without a compiled profile.
+///
+/// Each reason names the gate that unblocks the column — the recording
+/// still to take, and what must route through it once taken — so a
+/// pending row reads as a declared gap, never a silently absent
+/// provider.
 fn pending_providers(compiled: &[&'static ProviderProfile]) -> Vec<(String, String)> {
     let mut pending = Vec::new();
     for name in [
@@ -210,14 +224,19 @@ fn pending_providers(compiled: &[&'static ProviderProfile]) -> Vec<(String, Stri
     }
     pending.push((
         "bedrock".to_string(),
-        "Bedrock cassettes pending — its column fills in when the hermetic \
-         SigV4 recording suite lands"
+        "Bedrock cassettes pending — its column fills once the hermetic \
+         SigV4 recording suite lands and its HTTP failures classify through \
+         the shared status table; cassettes alone cannot turn it"
             .to_string(),
     ));
     pending
 }
 
 /// Run one profile's battery and fail loudly, naming every violation.
+///
+/// This is the battery CI runs per vendor: every scenario's findings are
+/// collected before the assert, so one run reports every broken rule
+/// with its scenario and family instead of stopping at the first.
 async fn conformance_run(profile: &'static ProviderProfile) {
     let reports = conformance::run_provider(profile).await;
     let mut violations: Vec<&Violation> = Vec::new();
@@ -386,30 +405,40 @@ async fn conformance_matrix_artifact() {
         markdown.contains("*family exercised by at least one fixture*"),
         "the legend states what an exercised column means:\n{markdown}"
     );
-    let taxonomy = cell("| openai |", 3);
+    #[cfg(feature = "openai")]
+    {
+        let taxonomy = cell("| openai |", 3);
+        assert!(
+            taxonomy.starts_with("n/r — ") && taxonomy.contains("no failure to classify"),
+            "an unadjudicated family renders with its reason, never a bare `n/r`: {taxonomy}"
+        );
+        assert_eq!(
+            cell("| openai |", 0),
+            "pass",
+            "the families openai's fixtures did decide stay green beside the one they could not"
+        );
+        assert_eq!(
+            cell("| openai-compat |", 3),
+            "pass",
+            "openai-compat is the one vendor whose recording decides the taxonomy"
+        );
+    }
+    let bedrock = cell("| bedrock |", 0);
     assert!(
-        taxonomy.starts_with("n/r — ") && taxonomy.contains("no failure to classify"),
-        "an unadjudicated family renders with its reason, never a bare `n/r`: {taxonomy}"
-    );
-    assert_eq!(
-        cell("| openai |", 0),
-        "pass",
-        "the families openai's fixtures did decide stay green beside the one they could not"
-    );
-    assert_eq!(
-        cell("| openai-compat |", 3),
-        "pass",
-        "openai-compat is the one vendor whose recording decides the taxonomy"
-    );
-    assert!(
-        cell("| bedrock |", 0).starts_with("n/r — Bedrock cassettes pending"),
-        "a provider that has not run yet reads as a gap carrying its reason"
+        bedrock.starts_with("n/r — Bedrock cassettes pending") && bedrock.contains("classif"),
+        "a provider that has not run yet reads as a gap carrying its reason, \
+         and the reason names both gates the column waits on — the recording \
+         and the status classification — not cassettes alone: {bedrock}"
     );
 }
 
 /// Drive an in-memory (possibly mutated) fixture through the exact
-/// battery CI runs, and hand back what it finds — violations and
-/// fixture-integrity gaps alike.
+/// battery CI runs.
+///
+/// The meta-pin harness: it returns findings instead of asserting, so
+/// one test can demand both directions — the planted violation
+/// surfacing in its right family, and the unmutated fixture staying
+/// silent.
 #[cfg(feature = "openai")]
 async fn drive_battery(
     scenario: &Scenario,
@@ -458,10 +487,11 @@ fn openai_compat_scenario(name: &str) -> Scenario {
         .unwrap()
 }
 
-/// Cut a recorded stream below its provider terminal: the terminating
-/// chunk and `[DONE]` go, the text and the usage chunk stay — which is
-/// exactly what a re-record cut short looks like on disk, since this
-/// dialect reports usage *after* its finish reason.
+/// Cut a recorded stream below its provider terminal.
+///
+/// The terminating chunk and `[DONE]` go, the text and the usage chunk
+/// stay — exactly what a re-record cut short looks like on disk, since
+/// this dialect reports usage *after* its finish reason.
 #[cfg(feature = "openai")]
 fn cut_below_terminal(interactions: &mut Vec<cassette::Interaction>) {
     for interaction in interactions {
@@ -477,8 +507,11 @@ fn cut_below_terminal(interactions: &mut Vec<cassette::Interaction>) {
     }
 }
 
-/// A run that surfaced nothing: no events, no errors — what a client
-/// that correctly stays silent on a truncated stream produces.
+/// A run that surfaced nothing: no events, no errors.
+///
+/// What a client that correctly stays silent on a truncated stream
+/// produces — the expectation for the pins asserting a cut fixture
+/// earns no verdict and no fabricated terminal.
 #[cfg(feature = "openai")]
 fn silent_run() -> conformance::RunOutput {
     conformance::RunOutput {
@@ -928,5 +961,45 @@ fn the_retry_after_oracle_reads_both_wire_forms() {
         conformance::recorded_retry_after(&fixture_retrying("soon-ish")),
         None,
         "unparseable is no delay — on both sides of the check"
+    );
+}
+
+#[cfg(feature = "openai")]
+#[test]
+fn the_retry_after_oracle_reads_the_error_response() {
+    let warm_up = cassette::load_interactions("openai-compat", "minimal_text")
+        .into_iter()
+        .next()
+        .expect("the corpus fixture has one interaction");
+    let pair = |name: &str, value: &str| cassette::Pair {
+        name: name.to_string(),
+        value: value.to_string(),
+    };
+
+    // Warm-up carries headers but no advice; the 429 records the delay.
+    let mut quiet_warm_up = warm_up.clone();
+    quiet_warm_up.then.header = Some(vec![pair("x-ratelimit-remaining", "9")]);
+    let mut advised_failure = warm_up.clone();
+    advised_failure.then.status = Some(429);
+    advised_failure.then.header = Some(vec![pair("retry-after", "12")]);
+    assert_eq!(
+        conformance::recorded_retry_after(&[quiet_warm_up, advised_failure]),
+        Some(std::time::Duration::from_secs(12)),
+        "the advice recorded on the failed response is the answer — a \
+         header-carrying warm-up must not silence it"
+    );
+
+    // Mirrored: the warm-up advised a delay, the failure recorded none.
+    let mut advising_warm_up = warm_up.clone();
+    advising_warm_up.then.status = Some(200);
+    advising_warm_up.then.header = Some(vec![pair("retry-after", "5")]);
+    let mut bare_failure = warm_up;
+    bare_failure.then.status = Some(429);
+    bare_failure.then.header = Some(Vec::new());
+    assert_eq!(
+        conformance::recorded_retry_after(&[advising_warm_up, bare_failure]),
+        None,
+        "advice recorded on a success is not the failure's advice — reading \
+         it as such would blame a conformant client for fabricating"
     );
 }

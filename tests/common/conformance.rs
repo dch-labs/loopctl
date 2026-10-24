@@ -35,6 +35,10 @@ use loopctl::stream::StreamEvent;
 use crate::cassette;
 
 /// The contract families, in report order.
+///
+/// Column order of the rendered [`Matrix`] and the index basis of
+/// [`RunReport::families`]; a family is added by extending this table
+/// and writing its check, never by reordering the existing names.
 pub const FAMILIES: [&str; 5] = [
     "stream_lifecycle",
     "usage_reporting",
@@ -44,15 +48,36 @@ pub const FAMILIES: [&str; 5] = [
 ];
 
 /// One broken contract rule, named precisely enough to act on.
+///
+/// Produced by a family check instead of panicking, so one run reports
+/// every rule it broke, and the meta-pin's deliberately planted fixture
+/// edits surface as exactly this shape — named, attributed, actionable.
 #[derive(Debug, Clone)]
 pub struct Violation {
     /// The profile that ran.
+    ///
+    /// The matrix column the violation lands in; it names the wire
+    /// dialect the broken rule was adjudicated under.
     pub provider: String,
+
     /// The cassette scenario that was replayed.
+    ///
+    /// Names the recording that proves the violation, so the repair
+    /// starts at a known fixture rather than at a stack frame.
     pub scenario: String,
+
     /// The contract family that caught it (a [`FAMILIES`] name).
+    ///
+    /// The family tags *which* rule broke, keeping the two failure kinds
+    /// separable: a `Fail` can never be confused with a fixture gap or
+    /// a coverage hole, which ride [`CellStatus::NotRun`] instead.
     pub family: &'static str,
+
     /// What the contract promised and what the run did instead.
+    ///
+    /// Written to read on its own: the matrix cell quotes this text, so
+    /// the reader never has to cross-reference the scenario roll-up to
+    /// know what to fix.
     pub detail: String,
 }
 
@@ -67,8 +92,16 @@ impl std::fmt::Display for Violation {
 }
 
 /// One client built for one provider profile.
+///
+/// The bundle a [`ProviderProfile::build`] hands back after pointing a
+/// real client at the cassette server; the battery holds only the trait
+/// object, so every profile instantiates through one shape.
 pub struct ClientBundle {
     /// The client under conformance.
+    ///
+    /// Built fresh per scenario from dummy credentials and the mock
+    /// base URL supplied by the runner — never from the environment, so
+    /// a run cannot leak an ambient key onto the replay endpoint.
     pub client: Box<dyn ApiClient>,
 }
 
@@ -79,24 +112,56 @@ pub struct ClientBundle {
 /// the shared checks below and never changes.
 pub struct ProviderProfile {
     /// The cassette folder / dialect name.
+    ///
+    /// Keys fixture discovery (`cassettes/<provider>/…`) and doubles as
+    /// the provider's display name in every report and matrix column.
     pub provider: &'static str,
+
     /// The model clients are configured with when no per-request
-    /// override is in play — the `model_override` scenario's fixture
-    /// must prove it left this string behind.
+    /// override is in play.
+    ///
+    /// The `model_override` scenario is driven against this default, so
+    /// the recorded wire model must prove the request left this string
+    /// behind — a fixture that records the default proves nothing about
+    /// the override path and is rejected as evidence.
     pub default_model: &'static str,
-    /// A client builder: dummy credentials, the mock base URL, and the
-    /// model to configure (the `model_override` scenario is driven
-    /// against this default so the override is the only path to a hit).
+
+    /// A client builder for one scenario run.
+    ///
+    /// Hands back a [`ClientBundle`] wired to dummy credentials and the
+    /// mock server's base URL, configured with the profile's model; the
+    /// override scenario reaches a different name only through the
+    /// per-request options, which is the path under test.
     pub build: fn(mock_base_url: &str, scenario: &cassette::Scenario) -> ClientBundle,
+
     /// Whether the client truthfully claims tool-constraint support.
+    ///
+    /// Cross-checked against `supports_tool_constraints()` by
+    /// [`check_options_honoring`]: a probe that lies in either direction
+    /// is a violation, because the engine decides constraint emission
+    /// on the answer the probe gives.
     pub expects_tool_constraints: bool,
 }
 
 /// Everything one scenario run produced.
+///
+/// The interpreted evidence both halves of a verdict read from: the
+/// family checks assert against the events, the error taxonomy against
+/// the typed errors — a success run carries an empty `errors`, an error
+/// fixture reaches no terminal events.
 pub struct RunOutput {
     /// The interpreted events, in order.
+    ///
+    /// Exactly what the client streamed for the one request the cassette
+    /// replays — the sequence [`check_stream_lifecycle`] counts terminals
+    /// and lane pairs in.
     pub events: Vec<StreamEvent>,
+
     /// The typed errors, in order (success streams yield none).
+    ///
+    /// Errors the client surfaced to its caller, not transport noise
+    /// swallowed on the way; [`check_error_taxonomy`] classifies each
+    /// against the recorded status.
     pub errors: Vec<ApiError>,
 }
 
@@ -104,11 +169,13 @@ pub struct RunOutput {
 /// oracle side of the rate-limit arm.
 ///
 /// Reads through the crate's own parser so a delta-seconds **and** an
-/// HTTP-date recording mean the same thing to oracle and client.
+/// HTTP-date recording mean the same thing to oracle and client. The
+/// advice is sourced from the fixture's failed response (see
+/// [`error_interaction`]): a warm-up success that carried headers must
+/// neither hide nor impersonate the 429's own advice.
 pub fn recorded_retry_after(interactions: &[cassette::Interaction]) -> Option<std::time::Duration> {
-    interactions
-        .iter()
-        .find_map(|i| i.then.header.as_ref())
+    error_interaction(interactions)
+        .and_then(|interaction| interaction.then.header.as_ref())
         .and_then(|headers| {
             headers
                 .iter()
@@ -117,35 +184,94 @@ pub fn recorded_retry_after(interactions: &[cassette::Interaction]) -> Option<st
         })
 }
 
+/// The interaction holding the fixture's failed response, when present.
+///
+/// The **last** interaction with an error status is the one the client
+/// errored on — the response a `Retry-After` rule must be read from.
+/// When no interaction records a status at all (the legacy single-response
+/// fixture shape), the last one carrying headers stands in: an error
+/// rides at the end of a recording, never the front.
+fn error_interaction(interactions: &[cassette::Interaction]) -> Option<&cassette::Interaction> {
+    interactions
+        .iter()
+        .rev()
+        .find(|interaction| interaction.then.status.is_some_and(|status| status >= 400))
+        .or_else(|| {
+            interactions
+                .iter()
+                .rev()
+                .find(|interaction| interaction.then.header.is_some())
+        })
+}
+
 /// The first recorded response status, when the fixture carries one.
+///
+/// The shape discriminator for the fixture-driven arms: a status at or
+/// above 400 marks the recording as an error fixture, and a legacy
+/// single-response fixture without a status field reads as the success
+/// shape it was recorded before status fields existed.
 fn fixture_status(interactions: &[cassette::Interaction]) -> Option<u16> {
     interactions.first().and_then(|i| i.then.status)
 }
 
 /// One provider-reported usage pair; per-field `None` = unreported.
+///
+/// The oracle unit of the usage latch: each recorded report payload
+/// yields one of these, and [`UsageReport`] folds them with the same
+/// field-wise max the interpretation under test must apply.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UsagePair {
     /// Tokens in, when reported.
+    ///
+    /// Read from the dialect's input key (`prompt_tokens`,
+    /// `input_tokens`, `promptTokenCount`); `None` is absence, not zero.
     pub input: Option<u64>,
+
     /// Tokens out, when reported.
+    ///
+    /// The dialect's matching output key; `None` is absence — a
+    /// provider that reported 0 output did report, which is a different
+    /// fact this type keeps addressable.
     pub output: Option<u64>,
 }
 
-/// The fixture's usage oracle: every report seen, field-wise max-merged
-/// (the same latch rule the interpretation must apply — asserted below).
+/// The fixture's usage oracle: every recorded report, field-wise
+/// max-merged.
+///
+/// Applies the identical latch rule the client interpretation must
+/// apply, but to the recorded bytes rather than the event stream — so
+/// the check compares two honest readings of one fixture instead of a
+/// reading against a hardcoded expectation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UsageReport {
     /// Any provider reported input tokens.
+    ///
+    /// The field-wise max over every recorded report's input — the
+    /// latch shape the usage-merge contract pins, arrived at
+    /// independently of the client under test.
     pub input: Option<u64>,
+
     /// Any provider reported output tokens.
+    ///
+    /// Max-merged the same way; together with [`UsageReport::present`]
+    /// it separates "reported nothing" from "reported zero".
     pub output: Option<u64>,
-    /// Whether any usage appeared at all (presence is its own fact:
-    /// reported zero is still a report).
+
+    /// Whether any usage appeared at all.
+    ///
+    /// Presence is its own fact, distinct from the counts: a provider
+    /// that reported zeroes did report, and a stream that sent no usage
+    /// block must not be scored against `input`/`output` at all.
     pub present: bool,
 }
 
 impl UsageReport {
     /// Latch one report with the field-wise-max rule.
+    ///
+    /// Applies to the recorded bytes the identical merge the
+    /// interpretation under test must apply, so the comparison is two
+    /// honest readings of one fixture, never a number written by the
+    /// test author.
     pub fn absorb(&mut self, pair: UsagePair) {
         self.present = true;
         self.input = max_opt(self.input, pair.input);
@@ -153,6 +279,11 @@ impl UsageReport {
     }
 }
 
+/// Field-wise max of two optional counts, treating `None` as no report.
+///
+/// Two reports take the larger; a report beside an absence keeps the
+/// report; two absences stay absent — never folded to zero, which the
+/// oracle's unreported-is-not-zero rule depends on.
 fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.max(y)),
@@ -189,6 +320,12 @@ fn fixture_usage(interactions: &[cassette::Interaction]) -> UsageReport {
 
 /// Split a recorded response body into JSON payloads: SSE `data:`
 /// lines on streaming bodies, the whole body otherwise.
+///
+/// Streaming recordings wrap each chunk in an SSE frame and end on the
+/// `[DONE]` sentinel — only the framed payloads are JSON, and the
+/// sentinel is transport punctuation, not a payload. A body carrying
+/// no frames *is* one payload: the non-streaming shape, pretty-printed
+/// or not, lands in that branch.
 fn wire_payloads(body: &str) -> Vec<String> {
     let mut payloads = Vec::new();
     for line in body.lines() {
@@ -205,9 +342,13 @@ fn wire_payloads(body: &str) -> Vec<String> {
     payloads
 }
 
-/// Pull one JSON value's usage pair, trying every dialect's key set,
-/// descending into nesting (Anthropic nests usage under
-/// `message_start`/`message_delta` event objects).
+/// Pull one JSON value's usage pair, trying every dialect's key set.
+///
+/// The three spellings and their keys are enumerated on
+/// [`fixture_usage`]; Anthropic additionally nests usage inside
+/// `message_start` / `message_delta` event objects, so a value that
+/// carries none of the keys here descends into its objects and arrays
+/// looking for them.
 fn usage_from_value(value: &serde_json::Value) -> Option<UsagePair> {
     let num = |v: Option<&serde_json::Value>| v.and_then(serde_json::Value::as_u64);
     if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
@@ -238,6 +379,11 @@ fn usage_from_value(value: &serde_json::Value) -> Option<UsagePair> {
 }
 
 /// The terminal `MessageDelta`'s usage, if the stream produced one.
+///
+/// Read from the back: the contract places the terminal last, and usage
+/// that reached it is the number the oracle compares against — earlier
+/// reports without a terminal are the truncation case, screened out by
+/// the fixture-gap arms before this reads anything.
 fn terminal_usage(events: &[StreamEvent]) -> Option<loopctl::stream::Usage> {
     events.iter().rev().find_map(|event| match event {
         StreamEvent::MessageDelta(md) => md.usage,
@@ -246,6 +392,10 @@ fn terminal_usage(events: &[StreamEvent]) -> Option<loopctl::stream::Usage> {
 }
 
 /// The stop reason the terminal `MessageDelta` reported.
+///
+/// Read from the back for the same reason as [`terminal_usage`]; the
+/// absence of a parseable reason at a terminal is precisely what the
+/// routing family reports.
 fn reported_stop_reason(events: &[StreamEvent]) -> Option<String> {
     events.iter().rev().find_map(|event| match event {
         StreamEvent::MessageDelta(md) => md.delta.stop_reason.clone(),
@@ -254,10 +404,13 @@ fn reported_stop_reason(events: &[StreamEvent]) -> Option<String> {
 }
 
 /// Whether the recorded body shows the provider reaching its own
-/// terminal: an SSE `[DONE]`, or a JSON payload carrying a string-valued
-/// finish/stop marker. A truncated fixture (the meta-pin's plant) lacks
-/// all of these. Detection parses the payloads — providers pretty-print
-/// their JSON, and a space after the colon must not hide a terminal.
+/// terminal.
+///
+/// Either an SSE `[DONE]` or a JSON payload carrying a string-valued
+/// finish/stop marker — a truncated fixture (the meta-pin's plant)
+/// lacks both. Detection parses the payloads rather than matching
+/// substrings: providers pretty-print their JSON, and a space after
+/// the colon must not hide a terminal.
 fn provider_reached_terminal(interactions: &[cassette::Interaction]) -> bool {
     interactions.iter().any(|i| {
         i.then.body.as_deref().is_some_and(|body| {
@@ -271,6 +424,11 @@ fn provider_reached_terminal(interactions: &[cassette::Interaction]) -> bool {
 }
 
 /// One payload (or its nesting) carries a string-valued terminal field.
+///
+/// The JSON-semantic leg of [`provider_reached_terminal`]: it descends
+/// objects and arrays looking for the dialects' finish/stop fields
+/// holding string values, which substring matching lost on
+/// pretty-printed recordings.
 fn value_has_terminal(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => {
@@ -296,8 +454,14 @@ fn value_has_terminal(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Tool lanes the stream surfaced: lane index plus the name `PartStart`
-/// announced, in order.
+/// Tool lanes the stream surfaced: lane index plus the name
+/// `PartStart` announced, in order.
+///
+/// Identity is read at the lane's open, where the event contract puts
+/// it: the routing rule checks the *requested* name against this list,
+/// and a lane that opened without one stays listed with a `None` name
+/// rather than being skipped — an unnamed lane is a finding, not an
+/// absence.
 fn tool_lanes(events: &[StreamEvent]) -> Vec<(usize, Option<String>)> {
     events
         .iter()
@@ -314,6 +478,10 @@ fn tool_lanes(events: &[StreamEvent]) -> Vec<(usize, Option<String>)> {
 }
 
 /// Accumulated tool-argument JSON across a dialect's two delta shapes.
+///
+/// Concatenates the argument fragments the interpretation surfaced, in
+/// stream order, so the routing check parses one JSON document per lane
+/// instead of judging mid-flight fragments that cannot be valid yet.
 fn tool_argument_text(events: &[StreamEvent]) -> String {
     let mut text = String::new();
     for event in events {
@@ -333,8 +501,12 @@ fn tool_argument_text(events: &[StreamEvent]) -> String {
 }
 
 /// Lanes opened by `PartStart` and never closed by a matching
-/// `PartStop` (an indexless `PartStop` closes the oldest open lane —
-/// the legacy rule the event contract documents).
+/// `PartStop`.
+///
+/// An indexless `PartStop` closes the oldest open lane — the legacy
+/// rule the event contract documents — so a balanced stream reads empty
+/// here whatever spelling its closes used; a lane still open at the
+/// terminal is the lifecycle violation this channel reports.
 fn unclosed_lanes(events: &[StreamEvent]) -> Vec<usize> {
     let mut open: Vec<usize> = Vec::new();
     for event in events {
@@ -358,7 +530,12 @@ fn unclosed_lanes(events: &[StreamEvent]) -> Vec<usize> {
     open
 }
 
-/// A violation: family tag + detail.
+/// A violation before its provider and scenario are known: the family
+/// tag plus the detail.
+///
+/// The shape the family checks report in; [`run_scenario`] and the
+/// matrix builders dress each into a full [`Violation`] once the run
+/// context is available.
 type Finding = (&'static str, String);
 
 /// One battery run: named rule violations, the rules the fixture's shape
@@ -375,16 +552,32 @@ type Finding = (&'static str, String);
 #[derive(Debug, Default)]
 pub struct BatteryReport {
     /// Broken contract rules, named precisely enough to act on.
+    ///
+    /// The verdict channel: a non-empty list fails the run, and the
+    /// first entry's detail is what the matrix cell quotes for a `FAIL`.
     pub violations: Vec<Finding>,
+
     /// Rules the fixture's shape made unjudgeable, each with its reason.
+    ///
+    /// The fixture-integrity channel — it blames the recording, not the
+    /// client: this run ended below its provider terminal, so the
+    /// terminal-shaped rules in the list cannot be scored against it.
     pub fixture_gaps: Vec<Finding>,
+
     /// The fixture's shape cannot exercise this family at all, whatever
-    /// the client did — a coverage hole, naming the fixture to record.
+    /// the client did.
+    ///
+    /// The coverage channel: a hole in the corpus, not a verdict, naming
+    /// the fixture whose recording would close it.
     pub not_applicable: Vec<Finding>,
 }
 
 impl BatteryReport {
     /// Fold another family's outcome into this one, channel by channel.
+    ///
+    /// Channels never cross: a violation stays a violation no matter how
+    /// many gaps the sibling report contributes, which is what keeps
+    /// "not decided" from diluting — or hiding — "decided against".
     pub fn merge(&mut self, other: Self) {
         self.violations.extend(other.violations);
         self.fixture_gaps.extend(other.fixture_gaps);
@@ -393,18 +586,25 @@ impl BatteryReport {
 }
 
 /// A success-shaped fixture whose recorded provider stream never reaches
-/// its terminal — the shape that makes every terminal-shaped rule
-/// unjudgeable against it.
+/// its terminal.
+///
+/// The shape that makes every terminal-shaped rule unjudgeable against
+/// it: the recording stopped short, not the client, so checks report
+/// fixture gaps on this shape and the matrix renders the cell `n/r`
+/// rather than scoring silence either way.
 pub fn fixture_truncated(interactions: &[cassette::Interaction]) -> bool {
     !fixture_status(interactions).is_some_and(|s| s >= 400)
         && !provider_reached_terminal(interactions)
 }
 
 /// `stream_lifecycle`: exactly one terminal, nothing after it, balanced
-/// lanes — and on a fixture that ends before the provider's terminal, a
-/// gap rather than a verdict: the pinned client contract for a truncated
-/// stream is silence (the 0.3.0 no-synthetic-stop rule), so only a
-/// fabricated terminal is decidable there.
+/// lanes.
+///
+/// On a fixture that ends before the provider's terminal the family
+/// reports a gap rather than a verdict: the pinned client contract for a
+/// truncated stream is silence (the 0.3.0 no-synthetic-stop rule), so
+/// the run can only decide what it can actually see — a fabricated
+/// terminal is decidable, silence is not.
 pub fn check_stream_lifecycle(
     output: &RunOutput,
     interactions: &[cassette::Interaction],
@@ -917,35 +1117,68 @@ pub fn check_options_honoring(
     }
 }
 
-/// One cell of the matrix.
+/// One cell of the matrix: the verdict one (scenario, family) pair
+/// reached, or the reason none was reachable.
+///
+/// The states are deliberately asymmetric: only [`CellStatus::Pass`]
+/// required a check to actually adjudicate a fixture, so the rendered
+/// table cannot go green by silence — the failure mode every gap channel
+/// in this module exists to prevent.
 #[derive(Debug, Clone)]
 pub enum CellStatus {
     /// A check adjudicated this fixture against the family's rules and
     /// found nothing broken.
+    ///
+    /// The only state that renders `pass` in the matrix — reachable
+    /// exclusively when a check chose against a fixture it could judge.
     Pass,
+
     /// Violations, rendered.
+    ///
+    /// Carries every [`Violation`] the family named for this scenario;
+    /// the cell quotes the first, and [`Matrix::violations`] collects
+    /// the full list for the CI gate.
     Fail(Vec<Violation>),
+
     /// Nothing was decided — no cassette, a fixture cut below its
-    /// terminal, or a fixture whose shape cannot test this family. A
-    /// visible gap, never a silent green.
+    /// terminal, or a fixture whose shape cannot test this family.
+    ///
+    /// The reason string says which of the three it was and what would
+    /// close it. A visible gap, never a silent green.
     NotRun(String),
 }
 
 /// One (provider, scenario) run's outcome with per-family detail.
+///
+/// The grain the [`Matrix`] aggregates twice over: family cells roll up
+/// into the scenario-level [`RunReport::status`], and every scenario a
+/// provider ran rolls up into that provider's column verdict.
 #[derive(Debug, Clone)]
 pub struct RunReport {
     /// The profile that ran.
+    ///
+    /// The matrix column this report contributes to.
     pub provider: String,
+
     /// The scenario replayed.
+    ///
+    /// Names the cassette; a gap reason quotes it, so the recording to
+    /// take is identifiable from the report alone.
     pub scenario: String,
-    /// Per-family outcomes, in [`FAMILIES`] order. A family the fixture's
-    /// shape could not test is `NotRun` here even when the scenario as a
-    /// whole passed.
+
+    /// Per-family outcomes, in [`FAMILIES`] order.
+    ///
+    /// A family the fixture's shape could not test is `NotRun` here even
+    /// when the scenario as a whole passed — the per-family grain is
+    /// where coverage gaps live and stay visible.
     pub families: Vec<CellStatus>,
-    /// The scenario-level roll-up: `Fail` on any violation, `NotRun` on a
-    /// fixture-integrity gap or a missing cassette, `Pass` otherwise.
-    /// Coverage gaps stay at family level — a scenario that broke nothing
-    /// does not become `n/r` because one family had nothing to chew on.
+
+    /// The scenario-level roll-up of the family cells.
+    ///
+    /// `Fail` on any violation, `NotRun` on a fixture-integrity gap or a
+    /// missing cassette, `Pass` otherwise. Coverage gaps stay at family
+    /// level — a scenario that broke nothing does not become `n/r`
+    /// because one family had nothing to chew on.
     pub status: CellStatus,
 }
 
@@ -1106,6 +1339,10 @@ pub fn battery_findings(
 }
 
 /// Drive a whole profile: every scenario in the registry for it.
+///
+/// A scenario whose cassette is not on disk still lands in the output —
+/// as an all-`NotRun` report carrying the missing-cassette reason — so
+/// the column shows what is absent instead of going quiet about it.
 pub async fn run_provider(profile: &ProviderProfile) -> Vec<RunReport> {
     let mut reports = Vec::new();
     for scenario in cassette::scenarios()
@@ -1129,19 +1366,36 @@ pub async fn run_provider(profile: &ProviderProfile) -> Vec<RunReport> {
 }
 
 /// The matrix: providers × contract families, generated from runs.
+///
+/// Assembled fresh on every artifact run, so the published table is
+/// derived from what the battery decided this second — the drift a
+/// hand-maintained coverage table invites is structurally unavailable.
 pub struct Matrix {
     /// Column headers, provider display order.
+    ///
+    /// The providers that actually ran; providers still awaiting their
+    /// cassettes ride [`Matrix::pending`] so their gaps render too.
     pub providers: Vec<String>,
+
     /// One report per (provider, scenario) run, in column order.
+    ///
+    /// The raw grain: [`Matrix::family_verdict`] rolls these up per
+    /// column and [`Matrix::violations`] flattens their failures.
     pub reports: Vec<RunReport>,
+
     /// Providers listed without any run (e.g. awaiting their cassettes),
     /// each with the reason a cell is not yet runnable.
+    ///
+    /// Rendered as full gap rows: a pending provider is a visible hole
+    /// in every column, not a missing row.
     pub pending: Vec<(String, String)>,
 }
 
-/// The first violation a provider's column recorded for one family: the
-/// detail that makes a rendered `FAIL` actionable on its own, without the
-/// reader cross-referencing the scenario roll-up below the table.
+/// The first violation a provider's column recorded for one family.
+///
+/// The detail that makes a rendered `FAIL` actionable on its own line,
+/// scenario and promise included, without the reader cross-referencing
+/// the scenario roll-up below the table.
 fn failure_reason(provider: &str, family: usize, reports: &[RunReport]) -> String {
     for report in reports.iter().filter(|report| report.provider == provider) {
         let Some(CellStatus::Fail(violations)) = report.families.get(family) else {
@@ -1159,16 +1413,35 @@ fn failure_reason(provider: &str, family: usize, reports: &[RunReport]) -> Strin
 }
 
 /// How one provider's whole corpus settled a single contract family.
+///
+/// The column-level roll-up the matrix renders: the three states keep a
+/// failure, an adjudicated pass, and an honest "nothing could decide"
+/// distinct, so the table never blurs what broke with what was never
+/// tested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FamilyVerdict {
     /// Some scenario named a violation.
+    ///
+    /// The verdict that outranks all evidence: one adjudicated fixture
+    /// that broke a rule beats any number of fixtures that had nothing
+    /// to say about the family.
     Failed,
+
     /// Some check adjudicated a fixture and found nothing broken — the
     /// only state that earns a `pass` in the table.
+    ///
+    /// "Adjudicated" is the load-bearing word: a check that ran over
+    /// fixtures whose shape it could not judge contributes nothing here,
+    /// which is what keeps a lucky silence from reading as green.
     Exercised,
+
     /// No check could adjudicate any of this provider's fixtures: no
     /// cassette, a recording cut below its terminal, or a corpus with
-    /// nothing of the shape the family tests. Carries the reason.
+    /// nothing of the shape the family tests.
+    ///
+    /// The carried reason is the cell's text, naming what to record to
+    /// close the gap — the rendered table is a to-do list as much as a
+    /// scoreboard.
     Unproven(String),
 }
 
@@ -1205,8 +1478,13 @@ impl Matrix {
         )
     }
 
-    /// Render the matrix as markdown — the CI-visible "which providers
-    /// are proven" table, generated, never hand-edited.
+    /// Render the matrix as markdown — the CI-visible table of which
+    /// providers are proven.
+    ///
+    /// Generated, never hand-edited: every cell comes from
+    /// [`Matrix::family_verdict`] over the runs and every gap line from
+    /// the reports that carried it, so the published artifact cannot
+    /// claim more — or less — than the battery actually decided.
     pub fn render_markdown(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
         lines.push("# Provider conformance matrix".to_string());
@@ -1295,6 +1573,11 @@ impl Matrix {
     }
 
     /// Every violation from any run — CI fails on non-empty.
+    ///
+    /// Read from the scenario-level [`RunReport::status`] roll-up, so one
+    /// violation counts once however many families caught the same slip.
+    /// The table may legitimately show `n/r` cells while the corpus
+    /// grows; it may never show a rule broken.
     pub fn violations(&self) -> Vec<&Violation> {
         self.reports
             .iter()

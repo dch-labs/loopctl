@@ -46,7 +46,12 @@ mod contracts {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    /// Where the test server's base URL and accept-count live.
+    /// A one-shot mock origin every client under test is pointed at.
+    ///
+    /// Answers each accepted connection with exactly one pre-scripted
+    /// response — enough to drive one request through one client — and
+    /// hands the accept-loop's join handle back so a caller can prove
+    /// the server actually served what it scripted.
     pub(crate) struct TestServer {
         /// Base URL every provider client should be pointed at.
         ///
@@ -55,8 +60,11 @@ mod contracts {
         /// test is about response headers, not routing.
         pub base_url: String,
 
-        /// Join handle for the spawned server task; await it to assert it
-        /// served every expected request.
+        /// Join handle for the spawned server task.
+        ///
+        /// Awaiting it proves the accept loop completed the scripted
+        /// exchanges — a client that quietly never hit the mock fails
+        /// on this await, not on a later timeout.
         pub task: tokio::task::JoinHandle<()>,
     }
 
@@ -108,6 +116,10 @@ mod contracts {
     }
 
     /// Shorthand for the single-response shape most contracts need.
+    ///
+    /// One connection, one scripted status/reason/headers/body — the
+    /// shape every "one failure reaches the typed error" pin asks for;
+    /// scenarios needing per-connection variety drive [`serve`] itself.
     async fn serve_once(
         status: u16,
         reason: &str,
@@ -117,9 +129,11 @@ mod contracts {
         serve(status, reason, &[headers], body).await
     }
 
-    /// Serve an SSE 200 whose chunked body cuts off mid-frame: the first
-    /// SSE events arrive, then the reader's next chunk fetch fails
-    /// because the connection ends where no chunk terminator did.
+    /// Serve an SSE 200 whose chunked body cuts off mid-frame.
+    ///
+    /// The first SSE events arrive, then the reader's next chunk fetch
+    /// fails because the connection ends where no chunk terminator did
+    /// — the mid-stream transport failure, recorded as it looks live.
     async fn serve_truncated_stream(headers: &[(&str, &str)], first_events: &str) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -151,7 +165,31 @@ mod contracts {
         }
     }
 
+    /// Serve raw pre-rendered response bytes after reading one request.
+    ///
+    /// For framing shapes (an oversized declared length, malformed JSON
+    /// under a 200) that [`serve`] cannot render because it computes
+    /// `Content-Length` and picks the status line itself.
+    async fn serve_raw(response: String) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_full_request(&mut sock).await;
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        TestServer {
+            base_url: format!("http://{addr}"),
+            task,
+        }
+    }
+
     /// Read one HTTP/1.1 request (head plus body) off `sock`.
+    ///
+    /// Consumes the body to `Content-Length` before the mock answers:
+    /// answering early races the client's write half and surfaces as
+    /// connection resets that would be blamed on the client under test.
     async fn read_full_request(sock: &mut TcpStream) {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -184,6 +222,10 @@ mod contracts {
     }
 
     /// Build an OpenAI client pointed at `base`.
+    ///
+    /// A dummy credential over the mock origin — this suite is about
+    /// response-header forensics, never about authentication — and an
+    /// explicit base URL, so nothing here can reach a real endpoint.
     #[cfg(feature = "openai")]
     fn openai_at(base: &str) -> loopctl::provider::OpenAiClient {
         loopctl::provider::OpenAiClient::builder()
@@ -194,6 +236,10 @@ mod contracts {
     }
 
     /// Build an Anthropic client pointed at `base`.
+    ///
+    /// The same dummy-credential, explicit-origin shape as the OpenAI
+    /// builder, speaking the Messages wire where the forensics headers
+    /// arrive under Anthropic's own spelling.
     #[cfg(feature = "anthropic")]
     fn anthropic_at(base: &str) -> loopctl::provider::AnthropicClient {
         loopctl::provider::AnthropicClient::builder()
@@ -204,6 +250,9 @@ mod contracts {
     }
 
     /// Build a Gemini client pointed at `base`.
+    ///
+    /// The third dialect's twin of the OpenAI and Anthropic builders:
+    /// same mock contract, Gemini's request and error shapes.
     #[cfg(feature = "gemini")]
     fn gemini_at(base: &str) -> loopctl::provider::GeminiClient {
         loopctl::provider::GeminiClient::builder()
@@ -213,24 +262,40 @@ mod contracts {
             .unwrap()
     }
 
-    /// A 200 body each provider's non-streaming parser accepts.
+    /// A minimal 200 body the OpenAI chat-completions parser accepts.
+    ///
+    /// Rides the failure responses as the diagnostic body the error
+    /// text quotes, and anchors the framing pins — well-formed on
+    /// purpose, so whatever a pin corrupts or over-sizes is the only
+    /// malformed thing in flight.
     #[cfg(feature = "openai")]
     const OPENAI_OK: &str = "{\"id\":\"cmpl-1\",\"object\":\"chat.completion\",\"created\":1,\
         \"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\
         \"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\
         \"completion_tokens\":1,\"total_tokens\":2}}";
+    /// A minimal 200 body the Anthropic Messages parser accepts.
+    ///
+    /// The OpenAI twin's role on the Messages wire; bodies are kept
+    /// per-dialect because each parser rejects the others' shapes.
     #[cfg(feature = "anthropic")]
     const ANTHROPIC_OK: &str = "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\
         \"model\":\"claude-test\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\
         \"stop_reason\":\"end_turn\",\"stop_sequence\":null,\
         \"usage\":{\"input_tokens\":1,\"output_tokens\":2}}";
+    /// A minimal 200 body the Gemini generateContent parser accepts.
+    ///
+    /// The same fixture role on the Gemini wire, again valid enough
+    /// that any parse failure below belongs to the pin's mutation.
     #[cfg(feature = "gemini")]
     const GEMINI_OK: &str = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}],\
         \"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":\
         {\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}";
 
-    /// Drive one `create_message` and hand back the typed error, having
-    /// also asserted the server served its expected requests.
+    /// Drive one `create_message` and hand back the typed error.
+    ///
+    /// Also awaits the server task: a client that swallowed the error,
+    /// retried against the mock, or never sent the request fails this
+    /// receipt rather than drifting to a later assertion.
     async fn one_error(client: &impl ApiClient, server: TestServer) -> ApiError {
         let err = client
             .create_message(&StreamRequest::new(vec![]))
@@ -240,8 +305,12 @@ mod contracts {
         err
     }
 
-    /// Assert the 500's `x-request-id` reaches both the accessor and the
-    /// `Display` suffix, for one provider client.
+    /// Assert a 500's `x-request-id` reaches both accessor and display.
+    ///
+    /// One pin per client for the pair: `provider_meta()` carries the
+    /// id for machine consumers, the ` [req <id>]` suffix carries it
+    /// for the paste-into-a-ticket workflow — a variant losing either
+    /// half fails here instead of half-passing silently.
     async fn assert_request_id_reaches_error(client: &impl ApiClient, server: TestServer) {
         let err = one_error(client, server).await;
         let meta = err.provider_meta();
@@ -255,6 +324,91 @@ mod contracts {
             "the Display suffix carries the id for the paste-into-a-ticket \
              workflow: {err}"
         );
+    }
+
+    /// Assert a **2xx** failure past the status check still carries meta.
+    ///
+    /// A body the read bound refuses, or the parser refuses, is built
+    /// after the status already looked clean — the two arms where the
+    /// response's headers are out of reach unless captured the moment
+    /// the response opened; both must still name the request and quota.
+    async fn assert_2xx_failure_keeps_meta(client: &impl ApiClient, server: TestServer, id: &str) {
+        let err = one_error(client, server).await;
+        let meta = err.provider_meta();
+        assert_eq!(
+            meta.request_id.as_deref(),
+            Some(id),
+            "headers read while the response was open must reach \
+             provider_meta() even when the status succeeded: {err}"
+        );
+        assert!(
+            meta.rate_limit.is_some(),
+            "the quota family captured beside the id survives into the \
+             failure's meta: {err:?}"
+        );
+        assert!(
+            err.to_string().ends_with(&format!(" [req {id}]")),
+            "the Display suffix carries the id for the paste-into-a-ticket \
+             workflow: {err}"
+        );
+    }
+
+    /// A success status whose declared body length breaks the read bound:
+    /// the refusal to read the body still names its request.
+    #[tokio::test]
+    async fn nonstream_body_read_failure_carries_the_response_id() {
+        let oversized = |id: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 11000000\r\n\
+                 x-request-id: {id}\r\nx-ratelimit-remaining: 7\r\n\
+                 Connection: close\r\n\r\nshort"
+            )
+        };
+        #[cfg(feature = "openai")]
+        {
+            let server = serve_raw(oversized("body-openai")).await;
+            assert_2xx_failure_keeps_meta(&openai_at(&server.base_url), server, "body-openai")
+                .await;
+        }
+        #[cfg(feature = "anthropic")]
+        {
+            let server = serve_raw(oversized("body-anthropic")).await;
+            assert_2xx_failure_keeps_meta(
+                &anthropic_at(&server.base_url),
+                server,
+                "body-anthropic",
+            )
+            .await;
+        }
+        #[cfg(feature = "gemini")]
+        {
+            let server = serve_raw(oversized("body-gemini")).await;
+            assert_2xx_failure_keeps_meta(&gemini_at(&server.base_url), server, "body-gemini")
+                .await;
+        }
+    }
+
+    /// A success status whose body is not JSON: the parse failure still
+    /// names the request its response headers carried.
+    #[tokio::test]
+    async fn nonstream_json_parse_failure_carries_the_response_id() {
+        let headers: &[(&str, &str)] =
+            &[("x-request-id", "parse-1"), ("x-ratelimit-remaining", "7")];
+        #[cfg(feature = "openai")]
+        {
+            let server = serve_once(200, "OK", headers, "not-json{").await;
+            assert_2xx_failure_keeps_meta(&openai_at(&server.base_url), server, "parse-1").await;
+        }
+        #[cfg(feature = "anthropic")]
+        {
+            let server = serve_once(200, "OK", headers, "not-json{").await;
+            assert_2xx_failure_keeps_meta(&anthropic_at(&server.base_url), server, "parse-1").await;
+        }
+        #[cfg(feature = "gemini")]
+        {
+            let server = serve_once(200, "OK", headers, "not-json{").await;
+            assert_2xx_failure_keeps_meta(&gemini_at(&server.base_url), server, "parse-1").await;
+        }
     }
 
     /// A 500 with `x-request-id: abc` → the typed error names the request.
@@ -376,10 +530,12 @@ mod contracts {
         }
     }
 
-    /// Shared body of [`rate_limit_snapshot_captured_verbatim`]: the 429's
-    /// id, verbatim family on the error meta, and the same snapshot in the
-    /// client's advisory accessor — `last_rate_limit()` is inherent to
-    /// each client, so the caller hands in a read of it, taken after the
+    /// Shared body of [`rate_limit_snapshot_captured_verbatim`].
+    ///
+    /// Checks the 429's id, the verbatim quota family on the error
+    /// meta, and the same snapshot in the client's advisory accessor.
+    /// `last_rate_limit()` is inherent to each concrete client, so the
+    /// caller hands in a closure reading it, taken only after the
     /// failing request has settled.
     async fn assert_throttle_forensics(
         client: &impl ApiClient,
@@ -557,9 +713,12 @@ mod contracts {
         }
     }
 
-    /// Shared assertions of [`body_bound_unchanged`]: the error text is
-    /// capped near the 8 KiB diagnostic bound (plus the status/class
-    /// prose and the id suffix), and the id is attached regardless.
+    /// Shared assertions of [`body_bound_unchanged`].
+    ///
+    /// The error text stays capped near the 8 KiB diagnostic bound
+    /// (plus its status/class prose and the id suffix), and the id is
+    /// attached regardless — the bound is a size rule, never a license
+    /// to drop forensics.
     fn assert_forensics_survives_truncation(err: &ApiError) {
         let text = err.to_string();
         assert!(
@@ -632,6 +791,10 @@ mod contracts {
     }
 
     /// Drive one streaming call to its first (and expected) error.
+    ///
+    /// A stream that ends without error means the mock's mid-stream
+    /// failure never surfaced at the caller — that is the pin failing
+    /// loudly here, not a silent pass.
     async fn drain_to_error(client: &impl ApiClient) -> ApiError {
         let stream = client.stream_messages(&StreamRequest::new(vec![]));
         let mut stream = std::pin::pin!(stream);
@@ -643,8 +806,12 @@ mod contracts {
         panic!("the mocked stream must fail");
     }
 
-    /// Drive one streaming call to its first error, counting the Ok
-    /// events that preceded it — the proof the failure is mid-stream.
+    /// Drive one streaming call to its first error, counting the
+    /// successful events that preceded it.
+    ///
+    /// The count is the proof the failure is mid-stream: a header-time
+    /// failure would yield zero events, while the pins this serves need
+    /// real content delivered first.
     async fn drain_to_reader_error(client: &impl ApiClient) -> (usize, ApiError) {
         let stream = client.stream_messages(&StreamRequest::new(vec![]));
         let mut stream = std::pin::pin!(stream);
@@ -754,7 +921,11 @@ mod contracts {
         }
     }
 
-    /// The 429's advised delay still reaches the structured variant.
+    /// Assert the 429's advised delay still reaches the structured variant.
+    ///
+    /// Forensics must not cost behavior: `retry_after` parses to the
+    /// advised five seconds exactly as before the meta rode along, and
+    /// this pins it inside the same match that proves the meta arrived.
     fn assert_retry_delay_parsed(err: ApiError) {
         match err {
             ApiError::RateLimit { retry_after, .. } => assert_eq!(

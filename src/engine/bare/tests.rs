@@ -5606,61 +5606,6 @@ async fn the_success_turn_end_duration_excludes_the_context_recount() {
     );
 }
 
-/// A clock whose monotonic half advances a fixed step per read.
-///
-/// Deterministic timing without sleeps: every `monotonic()` call returns
-/// the base instant advanced by one step per prior read, so any duration
-/// the engine measures through the seam is an exact multiple of the step.
-#[derive(Debug)]
-struct StepClock {
-    /// The zeroth reading, captured once at construction.
-    ///
-    /// Every monotonic read returns this instant advanced by `step` times
-    /// the number of prior reads, so the sequence is reproducible from a
-    /// single captured base — no re-reading the real clock mid-test.
-    base: Instant,
-
-    /// The fixed advance per monotonic read.
-    ///
-    /// The quantum of every duration the engine can measure through the
-    /// seam: each elapsed span is an exact multiple of this step, which
-    /// the duration pins assert on.
-    step: Duration,
-
-    /// Reads served so far.
-    ///
-    /// Counts monotonic calls to derive the next reading's multiplier;
-    /// atomic because the engine may consult the clock from tool futures.
-    calls: AtomicUsize,
-}
-
-impl StepClock {
-    /// Freeze a clock advancing `step` per read from now.
-    ///
-    /// The base is captured from the real clock once, here — after
-    /// construction the clock is fully deterministic and never touches
-    /// the system again.
-    fn new(step: Duration) -> Self {
-        Self {
-            base: Instant::now(),
-            step,
-            calls: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl crate::determinism::Clock for StepClock {
-    fn now(&self) -> std::time::SystemTime {
-        std::time::SystemTime::UNIX_EPOCH
-    }
-
-    fn monotonic(&self) -> Instant {
-        let reads = u32::try_from(self.calls.fetch_add(1, Ordering::SeqCst)).unwrap_or(0);
-        let offset = self.step.checked_mul(reads).unwrap_or(Duration::MAX);
-        self.base.checked_add(offset).unwrap_or(self.base)
-    }
-}
-
 fn recording_agent(client: RecordingClient, managers: LoopManagers) -> BareLoop<RecordingClient> {
     let registry = ToolRegistry::new();
     registry.register(EchoTool);
@@ -5828,7 +5773,10 @@ async fn engine_session_and_run_ids_come_from_the_id_gen_seam() {
 }
 
 #[tokio::test]
+#[cfg(feature = "testing")]
 async fn engine_durations_come_from_the_clock_seam() {
+    use crate::testing::StepClock;
+
     let client = RecordingClient::new("test-model");
     client.add_text_response("all done");
     let mut agent = recording_agent(
@@ -5875,6 +5823,7 @@ impl crate::observer::LoopObserver for ToolPostDurationRecorder {
 ///
 /// Shared with the test body, which drains it after the run and checks
 /// the compaction durations the engine measured and reported.
+#[cfg(feature = "testing")]
 struct CompactionDurationRecorder {
     /// One telemetry duration per `on_compaction` dispatch, in event order.
     ///
@@ -5884,6 +5833,7 @@ struct CompactionDurationRecorder {
     durations: Arc<Mutex<Vec<Duration>>>,
 }
 
+#[cfg(feature = "testing")]
 impl crate::observer::LoopObserver for CompactionDurationRecorder {
     fn name(&self) -> &'static str {
         "compaction-duration-recorder"
@@ -5929,7 +5879,10 @@ async fn pipeline_tool_durations_come_from_the_clock_seam() {
 }
 
 #[tokio::test]
+#[cfg(feature = "testing")]
 async fn compaction_telemetry_durations_come_from_the_clock_seam() {
+    use crate::testing::StepClock;
+
     let client = MockClient::new("test-model");
     // Drive enough tokens to trip a low threshold, then finish; the second
     // run guarantees the trip even if the first stays under the line.
@@ -5984,6 +5937,677 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
              clock's 7ms step: {duration:?}"
         );
     }
+}
+
+/// Build a compaction-spanning scenario client: a tool turn followed by a
+/// large text turn, then a plain text answer for the run that compacts.
+#[cfg(feature = "testing")]
+fn compaction_scenario_client() -> MockClient {
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text(
+        "call_1",
+        "echo",
+        &json!({"message": "hi"}),
+        &"x".repeat(2_000),
+    );
+    client.add_text_response("done");
+    client
+}
+
+/// Wire an engine over the scenario client with a pinned clock and the
+/// low-threshold compaction setup the scenario needs to trip.
+#[cfg(feature = "testing")]
+fn compaction_scenario_agent(
+    clock: Arc<dyn crate::determinism::Clock>,
+    observer: Arc<crate::testing::CapturingObserver>,
+) -> BareLoop<MockClient> {
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(compaction_scenario_client()),
+        registry,
+        make_config()
+            .with_context_window(600)
+            .with_compact_threshold(20),
+        LoopManagers::new().with_clock(clock),
+    );
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new()
+                .with_preserve_recent(1)
+                .with_min_messages(2),
+        ))
+        .with_context_window(600)
+        .with_threshold(20)
+        .with_compact_target_pct(30),
+    ));
+    agent.register_observer(observer);
+    agent
+}
+
+#[tokio::test]
+#[cfg(feature = "testing")]
+async fn pinned_clock_zeroes_every_engine_reported_duration() {
+    use crate::determinism::FixedClock;
+    use crate::testing::{CapturedEvent, CapturingObserver};
+
+    let observer = Arc::new(CapturingObserver::new());
+    let mut agent = compaction_scenario_agent(
+        Arc::new(FixedClock::new(std::time::SystemTime::UNIX_EPOCH)),
+        observer.clone(),
+    );
+    agent
+        .run("span the phases", &RunConfig::default())
+        .await
+        .unwrap();
+    agent
+        .run("compact me", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let events = observer.snapshot();
+    let turn_ends = events
+        .iter()
+        .filter(|event| matches!(event, CapturedEvent::TurnEnd { .. }))
+        .count();
+    assert!(
+        turn_ends >= 2,
+        "the scenario must span both turn-end phases — the model-phase and \
+         the tools-phase turn-end: {turn_ends} turn-ends captured"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, CapturedEvent::ToolPost { .. })),
+        "the scenario must dispatch at least one tool call"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, CapturedEvent::Compaction { .. })),
+        "the scenario must trip at least one compaction pass"
+    );
+    for event in &events {
+        if let CapturedEvent::TurnEnd { duration_ms, .. } = event {
+            assert_eq!(
+                *duration_ms, 0,
+                "a frozen clock must zero the turn-end duration: {event:?}"
+            );
+        }
+        if let CapturedEvent::RunEnd { duration_ms, .. } = event {
+            assert_eq!(
+                *duration_ms, 0,
+                "a frozen clock must zero the run-end duration: {event:?}"
+            );
+        }
+        if let CapturedEvent::ToolPost { duration, .. } = event {
+            assert_eq!(
+                *duration,
+                Duration::ZERO,
+                "a frozen clock must zero the tool-post duration on every \
+                 dispatch path, the default-installed pipeline included: {event:?}"
+            );
+        }
+        if let CapturedEvent::Compaction {
+            telemetry_duration, ..
+        } = event
+        {
+            assert_eq!(
+                *telemetry_duration,
+                Duration::ZERO,
+                "a frozen clock must zero the compaction telemetry duration: {event:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "testing")]
+async fn stepping_clock_durations_are_exact_step_multiples() {
+    use crate::testing::{CapturedEvent, CapturingObserver, StepClock};
+
+    let observer = Arc::new(CapturingObserver::new());
+    let mut agent = compaction_scenario_agent(
+        Arc::new(StepClock::new(Duration::from_millis(7))),
+        observer.clone(),
+    );
+    agent
+        .run("span the phases", &RunConfig::default())
+        .await
+        .unwrap();
+    agent
+        .run("compact me", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let events = observer.snapshot();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, CapturedEvent::Compaction { .. })),
+        "the scenario must trip at least one compaction pass"
+    );
+    for event in &events {
+        if let CapturedEvent::TurnEnd { duration_ms, .. } = event {
+            assert!(
+                *duration_ms > 0,
+                "a stepping clock must advance the turn-end duration past \
+                 zero — a duration of {duration_ms}ms means the site read the \
+                 real clock, not the seam: {event:?}"
+            );
+            assert_eq!(
+                duration_ms % 7,
+                0,
+                "every turn-end duration is an exact multiple of the clock's \
+                 7ms step: {event:?}"
+            );
+        }
+        if let CapturedEvent::RunEnd { duration_ms, .. } = event {
+            assert!(
+                *duration_ms > 0,
+                "a stepping clock must advance the run-end duration past \
+                 zero — a duration of {duration_ms}ms means the site read the \
+                 real clock, not the seam: {event:?}"
+            );
+            assert_eq!(
+                duration_ms % 7,
+                0,
+                "every run-end duration is an exact multiple of the clock's \
+                 7ms step: {event:?}"
+            );
+        }
+        if let CapturedEvent::ToolPost { duration, .. } = event {
+            assert!(
+                *duration >= Duration::from_millis(7),
+                "a stepping clock reports at least one 7ms step of tool \
+                 dispatch, got {duration:?}: {event:?}"
+            );
+            assert_eq!(
+                duration.as_nanos() % 7_000_000,
+                0,
+                "every tool-post duration is an exact multiple of the clock's \
+                 7ms step: {event:?}"
+            );
+        }
+        if let CapturedEvent::Compaction {
+            telemetry_duration, ..
+        } = event
+        {
+            assert!(
+                *telemetry_duration >= Duration::from_millis(7),
+                "a stepping clock reports at least one 7ms step of compaction, \
+                 got {telemetry_duration:?}: {event:?}"
+            );
+            assert_eq!(
+                telemetry_duration.as_nanos() % 7_000_000,
+                0,
+                "every compaction telemetry duration is an exact multiple of \
+                 the clock's 7ms step: {event:?}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "testing")]
+fn same_seed_scenario_client() -> RecordingClient {
+    let client = RecordingClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    client.add_text_response("second answer");
+    client
+}
+
+#[tokio::test]
+#[cfg(feature = "testing")]
+async fn same_seed_engines_emit_identical_engine_sourced_callback_streams() {
+    use crate::determinism::SeededIdGen;
+    use crate::testing::{CapturedEvent, CapturingObserver, StepClock};
+
+    let left_observer = Arc::new(CapturingObserver::new());
+    let mut left_agent = recording_agent(
+        same_seed_scenario_client(),
+        LoopManagers::new()
+            .with_clock(Arc::new(StepClock::new(Duration::from_millis(7))))
+            .with_id_gen(Arc::new(SeededIdGen::new(99))),
+    );
+    left_agent.register_observer(left_observer.clone());
+    left_agent
+        .run("echo hi", &RunConfig::default())
+        .await
+        .unwrap();
+    left_agent
+        .run("again", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let right_observer = Arc::new(CapturingObserver::new());
+    let mut right_agent = recording_agent(
+        same_seed_scenario_client(),
+        LoopManagers::new()
+            .with_clock(Arc::new(StepClock::new(Duration::from_millis(7))))
+            .with_id_gen(Arc::new(SeededIdGen::new(99))),
+    );
+    right_agent.register_observer(right_observer.clone());
+    right_agent
+        .run("echo hi", &RunConfig::default())
+        .await
+        .unwrap();
+    right_agent
+        .run("again", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let left = left_observer.snapshot();
+    let right = right_observer.snapshot();
+    assert!(
+        matches!(left.first(), Some(CapturedEvent::RunStart { .. })),
+        "the captured stream opens with run-start: {:?}",
+        left.first()
+    );
+    assert!(
+        matches!(left.last(), Some(CapturedEvent::RunEnd { .. })),
+        "the captured stream closes with run-end: {:?}",
+        left.last()
+    );
+    assert!(
+        left.iter()
+            .filter(|event| matches!(event, CapturedEvent::TurnEnd { .. }))
+            .count()
+            >= 2,
+        "the scenario must span both turn-end phases before equality means anything"
+    );
+    assert!(
+        left.iter()
+            .any(|event| matches!(event, CapturedEvent::ToolPost { .. })),
+        "the scenario must dispatch at least one tool call"
+    );
+    let session_ids: Vec<_> = left
+        .iter()
+        .filter_map(|event| match event {
+            CapturedEvent::RunStart { session_id } => Some(*session_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        session_ids.len(),
+        2,
+        "two runs fire two run-start events: {session_ids:?}"
+    );
+    assert_eq!(
+        session_ids[0], session_ids[1],
+        "both runs report the one session id the id seam minted"
+    );
+    assert_eq!(
+        left, right,
+        "two engines built from the same seed and step clock emit identical \
+         engine-sourced callback streams, event for event and field for field"
+    );
+}
+
+/// Pin the one engine read of the clock's wall half: a gated dispatch's
+/// decision record carries the installed clock's frozen wall time, not the
+/// real system clock's.
+#[tokio::test]
+#[cfg(feature = "testing")]
+async fn gate_decision_timestamps_come_from_the_clock_seam() {
+    use crate::determinism::FixedClock;
+    use crate::middleware::ToolPipeline;
+    use crate::middleware::permission::PermissionMiddleware;
+    use crate::testing::{CapturedEvent, CapturingObserver};
+
+    let wall = std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_123);
+    let observer = Arc::new(CapturingObserver::new());
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "done");
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        registry,
+        make_config(),
+        LoopManagers::new().with_clock(Arc::new(FixedClock::new(wall))),
+    );
+    agent
+        .set_pipeline(ToolPipeline::builder().with_middleware(PermissionMiddleware::allow_all()))
+        .expect("an always-allow gate over the registered tools assembles");
+    agent.register_observer(observer.clone());
+    agent.run("hi", &RunConfig::default()).await.unwrap();
+
+    let decisions: Vec<_> = observer
+        .snapshot()
+        .iter()
+        .filter_map(|event| match event {
+            CapturedEvent::GateDecision { decision, .. } => Some(decision.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        decisions.len(),
+        1,
+        "one gated dispatch emits exactly one gate-decision record: {decisions:?}"
+    );
+    assert_eq!(
+        decisions[0].ts, 1_700_000_123,
+        "the gate record's timestamp is the installed clock's frozen wall — \
+         a record stamped by the real system clock would carry today's epoch \
+         millis, not the pinned wall's"
+    );
+}
+
+/// Assert the engine's session and run ids against a fresh same-seed oracle.
+fn ids_match_oracle<C: crate::api::ApiClient>(agent: &BareLoop<C>, seed: u64, scenario: &str) {
+    let oracle = crate::determinism::SeededIdGen::new(seed);
+    assert_eq!(
+        agent.session().id,
+        oracle.next_id(),
+        "{scenario}: the session id is the seeded sequence's first draw"
+    );
+    let run_ids: Vec<_> = agent.session().runs.iter().map(|run| run.id).collect();
+    for (idx, run_id) in run_ids.iter().enumerate() {
+        assert_eq!(
+            *run_id,
+            oracle.next_id(),
+            "{scenario}: run {idx}'s id is the seeded sequence's next draw, in run order"
+        );
+    }
+}
+
+/// A cancellation-mid-tool script: one tool-only response whose dispatch
+/// signals it has begun and then never resolves, so the run is cancelled
+/// at a known point and must surface `LoopError::Cancelled`.
+async fn cancellation_mid_tool_ids_match_the_oracle() {
+    struct HangingTool {
+        started: Arc<tokio::sync::Notify>,
+    }
+    impl Tool for HangingTool {
+        fn name(&self) -> &'static str {
+            "hanging"
+        }
+
+        fn description(&self) -> &'static str {
+            "Signals start, then never resolves"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "hanging".into(),
+                description: "Signals start, then never resolves".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    let client = MockClient::new("test-model");
+    client.add_tool_only_response("c1", "hanging", &json!({"message": "x"}));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let registry = ToolRegistry::new();
+    registry.register(HangingTool {
+        started: Arc::clone(&started),
+    });
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        registry,
+        make_config(),
+        LoopManagers::new().with_id_gen(Arc::new(crate::determinism::SeededIdGen::new(11))),
+    );
+    let signal = agent.cancel_signal();
+    tokio::spawn(async move {
+        started.notified().await;
+        signal.cancel();
+    });
+    let result = agent.run("go", &RunConfig::default()).await;
+    assert!(
+        matches!(result, Err(LoopError::Cancelled)),
+        "the mid-tool cancellation surfaces as LoopError::Cancelled, got {result:?}"
+    );
+    assert_eq!(
+        agent.session().runs.len(),
+        1,
+        "the cancelled scenario pushes exactly one run record"
+    );
+    ids_match_oracle(&agent, 11, "cancellation mid-tool");
+}
+
+/// A compaction-turn script: the first run's large response pushes the
+/// context over the threshold and the second run is served from compacted
+/// history.
+async fn compaction_turn_ids_match_the_oracle() {
+    let client = MockClient::new("test-model");
+    client.add_text_response(&"x".repeat(2_000));
+    client.add_text_response("done");
+    client.add_text_response("done again");
+    let counter = Arc::new(CompactionCounter {
+        count: Arc::new(Mutex::new(0)),
+    });
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config()
+            .with_context_window(600)
+            .with_compact_threshold(20),
+        LoopManagers::new().with_id_gen(Arc::new(crate::determinism::SeededIdGen::new(12))),
+    );
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new()
+                .with_preserve_recent(1)
+                .with_min_messages(2),
+        ))
+        .with_context_window(600)
+        .with_threshold(20)
+        .with_compact_target_pct(30),
+    ));
+    agent.register_observer(counter.clone());
+    agent
+        .run("fill it up", &RunConfig::default())
+        .await
+        .unwrap();
+    agent
+        .run("second run", &RunConfig::default())
+        .await
+        .unwrap();
+    assert!(
+        *crate::error::recover_guard(counter.count.lock()) >= 1,
+        "precondition: the compaction scenario actually compacted"
+    );
+    ids_match_oracle(&agent, 12, "compaction turn");
+}
+
+/// A multi-run continuation script: three sequential runs on one session.
+async fn multi_run_continuation_ids_match_the_oracle() {
+    let client = RecordingClient::new("test-model");
+    client.add_text_response("first answer");
+    client.add_text_response("second answer");
+    client.add_text_response("third answer");
+    let mut agent = recording_agent(
+        client,
+        LoopManagers::new().with_id_gen(Arc::new(crate::determinism::SeededIdGen::new(13))),
+    );
+    agent.run("one", &RunConfig::default()).await.unwrap();
+    agent.run("two", &RunConfig::default()).await.unwrap();
+    agent.run("three", &RunConfig::default()).await.unwrap();
+    assert_eq!(
+        agent.session().runs.len(),
+        3,
+        "the multi-run scenario completes three runs"
+    );
+    ids_match_oracle(&agent, 13, "multi-run continuation");
+}
+
+/// A fallback-switch script: the first run dies on rate-limit escalation,
+/// the second is served by the fallback model.
+#[cfg(feature = "streaming")]
+async fn fallback_switch_ids_match_the_oracle() {
+    use crate::fallback::{FallbackManager, FallbackState};
+    use crate::stream::handler::{RateLimitConfig, StreamHandler, StreamTimeoutConfig};
+
+    struct RateLimitThenTextClient {
+        served_models: Arc<Mutex<Vec<Option<String>>>>,
+    }
+    impl ApiClient for RateLimitThenTextClient {
+        fn model(&self) -> String {
+            "primary-model".to_string()
+        }
+        fn base_url(&self) -> String {
+            "rate-limit-then-text".to_string()
+        }
+        fn set_model(&self, _model: &str) -> bool {
+            false
+        }
+        fn stream_messages(
+            &self,
+            request: &crate::api::StreamRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
+        }
+        fn create_message(
+            &self,
+            request: &crate::api::StreamRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
+            self.create_message_with_options(request, crate::structured::RequestOptions::default())
+        }
+        fn stream_messages_with_options(
+            &self,
+            _request: &crate::api::StreamRequest,
+            options: crate::structured::RequestOptions,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            crate::error::recover_guard(self.served_models.lock()).push(options.model.clone());
+            if options.model.as_deref() == Some("fallback-model") {
+                let events = vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: "msg_fb".into(),
+                            role: "assistant".into(),
+                            model: "fallback-model".into(),
+                        },
+                    })),
+                    Ok(StreamEvent::PartStart(PartStart {
+                        index: 0,
+                        part: Some(MessagePart::text("served by fallback")),
+                    })),
+                    Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: 0,
+                        delta: DeltaPart::Text {
+                            text: "served by fallback".into(),
+                        },
+                    })),
+                    Ok(StreamEvent::PartStop { index: Some(0) }),
+                    Ok(StreamEvent::MessageDelta(MessageDelta {
+                        delta: MessageDeltaPayload {
+                            stop_reason: Some("end_turn".into()),
+                        },
+                        usage: Some(Usage::new(1, 1)),
+                    })),
+                    Ok(StreamEvent::MessageStop),
+                ];
+                return Box::pin(futures::stream::iter(events));
+            }
+            Box::pin(futures::stream::once(async {
+                Err(ApiError::RateLimit {
+                    retry_after: None,
+                    message: "slow down".into(),
+                    meta: None,
+                })
+            }))
+        }
+        fn create_message_with_options(
+            &self,
+            _request: &crate::api::StreamRequest,
+            _options: crate::structured::RequestOptions,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
+        }
+        fn extract_structured(&self, _message: &crate::message::Message) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+    }
+
+    let handler = StreamHandler::new()
+        .with_timeout_config(StreamTimeoutConfig {
+            fallback_to_non_streaming: false,
+            ..Default::default()
+        })
+        .with_rate_limit_config(RateLimitConfig {
+            fallback_after_retries: 0,
+            default_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            ..Default::default()
+        });
+
+    let manager = FallbackManager::new(1, 2);
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
+    assert_eq!(
+        manager.state(),
+        Ok(FallbackState::Primary),
+        "precondition: the fallback manager starts from a clean Primary state"
+    );
+    let managers = LoopManagers::new()
+        .with_fallback(manager)
+        .with_stream_handler(handler)
+        .with_id_gen(Arc::new(crate::determinism::SeededIdGen::new(14)));
+
+    let served_models = Arc::new(Mutex::new(Vec::new()));
+    let client = Arc::new(RateLimitThenTextClient {
+        served_models: Arc::clone(&served_models),
+    });
+    let mut agent =
+        BareLoop::new_with_managers(client, ToolRegistry::new(), make_config(), managers);
+
+    let result = agent.run("Hi", &RunConfig::default()).await;
+    assert!(result.is_err(), "the rate-limited run fails");
+    assert!(
+        agent.managers.fallback().is_using_fallback().unwrap(),
+        "precondition: escalation tripped the breaker to the fallback model"
+    );
+    agent
+        .run("Hi", &RunConfig::default())
+        .await
+        .expect("the fallback model serves the next run");
+    assert_eq!(
+        crate::error::recover_guard(served_models.lock()).last(),
+        Some(&Some("fallback-model".to_string())),
+        "precondition: the surviving run's request carried the fallback model override"
+    );
+    ids_match_oracle(&agent, 14, "fallback switch");
+}
+
+#[tokio::test]
+async fn session_and_run_id_sequences_match_a_fresh_oracle_per_scenario() {
+    cancellation_mid_tool_ids_match_the_oracle().await;
+    compaction_turn_ids_match_the_oracle().await;
+    multi_run_continuation_ids_match_the_oracle().await;
+    #[cfg(feature = "streaming")]
+    fallback_switch_ids_match_the_oracle().await;
 }
 
 #[tokio::test]

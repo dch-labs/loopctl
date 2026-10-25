@@ -669,7 +669,10 @@ impl OpenAiClient {
     /// `created` the creation stamp **verbatim** — servers spell it as
     /// an epoch integer or an ISO string depending on lineage, and
     /// guessing a unit is worse than handing the caller the text. An
-    /// entry without a usable id is skipped, not guessed. Each entry's
+    /// entry without a usable id — absent, blank, or whitespace — is
+    /// skipped, not guessed: `set_model` would refuse such an id, so a
+    /// listing that carried one would be selling an unusable choice.
+    /// Each entry's
     /// metadata is the curated opinion where one exists
     /// ([`curated_model_metadata`](crate::api::probe::curated_model_metadata)),
     /// unreported elsewhere — this endpoint discloses no capabilities.
@@ -688,6 +691,9 @@ impl OpenAiClient {
             .iter()
             .filter_map(|entry| {
                 let id = entry.get("id").and_then(Value::as_str)?;
+                if id.trim().is_empty() {
+                    return None;
+                }
                 let mut info = ModelInfo::new(id).with_metadata(Self::metadata_opinion(id));
                 if let Some(owned) = entry.get("owned_by").and_then(Value::as_str) {
                     info = info.with_owned_by(owned);
@@ -710,7 +716,10 @@ impl OpenAiClient {
     /// (tag included — `llama3.1:latest` is what the wire wants),
     /// `modified_at` rides as the creation stamp verbatim, and the
     /// weight `size` lands in [`size_bytes`](crate::api::probe::ModelInfo::size_bytes)
-    /// — the only listing that discloses one.
+    /// — the only listing that discloses one. An entry whose name is
+    /// blank or whitespace is skipped, exactly as in
+    /// [`parse_openai_models`](Self::parse_openai_models): an id the
+    /// caller could never select is not a listing entry.
     ///
     /// # Errors
     ///
@@ -725,6 +734,9 @@ impl OpenAiClient {
             .iter()
             .filter_map(|entry| {
                 let id = entry.get("name").and_then(Value::as_str)?;
+                if id.trim().is_empty() {
+                    return None;
+                }
                 let mut info = ModelInfo::new(id).with_metadata(Self::metadata_opinion(id));
                 if let Some(stamp) = entry.get("modified_at").and_then(Value::as_str) {
                     info = info.with_created(stamp);
@@ -5625,14 +5637,21 @@ mod tests {
             "data": [
                 { "id": "gpt-4o-mini", "object": "model", "created": 1_721_172_744_u64, "owned_by": "openai" },
                 { "id": "who-knows", "object": "model" },
-                { "object": "model" }
+                { "object": "model" },
+                { "id": "", "object": "model", "owned_by": "ghost" },
+                { "id": "   ", "object": "model", "owned_by": "ghost" }
             ]
         });
         let models = OpenAiClient::parse_openai_models(&doc).expect("listing parses");
         assert_eq!(
             models.len(),
             2,
-            "the entry without an id is skipped, not guessed"
+            "the entries without a usable id — absent, empty, whitespace — are \
+             skipped, not guessed: set_model would refuse every one of them"
+        );
+        assert!(
+            models.iter().all(|m| !m.id.trim().is_empty()),
+            "no blank id survives into a selectable listing"
         );
         assert_eq!(models[0].id, "gpt-4o-mini");
         assert_eq!(
@@ -5709,7 +5728,7 @@ mod tests {
             for (body, status) in [
                 (String::new(), "404 Not Found"),
                 (
-                    r#"{"models":[{"name":"llama3.1:latest","modified_at":"2025-01-01T00:00:00Z","size":4800000000}]}"#.to_string(),
+                    r#"{"models":[{"name":"  "},{"name":"llama3.1:latest","modified_at":"2025-01-01T00:00:00Z","size":4800000000}]}"#.to_string(),
                     "200 OK",
                 ),
             ] {
@@ -5737,7 +5756,11 @@ mod tests {
             .list_models()
             .await
             .expect("a server without the OpenAI route but with /api/tags must still list");
-        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models.len(),
+            1,
+            "a blank Ollama name is skipped exactly as a blank OpenAI id is"
+        );
         assert_eq!(models[0].id, "llama3.1:latest");
         assert_eq!(models[0].size_bytes, Some(4_800_000_000));
         assert_eq!(

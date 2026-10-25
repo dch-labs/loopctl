@@ -301,6 +301,15 @@ impl GeminiClient {
             .iter()
             .filter_map(|entry| {
                 let name = entry.get("name").and_then(serde_json::Value::as_str)?;
+                let speaks_generation = match entry.get("supportedGenerationMethods") {
+                    Some(serde_json::Value::Array(methods)) => methods
+                        .iter()
+                        .any(|method| method.as_str() == Some("generateContent")),
+                    _ => true,
+                };
+                if !speaks_generation {
+                    return None;
+                }
                 let id = name.rsplit('/').next().unwrap_or(name);
                 let disclosed = entry
                     .get("inputTokenLimit")
@@ -4445,11 +4454,24 @@ mod tests {
                 {
                     "name": "models/undisclosed-model",
                     "displayName": "Quiet Model"
+                },
+                {
+                    "name": "models/gemini-embedding-001",
+                    "displayName": "Embeddings Only",
+                    "supportedGenerationMethods": ["embedContent"]
                 }
             ]
         });
         let models = GeminiClient::parse_models(&doc).expect("catalog parses");
-        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models.len(),
+            2,
+            "the entry whose methods explicitly exclude generateContent is skipped"
+        );
+        assert!(
+            models.iter().all(|m| m.id != "gemini-embedding-001"),
+            "an id this client could never call must not ride the listing"
+        );
         assert_eq!(
             models[0].id, "gemini-2.5-pro",
             "the resource path is stripped to the id generateContent wants"

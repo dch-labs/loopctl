@@ -1230,6 +1230,22 @@ const CURATED: &[CuratedRow] = &[
         input_modalities: Some(TEXT_IN),
         output_modalities: Some(TEXT_OUT),
     },
+    CuratedRow {
+        prefix: "mistral-large-2512",
+        context_window: Some(256_000),
+        structured_output: None,
+        tool_calling: Some(true),
+        input_modalities: Some(TEXT_IMAGE_IN),
+        output_modalities: Some(TEXT_OUT),
+    },
+    CuratedRow {
+        prefix: "mistral-large-latest",
+        context_window: None,
+        structured_output: None,
+        tool_calling: Some(true),
+        input_modalities: Some(TEXT_IMAGE_IN),
+        output_modalities: Some(TEXT_OUT),
+    },
 ];
 
 /// The crate's curated metadata opinion for a model id, if it has one.
@@ -1411,21 +1427,55 @@ mod tests {
         );
         assert_eq!(qwen.capabilities.tool_calling, Some(true));
 
-        let mistral = curated_model_metadata("mistral-large-latest")
+        let mistral_old = curated_model_metadata("mistral-large-2407")
             .expect("the mistral-large family has a row");
         assert_eq!(
-            mistral.context_window,
+            mistral_old.context_window,
             Some(128_000),
-            "the family's published window, pinned"
+            "the text-only Large generations' published window, pinned"
         );
         assert_eq!(
-            mistral.capabilities.tool_calling,
+            mistral_old.capabilities.tool_calling,
             Some(true),
             "function calling is the family's documented surface"
         );
         assert_eq!(
-            mistral.capabilities.structured_output, None,
+            mistral_old.capabilities.structured_output, None,
             "the table holds no schema-mode claim beside the published record"
+        );
+
+        let mistral_three =
+            curated_model_metadata("mistral-large-2512").expect("Mistral Large 3 has its own row");
+        assert_eq!(
+            mistral_three.context_window,
+            Some(256_000),
+            "Large 3 doubled the window — the generic family row must not down-rate it"
+        );
+        assert!(
+            mistral_three
+                .input_modalities
+                .as_ref()
+                .is_some_and(|m| m.contains(&Modality::Image)),
+            "Large 3 is multimodal; the table says so instead of claiming text-only"
+        );
+        assert_eq!(
+            mistral_three.capabilities.tool_calling,
+            Some(true),
+            "the function-calling surface carries to the new generation"
+        );
+
+        let mistral_latest =
+            curated_model_metadata("mistral-large-latest").expect("the alias has its own row");
+        assert_eq!(
+            mistral_latest.context_window, None,
+            "the alias rolls to whichever Large is current, so no single window is its fact"
+        );
+        assert!(
+            mistral_latest
+                .input_modalities
+                .as_ref()
+                .is_some_and(|m| m.contains(&Modality::Image)),
+            "every Large generation the alias has pointed at accepts image input"
         );
     }
 

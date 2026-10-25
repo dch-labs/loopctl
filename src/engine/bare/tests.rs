@@ -6311,32 +6311,66 @@ fn ids_match_oracle<C: crate::api::ApiClient>(agent: &BareLoop<C>, seed: u64, sc
     }
 }
 
-/// A cancellation-mid-tool script: tool-only responses that never finish,
-/// cancelled while the engine is between dispatches.
+/// A cancellation-mid-tool script: one tool-only response whose dispatch
+/// signals it has begun and then never resolves, so the run is cancelled
+/// at a known point and must surface `LoopError::Cancelled`.
 async fn cancellation_mid_tool_ids_match_the_oracle() {
-    let client = MockClient::new("test-model");
-    for _ in 0..5 {
-        client.add_tool_only_response("c1", "echo", &json!({"message": "x"}));
+    struct HangingTool {
+        started: Arc<tokio::sync::Notify>,
     }
+    impl Tool for HangingTool {
+        fn name(&self) -> &'static str {
+            "hanging"
+        }
+
+        fn description(&self) -> &'static str {
+            "Signals start, then never resolves"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "hanging".into(),
+                description: "Signals start, then never resolves".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    let client = MockClient::new("test-model");
+    client.add_tool_only_response("c1", "hanging", &json!({"message": "x"}));
+    let started = Arc::new(tokio::sync::Notify::new());
     let registry = ToolRegistry::new();
-    registry.register(EchoTool);
+    registry.register(HangingTool {
+        started: Arc::clone(&started),
+    });
     let mut agent = BareLoop::new_with_managers(
         Arc::new(client),
         registry,
         make_config(),
         LoopManagers::new().with_id_gen(Arc::new(crate::determinism::SeededIdGen::new(11))),
     );
-    let handle = agent.cancel_signal();
-    let join = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        handle.cancel();
+    let signal = agent.cancel_signal();
+    tokio::spawn(async move {
+        started.notified().await;
+        signal.cancel();
     });
     let result = agent.run("go", &RunConfig::default()).await;
     assert!(
-        result.is_err(),
-        "the cancelled scenario's run returns an error"
+        matches!(result, Err(LoopError::Cancelled)),
+        "the mid-tool cancellation surfaces as LoopError::Cancelled, got {result:?}"
     );
-    join.await.unwrap();
     assert_eq!(
         agent.session().runs.len(),
         1,

@@ -451,6 +451,42 @@ pub(super) async fn get_checked(
     Err(response_failure_error(resp, rate_limit).await)
 }
 
+/// Read the entries array out of an answered listing document.
+///
+/// The listing surface keeps its two-outcomes rule exact at the parsing
+/// edge: an answered body that carries none of the accepted entry-array
+/// spellings stated no catalog at all, so it is a failure
+/// ([`ApiError::api`], classified [`Other`](crate::api::probe::ProbeClass::Other))
+/// rather than an empty success — the empty-catalog answer belongs to an
+/// endpoint that served an empty array, not to a document that never
+/// spoke of models (the loud-default rule the listing itself ships by).
+/// The message names the listing surface, never one route's spelling,
+/// because fallback chains read the same document shape from either.
+///
+/// # Errors
+///
+/// Returns [`ApiError::api`] when no accepted key holds an array.
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
+pub(crate) fn listing_entries<'a>(
+    value: &'a serde_json::Value,
+    keys: &[&str],
+    surface: &str,
+) -> Result<&'a Vec<serde_json::Value>, ApiError> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_array))
+        .ok_or_else(|| {
+            ApiError::api(format!(
+                "{surface}: answered body carries no entries array (expected one of {})",
+                keys.join(", ")
+            ))
+        })
+}
+
 /// Send a JSON POST and classify non-success responses into structured
 /// [`ApiError`] variants.
 ///

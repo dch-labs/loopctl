@@ -1222,6 +1222,14 @@ const CURATED: &[CuratedRow] = &[
         input_modalities: Some(TEXT_IN),
         output_modalities: Some(TEXT_OUT),
     },
+    CuratedRow {
+        prefix: "mistral-large",
+        context_window: Some(128_000),
+        structured_output: None,
+        tool_calling: Some(true),
+        input_modalities: Some(TEXT_IN),
+        output_modalities: Some(TEXT_OUT),
+    },
 ];
 
 /// The crate's curated metadata opinion for a model id, if it has one.
@@ -1402,6 +1410,23 @@ mod tests {
             "the crate has no verified schema-support claim for Qwen"
         );
         assert_eq!(qwen.capabilities.tool_calling, Some(true));
+
+        let mistral = curated_model_metadata("mistral-large-latest")
+            .expect("the mistral-large family has a row");
+        assert_eq!(
+            mistral.context_window,
+            Some(128_000),
+            "the family's published window, pinned"
+        );
+        assert_eq!(
+            mistral.capabilities.tool_calling,
+            Some(true),
+            "function calling is the family's documented surface"
+        );
+        assert_eq!(
+            mistral.capabilities.structured_output, None,
+            "the table holds no schema-mode claim beside the published record"
+        );
     }
 
     #[test]

@@ -659,11 +659,8 @@ impl OpenAiClient {
     /// [`ApiError::http`] when the answered body cannot be read, or
     /// [`ApiError::Json`] when it is not a JSON document.
     async fn read_listing_json(&self, response: reqwest::Response) -> Result<Value, ApiError> {
-        let body = response
-            .text()
-            .await
-            .map_err(|e| ApiError::http(format!("reading model listing failed: {e}")))?;
-        Ok(serde_json::from_str(&body)?)
+        let body = super::read_bounded_body(response).await?;
+        Ok(serde_json::from_slice(&body)?)
     }
 
     /// Map an OpenAI `/models` document to listing entries.
@@ -671,38 +668,40 @@ impl OpenAiClient {
     /// `data[].id` becomes the usable id, `owned_by` the operator, and
     /// `created` the creation stamp **verbatim** — servers spell it as
     /// an epoch integer or an ISO string depending on lineage, and
-    /// guessing a unit is worse than handing the caller the text. Each
-    /// entry's metadata is the curated opinion where one exists
+    /// guessing a unit is worse than handing the caller the text. An
+    /// entry without a usable id is skipped, not guessed. Each entry's
+    /// metadata is the curated opinion where one exists
     /// ([`curated_model_metadata`](crate::api::probe::curated_model_metadata)),
     /// unreported elsewhere — this endpoint discloses no capabilities.
     ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::api`] when the answered body carries no
+    /// `data` array — a document that never spoke of models is a
+    /// failure, never an empty catalog.
+    ///
     /// [`curated_model_metadata`]: crate::api::probe::curated_model_metadata
-    fn parse_openai_models(value: &Value) -> Vec<crate::api::probe::ModelInfo> {
+    fn parse_openai_models(value: &Value) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
         use crate::api::probe::ModelInfo;
-        value
-            .get("data")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let id = entry.get("id").and_then(Value::as_str)?;
-                        let mut info = ModelInfo::new(id).with_metadata(Self::metadata_opinion(id));
-                        if let Some(owned) = entry.get("owned_by").and_then(Value::as_str) {
-                            info = info.with_owned_by(owned);
-                        }
-                        match entry.get("created") {
-                            Some(Value::String(stamp)) => info = info.with_created(stamp),
-                            Some(stamp) if stamp.is_number() => {
-                                info = info.with_created(stamp.to_string());
-                            }
-                            _ => {}
-                        }
-                        Some(info)
-                    })
-                    .collect()
+        let entries = super::listing_entries(value, &["data"], "model listing")?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(Value::as_str)?;
+                let mut info = ModelInfo::new(id).with_metadata(Self::metadata_opinion(id));
+                if let Some(owned) = entry.get("owned_by").and_then(Value::as_str) {
+                    info = info.with_owned_by(owned);
+                }
+                match entry.get("created") {
+                    Some(Value::String(stamp)) => info = info.with_created(stamp),
+                    Some(stamp) if stamp.is_number() => {
+                        info = info.with_created(stamp.to_string());
+                    }
+                    _ => {}
+                }
+                Some(info)
             })
-            .unwrap_or_default()
+            .collect())
     }
 
     /// Map Ollama's `/api/tags` document to listing entries.
@@ -712,28 +711,30 @@ impl OpenAiClient {
     /// `modified_at` rides as the creation stamp verbatim, and the
     /// weight `size` lands in [`size_bytes`](crate::api::probe::ModelInfo::size_bytes)
     /// — the only listing that discloses one.
-    fn parse_ollama_tags(value: &Value) -> Vec<crate::api::probe::ModelInfo> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::api`] when the answered body carries no
+    /// `models` array — a document that never spoke of models is a
+    /// failure, never an empty catalog (the fallback path surfaces it
+    /// rather than reporting an empty Ollama catalog).
+    fn parse_ollama_tags(value: &Value) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
         use crate::api::probe::ModelInfo;
-        value
-            .get("models")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let id = entry.get("name").and_then(Value::as_str)?;
-                        let mut info = ModelInfo::new(id).with_metadata(Self::metadata_opinion(id));
-                        if let Some(stamp) = entry.get("modified_at").and_then(Value::as_str) {
-                            info = info.with_created(stamp);
-                        }
-                        if let Some(size) = entry.get("size").and_then(Value::as_u64) {
-                            info = info.with_size_bytes(size);
-                        }
-                        Some(info)
-                    })
-                    .collect()
+        let entries = super::listing_entries(value, &["models"], "Ollama tags listing")?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("name").and_then(Value::as_str)?;
+                let mut info = ModelInfo::new(id).with_metadata(Self::metadata_opinion(id));
+                if let Some(stamp) = entry.get("modified_at").and_then(Value::as_str) {
+                    info = info.with_created(stamp);
+                }
+                if let Some(size) = entry.get("size").and_then(Value::as_u64) {
+                    info = info.with_size_bytes(size);
+                }
+                Some(info)
             })
-            .unwrap_or_default()
+            .collect())
     }
 
     /// The curated metadata opinion for a listing entry's id, if any.
@@ -827,13 +828,13 @@ impl ApiClient for OpenAiClient {
             match self.fetch_model_listing().await {
                 Ok(response) => {
                     let value = self.read_listing_json(response).await?;
-                    Ok(Self::parse_openai_models(&value))
+                    Self::parse_openai_models(&value)
                 }
                 Err(err) if err.http_status() == Some(404) => {
                     match self.fetch_ollama_tags().await {
                         Ok(response) => {
                             let value = self.read_listing_json(response).await?;
-                            Ok(Self::parse_ollama_tags(&value))
+                            Self::parse_ollama_tags(&value)
                         }
                         Err(_) => Err(err),
                     }
@@ -5627,7 +5628,7 @@ mod tests {
                 { "object": "model" }
             ]
         });
-        let models = OpenAiClient::parse_openai_models(&doc);
+        let models = OpenAiClient::parse_openai_models(&doc).expect("listing parses");
         assert_eq!(
             models.len(),
             2,
@@ -5655,6 +5656,46 @@ mod tests {
             crate::api::probe::ModelMetadata::unreported(),
             "an id outside every family answers unreported"
         );
+    }
+
+    #[tokio::test]
+    async fn the_openai_listing_rejects_an_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            drop(sock.read(&mut buf).await);
+            // The padding pushes a still-valid catalog past the shared
+            // ceiling, so refusing it is the only correct answer.
+            let oversized = "y".repeat(super::super::MAX_RESPONSE_BODY);
+            let body = format!(
+                r#"{{"object":"list","data":[{{"id":"oversized","owned_by":"{oversized}"}}]}}"#
+            );
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a catalog past the shared ceiling must fail, not be buffered into memory");
+        assert!(
+            err.to_string().contains("too large"),
+            "the listing must reject through the shared bounded-body reader: {err}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -5717,6 +5758,62 @@ mod tests {
             "the tags fallback sits at the server root, not under /v1: {}",
             requests[1]
         );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_body_without_a_models_array_is_a_failure_not_an_empty_catalog() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Two connections only: the 404 that opens the fallback and
+            // the tags answer. A third request would hang this task, and
+            // the listing must not chase one.
+            let mut bodies = [
+                (String::new(), "404 Not Found"),
+                (r#"{"error":"upstream exploded"}"#.to_string(), "200 OK"),
+            ]
+            .into_iter();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let (body, status) = bodies.next().unwrap();
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+            drop(sock);
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let (body, status) = bodies.next().unwrap();
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let err = client.list_models().await.expect_err(
+            "a tags route that answered without speaking of models \
+                         failed the listing — an empty success here would dress \
+                         a broken proxy up as a clean empty deployment",
+        );
+        assert_eq!(
+            crate::api::probe::ProbeClass::from_error(&err),
+            crate::api::probe::ProbeClass::Other,
+            "the malformed-body failure classifies Other"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

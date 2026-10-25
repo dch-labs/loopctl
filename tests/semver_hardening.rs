@@ -11,7 +11,8 @@
     clippy::panic,
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
-    clippy::redundant_clone
+    clippy::redundant_clone,
+    clippy::wildcard_in_or_patterns
 )]
 
 use loopctl::compact::CompactionOutcome;

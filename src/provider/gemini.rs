@@ -286,36 +286,36 @@ impl GeminiClient {
     /// followed — the first page is this surface's documented bound
     /// (see [`ApiClient::list_models`](crate::api::ApiClient::list_models)),
     /// so a completed page-one answer is complete *within that bound*.
-    fn parse_models(value: &serde_json::Value) -> Vec<crate::api::probe::ModelInfo> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::api`] when the answered body carries no
+    /// `models` array — a document that never spoke of models is a
+    /// failure, never an empty catalog.
+    fn parse_models(
+        value: &serde_json::Value,
+    ) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
         use crate::api::probe::{ModelInfo, ModelMetadata, curated_model_metadata};
-        value
-            .get("models")
-            .and_then(serde_json::Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let name = entry.get("name").and_then(serde_json::Value::as_str)?;
-                        let id = name.rsplit('/').next().unwrap_or(name);
-                        let disclosed = entry
-                            .get("inputTokenLimit")
-                            .and_then(serde_json::Value::as_u64)
-                            .map(ModelMetadata::disclosed_context_window);
-                        let metadata = ModelMetadata::merged(
-                            disclosed.as_ref(),
-                            curated_model_metadata(id).as_ref(),
-                        );
-                        let mut info = ModelInfo::new(id).with_metadata(metadata);
-                        if let Some(display) =
-                            entry.get("displayName").and_then(serde_json::Value::as_str)
-                        {
-                            info = info.with_display_name(display);
-                        }
-                        Some(info)
-                    })
-                    .collect()
+        let entries = super::listing_entries(value, &["models"], "model listing")?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| {
+                let name = entry.get("name").and_then(serde_json::Value::as_str)?;
+                let id = name.rsplit('/').next().unwrap_or(name);
+                let disclosed = entry
+                    .get("inputTokenLimit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(ModelMetadata::disclosed_context_window);
+                let metadata =
+                    ModelMetadata::merged(disclosed.as_ref(), curated_model_metadata(id).as_ref());
+                let mut info = ModelInfo::new(id).with_metadata(metadata);
+                if let Some(display) = entry.get("displayName").and_then(serde_json::Value::as_str)
+                {
+                    info = info.with_display_name(display);
+                }
+                Some(info)
             })
-            .unwrap_or_default()
+            .collect())
     }
 
     /// Build a typed [`NonStreamingResponse`] from Gemini's native JSON.
@@ -494,12 +494,9 @@ impl ApiClient for GeminiClient {
     > {
         Box::pin(async move {
             let response = self.fetch_model_listing().await?;
-            let body = response
-                .text()
-                .await
-                .map_err(|e| ApiError::http(format!("reading model listing failed: {e}")))?;
-            let value: serde_json::Value = serde_json::from_str(&body)?;
-            Ok(Self::parse_models(&value))
+            let body = super::read_bounded_body(response).await?;
+            let value: serde_json::Value = serde_json::from_slice(&body)?;
+            Self::parse_models(&value)
         })
     }
 
@@ -4451,7 +4448,7 @@ mod tests {
                 }
             ]
         });
-        let models = GeminiClient::parse_models(&doc);
+        let models = GeminiClient::parse_models(&doc).expect("catalog parses");
         assert_eq!(models.len(), 2);
         assert_eq!(
             models[0].id, "gemini-2.5-pro",
@@ -4533,6 +4530,46 @@ mod tests {
                 "the key rides the probe exactly as on a generation call: {request}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_gemini_listing_rejects_an_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            drop(sock.read(&mut buf).await);
+            // The padding pushes a still-valid catalog past the shared
+            // ceiling, so refusing it is the only correct answer.
+            let oversized = "y".repeat(super::super::MAX_RESPONSE_BODY);
+            let body = format!(
+                r#"{{"models":[{{"name":"models/oversized","displayName":"{oversized}"}}]}}"#
+            );
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = GeminiClient::builder()
+            .with_api_key("g-key")
+            .with_base_url(format!("http://{addr}/v1beta"))
+            .build()
+            .unwrap();
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a catalog past the shared ceiling must fail, not be buffered into memory");
+        assert!(
+            err.to_string().contains("too large"),
+            "the listing must reject through the shared bounded-body reader: {err}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

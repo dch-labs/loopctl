@@ -418,30 +418,31 @@ impl AnthropicClient {
     /// [`ApiClient::list_models`](crate::api::ApiClient::list_models)), so
     /// a completed page-one answer is complete *within that bound*, not
     /// silently truncated.
-    fn parse_models(value: &Value) -> Vec<crate::api::probe::ModelInfo> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::api`] when the answered body carries no
+    /// `data` array — a document that never spoke of models is a
+    /// failure, never an empty catalog.
+    fn parse_models(value: &Value) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
         use crate::api::probe::ModelInfo;
-        value
-            .get("data")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let id = entry.get("id").and_then(Value::as_str)?;
-                        let metadata = crate::api::probe::curated_model_metadata(id)
-                            .unwrap_or_else(crate::api::probe::ModelMetadata::unreported);
-                        let mut info = ModelInfo::new(id).with_metadata(metadata);
-                        if let Some(name) = entry.get("display_name").and_then(Value::as_str) {
-                            info = info.with_display_name(name);
-                        }
-                        if let Some(stamp) = entry.get("created_at").and_then(Value::as_str) {
-                            info = info.with_created(stamp);
-                        }
-                        Some(info)
-                    })
-                    .collect()
+        let entries = super::listing_entries(value, &["data"], "model listing")?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(Value::as_str)?;
+                let metadata = crate::api::probe::curated_model_metadata(id)
+                    .unwrap_or_else(crate::api::probe::ModelMetadata::unreported);
+                let mut info = ModelInfo::new(id).with_metadata(metadata);
+                if let Some(name) = entry.get("display_name").and_then(Value::as_str) {
+                    info = info.with_display_name(name);
+                }
+                if let Some(stamp) = entry.get("created_at").and_then(Value::as_str) {
+                    info = info.with_created(stamp);
+                }
+                Some(info)
             })
-            .unwrap_or_default()
+            .collect())
     }
 
     /// Build a request body under this client's full configuration.
@@ -631,12 +632,9 @@ impl ApiClient for AnthropicClient {
     > {
         Box::pin(async move {
             let response = self.fetch_model_listing().await?;
-            let body = response
-                .text()
-                .await
-                .map_err(|e| ApiError::http(format!("reading model listing failed: {e}")))?;
-            let value: Value = serde_json::from_str(&body)?;
-            Ok(Self::parse_models(&value))
+            let body = super::read_bounded_body(response).await?;
+            let value: Value = serde_json::from_slice(&body)?;
+            Self::parse_models(&value)
         })
     }
 
@@ -7389,7 +7387,7 @@ mod tests {
             ],
             "has_more": false
         });
-        let models = AnthropicClient::parse_models(&doc);
+        let models = AnthropicClient::parse_models(&doc).expect("listing parses");
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "claude-sonnet-4-5");
         assert_eq!(
@@ -7464,6 +7462,46 @@ mod tests {
             request.contains("anthropic-version: "),
             "the endpoint refuses the listing without its version header: {request}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_listing_rejects_an_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            drop(sock.read(&mut buf).await);
+            // The padding pushes a still-valid catalog past the shared
+            // ceiling, so refusing it is the only correct answer.
+            let oversized = "y".repeat(super::super::MAX_RESPONSE_BODY);
+            let body = format!(
+                r#"{{"data":[{{"type":"model","id":"oversized","display_name":"{oversized}"}}],"has_more":false}}"#
+            );
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a catalog past the shared ceiling must fail, not be buffered into memory");
+        assert!(
+            err.to_string().contains("too large"),
+            "the listing must reject through the shared bounded-body reader: {err}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

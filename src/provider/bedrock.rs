@@ -887,16 +887,22 @@ fn foundation_models_url(region: &str) -> String {
 /// model family, so the first dot-separated segment comes off **for the
 /// lookup only** — the entry itself keeps the full prefixed id, which is
 /// what an invoke request must carry.
-fn parse_foundation_models(value: &serde_json::Value) -> Vec<crate::api::probe::ModelInfo> {
+///
+/// # Errors
+///
+/// Returns [`ApiError::api`] when the answered body carries neither
+/// array spelling — a document that never spoke of models is a
+/// failure, never an empty catalog.
+fn parse_foundation_models(
+    value: &serde_json::Value,
+) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
     use crate::api::probe::ModelInfo;
-    let entries = value
-        .get("modelSummaries")
-        .or_else(|| value.get("summaryList"))
-        .and_then(serde_json::Value::as_array);
-    let Some(entries) = entries else {
-        return Vec::new();
-    };
-    entries
+    let entries = super::listing_entries(
+        value,
+        &["modelSummaries", "summaryList"],
+        "foundation-models listing",
+    )?;
+    Ok(entries
         .iter()
         .filter_map(|entry| {
             let id = entry.get("modelId").and_then(serde_json::Value::as_str)?;
@@ -915,7 +921,7 @@ fn parse_foundation_models(value: &serde_json::Value) -> Vec<crate::api::probe::
             }
             Some(info)
         })
-        .collect()
+        .collect())
 }
 
 /// Incremental decoder for `application/vnd.amazon.eventstream` frames.
@@ -2009,12 +2015,9 @@ impl ApiClient for BedrockClient {
     > {
         Box::pin(async move {
             let response = self.fetch_foundation_models().await?;
-            let body = response
-                .text()
-                .await
-                .map_err(|e| ApiError::http(format!("reading model listing failed: {e}")))?;
-            let value: serde_json::Value = serde_json::from_str(&body)?;
-            Ok(parse_foundation_models(&value))
+            let body = super::read_bounded_body(response).await?;
+            let value: serde_json::Value = serde_json::from_slice(&body)?;
+            parse_foundation_models(&value)
         })
     }
 
@@ -4843,7 +4846,7 @@ mod tests {
             ],
             "nextToken": "second-page"
         });
-        let models = parse_foundation_models(&classic);
+        let models = parse_foundation_models(&classic).expect("classic array parses");
         assert_eq!(
             models.len(),
             2,
@@ -4872,7 +4875,7 @@ mod tests {
         let newer = serde_json::json!({
             "summaryList": [{ "modelId": "meta.llama3-2-70b-instruct-v1:0" }]
         });
-        let models = parse_foundation_models(&newer);
+        let models = parse_foundation_models(&newer).expect("newer array parses");
         assert_eq!(
             models.len(),
             1,
@@ -4895,9 +4898,16 @@ mod tests {
         );
         assert!(models[0].display_name.is_none());
 
-        assert!(
-            parse_foundation_models(&serde_json::json!({ "message": "gone" })).is_empty(),
-            "an answer with neither array is an empty catalog, not a panic"
+        let malformed = parse_foundation_models(&serde_json::json!({ "message": "gone" }))
+            .expect_err(
+                "an answer that spoke of no models is a failure, not a \
+                         catalog dressed up empty",
+            );
+        assert_eq!(
+            crate::api::probe::ProbeClass::from_error(&malformed),
+            crate::api::probe::ProbeClass::Other,
+            "the malformed-body failure classifies Other — no endpoint fact to \
+             own, yet clearly not a network or auth story"
         );
     }
 }

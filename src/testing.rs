@@ -42,6 +42,15 @@
 //!   tool-call content blocks.
 //! - [`test_config`] — Create a test [`SessionConfig`] with sensible defaults.
 //!
+//! # Determinism Fixtures
+//!
+//! - [`StepClock`] — A [`Clock`](crate::determinism::Clock) whose monotonic
+//!   half advances a fixed step per read, so every engine-measured duration
+//!   is an exact multiple of that step.
+//! - [`CapturingObserver`] — A [`LoopObserver`](crate::observer::LoopObserver)
+//!   that records every callback's engine-sourced fields into a comparable
+//!   [`CapturedEvent`] log.
+//!
 //! # Test Environment
 //!
 //! - [`EnvGuard`] — serialize and restore environment variables around
@@ -91,6 +100,10 @@
 //!         stop_reason: "end_turn".into(),
 //!     },
 //! ]);
+
+pub mod determinism;
+
+pub use determinism::{CapturedEvent, CapturingObserver, StepClock};
 
 use crate::api::ApiClient;
 use crate::api::error::ApiError;

@@ -2877,6 +2877,165 @@ mod tests {
         );
     }
 
+    /// A client that fails its first `failures` stream attempts with a
+    /// retryable transport error, then serves the happy path — stamping
+    /// the (virtual) instant of every attempt, so the gaps between
+    /// attempts are exactly the backoffs the handler slept.
+    struct LadderMock {
+        /// How many leading attempts fail with a retryable error.
+        failures: u32,
+
+        /// The instant of every attempt, in attempt order.
+        stamps: std::sync::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl ApiClient for LadderMock {
+        fn model(&self) -> String {
+            "ladder-test".to_string()
+        }
+        fn base_url(&self) -> String {
+            "ladder-test".to_string()
+        }
+        fn set_model(&self, _: &str) -> bool {
+            false
+        }
+        fn stream_messages(
+            &self,
+            request: &crate::api::StreamRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
+        }
+        fn create_message(
+            &self,
+            request: &crate::api::StreamRequest,
+        ) -> Pin<
+            Box<
+                dyn futures::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.create_message_with_options(request, crate::structured::RequestOptions::default())
+        }
+        fn stream_messages_with_options(
+            &self,
+            _request: &crate::api::StreamRequest,
+            _options: crate::structured::RequestOptions,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            let stamp = tokio::time::Instant::now();
+            let mut stamps = crate::error::recover_guard(self.stamps.lock());
+            stamps.push(stamp);
+            let attempt = u32::try_from(stamps.len()).unwrap_or(u32::MAX);
+            if attempt <= self.failures {
+                return Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: String::new(),
+                            role: "assistant".into(),
+                            model: String::new(),
+                        },
+                    })),
+                    Err(ApiError::api("transient")),
+                ]));
+            }
+            Box::pin(futures::stream::iter(happy_stream_events()))
+        }
+        fn create_message_with_options(
+            &self,
+            _request: &crate::api::StreamRequest,
+            _options: crate::structured::RequestOptions,
+        ) -> Pin<
+            Box<
+                dyn futures::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
+        }
+        fn extract_structured(&self, _: &crate::message::Message) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+    }
+
+    /// The delay rounded up to the next whole millisecond.
+    ///
+    /// Tokio's clock rounds every requested sleep up to its millisecond
+    /// granularity, so the gap a virtual-clock test observes is the drawn
+    /// delay rounded up — the pin compares against this, not the raw draw.
+    fn ceil_to_millis(delay: Duration) -> Duration {
+        let whole = delay.as_millis();
+        let sub_millisecond = delay.subsec_nanos() % 1_000_000;
+        let millis = whole.saturating_add(u128::from(sub_millisecond != 0));
+        Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seeded_rng_pins_the_transport_retry_ladder() {
+        let retry_config = StreamRetryConfig {
+            max_retries: 3,
+            base_delay_ms: 100,
+            max_delay_ms: 100_000,
+            jitter_factor: 0.5,
+        };
+        let oracle = crate::determinism::SeededRng::new(0x5EED);
+        let predicted: Vec<_> = (0..2)
+            .map(|attempt| retry_config.jittered_base_delay_with(attempt, &oracle))
+            .collect();
+        let raw: Vec<_> = (0..2)
+            .map(|attempt| retry_config.base_delay(attempt))
+            .collect();
+        assert_ne!(
+            predicted, raw,
+            "the oracle's draws must move off the raw backoff — a dead jitter \
+             would make this pin vacuous"
+        );
+        let handler = StreamHandler::new()
+            .with_retry_config(retry_config)
+            .with_rng(Arc::new(crate::determinism::SeededRng::new(0x5EED)));
+
+        let client = LadderMock {
+            failures: 2,
+            stamps: std::sync::Mutex::new(Vec::new()),
+        };
+        let cancel = Arc::new(CancelSignal::new());
+        let result = handler
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
+            .await;
+        assert!(
+            result.is_ok(),
+            "two scripted failures then the success complete the turn: {:?}",
+            result.err()
+        );
+
+        let stamps = crate::error::recover_guard(client.stamps.lock()).clone();
+        assert_eq!(
+            stamps.len(),
+            3,
+            "two failing attempts then the successful one: {stamps:?}"
+        );
+        for (attempt, delay) in predicted.iter().enumerate() {
+            let observed = stamps[attempt + 1] - stamps[attempt];
+            assert_eq!(
+                observed,
+                ceil_to_millis(*delay),
+                "retry {attempt}'s backoff is the delay the installed rng drew \
+                 for that attempt, attempt for attempt, up to tokio's \
+                 millisecond sleep rounding — a gap of {observed:?} against a \
+                 predicted {delay:?} means the handler did not sleep the \
+                 seeded ladder"
+            );
+        }
+    }
+
     #[test]
     fn outcome_completed_display() {
         let outcome = StreamOutcome::Completed {

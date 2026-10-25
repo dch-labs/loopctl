@@ -7,7 +7,8 @@
 //! produce different ids, timestamps, and jitter — harmless for live use,
 //! fatal for anything that must agree byte-for-byte across runs (cassette
 //! replay, recorded request comparison, diff suites). The clock trait
-//! also carries a wall half; the engine never reads it — that half is the
+//! also carries a wall half; the engine's one wall read stamps the
+//! timestamp on permission-gate decision records, and that half is the
 //! adoption surface for host components that stamp `SystemTime`.
 //!
 //! Each source gets an object-safe trait here with two implementations: a
@@ -55,7 +56,9 @@ use uuid::Uuid;
 /// session start instants and every duration it reports — so that is the
 /// half a pinned implementation must freeze for replay. The wall half
 /// exists for host components that stamp `SystemTime` onto artifacts a
-/// consumer may render or persist; the engine itself never reads it.
+/// consumer may render or persist; the engine's one wall read stamps the
+/// timestamp on permission-gate decision records, so a pinned clock
+/// pins those too.
 /// Implementations must be cheap to call and free of panics; the default
 /// [`SystemClock`] performs the live reads, and a pinned implementation
 /// (see [`FixedClock`]) freezes both halves.

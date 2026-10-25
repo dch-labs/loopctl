@@ -72,15 +72,10 @@ const TEXT_PART_INDEX: usize = 0;
 /// thinking deltas, and the lanes interleave in any order.
 const THINKING_PART_INDEX: usize = 1;
 
-/// Total deadline for one metadata probe request.
-///
-/// The probes ride the client's pooled HTTP layer but override its
-/// read-idleness timeout with this shorter per-request deadline — a
-/// total bound that covers connecting through body completion, so a
-/// metadata endpoint that accepts the connection and never answers
-/// costs run start seconds, not the conversational timeout's minutes,
-/// and answers `None` (fail-soft) when the deadline fires.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The metadata probes' shared per-request deadline, documented on
+/// [`super::PROBE_TIMEOUT`] alongside the discovery probes that share
+/// it.
+use super::PROBE_TIMEOUT;
 
 /// The per-model state of a context-window probe.
 ///
@@ -595,6 +590,174 @@ impl OpenAiClient {
             "context-window probe attempt failed"
         );
     }
+
+    /// GET the OpenAI-spelling model listing, credentials applied.
+    ///
+    /// `{base_url}/models` under the shared probe transport — the
+    /// probe deadline, the rate-limit slot recording, and the full
+    /// failure classification (auth / throttle / server keep their
+    /// variants and forensics) come from
+    /// [`get_checked`](super::get_checked), so a listing failure reads
+    /// exactly like a completion failure off the same endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::auth_invalid_key`] when the key cannot form
+    /// a header value, [`ApiError::http`] on transport failure or probe
+    /// deadline, or the classified variant for a non-success status.
+    async fn fetch_model_listing(&self) -> Result<reqwest::Response, ApiError> {
+        let bearer = bearer_header(&self.api_key)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        super::get_checked(
+            &self.http,
+            &url,
+            &[(reqwest::header::AUTHORIZATION, bearer)],
+            Some(&self.rate_limit),
+        )
+        .await
+    }
+
+    /// GET Ollama's `/api/tags` and hand back the answered response.
+    ///
+    /// The fallback spelling of the listing for the OpenAI-compatible
+    /// endpoints Ollama serves: entries carry `name`, `modified_at`,
+    /// and a weight `size` instead of OpenAI's `id`/`created`/`owned_by`,
+    /// and sit at the server root (the same address the context-window
+    /// probes use) because Ollama has no `/v1` prefix on its native
+    /// API. The response travels unparsed so the liveness probe can
+    /// read its headers — `parse_ollama_tags` and
+    /// [`read_listing_json`](Self::read_listing_json) do the reading at
+    /// the use site.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`get_checked`](super::get_checked) failure for the
+    /// tags route: an [`ApiError::Auth`] for a non-ASCII key, an
+    /// [`ApiError::http`] on transport failure or probe deadline, or the
+    /// classified variant for a non-success status.
+    async fn fetch_ollama_tags(&self) -> Result<reqwest::Response, ApiError> {
+        let bearer = bearer_header(&self.api_key)?;
+        let url = format!("{}/api/tags", self.probe_root());
+        super::get_checked(
+            &self.http,
+            &url,
+            &[(reqwest::header::AUTHORIZATION, bearer)],
+            Some(&self.rate_limit),
+        )
+        .await
+    }
+
+    /// Read an answered listing response into a JSON document.
+    ///
+    /// The shared reading step behind both listing spellings — the
+    /// failure text is identical whichever route produced the response,
+    /// so it names the listing the caller asked about, never one
+    /// spelling's route over the other's.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::http`] when the answered body cannot be read, or
+    /// [`ApiError::Json`] when it is not a JSON document.
+    async fn read_listing_json(&self, response: reqwest::Response) -> Result<Value, ApiError> {
+        let body = super::read_bounded_body(response).await?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Map an OpenAI `/models` document to listing entries.
+    ///
+    /// `data[].id` becomes the usable id, `owned_by` the operator, and
+    /// `created` the creation stamp **verbatim** — servers spell it as
+    /// an epoch integer or an ISO string depending on lineage, and
+    /// guessing a unit is worse than handing the caller the text. An
+    /// entry without a usable id — absent, blank, or whitespace — is
+    /// skipped, not guessed: `set_model` would refuse such an id, so a
+    /// listing that carried one would be selling an unusable choice.
+    /// Each entry's
+    /// metadata is the curated opinion where one exists
+    /// ([`curated_model_metadata`](crate::api::probe::curated_model_metadata)),
+    /// unreported elsewhere — this endpoint discloses no capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::api`] when the answered body carries no
+    /// `data` array — a document that never spoke of models is a
+    /// failure, never an empty catalog.
+    ///
+    /// [`curated_model_metadata`]: crate::api::probe::curated_model_metadata
+    fn parse_openai_models(value: &Value) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
+        use crate::api::probe::ModelInfo;
+        let entries = super::listing_entries(value, &["data"], "model listing")?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(Value::as_str)?;
+                if id.trim().is_empty() {
+                    return None;
+                }
+                let mut info = ModelInfo::new(id).with_metadata(Self::metadata_opinion(id));
+                if let Some(owned) = entry.get("owned_by").and_then(Value::as_str) {
+                    info = info.with_owned_by(owned);
+                }
+                match entry.get("created") {
+                    Some(Value::String(stamp)) => info = info.with_created(stamp),
+                    Some(stamp) if stamp.is_number() => {
+                        info = info.with_created(stamp.to_string());
+                    }
+                    _ => {}
+                }
+                Some(info)
+            })
+            .collect())
+    }
+
+    /// Map Ollama's `/api/tags` document to listing entries.
+    ///
+    /// `models[].name` is the id the caller passes on a request
+    /// (tag included — `llama3.1:latest` is what the wire wants),
+    /// `modified_at` rides as the creation stamp verbatim, and the
+    /// weight `size` lands in [`size_bytes`](crate::api::probe::ModelInfo::size_bytes)
+    /// — the only listing that discloses one. An entry whose name is
+    /// blank or whitespace is skipped, exactly as in
+    /// [`parse_openai_models`](Self::parse_openai_models): an id the
+    /// caller could never select is not a listing entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::api`] when the answered body carries no
+    /// `models` array — a document that never spoke of models is a
+    /// failure, never an empty catalog (the fallback path surfaces it
+    /// rather than reporting an empty Ollama catalog).
+    fn parse_ollama_tags(value: &Value) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
+        use crate::api::probe::ModelInfo;
+        let entries = super::listing_entries(value, &["models"], "Ollama tags listing")?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("name").and_then(Value::as_str)?;
+                if id.trim().is_empty() {
+                    return None;
+                }
+                let mut info = ModelInfo::new(id).with_metadata(Self::metadata_opinion(id));
+                if let Some(stamp) = entry.get("modified_at").and_then(Value::as_str) {
+                    info = info.with_created(stamp);
+                }
+                if let Some(size) = entry.get("size").and_then(Value::as_u64) {
+                    info = info.with_size_bytes(size);
+                }
+                Some(info)
+            })
+            .collect())
+    }
+
+    /// The curated metadata opinion for a listing entry's id, if any.
+    ///
+    /// The listing endpoints this client speaks disclose no capability
+    /// facts, so an entry's metadata is exactly the table's view of
+    /// that id's family — or fully unreported.
+    fn metadata_opinion(model: &str) -> crate::api::probe::ModelMetadata {
+        crate::api::probe::curated_model_metadata(model)
+            .unwrap_or_else(crate::api::probe::ModelMetadata::unreported)
+    }
 }
 
 /// Whether a URL path segment is a version marker (`v1`, `v1beta`).
@@ -653,6 +816,98 @@ impl ApiClient for OpenAiClient {
 
     fn model_context_window(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
         Box::pin(async move { self.probe_context_window().await })
+    }
+
+    /// List models over `GET {base}/models`, falling back to Ollama's
+    /// `GET /api/tags` on a genuine `404`.
+    ///
+    /// The fallback fires only when the OpenAI-style route is truly
+    /// absent: an auth refusal or throttle on `/models` surfaces
+    /// directly, because laundering a credential failure into "this
+    /// server speaks Ollama instead" would send the caller hunting a
+    /// URL while the real answer is a key. When the fallback is reached
+    /// and fails too, the **original** 404 surfaces — it is the primary
+    /// observation ("this server serves neither spelling") and carries
+    /// the forensics the caller already trusts; the fallback's own
+    /// failure has at that point narrated itself through the shared
+    /// probe transport's wire-failure telemetry.
+    fn list_models(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<crate::api::probe::ModelInfo>, ApiError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            match self.fetch_model_listing().await {
+                Ok(response) => {
+                    let value = self.read_listing_json(response).await?;
+                    Self::parse_openai_models(&value)
+                }
+                Err(err) if err.http_status() == Some(404) => {
+                    match self.fetch_ollama_tags().await {
+                        Ok(response) => {
+                            let value = self.read_listing_json(response).await?;
+                            Self::parse_ollama_tags(&value)
+                        }
+                        Err(_) => Err(err),
+                    }
+                }
+                Err(err) => Err(err),
+            }
+        })
+    }
+
+    /// Liveness-probe the metadata route, sharing `list_models`' `404`
+    /// fallback to Ollama's `/api/tags`.
+    ///
+    /// A server that lists through the fallback is live and listable,
+    /// and the ping must not misread it as a wrong URL; a server that
+    /// answers neither spelling gets the original refusal of the
+    /// primary route, exactly as the listing reports it — the ping
+    /// asks the same question the listing asks.
+    fn ping(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::probe::PingReport, ApiError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let response = match self.fetch_model_listing().await {
+                Ok(response) => response,
+                Err(err) if err.http_status() == Some(404) => {
+                    match self.fetch_ollama_tags().await {
+                        Ok(response) => response,
+                        Err(_) => return Err(err),
+                    }
+                }
+                Err(err) => return Err(err),
+            };
+            let meta = crate::provider::forensics::capture_provider_meta(response.headers());
+            let mut report = crate::api::probe::PingReport::new(started.elapsed());
+            if let Some(rate_limit) = meta.rate_limit {
+                report = report.with_rate_limit(rate_limit);
+            }
+            if let Some(request_id) = meta.request_id {
+                report = report.with_request_id(request_id);
+            }
+            Ok(report)
+        })
+    }
+
+    fn model_metadata(
+        &self,
+        model: &str,
+    ) -> Pin<Box<dyn Future<Output = crate::api::probe::ModelMetadata> + Send + '_>> {
+        let curated = crate::api::probe::curated_model_metadata(model);
+        let about_current = self.model() == model;
+        Box::pin(async move {
+            let disclosed = if about_current {
+                self.probe_context_window()
+                    .await
+                    .map(crate::api::probe::ModelMetadata::disclosed_context_window)
+            } else {
+                None
+            };
+            crate::api::probe::ModelMetadata::merged(disclosed.as_ref(), curated.as_ref())
+        })
     }
 
     fn stream_messages(
@@ -5373,5 +5628,560 @@ mod tests {
             .await
             .expect("reader must not err");
         assert_eq!(third, None, "the stream must end cleanly after the payload");
+    }
+
+    #[test]
+    fn listing_entries_carry_ids_verbatim_stamps_and_curation() {
+        let doc = serde_json::json!({
+            "object": "list",
+            "data": [
+                { "id": "gpt-4o-mini", "object": "model", "created": 1_721_172_744_u64, "owned_by": "openai" },
+                { "id": "who-knows", "object": "model" },
+                { "object": "model" },
+                { "id": "", "object": "model", "owned_by": "ghost" },
+                { "id": "   ", "object": "model", "owned_by": "ghost" }
+            ]
+        });
+        let models = OpenAiClient::parse_openai_models(&doc).expect("listing parses");
+        assert_eq!(
+            models.len(),
+            2,
+            "the entries without a usable id — absent, empty, whitespace — are \
+             skipped, not guessed: set_model would refuse every one of them"
+        );
+        assert!(
+            models.iter().all(|m| !m.id.trim().is_empty()),
+            "no blank id survives into a selectable listing"
+        );
+        assert_eq!(models[0].id, "gpt-4o-mini");
+        assert_eq!(
+            models[0].created.as_deref(),
+            Some("1721172744"),
+            "the epoch stamp rides verbatim — the crate does not guess units"
+        );
+        assert_eq!(models[0].owned_by.as_deref(), Some("openai"));
+        assert_eq!(
+            models[0].metadata.context_window,
+            Some(128_000),
+            "a curated family keeps its published window through the listing"
+        );
+        assert_eq!(
+            models[0].metadata.source,
+            crate::api::probe::MetadataSource::Curated,
+            "and the provenance says the number came from the table, not the wire"
+        );
+        assert_eq!(
+            models[1].metadata,
+            crate::api::probe::ModelMetadata::unreported(),
+            "an id outside every family answers unreported"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_openai_listing_rejects_an_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            drop(sock.read(&mut buf).await);
+            // The padding pushes a still-valid catalog past the shared
+            // ceiling, so refusing it is the only correct answer.
+            let oversized = "y".repeat(super::super::MAX_RESPONSE_BODY);
+            let body = format!(
+                r#"{{"object":"list","data":[{{"id":"oversized","owned_by":"{oversized}"}}]}}"#
+            );
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a catalog past the shared ceiling must fail, not be buffered into memory");
+        assert!(
+            err.to_string().contains("too large"),
+            "the listing must reject through the shared bounded-body reader: {err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_models_route_404_falls_back_to_ollama_tags() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (body, status) in [
+                (String::new(), "404 Not Found"),
+                (
+                    r#"{"models":[{"name":"  "},{"name":"llama3.1:latest","modified_at":"2025-01-01T00:00:00Z","size":4800000000}]}"#.to_string(),
+                    "200 OK",
+                ),
+            ] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                drop(sock.write_all(head.as_bytes()).await);
+                drop(sock.write_all(body.as_bytes()).await);
+            }
+            requests
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .with_model("llama3.1:latest")
+            .build()
+            .unwrap();
+        let models = client
+            .list_models()
+            .await
+            .expect("a server without the OpenAI route but with /api/tags must still list");
+        assert_eq!(
+            models.len(),
+            1,
+            "a blank Ollama name is skipped exactly as a blank OpenAI id is"
+        );
+        assert_eq!(models[0].id, "llama3.1:latest");
+        assert_eq!(models[0].size_bytes, Some(4_800_000_000));
+        assert_eq!(
+            models[0].created.as_deref(),
+            Some("2025-01-01T00:00:00Z"),
+            "Ollama's modification time rides as the creation stamp verbatim"
+        );
+        assert_eq!(models[0].metadata.context_window, Some(128_000));
+
+        let requests = server.await.unwrap();
+        assert!(
+            requests[0].contains("GET /v1/models"),
+            "the OpenAI spelling is tried first: {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("GET /api/tags"),
+            "the tags fallback sits at the server root, not under /v1: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_body_without_a_models_array_is_a_failure_not_an_empty_catalog() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Two connections only: the 404 that opens the fallback and
+            // the tags answer. A third request would hang this task, and
+            // the listing must not chase one.
+            let mut bodies = [
+                (String::new(), "404 Not Found"),
+                (r#"{"error":"upstream exploded"}"#.to_string(), "200 OK"),
+            ]
+            .into_iter();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let (body, status) = bodies.next().unwrap();
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+            drop(sock);
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let (body, status) = bodies.next().unwrap();
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let err = client.list_models().await.expect_err(
+            "a tags route that answered without speaking of models \
+                         failed the listing — an empty success here would dress \
+                         a broken proxy up as a clean empty deployment",
+        );
+        assert_eq!(
+            crate::api::probe::ProbeClass::from_error(&err),
+            crate::api::probe::ProbeClass::Other,
+            "the malformed-body failure classifies Other"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failing_fallback_surfaces_the_original_refusal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (_, status) in [("", "404 Not Found"), ("", "401 Unauthorized")] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 1024];
+                drop(sock.read(&mut buf).await);
+                let head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+                drop(sock.write_all(head.as_bytes()).await);
+            }
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let err = client
+            .list_models()
+            .await
+            .expect_err("both spellings refused, so the listing fails");
+        assert_eq!(
+            err.http_status(),
+            Some(404),
+            "the primary route's refusal is the primary observation even when \
+             the fallback answers differently: {err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_ping_rides_the_tags_fallback_when_the_models_route_404s() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (body, head) in [
+                (String::new(), "404 Not Found".to_string()),
+                (
+                    r#"{"models":[]}"#.to_string(),
+                    "200 OK\r\nx-request-id: tagger-1".to_string(),
+                ),
+            ] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let head = format!(
+                    "HTTP/1.1 {head}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                drop(sock.write_all(head.as_bytes()).await);
+                drop(sock.write_all(body.as_bytes()).await);
+            }
+            requests
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let report = client
+            .ping()
+            .await
+            .expect("a tags-only server is live, and the ping must read it that way");
+        assert_eq!(
+            report.request_id.as_deref(),
+            Some("tagger-1"),
+            "the report's forensics come from the response that proved liveness"
+        );
+
+        let requests = server.await.unwrap();
+        assert!(
+            requests[0].contains("GET /v1/models"),
+            "the ping tries the OpenAI spelling first, like the listing: {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("GET /api/tags"),
+            "and takes the same server-root fallback the listing takes: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_tags_fallback_surfaces_the_original_404_to_the_ping() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (_, status) in [("", "404 Not Found"), ("", "500 Internal Server Error")] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 1024];
+                drop(sock.read(&mut buf).await);
+                let head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+                drop(sock.write_all(head.as_bytes()).await);
+            }
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let err = client
+            .ping()
+            .await
+            .expect_err("neither spelling answered, so the ping fails");
+        assert_eq!(
+            err.http_status(),
+            Some(404),
+            "the ping surfaces the primary route's refusal with its forensics, \
+             exactly as the listing does: {err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_ping_reports_the_answers_forensics() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let head = "HTTP/1.1 200 OK\r\n\
+                        x-request-id: pinger-1\r\n\
+                        x-ratelimit-remaining: 7\r\n\
+                        Content-Type: application/json\r\n\
+                        Content-Length: 12\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(b"{\"data\":[]}\n").await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let report = client
+            .ping()
+            .await
+            .expect("a serving listing route answers the ping");
+        assert_eq!(
+            report.request_id.as_deref(),
+            Some("pinger-1"),
+            "the id a support desk asks for reaches the health report"
+        );
+        assert_eq!(
+            report
+                .rate_limit
+                .as_ref()
+                .and_then(|snapshot| snapshot.remaining.as_deref()),
+            Some("7"),
+            "the quota state the answer carried reaches the health report"
+        );
+        // The probe shares the response plumbing every metered call uses, so
+        // the client's documented rate-limit view reflects the probe's own
+        // response — verbatim, as the headers spelled it.
+        let seen = client
+            .last_rate_limit()
+            .expect("the probe response carried a rate-limit header");
+        assert_eq!(seen.remaining.as_deref(), Some("7"));
+
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("GET /v1/models"),
+            "the ping rides the metadata route, not a metered completion: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_metadata_folds_the_disclosed_window_into_the_curation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let body = r#"{"default_generation_settings":{"n_ctx":32768},"total_slots":1}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .with_model("gpt-4o-mini")
+            .build()
+            .unwrap();
+        let metadata = client.model_metadata("gpt-4o-mini").await;
+        assert_eq!(
+            metadata.context_window,
+            Some(32_768),
+            "the window this deployment disclosed beats the family's published value"
+        );
+        assert_eq!(
+            metadata.capabilities.tool_calling,
+            Some(true),
+            "the curated capabilities still ride along where the wire said nothing"
+        );
+        assert_eq!(
+            metadata.source,
+            crate::api::probe::MetadataSource::DisclosedAndCurated,
+            "and the provenance names both contributors"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_for_another_model_never_spends_a_probe() {
+        // A listener nobody ever answers: if the metadata path probed
+        // for a foreign model id, the call would stall to the probe
+        // deadline instead of returning instantly.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .with_model("gpt-4o-mini")
+            .build()
+            .unwrap();
+        let metadata = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.model_metadata("deepseek-chat"),
+        )
+        .await
+        .expect("asking about a foreign model must not touch the socket");
+        assert_eq!(metadata.context_window, Some(64_000));
+        assert_eq!(
+            metadata.source,
+            crate::api::probe::MetadataSource::Curated,
+            "pure curation — nothing was disclosed, because nothing was asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_auth_failure_never_reaches_the_tags_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let _n = sock.read(&mut buf).await.unwrap_or(0);
+            drop(
+                sock.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                    .await,
+            );
+            drop(sock);
+            // Did a second connection (the tags fallback) ever arrive?
+            tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a rejected credential fails the listing");
+        assert_eq!(
+            crate::api::probe::ProbeClass::from_error(&err),
+            crate::api::probe::ProbeClass::Auth,
+            "the credential answer is the answer: {err}"
+        );
+        assert!(
+            !server.await.unwrap(),
+            "the fallback exists for a missing route (404), never to route around \
+             a rejected credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_listing_get_carries_the_bearer_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let body = r#"{"data":[{"id":"gpt-4o","object":"model","owned_by":"openai"}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("probe-bearer")
+            .with_base_url(format!("http://{addr}/v1"))
+            .build()
+            .unwrap();
+        let models = client
+            .list_models()
+            .await
+            .expect("the OpenAI-shape listing is read verbatim");
+        assert_eq!(models[0].id, "gpt-4o");
+        assert_eq!(models[0].owned_by.as_deref(), Some("openai"));
+        assert_eq!(
+            models[0].metadata.context_window,
+            Some(128_000),
+            "the curated family value rides the listing entry"
+        );
+
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("GET /v1/models"),
+            "the listing route: {request}"
+        );
+        assert!(
+            request.contains("authorization: Bearer probe-bearer")
+                || request.contains("authorization: bearer probe-bearer"),
+            "the listing GET carries the same bearer credential a completion \
+             sends: {request}"
+        );
     }
 }

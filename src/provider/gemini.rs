@@ -242,6 +242,91 @@ impl GeminiClient {
         format!("{}/models/{model}:generateContent", self.base_url)
     }
 
+    /// GET the model catalog under the probe transport.
+    ///
+    /// `{base}/models` (`/v1beta/models` on the default endpoint) with
+    /// the `x-goog-api-key` credential — the probe deadline, rate-limit
+    /// slot recording, and full failure classification come from
+    /// [`get_checked`](super::get_checked), so a probe reads an expired
+    /// key or a quota throttle with the same variants a generation
+    /// failure carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::auth_invalid_key`] when the key cannot form
+    /// a header value, [`ApiError::http`] on transport failure or probe
+    /// deadline, or the classified variant for a non-success status.
+    async fn fetch_model_listing(&self) -> Result<reqwest::Response, ApiError> {
+        let mut key_header = reqwest::header::HeaderValue::from_str(&self.api_key)
+            .map_err(|e| ApiError::auth_invalid_key(format!("invalid api key header: {e}")))?;
+        key_header.set_sensitive(true);
+        let url = format!("{}/models", self.base_url);
+        super::get_checked(
+            &self.http,
+            &url,
+            &[(
+                reqwest::header::HeaderName::from_static("x-goog-api-key"),
+                key_header,
+            )],
+            Some(&self.rate_limit),
+        )
+        .await
+    }
+
+    /// Map a `models` catalog document to listing entries.
+    ///
+    /// `models[].name` is a resource path (`models/gemini-2.5-pro`);
+    /// the usable id is its last segment — what the generateContent
+    /// URL wants. This is the one hosted listing that discloses facts:
+    /// `inputTokenLimit` lands as a **disclosed** context window,
+    /// merged over the curated opinion so the wire number wins and the
+    /// provenance marker says exactly that.
+    ///
+    /// `nextPageToken` marks a further page; continuation is not
+    /// followed — the first page is this surface's documented bound
+    /// (see [`ApiClient::list_models`](crate::api::ApiClient::list_models)),
+    /// so a completed page-one answer is complete *within that bound*.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::api`] when the answered body carries no
+    /// `models` array — a document that never spoke of models is a
+    /// failure, never an empty catalog.
+    fn parse_models(
+        value: &serde_json::Value,
+    ) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
+        use crate::api::probe::{ModelInfo, ModelMetadata, curated_model_metadata};
+        let entries = super::listing_entries(value, &["models"], "model listing")?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| {
+                let name = entry.get("name").and_then(serde_json::Value::as_str)?;
+                let speaks_generation = match entry.get("supportedGenerationMethods") {
+                    Some(serde_json::Value::Array(methods)) => methods
+                        .iter()
+                        .any(|method| method.as_str() == Some("generateContent")),
+                    _ => true,
+                };
+                if !speaks_generation {
+                    return None;
+                }
+                let id = name.rsplit('/').next().unwrap_or(name);
+                let disclosed = entry
+                    .get("inputTokenLimit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(ModelMetadata::disclosed_context_window);
+                let metadata =
+                    ModelMetadata::merged(disclosed.as_ref(), curated_model_metadata(id).as_ref());
+                let mut info = ModelInfo::new(id).with_metadata(metadata);
+                if let Some(display) = entry.get("displayName").and_then(serde_json::Value::as_str)
+                {
+                    info = info.with_display_name(display);
+                }
+                Some(info)
+            })
+            .collect())
+    }
+
     /// Build a typed [`NonStreamingResponse`] from Gemini's native JSON.
     ///
     /// Reads `candidates[0].content.parts` into [`MessagePart`]s: each `text`
@@ -409,6 +494,38 @@ impl ApiClient for GeminiClient {
 
     fn supports_tool_constraints(&self) -> bool {
         true
+    }
+
+    fn list_models(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<crate::api::probe::ModelInfo>, ApiError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let response = self.fetch_model_listing().await?;
+            let body = super::read_bounded_body(response).await?;
+            let value: serde_json::Value = serde_json::from_slice(&body)?;
+            Self::parse_models(&value)
+        })
+    }
+
+    fn ping(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::probe::PingReport, ApiError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let response = self.fetch_model_listing().await?;
+            let meta = crate::provider::forensics::capture_provider_meta(response.headers());
+            let mut report = crate::api::probe::PingReport::new(started.elapsed());
+            if let Some(rate_limit) = meta.rate_limit {
+                report = report.with_rate_limit(rate_limit);
+            }
+            if let Some(request_id) = meta.request_id {
+                report = report.with_request_id(request_id);
+            }
+            Ok(report)
+        })
     }
 
     fn stream_messages(
@@ -4321,6 +4438,206 @@ mod tests {
             parsed,
             Some(serde_json::json!({"candidates": []})),
             "an empty data payload is skipped inside the reader; the next chunk still parses"
+        );
+    }
+
+    #[test]
+    fn listing_entries_strip_resource_paths_and_fold_disclosed_limits() {
+        let doc = serde_json::json!({
+            "models": [
+                {
+                    "name": "models/gemini-2.5-pro",
+                    "displayName": "Gemini 2.5 Pro",
+                    "inputTokenLimit": 1_048_576,
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                    "name": "models/undisclosed-model",
+                    "displayName": "Quiet Model"
+                },
+                {
+                    "name": "models/gemini-embedding-001",
+                    "displayName": "Embeddings Only",
+                    "supportedGenerationMethods": ["embedContent"]
+                }
+            ]
+        });
+        let models = GeminiClient::parse_models(&doc).expect("catalog parses");
+        assert_eq!(
+            models.len(),
+            2,
+            "the entry whose methods explicitly exclude generateContent is skipped"
+        );
+        assert!(
+            models.iter().all(|m| m.id != "gemini-embedding-001"),
+            "an id this client could never call must not ride the listing"
+        );
+        assert_eq!(
+            models[0].id, "gemini-2.5-pro",
+            "the resource path is stripped to the id generateContent wants"
+        );
+        assert_eq!(models[0].display_name.as_deref(), Some("Gemini 2.5 Pro"));
+        assert_eq!(
+            models[0].metadata.context_window,
+            Some(1_048_576),
+            "the provider's own inputTokenLimit is the window"
+        );
+        assert_eq!(
+            models[0].metadata.capabilities.tool_calling,
+            Some(true),
+            "curated capabilities fill where the listing is silent"
+        );
+        assert_eq!(
+            models[0].metadata.source,
+            crate::api::probe::MetadataSource::DisclosedAndCurated,
+            "the provenance names the disclosure and the table"
+        );
+        assert_eq!(
+            models[1].metadata,
+            crate::api::probe::ModelMetadata::unreported(),
+            "no disclosure, no table row: unreported"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gemini_listing_carries_the_api_key_and_the_ping_follows_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = r#"{"models":[{"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","inputTokenLimit":1048576}]}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                drop(sock.write_all(head.as_bytes()).await);
+                drop(sock.write_all(body.as_bytes()).await);
+            }
+            requests
+        });
+
+        let client = GeminiClient::builder()
+            .with_api_key("g-key")
+            .with_base_url(format!("http://{addr}/v1beta"))
+            .build()
+            .unwrap();
+        let models = client
+            .list_models()
+            .await
+            .expect("the catalog arrives through the api-key header");
+        assert_eq!(models[0].id, "gemini-2.5-pro");
+        assert_eq!(models[0].metadata.context_window, Some(1_048_576));
+
+        let report = client
+            .ping()
+            .await
+            .expect("the same route answers the ping");
+        assert_eq!(report.rate_limit, None, "this answer sent no quota headers");
+
+        let requests = server.await.unwrap();
+        for request in requests {
+            assert!(
+                request.contains("GET /v1beta/models"),
+                "the catalog route: {request}"
+            );
+            assert!(
+                request.contains("x-goog-api-key: g-key"),
+                "the key rides the probe exactly as on a generation call: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gemini_listing_rejects_an_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            drop(sock.read(&mut buf).await);
+            // The padding pushes a still-valid catalog past the shared
+            // ceiling, so refusing it is the only correct answer.
+            let oversized = "y".repeat(super::super::MAX_RESPONSE_BODY);
+            let body = format!(
+                r#"{{"models":[{{"name":"models/oversized","displayName":"{oversized}"}}]}}"#
+            );
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = GeminiClient::builder()
+            .with_api_key("g-key")
+            .with_base_url(format!("http://{addr}/v1beta"))
+            .build()
+            .unwrap();
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a catalog past the shared ceiling must fail, not be buffered into memory");
+        assert!(
+            err.to_string().contains("too large"),
+            "the listing must reject through the shared bounded-body reader: {err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_gemini_listing_answers_page_one_and_stops() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _n = sock.read(&mut buf).await.unwrap_or(0);
+                let body = r#"{"models":[{"name":"models/gemini-2.5-pro","inputTokenLimit":1048576},{"name":"models/gemini-2.5-flash","inputTokenLimit":1048576}],"nextPageToken":"page-2-token"}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                drop(sock.write_all(head.as_bytes()).await);
+                drop(sock.write_all(body.as_bytes()).await);
+                drop(sock);
+                // Did a second request (the continuation page) ever arrive?
+                tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_ok()
+            }
+        });
+
+        let client = GeminiClient::builder()
+            .with_api_key("g-key")
+            .with_base_url(format!("http://{addr}/v1beta"))
+            .build()
+            .unwrap();
+        let models = client
+            .list_models()
+            .await
+            .expect("a continuation token changes nothing about this page's answer");
+        assert_eq!(
+            models.len(),
+            2,
+            "the first page is served whole, disclosed windows and all"
+        );
+        assert!(
+            !server.await.unwrap(),
+            "page-1-only is the documented bound of the listing surface — \
+             a `nextPageToken` must not silently become a second request"
         );
     }
 }

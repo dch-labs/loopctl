@@ -356,6 +356,95 @@ impl AnthropicClient {
         format!("{}/v1/messages", self.base_url)
     }
 
+    /// The credential pair every Anthropic wire call carries.
+    ///
+    /// `x-api-key` (marked sensitive, exactly as the completions path
+    /// marks it) and the `anthropic-version` the endpoint requires —
+    /// the listing GET refuses without it, so the probe path must send
+    /// the same pair a Messages request sends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::auth_invalid_key`] when the key cannot form
+    /// a header value.
+    fn credential_headers(
+        &self,
+    ) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, ApiError> {
+        let mut key_header = reqwest::header::HeaderValue::from_str(&self.api_key)
+            .map_err(|e| ApiError::auth_invalid_key(format!("invalid api key header: {e}")))?;
+        key_header.set_sensitive(true);
+        Ok(vec![
+            (
+                reqwest::header::HeaderName::from_static("x-api-key"),
+                key_header,
+            ),
+            (
+                reqwest::header::HeaderName::from_static("anthropic-version"),
+                reqwest::header::HeaderValue::from_static(ANTHROPIC_VERSION),
+            ),
+        ])
+    }
+
+    /// GET the account's model listing under the probe transport.
+    ///
+    /// `{base}/v1/models` — the credential pair applied, the probe
+    /// deadline and full failure classification from
+    /// [`get_checked`](super::get_checked), so an auth rejection or a
+    /// throttle answers a probe with the same variant and forensics a
+    /// Messages failure carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::auth_invalid_key`] when the key cannot form
+    /// a header value, [`ApiError::http`] on transport failure or probe
+    /// deadline, or the classified variant for a non-success status.
+    async fn fetch_model_listing(&self) -> Result<reqwest::Response, ApiError> {
+        let headers = self.credential_headers()?;
+        let url = format!("{}/v1/models", self.base_url);
+        super::get_checked(&self.http, &url, &headers, Some(&self.rate_limit)).await
+    }
+
+    /// Map a `/v1/models` document to listing entries.
+    ///
+    /// `data[].id` is the usable id, `display_name` the human name, and
+    /// `created_at` the RFC 3339 stamp verbatim. The endpoint discloses
+    /// no window or modality facts, so metadata is the curated opinion
+    /// where one exists — this is where that rule earns its keep:
+    /// Anthropic's own listing would otherwise say nothing about
+    /// context windows.
+    ///
+    /// `has_more` / `next_page` mark a further page; continuation is not
+    /// followed — the first page is this surface's documented bound (see
+    /// [`ApiClient::list_models`](crate::api::ApiClient::list_models)), so
+    /// a completed page-one answer is complete *within that bound*, not
+    /// silently truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::api`] when the answered body carries no
+    /// `data` array — a document that never spoke of models is a
+    /// failure, never an empty catalog.
+    fn parse_models(value: &Value) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
+        use crate::api::probe::ModelInfo;
+        let entries = super::listing_entries(value, &["data"], "model listing")?;
+        Ok(entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(Value::as_str)?;
+                let metadata = crate::api::probe::curated_model_metadata(id)
+                    .unwrap_or_else(crate::api::probe::ModelMetadata::unreported);
+                let mut info = ModelInfo::new(id).with_metadata(metadata);
+                if let Some(name) = entry.get("display_name").and_then(Value::as_str) {
+                    info = info.with_display_name(name);
+                }
+                if let Some(stamp) = entry.get("created_at").and_then(Value::as_str) {
+                    info = info.with_created(stamp);
+                }
+                Some(info)
+            })
+            .collect())
+    }
+
     /// Build a request body under this client's full configuration.
     ///
     /// Wraps [`build_request_body`] with the client-level knobs
@@ -534,6 +623,38 @@ impl ApiClient for AnthropicClient {
 
     fn supports_tool_constraints(&self) -> bool {
         true
+    }
+
+    fn list_models(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<crate::api::probe::ModelInfo>, ApiError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let response = self.fetch_model_listing().await?;
+            let body = super::read_bounded_body(response).await?;
+            let value: Value = serde_json::from_slice(&body)?;
+            Self::parse_models(&value)
+        })
+    }
+
+    fn ping(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::probe::PingReport, ApiError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let response = self.fetch_model_listing().await?;
+            let meta = crate::provider::forensics::capture_provider_meta(response.headers());
+            let mut report = crate::api::probe::PingReport::new(started.elapsed());
+            if let Some(rate_limit) = meta.rate_limit {
+                report = report.with_rate_limit(rate_limit);
+            }
+            if let Some(request_id) = meta.request_id {
+                report = report.with_request_id(request_id);
+            }
+            Ok(report)
+        })
     }
 
     fn stream_messages(
@@ -7250,5 +7371,234 @@ mod tests {
             (25, 15),
             "a compact-event-line wire must report the same usage as the spaced form"
         );
+    }
+
+    #[test]
+    fn listing_entries_carry_display_names_stamps_and_curation() {
+        let doc = serde_json::json!({
+            "data": [
+                {
+                    "type": "model",
+                    "id": "claude-sonnet-4-5",
+                    "display_name": "Claude Sonnet 4.5",
+                    "created_at": "2025-09-29T00:00:00Z"
+                },
+                { "type": "model", "id": "mystery-model" }
+            ],
+            "has_more": false
+        });
+        let models = AnthropicClient::parse_models(&doc).expect("listing parses");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-sonnet-4-5");
+        assert_eq!(
+            models[0].display_name.as_deref(),
+            Some("Claude Sonnet 4.5"),
+            "the human name is what a picker displays"
+        );
+        assert_eq!(
+            models[0].created.as_deref(),
+            Some("2025-09-29T00:00:00Z"),
+            "the RFC 3339 stamp rides verbatim"
+        );
+        assert_eq!(
+            models[0].metadata.context_window,
+            Some(200_000),
+            "the endpoint discloses no windows — the curated family value fills in"
+        );
+        assert_eq!(
+            models[0].metadata.capabilities.structured_output,
+            Some(false),
+            "and the curated capability claims ride with it"
+        );
+        assert_eq!(
+            models[1].metadata,
+            crate::api::probe::ModelMetadata::unreported(),
+            "an unknown id answers nobody said, never a plausible zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_listing_sends_the_version_pair_and_maps_models() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let body = r#"{"data":[{"type":"model","id":"claude-sonnet-4-5","display_name":"Claude Sonnet 4.5","created_at":"2025-09-29T00:00:00Z"}],"has_more":false}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = AnthropicClient::builder()
+            .with_api_key("k-secret")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let models = client
+            .list_models()
+            .await
+            .expect("the listing arrives through the credential pair");
+        assert_eq!(models[0].id, "claude-sonnet-4-5");
+        assert_eq!(models[0].display_name.as_deref(), Some("Claude Sonnet 4.5"));
+
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("GET /v1/models"),
+            "the models route, not the messages route: {request}"
+        );
+        assert!(
+            request.contains("x-api-key: k-secret"),
+            "the credential rides the probe exactly as on a Messages call: {request}"
+        );
+        assert!(
+            request.contains("anthropic-version: "),
+            "the endpoint refuses the listing without its version header: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_listing_rejects_an_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            drop(sock.read(&mut buf).await);
+            // The padding pushes a still-valid catalog past the shared
+            // ceiling, so refusing it is the only correct answer.
+            let oversized = "y".repeat(super::super::MAX_RESPONSE_BODY);
+            let body = format!(
+                r#"{{"data":[{{"type":"model","id":"oversized","display_name":"{oversized}"}}],"has_more":false}}"#
+            );
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+        });
+
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a catalog past the shared ceiling must fail, not be buffered into memory");
+        assert!(
+            err.to_string().contains("too large"),
+            "the listing must reject through the shared bounded-body reader: {err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_listing_answers_page_one_and_stops() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _n = sock.read(&mut buf).await.unwrap_or(0);
+                let body = r#"{"data":[{"type":"model","id":"claude-sonnet-4-5"},{"type":"model","id":"claude-haiku-4-5"}],"has_more":true,"next_page":"cursor-page-2"}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                drop(sock.write_all(head.as_bytes()).await);
+                drop(sock.write_all(body.as_bytes()).await);
+                drop(sock);
+                // Did a second request (page two) ever arrive?
+                tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_ok()
+            }
+        });
+
+        let client = AnthropicClient::builder()
+            .with_api_key("k-secret")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let models = client
+            .list_models()
+            .await
+            .expect("a further page changes nothing about this page's answer");
+        assert_eq!(
+            models.len(),
+            2,
+            "the first page is served whole, markers and all"
+        );
+        assert!(
+            !server.await.unwrap(),
+            "page-1-only is the documented bound of the listing surface — \
+             a `has_more` marker must not silently become a second request"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_ping_answers_the_models_route() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for body in [
+                r#"{"data":[],"has_more":false}"#,
+                r#"{"type":"error","error":{"type":"authentication_error","message":"bad"}}"#,
+            ] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 1024];
+                let _n = sock.read(&mut buf).await.unwrap_or(0);
+                let status = if body.contains("error") {
+                    "403 Forbidden"
+                } else {
+                    "200 OK"
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                drop(sock.write_all(head.as_bytes()).await);
+                drop(sock.write_all(body.as_bytes()).await);
+            }
+        });
+
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let report = client
+            .ping()
+            .await
+            .expect("a serving models route answers the ping");
+        assert_eq!(report.request_id, None, "this answer sent no headers");
+
+        let err = client
+            .ping()
+            .await
+            .expect_err("the rejection must surface as the classified failure");
+        assert_eq!(
+            crate::api::probe::ProbeClass::from_error(&err),
+            crate::api::probe::ProbeClass::Auth,
+            "403 reads as the credential problem it is: {err}"
+        );
+        server.await.unwrap();
     }
 }

@@ -535,7 +535,6 @@ fn sigv4_sign(
     use sha2::Digest as _;
 
     let amz_date = format_amz_date(now);
-    let date_stamp = &amz_date[..8];
 
     let payload_hash = hex::encode(Sha256::digest(payload));
     let (canonical_headers, signed_header_list) = match session_token {
@@ -556,6 +555,83 @@ fn sigv4_sign(
     let canonical = canonical_uri(uri);
     let canonical_request =
         format!("POST\n{canonical}\n\n{canonical_headers}\n{signed_header_list}\n{payload_hash}");
+    sign_canonical_request(
+        &canonical_request,
+        signed_header_list,
+        access_key_id,
+        secret_access_key,
+        region,
+        &amz_date,
+    )
+}
+
+/// Sign a GET against the Bedrock control plane.
+///
+/// The same `SigV4` machinery as [`sigv4_sign`] with the three GET
+/// differences the service demands: the method line is `GET`, the
+/// payload hash is the well-known hash of the empty body, and
+/// `Content-Type` is not signed (a GET sends none, and signing a
+/// header the request never sends is a signature AWS rejects). The
+/// control plane is `bedrock.{region}.amazonaws.com` — the management
+/// endpoint, not `bedrock-runtime`.
+fn sigv4_sign_get(
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    host: &str,
+    uri: &str,
+    now: std::time::SystemTime,
+) -> SigV4Headers {
+    use sha2::Digest as _;
+
+    let amz_date = format_amz_date(now);
+    let payload_hash = hex::encode(Sha256::digest(b""));
+    let (canonical_headers, signed_header_list) = match session_token {
+        Some(token) => (
+            format!(
+                "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\nx-amz-security-token:{token}\n"
+            ),
+            "host;x-amz-content-sha256;x-amz-date;x-amz-security-token",
+        ),
+        None => (
+            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"),
+            "host;x-amz-content-sha256;x-amz-date",
+        ),
+    };
+
+    let canonical = canonical_uri(uri);
+    let canonical_request =
+        format!("GET\n{canonical}\n\n{canonical_headers}\n{signed_header_list}\n{payload_hash}");
+    sign_canonical_request(
+        &canonical_request,
+        signed_header_list,
+        access_key_id,
+        secret_access_key,
+        region,
+        &amz_date,
+    )
+}
+
+/// The signing tail shared by the POST and GET request signers.
+///
+/// Turns a fully composed canonical request into the
+/// [`SigV4Headers`]: string-to-sign, key derivation, signature, and
+/// the `Authorization` header text. Both callers have already spelled
+/// the method, headers, and payload differences into the canonical
+/// request; what remains is identical, and this is the single place
+/// the credential scope and header format are decided.
+fn sign_canonical_request(
+    canonical_request: &str,
+    signed_header_list: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+    region: &str,
+    amz_date: &str,
+) -> SigV4Headers {
+    use sha2::Digest as _;
+
+    let date_stamp = &amz_date[..8];
     let credential_scope = format!("{date_stamp}/{region}/bedrock/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
@@ -570,7 +646,7 @@ fn sigv4_sign(
             "AWS4-HMAC-SHA256 Credential={access_key_id}/{credential_scope}, \
              SignedHeaders={signed_header_list}, Signature={signature}"
         ),
-        amz_date,
+        amz_date: amz_date.to_string(),
     }
 }
 
@@ -766,6 +842,86 @@ fn invoke_url(region: &str, model: &str, path: BedrockPath) -> String {
         "https://bedrock-runtime.{region}.amazonaws.com/model/{}/{suffix}",
         encode_path_segment(model)
     )
+}
+
+/// The control-plane host for one region.
+///
+/// `bedrock.{region}.amazonaws.com` — the model-management endpoint,
+/// deliberately distinct from the `bedrock-runtime` host completions
+/// ride. The discovery surface ([`list_models`] and
+/// [`ping`](crate::api::ApiClient::ping)) addresses only this host.
+///
+/// [`list_models`]: crate::api::ApiClient::list_models
+fn control_plane_host(region: &str) -> String {
+    format!("bedrock.{region}.amazonaws.com")
+}
+
+/// The `/foundation-models` catalog URL for one region.
+///
+/// The AWS-defined listing of models the region offers. Its answer is
+/// catalog truth, not account entitlement: whether this account's
+/// model access settings enable a model is a different question the
+/// listing does not answer — callers that need "can *I* invoke it"
+/// still ask by invoking.
+fn foundation_models_url(region: &str) -> String {
+    format!("https://{}/foundation-models", control_plane_host(region))
+}
+
+/// Map a `/foundation-models` document to listing entries.
+///
+/// The endpoint has spelled its array two ways across API revisions —
+/// `modelSummaries` (classic) and `summaryList` (the newer revision) —
+/// and both are accepted; either way `modelId` is the usable id,
+/// `modelName` the human name, and `providerName` (Anthropic, Meta, …)
+/// the operator that lands in `owned_by`. The listing discloses no
+/// window or modality facts — those live on a per-model detail route
+/// the probe surface deliberately does not fan out to — so metadata is
+/// the curated opinion where one exists.
+///
+/// Pagination follows the surface's first-page bound: a `nextToken` in
+/// the document is accepted and left unchased, exactly as Anthropic's
+/// `has_more` and Gemini's `nextPageToken` are.
+///
+/// The curated lookup strips the provider root first: Bedrock ids carry
+/// one (`anthropic.claude-…`, `meta.llama…`) and the table is keyed by
+/// model family, so the first dot-separated segment comes off **for the
+/// lookup only** — the entry itself keeps the full prefixed id, which is
+/// what an invoke request must carry.
+///
+/// # Errors
+///
+/// Returns [`ApiError::api`] when the answered body carries neither
+/// array spelling — a document that never spoke of models is a
+/// failure, never an empty catalog.
+fn parse_foundation_models(
+    value: &serde_json::Value,
+) -> Result<Vec<crate::api::probe::ModelInfo>, ApiError> {
+    use crate::api::probe::ModelInfo;
+    let entries = super::listing_entries(
+        value,
+        &["modelSummaries", "summaryList"],
+        "foundation-models listing",
+    )?;
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("modelId").and_then(serde_json::Value::as_str)?;
+            let lookup_key = id.split_once('.').map_or(id, |(_, rest)| rest);
+            let metadata = crate::api::probe::curated_model_metadata(lookup_key)
+                .unwrap_or_else(crate::api::probe::ModelMetadata::unreported);
+            let mut info = ModelInfo::new(id).with_metadata(metadata);
+            if let Some(name) = entry.get("modelName").and_then(serde_json::Value::as_str) {
+                info = info.with_display_name(name);
+            }
+            if let Some(provider) = entry
+                .get("providerName")
+                .and_then(serde_json::Value::as_str)
+            {
+                info = info.with_owned_by(provider);
+            }
+            Some(info)
+        })
+        .collect())
 }
 
 /// Incremental decoder for `application/vnd.amazon.eventstream` frames.
@@ -1596,6 +1752,75 @@ impl std::fmt::Debug for BedrockClient {
 }
 
 impl BedrockClient {
+    /// GET the region's foundation-model catalog, `SigV4`-signed.
+    ///
+    /// Signs the GET against the control-plane host with the current
+    /// credential generation (the same rotate-safe triple the invoke
+    /// paths sign with), then sends it through
+    /// [`get_checked`](super::get_checked): probe deadline, rate-limit
+    /// slot recording, and the shared failure classification, so a
+    /// revoked key or a control-plane throttle answers a probe with
+    /// the same [`ApiError`] variants a runtime failure carries. The
+    /// signed headers ride exactly as signed — `X-Amz-Date`, the empty
+    /// payload's `X-Amz-Content-Sha256`, and `X-Amz-Security-Token`
+    /// when the credentials are temporary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::config`] when a signature or credential
+    /// cannot form a header value, [`ApiError::http`] on transport
+    /// failure or probe deadline, or the classified variant for a
+    /// non-success status.
+    async fn fetch_foundation_models(&self) -> Result<reqwest::Response, ApiError> {
+        use sha2::Digest as _;
+
+        let creds = crate::error::recover_guard(self.credentials.read()).clone();
+        let host = control_plane_host(&self.region);
+        let signed = sigv4_sign_get(
+            &creds.access_key_id,
+            &creds.secret_access_key,
+            creds.session_token.as_deref(),
+            &self.region,
+            &host,
+            "/foundation-models",
+            std::time::SystemTime::now(),
+        );
+        let payload_hash = hex::encode(sha2::Sha256::digest(b""));
+
+        let mut authorization = reqwest::header::HeaderValue::from_str(&signed.authorization)
+            .map_err(|e| ApiError::config(format!("bedrock: authorization header: {e}")))?;
+        authorization.set_sensitive(true);
+        let mut headers = vec![
+            (reqwest::header::AUTHORIZATION, authorization),
+            (
+                reqwest::header::HeaderName::from_static("x-amz-date"),
+                reqwest::header::HeaderValue::from_str(&signed.amz_date)
+                    .map_err(|e| ApiError::config(format!("bedrock: amz date header: {e}")))?,
+            ),
+            (
+                reqwest::header::HeaderName::from_static("x-amz-content-sha256"),
+                reqwest::header::HeaderValue::from_str(&payload_hash)
+                    .map_err(|e| ApiError::config(format!("bedrock: payload hash header: {e}")))?,
+            ),
+        ];
+        if let Some(token) = creds.session_token.as_deref() {
+            let mut value = reqwest::header::HeaderValue::from_str(token)
+                .map_err(|e| ApiError::config(format!("bedrock: session token header: {e}")))?;
+            value.set_sensitive(true);
+            headers.push((
+                reqwest::header::HeaderName::from_static("x-amz-security-token"),
+                value,
+            ));
+        }
+        super::get_checked(
+            &self.http,
+            &foundation_models_url(&self.region),
+            &headers,
+            Some(&self.rate_limit),
+        )
+        .await
+    }
+
     /// Build from AWS environment variables.
     ///
     /// Reads `AWS_REGION` (required), `AWS_ACCESS_KEY_ID` (required),
@@ -1781,6 +2006,38 @@ impl ApiClient for BedrockClient {
 
     fn base_url(&self) -> String {
         format!("https://{}", self.host())
+    }
+
+    fn list_models(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<crate::api::probe::ModelInfo>, ApiError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let response = self.fetch_foundation_models().await?;
+            let body = super::read_bounded_body(response).await?;
+            let value: serde_json::Value = serde_json::from_slice(&body)?;
+            parse_foundation_models(&value)
+        })
+    }
+
+    fn ping(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::probe::PingReport, ApiError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let response = self.fetch_foundation_models().await?;
+            let meta = crate::provider::forensics::capture_provider_meta(response.headers());
+            let mut report = crate::api::probe::PingReport::new(started.elapsed());
+            if let Some(rate_limit) = meta.rate_limit {
+                report = report.with_rate_limit(rate_limit);
+            }
+            if let Some(request_id) = meta.request_id {
+                report = report.with_request_id(request_id);
+            }
+            Ok(report)
+        })
     }
 
     /// # Errors
@@ -4502,5 +4759,155 @@ mod tests {
             .checked_add(std::time::Duration::from_secs(1_704_067_200))
             .unwrap();
         assert_eq!(format_amz_date(now), "20240101T000000Z");
+    }
+
+    // The control-plane GET, pinned the same way the POST vectors are:
+    // the expected signature was computed independently (a from-spec
+    // Python implementation) for the documented AWS example credentials
+    // at the same fixed instant, over the GET canonical request —
+    // empty-body payload hash, no content-type signed. Any drift in the
+    // GET layout (method line, header set, payload hash) breaks it.
+    #[test]
+    fn control_plane_get_signs_against_the_documented_credentials() {
+        let headers = sigv4_sign_get(
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            None,
+            "us-east-1",
+            "bedrock.us-east-1.amazonaws.com",
+            "/foundation-models",
+            // 2015-08-30T12:36:00Z — the same documented instant as the POST vector
+            std::time::SystemTime::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(1_440_938_160))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        );
+        assert_eq!(headers.amz_date, "20150830T123600Z");
+        assert_eq!(
+            headers.authorization,
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+             Signature=63f049870e8eb528f61bbdefe718ff20102d3b42787c0256db3778393048c4c2",
+            "the GET signature pins the method line, the header set (no \
+             content-type), and the empty-payload hash together"
+        );
+
+        // A session token joins the signed set — and changes the
+        // signature (an unsigned token is the injection AWS rejects).
+        let with_token = sigv4_sign_get(
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            Some("SESSION"),
+            "us-east-1",
+            "bedrock.us-east-1.amazonaws.com",
+            "/foundation-models",
+            std::time::SystemTime::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(1_440_938_160))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        );
+        assert!(
+            with_token.authorization.contains(
+                "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+            ),
+            "temporary credentials must sign their token in: {}",
+            with_token.authorization
+        );
+        assert_ne!(
+            with_token.authorization, headers.authorization,
+            "the token changes the signature — it is covered, not decorated"
+        );
+    }
+
+    #[test]
+    fn control_plane_addressing_targets_the_management_endpoint_not_the_runtime() {
+        assert_eq!(
+            foundation_models_url("us-east-1"),
+            "https://bedrock.us-east-1.amazonaws.com/foundation-models",
+            "discovery must never land on bedrock-runtime — completion \
+             bytes and catalog bytes are different authorities"
+        );
+    }
+
+    #[test]
+    fn foundation_model_summaries_parse_both_api_spellings() {
+        let classic = serde_json::json!({
+            "modelSummaries": [
+                {
+                    "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5",
+                    "modelId": "anthropic.claude-sonnet-4-5",
+                    "modelName": "Claude Sonnet 4.5",
+                    "providerName": "Anthropic",
+                    "modelStatus": "AVAILABLE"
+                },
+                {
+                    "modelId": "custom.fine-tune-9000",
+                    "modelName": "My Tuned One"
+                }
+            ],
+            "nextToken": "second-page"
+        });
+        let models = parse_foundation_models(&classic).expect("classic array parses");
+        assert_eq!(
+            models.len(),
+            2,
+            "a served `nextToken` is the first page, whole — the continuation \
+             is neither chased nor the page cut"
+        );
+        assert_eq!(models[0].id, "anthropic.claude-sonnet-4-5");
+        assert_eq!(
+            models[0].display_name.as_deref(),
+            Some("Claude Sonnet 4.5"),
+            "the human name is what a picker displays"
+        );
+        assert_eq!(models[0].owned_by.as_deref(), Some("Anthropic"));
+        assert_eq!(
+            models[0].metadata.context_window,
+            Some(200_000),
+            "the provider-prefixed id must still find its curated family \
+             (the lookup strips the provider prefix)"
+        );
+        assert_eq!(
+            models[1].metadata,
+            crate::api::probe::ModelMetadata::unreported(),
+            "an id nobody documents stays unreported — no invented window"
+        );
+
+        let newer = serde_json::json!({
+            "summaryList": [{ "modelId": "meta.llama3-2-70b-instruct-v1:0" }]
+        });
+        let models = parse_foundation_models(&newer).expect("newer array parses");
+        assert_eq!(
+            models.len(),
+            1,
+            "the newer revision's array spelling parses identically"
+        );
+        assert_eq!(
+            models[0].id, "meta.llama3-2-70b-instruct-v1:0",
+            "the entry keeps the full prefixed invoke id"
+        );
+        assert_eq!(
+            models[0].metadata.context_window,
+            Some(128_000),
+            "the dash-spelled Bedrock llama id (past the `meta.` root) finds its \
+             curated family too — dot and dash spellings both key the table"
+        );
+        assert_eq!(
+            models[0].metadata.source,
+            crate::api::probe::MetadataSource::Curated,
+            "a curated fill on a catalog that discloses nothing must say Curated"
+        );
+        assert!(models[0].display_name.is_none());
+
+        let malformed = parse_foundation_models(&serde_json::json!({ "message": "gone" }))
+            .expect_err(
+                "an answer that spoke of no models is a failure, not a \
+                         catalog dressed up empty",
+            );
+        assert_eq!(
+            crate::api::probe::ProbeClass::from_error(&malformed),
+            crate::api::probe::ProbeClass::Other,
+            "the malformed-body failure classifies Other — no endpoint fact to \
+             own, yet clearly not a network or auth story"
+        );
     }
 }

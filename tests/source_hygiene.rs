@@ -32,6 +32,15 @@ use std::path::{Path, PathBuf};
 /// `char`s so this file itself never spells the tokens it hunts.
 const ID_PREFIXES: [char; 3] = ['L', 'T', 'R'];
 
+/// Reserved multi-letter id prefixes: an external issue id from the
+/// private tracker (this two-letter prefix, a dash, a digit) is
+/// planning metadata exactly like the single-letter ids, but the
+/// word-boundary leg of [`has_task_id`] cannot see it — the prefix's
+/// own letters continue the word, so the dash never lands after a fresh
+/// word start. Spelled as the bare prefix, never the id shape: this
+/// file hunts its own tokens and must not carry one.
+const EXTENDED_ID_PREFIXES: [&str; 1] = ["TX"];
+
 /// Files whose id-shaped strings *in code* are data under test
 /// (redaction inputs), not leaked metadata.
 ///
@@ -111,6 +120,17 @@ fn has_task_id(line: &str) -> bool {
             && index + 2 < chars.len()
             && chars[index + 1] == '-'
             && chars[index + 2].is_ascii_digit()
+    }) || EXTENDED_ID_PREFIXES.iter().any(|prefix| {
+        line.match_indices(*prefix).any(|(index, _)| {
+            let after = &line[index + prefix.len()..];
+            after.starts_with('-')
+                && after.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+                && (index == 0
+                    || !line[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric()))
+        })
     })
 }
 
@@ -429,6 +449,15 @@ fn changelog_ships_changes_not_planning_metadata() {
     assert!(
         has_task_id(&roadmap_tail) && names_planning_prose(&roadmap_tail),
         "a tagged tail trips both probes by construction: {roadmap_tail}"
+    );
+    let external_id = format!("ships after {}{}-9 lands", "T", "X");
+    assert!(
+        has_task_id(&external_id),
+        "a multi-letter tracker id trips the id probe: {external_id}"
+    );
+    assert!(
+        !has_task_id("dates follow ISO-8601 spellings on the wire"),
+        "an ordinary standard reference is not a planning id"
     );
     assert!(
         names_planning_prose(&provenance),

@@ -1030,6 +1030,44 @@ impl ApiError {
         matches!(self, Self::Auth(..))
     }
 
+    /// The HTTP status code, if this failure was an answered HTTP
+    /// response and the status survived into the message text.
+    ///
+    /// Returns [`Some`] exactly when [`code`](Self::code) consulted a
+    /// status line — an [`Http`](Self::Http) failure whose message
+    /// carries the `"HTTP {status}:"` prefix written by
+    /// [`http_with_status`](Self::http_with_status). Failures the
+    /// providers classified into a dedicated variant ([`Auth`](Self::Auth),
+    /// [`RateLimit`](Self::RateLimit)) hold the status in the *variant*
+    /// rather than the message and answer [`None`]; so does a transport
+    /// failure that never saw a response — the absence of a status is
+    /// itself the information ("the endpoint never answered"), which is
+    /// why this returns `Option` rather than defaulting.
+    ///
+    /// Model-probe classification branches on this ([`ProbeClass`]
+    /// distinguishes "answered with a status" from "never answered"),
+    /// and so can callers reconciling a failure against a provider's
+    /// documented status table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::api::error::ApiError;
+    /// let refused = ApiError::http_with_status(404, "no such route");
+    /// assert_eq!(refused.http_status(), Some(404));
+    /// let dead = ApiError::http("connection refused");
+    /// assert_eq!(dead.http_status(), None, "no response means no status");
+    /// ```
+    ///
+    /// [`ProbeClass`]: crate::api::probe::ProbeClass
+    #[must_use]
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Http(msg, _) => http_status_from_message(msg),
+            _ => None,
+        }
+    }
+
     /// Check whether this is a configuration error ([`ApiError::Config`]).
     ///
     /// Useful for directing the user to fix their config file rather

@@ -12,6 +12,7 @@
 //! compaction-pass model calls are outside the accounting and the
 //! enforcement alike.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use crate::error::LoopError;
 /// "which budget ran out" across errors, events, and audit records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BudgetDimension {
     /// Provider-reported tokens, input plus output.
     ///
@@ -49,6 +51,18 @@ pub enum BudgetDimension {
     /// so a replayed run crosses the same lines at the same logical
     /// instants.
     WallClock,
+
+    /// Estimated spend in US dollars, priced at capture.
+    ///
+    /// Accrued only while the gate carries a price table: each
+    /// turn-serving usage report is priced through the table at
+    /// [`observe_cost`](BudgetGate::observe_cost), so a provider that
+    /// reports no usage — or a model the table does not price — spends
+    /// nothing against this line, never a guess. The dimension's
+    /// `u64` unit is micro-dollars, the same
+    /// dimension-specific-unit pattern wall-clock uses with
+    /// milliseconds.
+    Usd,
 }
 
 impl std::fmt::Display for BudgetDimension {
@@ -57,6 +71,7 @@ impl std::fmt::Display for BudgetDimension {
             Self::Tokens => "tokens",
             Self::Turns => "turns",
             Self::WallClock => "wall-clock",
+            Self::Usd => "usd",
         };
         formatter.write_str(name)
     }
@@ -68,10 +83,12 @@ impl std::fmt::Display for BudgetDimension {
 /// host supplies limits directly, or maps the manifest's advisory
 /// [`Budgets`](crate::manifest::Budgets) stanza through the
 /// `From<&Budgets>` impl behind the `manifest` feature. `None`
-/// disables a line — no threshold, no warn, no refusal. No price
-/// table is consulted, so cost has no line; a configured `cost_usd`
-/// maps to nothing (the gate refuses to guess a cost).
+/// disables a line — no threshold, no warn, no refusal. The `usd` line
+/// accrues only while the gate carries a price table (see
+/// [`BudgetGate::with_price_table`]); without one it stays inert
+/// rather than guessing a cost.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct BudgetLimits {
     /// The hard ceiling on provider-reported tokens per run.
     ///
@@ -89,6 +106,17 @@ pub struct BudgetLimits {
     /// Measured from the run's `begin` instant through the clock
     /// seam; the soft line is a fraction of this value.
     pub duration: Option<Duration>,
+
+    /// The hard ceiling on estimated spend, in US dollars.
+    ///
+    /// Accrues from table-priced usage reports only (see
+    /// [`BudgetDimension::Usd`]; the soft line is a fraction of this
+    /// value, and the value compares in micro-dollars internally. A
+    /// negative or NaN value set directly on this field reads as zero
+    /// micro-dollars — a zero budget, refusing the run's first
+    /// request; the manifest mapping drops such values with a warning
+    /// instead of arming that refusal.
+    pub usd: Option<f64>,
 }
 
 impl BudgetLimits {
@@ -96,7 +124,22 @@ impl BudgetLimits {
     ///
     /// The empty budget: a gate over these limits never warns and
     /// never refuses — the additive identity a host composes from
-    /// when only some dimensions are configured.
+    /// when only some dimensions are configured. The type is
+    /// `#[non_exhaustive]`, so code outside this crate constructs it
+    /// here and then sets the public fields it wants, never by struct
+    /// literal.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::budget::BudgetLimits;
+    ///
+    /// let mut limits = BudgetLimits::new();
+    /// limits.usd = Some(1.5);
+    /// limits.tokens = Some(10_000);
+    /// assert_eq!(limits.usd, Some(1.5));
+    /// assert_eq!(limits.tokens, Some(10_000));
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -118,10 +161,22 @@ impl From<&crate::manifest::Budgets> for BudgetLimits {
                 })
                 .ok()
         });
+        let usd = budgets.cost_usd.filter(|cost| {
+            let sane = cost.is_finite() && *cost >= 0.0;
+            if !sane {
+                tracing::warn!(
+                    target: "loopctl::metrics",
+                    cost,
+                    "ignoring a negative or non-numeric cost budget"
+                );
+            }
+            sane
+        });
         Self {
             tokens: budgets.tokens,
             turns: budgets.turns,
             duration,
+            usd,
         }
     }
 }
@@ -277,6 +332,12 @@ pub struct BudgetGate {
     /// Immutable after construction; only the spend state mutates.
     config: BudgetConfig,
 
+    /// The table the USD line prices through, when one is installed.
+    ///
+    /// `None` leaves the USD line inert — no accrual, no warn, no
+    /// refusal — because a cost without a price source is a guess.
+    prices: Option<Arc<crate::pricing::PriceTable>>,
+
     /// The mutable spend state, latched per run.
     ///
     /// Interior-mutex so the loop's request, response, and turn-end
@@ -325,22 +386,18 @@ struct GateState {
     /// Incremented at turn end only.
     turns: u64,
 
-    /// Which dimensions have already warned.
+    /// Which dimensions have already warned, as a bitset.
     ///
     /// One latch per dimension: the soft line warns exactly once per
     /// run, however many requests land between the soft line and
-    /// the hard one.
-    warned_tokens: bool,
+    /// the hard one. See [`WarnLatches`].
+    warned: WarnLatches,
 
-    /// The turns dimension's warn latch.
+    /// The USD dimension's spend, in micro-dollars.
     ///
-    /// Set exactly when the dimension's first warn is pushed.
-    warned_turns: bool,
-
-    /// The wall-clock dimension's warn latch.
-    ///
-    /// Set exactly when the dimension's first warn is pushed.
-    warned_wall_clock: bool,
+    /// The table-priced sum of every reported usage report's estimate,
+    /// saturating; zero forever when no table is installed.
+    spent_usd_micro: u64,
 }
 
 impl BudgetGate {
@@ -356,8 +413,25 @@ impl BudgetGate {
                 limits,
                 soft_fraction: 0.80,
             },
+            prices: None,
             state: Mutex::new(GateState::default()),
         }
+    }
+
+    /// Install the price table the USD line prices through.
+    ///
+    /// Without a table the `usd` limit — if configured — stays inert:
+    /// nothing accrues, nothing warns, nothing refuses, because cost
+    /// without a price source is a guess and the gate does not guess.
+    /// Installing a table arms the line from the next
+    /// [`observe_cost`](Self::observe_cost) on; the usual source is the
+    /// crate's vendored
+    /// [`PriceTable::curated()`](crate::pricing::PriceTable::curated),
+    /// optionally layered with host override files.
+    #[must_use]
+    pub fn with_price_table(mut self, table: Arc<crate::pricing::PriceTable>) -> Self {
+        self.prices = Some(table);
+        self
     }
 
     /// Move every soft line to `fraction` of its hard line.
@@ -417,6 +491,26 @@ impl BudgetGate {
         }
     }
 
+    /// Price one usage report and accrue it against the USD line.
+    ///
+    /// The cost-capture twin of [`observe_usage`](Self::observe_usage):
+    /// the report is priced through the installed table at capture
+    /// time — the same estimate the event ledger stamps — and the
+    /// micro-dollar total accrues. A model the table does not price
+    /// accrues nothing (the no-guess contract), `None` usage accrues
+    /// nothing, and a gate without a table ignores the call entirely.
+    pub fn observe_cost(&self, model: &str, usage: Option<&crate::stream::Usage>) {
+        let (Some(table), Some(usage)) = (&self.prices, usage) else {
+            return;
+        };
+        let Some(cost) = table.cost(model, *usage) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.spent_usd_micro = state.spent_usd_micro.saturating_add(cost.total_usd_micro);
+        }
+    }
+
     /// Record one completed turn.
     ///
     /// Called at a successful turn's end so an in-flight turn never
@@ -462,7 +556,7 @@ impl BudgetGate {
             if state.spent_tokens >= limit {
                 let spent = state.spent_tokens;
                 latch_warn(
-                    &mut state.warned_tokens,
+                    &mut state.warned,
                     &mut warns,
                     BudgetDimension::Tokens,
                     spent,
@@ -473,11 +567,11 @@ impl BudgetGate {
                     spent,
                     limit,
                 });
-            } else if !state.warned_tokens
+            } else if !state.warned.fired(BudgetDimension::Tokens)
                 && soft_line(limit, self.config.soft_fraction)
                     .is_some_and(|soft| state.spent_tokens >= soft)
             {
-                state.warned_tokens = true;
+                state.warned.take(BudgetDimension::Tokens);
                 warns.push(BudgetWarn {
                     dimension: BudgetDimension::Tokens,
                     spent: state.spent_tokens,
@@ -490,7 +584,7 @@ impl BudgetGate {
             if state.turns >= limit {
                 let spent = state.turns;
                 latch_warn(
-                    &mut state.warned_turns,
+                    &mut state.warned,
                     &mut warns,
                     BudgetDimension::Turns,
                     spent,
@@ -503,11 +597,11 @@ impl BudgetGate {
                         limit,
                     });
                 }
-            } else if !state.warned_turns
+            } else if !state.warned.fired(BudgetDimension::Turns)
                 && soft_line(limit, self.config.soft_fraction)
                     .is_some_and(|soft| state.turns >= soft)
             {
-                state.warned_turns = true;
+                state.warned.take(BudgetDimension::Turns);
                 warns.push(BudgetWarn {
                     dimension: BudgetDimension::Turns,
                     spent: state.turns,
@@ -521,7 +615,7 @@ impl BudgetGate {
             let limit_ms = limit.as_millis().try_into().unwrap_or(u64::MAX);
             if elapsed_ms >= limit_ms {
                 latch_warn(
-                    &mut state.warned_wall_clock,
+                    &mut state.warned,
                     &mut warns,
                     BudgetDimension::WallClock,
                     elapsed_ms,
@@ -534,15 +628,46 @@ impl BudgetGate {
                         limit: limit_ms,
                     });
                 }
-            } else if !state.warned_wall_clock
+            } else if !state.warned.fired(BudgetDimension::WallClock)
                 && soft_line(limit_ms, self.config.soft_fraction)
                     .is_some_and(|soft| elapsed_ms >= soft)
             {
-                state.warned_wall_clock = true;
+                state.warned.take(BudgetDimension::WallClock);
                 warns.push(BudgetWarn {
                     dimension: BudgetDimension::WallClock,
                     spent: elapsed_ms,
                     limit: limit_ms,
+                });
+            }
+        }
+
+        if let Some(limit) = self.config.limits.usd {
+            let limit_micro = crate::pricing::micro_usd(limit);
+            let spent_usd = state.spent_usd_micro;
+            if spent_usd >= limit_micro {
+                latch_warn(
+                    &mut state.warned,
+                    &mut warns,
+                    BudgetDimension::Usd,
+                    spent_usd,
+                    limit_micro,
+                );
+                if hard.is_none() {
+                    hard = Some(HardCrossing {
+                        dimension: BudgetDimension::Usd,
+                        spent: spent_usd,
+                        limit: limit_micro,
+                    });
+                }
+            } else if !state.warned.fired(BudgetDimension::Usd)
+                && soft_line(limit_micro, self.config.soft_fraction)
+                    .is_some_and(|soft| spent_usd >= soft)
+            {
+                state.warned.take(BudgetDimension::Usd);
+                warns.push(BudgetWarn {
+                    dimension: BudgetDimension::Usd,
+                    spent: spent_usd,
+                    limit: limit_micro,
                 });
             }
         }
@@ -576,20 +701,72 @@ pub struct HardCrossing {
     pub limit: u64,
 }
 
+/// The per-dimension soft-warn latches for one run, as a bitset.
+///
+/// Four one-shot flags — one per budget dimension — with the
+/// fire-once semantics built in: [`take`](Self::take) sets a
+/// dimension's latch and answers whether this was its first crossing,
+/// so however many checks pass between a soft line and its hard one,
+/// the dimension warns exactly once.
+#[derive(Debug, Default)]
+struct WarnLatches {
+    /// One bit per dimension, in [`BudgetDimension`] order.
+    ///
+    /// A `u8` because there are exactly four dimensions; the bit each
+    /// owns is [`WarnLatches::mask`]'s to say.
+    bits: u8,
+}
+
+impl WarnLatches {
+    /// The bit a dimension owns.
+    ///
+    /// Stable per variant, so latches survive a run untouched by enum
+    /// growth; a future fifth dimension takes the next bit.
+    #[must_use]
+    fn mask(dimension: BudgetDimension) -> u8 {
+        match dimension {
+            BudgetDimension::Tokens => 1 << 0,
+            BudgetDimension::Turns => 1 << 1,
+            BudgetDimension::WallClock => 1 << 2,
+            BudgetDimension::Usd => 1 << 3,
+        }
+    }
+
+    /// Whether a dimension has already warned.
+    ///
+    /// The read half of the latch; the pre-request soft check reads it
+    /// to keep a warned dimension silent until the run resets.
+    #[must_use]
+    fn fired(&self, dimension: BudgetDimension) -> bool {
+        self.bits & Self::mask(dimension) != 0
+    }
+
+    /// Set a dimension's latch, answering whether this was its first.
+    ///
+    /// The fire-once semantics: `true` exactly once per dimension per
+    /// run, on the crossing that earns the warn.
+    fn take(&mut self, dimension: BudgetDimension) -> bool {
+        let mask = Self::mask(dimension);
+        let first = self.bits & mask == 0;
+        self.bits |= mask;
+        first
+    }
+}
+
 /// Latch one soft crossing if it has not fired yet.
 ///
-/// The once-per-run semantics live here: the latch is set only when
-/// the warn is pushed, so however many checks pass between the soft
-/// line and the hard one, the dimension reports exactly once.
+/// The once-per-run semantics live in the latch: the warn is pushed
+/// only on the dimension's first crossing, so however many checks pass
+/// between the soft line and the hard one, the dimension reports
+/// exactly once.
 fn latch_warn(
-    latched: &mut bool,
+    latches: &mut WarnLatches,
     warns: &mut Vec<BudgetWarn>,
     dimension: BudgetDimension,
     spent: u64,
     limit: u64,
 ) {
-    if !*latched {
-        *latched = true;
+    if latches.take(dimension) {
         warns.push(BudgetWarn {
             dimension,
             spent,
@@ -846,6 +1023,108 @@ mod tests {
         }
     }
 
+    /// A priced test table whose dates never interact with the wall clock.
+    fn fresh_gpt_table() -> Arc<crate::pricing::PriceTable> {
+        let json = r#"{ "table_version": "test-table", "pricing_updated": "2999-01-01",
+            "models": { "gpt-4o": { "input_per_mtok": 2.5, "output_per_mtok": 10.0,
+                                      "cache_read_per_mtok": 1.25 } } }"#;
+        Arc::new(crate::pricing::PriceTable::from_json(json).expect("valid test table"))
+    }
+
+    #[test]
+    fn usd_line_charges_warns_and_refuses_in_micro_dollars() {
+        let limits = BudgetLimits {
+            usd: Some(0.0008),
+            ..BudgetLimits::new()
+        };
+        let gate = BudgetGate::new(limits).with_price_table(fresh_gpt_table());
+        gate.begin();
+        let report = crate::stream::Usage::new(50, 25);
+
+        gate.observe_cost("gpt-4o", Some(&report));
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        assert!(
+            warns.is_empty(),
+            "one report spends 375µ, under the 640µ soft line: {warns:?}"
+        );
+        assert!(hard.is_none(), "and far under the 800µ hard line");
+
+        gate.observe_cost("gpt-4o", Some(&report));
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        assert_eq!(
+            warns.len(),
+            1,
+            "750µ crosses the 640µ soft line exactly once: {warns:?}"
+        );
+        assert_eq!(warns[0].dimension, BudgetDimension::Usd);
+        assert_eq!(warns[0].spent, 750);
+        assert_eq!(warns[0].limit, 800);
+        assert!(hard.is_none(), "still under the hard line");
+
+        let (warns, _) = gate.pre_request(Duration::ZERO);
+        assert!(
+            warns.is_empty(),
+            "the soft warn latches — it fires once per run"
+        );
+
+        gate.observe_cost("gpt-4o", Some(&report));
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        let crossing = hard.expect("1125µ crosses the 800µ hard line");
+        assert_eq!(crossing.dimension, BudgetDimension::Usd);
+        assert_eq!(crossing.spent, 1125);
+        assert_eq!(crossing.limit, 800);
+        assert_eq!(crossing.dimension.to_string(), "usd");
+        assert!(
+            warns.is_empty(),
+            "the warn already latched earlier in the run"
+        );
+    }
+
+    #[test]
+    fn usd_line_without_a_table_never_accrues() {
+        let limits = BudgetLimits {
+            usd: Some(0.000_005),
+            ..BudgetLimits::new()
+        };
+        let gate = BudgetGate::new(limits);
+        gate.begin();
+        let report = crate::stream::Usage::new(1_000_000, 1_000_000);
+        for _ in 0..10 {
+            gate.observe_cost("gpt-4o", Some(&report));
+        }
+        gate.observe_cost("gpt-4o", None);
+        gate.observe_cost("my-fine-tune-9000", Some(&report));
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        assert!(
+            warns.is_empty() && hard.is_none(),
+            "without a table the USD line is inert — one priced report of a \
+             million tokens would cross this 5µ line instantly, and ten of \
+             them moved it nowhere: {warns:?} {hard:?}"
+        );
+    }
+
+    #[test]
+    fn unpriced_models_and_unreported_usage_accrue_nothing() {
+        let limits = BudgetLimits {
+            usd: Some(0.000_005),
+            ..BudgetLimits::new()
+        };
+        let gate = BudgetGate::new(limits).with_price_table(fresh_gpt_table());
+        gate.begin();
+        let report = crate::stream::Usage::new(1_000_000, 1_000_000);
+        for _ in 0..10 {
+            gate.observe_cost("my-fine-tune-9000", Some(&report));
+            gate.observe_cost("gpt-4o", None);
+        }
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        assert!(
+            warns.is_empty() && hard.is_none(),
+            "a model the table does not price spends nothing and an \
+             unreported request spends nothing — one priced gpt-4o report of \
+             this size would cross the 5µ line instantly: {warns:?} {hard:?}"
+        );
+    }
+
     #[cfg(feature = "manifest")]
     mod manifest_mapping {
         use super::*;
@@ -863,6 +1142,66 @@ mod tests {
             assert_eq!(limits.turns, Some(10));
             assert_eq!(limits.tokens, Some(5_000));
             assert_eq!(limits.duration, Some(Duration::from_hours(4)));
+            assert_eq!(limits.usd, Some(1.5));
+        }
+
+        #[test]
+        fn a_negative_or_nan_cost_budget_maps_to_no_usd_line() {
+            for nonsense in [-1.0, f64::NAN] {
+                let budgets = Budgets {
+                    cost_usd: Some(nonsense),
+                    ..Budgets::default()
+                };
+                assert_eq!(
+                    BudgetLimits::from(&budgets).usd,
+                    None,
+                    "a negative or NaN cost disables the line loudly — it never \
+                     arms a zero-micro-dollar refusal at the first request                      (value: {nonsense})"
+                );
+            }
+        }
+
+        #[test]
+        fn a_direct_negative_usd_limit_reads_as_zero_and_refuses_the_first_request() {
+            // The documented direct-construction contract: the field is
+            // pub f64 and the gate's micro-dollar conversion maps nonsense
+            // to zero — a zero budget refuses immediately. The manifest
+            // mapping never produces this shape (it drops the value); this
+            // pin is for the host that sets the field by hand.
+            let limits = BudgetLimits {
+                usd: Some(-1.0),
+                ..BudgetLimits::new()
+            };
+            let gate = BudgetGate::new(limits).with_price_table(fresh_gpt_table());
+            gate.begin();
+            let (warns, hard) = gate.pre_request(Duration::ZERO);
+            let crossing = hard.expect("a zero micro-dollar limit refuses at once");
+            assert_eq!(crossing.dimension, BudgetDimension::Usd);
+            assert_eq!(
+                (crossing.spent, crossing.limit),
+                (0, 0),
+                "nonsense read as zero — the usd field's doc says exactly this"
+            );
+            assert_eq!(warns.len(), 1, "the warn still latches: {warns:?}");
+        }
+
+        #[test]
+        fn manifest_cost_usd_maps_to_the_usd_line() {
+            let with_cost = Budgets {
+                cost_usd: Some(0.25),
+                ..Budgets::default()
+            };
+            assert_eq!(
+                BudgetLimits::from(&with_cost).usd,
+                Some(0.25),
+                "a configured cost lands on the USD line it used to map to nothing"
+            );
+            let without_cost = Budgets::default();
+            assert_eq!(
+                BudgetLimits::from(&without_cost).usd,
+                None,
+                "no configured cost leaves the line disabled"
+            );
         }
 
         #[test]

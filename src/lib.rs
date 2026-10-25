@@ -119,6 +119,7 @@ pub mod middleware;
 pub(crate) mod numeric;
 pub mod observer;
 pub mod presets;
+pub mod pricing;
 #[cfg(feature = "providers")]
 pub mod provider;
 pub mod reflection;

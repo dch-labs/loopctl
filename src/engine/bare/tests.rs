@@ -13845,6 +13845,71 @@ mod budget_gate_tests {
         );
     }
 
+    #[tokio::test]
+    async fn budget_gate_charges_cost_from_reported_usage() {
+        // The USD line charges from the same reported usage the token line
+        // reads, priced at capture through the gate's installed table.
+        // Six scripted `gpt-4o` turns at 375µ each against a $0.0011 line:
+        // the soft line (880µ) passes unlit at 750µ, the third turn's
+        // charge (1125µ) crosses the hard line, and the fourth request is
+        // refused — the crossing request still completes, exactly as the
+        // token line behaves.
+        let client = crate::testing::MockApiClient::new("gpt-4o").with_responses(budget_script(6));
+        let collector = std::sync::Arc::new(BudgetCollector {
+            warns: Mutex::new(Vec::new()),
+            decisions: Mutex::new(Vec::new()),
+        });
+        let registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let mut agent = BareLoop::new_with_managers(
+            std::sync::Arc::new(client.clone()),
+            registry,
+            make_config(),
+            LoopManagers::new(),
+        );
+        agent.register_observer(
+            std::sync::Arc::clone(&collector) as std::sync::Arc<dyn LoopObserver>
+        );
+        let mut agent = agent.with_budget_gate(
+            crate::budget::BudgetGate::new(crate::budget::BudgetLimits {
+                usd: Some(0.0011),
+                ..crate::budget::BudgetLimits::new()
+            })
+            .with_price_table(std::sync::Arc::new(
+                crate::pricing::PriceTable::from_json(
+                    r#"{ "table_version": "engine-pin", "pricing_updated": "2999-01-01",
+                        "models": { "gpt-4o": { "input_per_mtok": 2.5,
+                                                "output_per_mtok": 10.0 } } }"#,
+                )
+                .expect("valid pin table"),
+            )),
+        );
+        let error = agent
+            .run("start", &make_run_config())
+            .await
+            .expect_err("the fourth request is refused over cost");
+        match error {
+            crate::error::LoopError::BudgetExhausted {
+                dimension,
+                spent,
+                limit,
+            } => {
+                assert_eq!(dimension, crate::budget::BudgetDimension::Usd);
+                assert_eq!(
+                    spent, 1125,
+                    "three turns of gpt-4o at 50in/25out, 375µ each"
+                );
+                assert_eq!(limit, 1100);
+            }
+            other => panic!("expected BudgetExhausted over usd, got {other:?}"),
+        }
+        assert_eq!(
+            client.with_options_calls(),
+            3,
+            "the three crossing-completed requests hit the provider; the fourth was refused"
+        );
+    }
+
     /// The nested-loop tool for the independence pin below.
     ///
     /// Parks a second `BareLoop` behind a tokio mutex and runs it to

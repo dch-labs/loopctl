@@ -72,7 +72,9 @@
 //! mapped `fallback` kind is the model fallback). `gate.decision`
 //! maps the permission gate's per-call verdict (tool, argument
 //! digest, rule provenance); `usage` remains a reserved label this
-//! version does not emit.
+//! version does not emit. Stream success is *observed* without a line
+//! of its own — a table-carrying observer remembers the served model
+//! from it and stamps that model's cost onto the turn's `turn.ended`.
 //!
 //! # Reader tolerance
 //!
@@ -105,7 +107,7 @@ use crate::error::recover_guard;
 use crate::observer::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, GateDecisionContext,
     LoopDetectedContext, LoopObserver, ModelSwitchedContext, RunEndContext, RunStartContext,
-    ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
+    StreamContext, ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
 };
 
 use super::sink::{DEFAULT_QUEUE_CAPACITY, LedgerWriter};
@@ -322,6 +324,16 @@ struct ObserverState {
     /// steps the run id, and restarts the sequence), and once a run
     /// has ended this flag seals the stream until the next start.
     run_open: bool,
+
+    /// The model the current turn's stream served, when known.
+    ///
+    /// Remembered from each `on_stream_success` — the callback that
+    /// names the model actually serving — so the turn's `turn.ended`
+    /// stamp prices under the right family. Cleared at run start and
+    /// again at every turn start: a turn whose model call failed never
+    /// inherits the previous turn's model, and prices nothing — its
+    /// `cost` says null with a note instead.
+    current_model: Option<String>,
 }
 
 /// The per-event ledger observer — one JSONL line per mapped callback.
@@ -355,6 +367,15 @@ pub struct EventLedgerObserver {
     /// per-run observer set it through
     /// [`with_capture_limit`](Self::with_capture_limit).
     capture_limit: usize,
+
+    /// The table turn-end cost stamps price through, when one is set.
+    ///
+    /// `None` leaves every line exactly as this ledger always wrote
+    /// it — no cost field at all. A table adds the `cost` object to
+    /// `turn.ended` lines (or `cost: null` plus a note when the turn's
+    /// model is unpriced), stamped at capture so the line carries the
+    /// prices it was computed under.
+    prices: Option<std::sync::Arc<crate::pricing::PriceTable>>,
 }
 
 impl std::fmt::Debug for EventLedgerObserver {
@@ -371,6 +392,7 @@ impl std::fmt::Debug for EventLedgerObserver {
             .field("seq", &state.seq)
             .field("run_open", &state.run_open)
             .field("capture_limit", &self.capture_limit)
+            .field("prices", &self.prices.as_ref().map(|table| table.version()))
             .finish_non_exhaustive()
     }
 }
@@ -388,7 +410,25 @@ impl EventLedgerObserver {
             sink: LedgerWriter::with_file(dir.into(), EVENTS_FILE, DEFAULT_QUEUE_CAPACITY, true),
             state: Mutex::new(ObserverState::default()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
+            prices: None,
         }
+    }
+
+    /// Set the price table turn-end cost stamps price through.
+    ///
+    /// Without a table the ledger writes exactly the lines it always
+    /// did — no cost field anywhere. With one, each `turn.ended` line
+    /// carries a `cost` object — the per-class estimate in
+    /// micro-dollars, the priced model family, the table version and
+    /// pricing date, and a `stale` flag measured against the line's
+    /// own date — or `cost: null` with a `cost_note` naming the model
+    /// when the table does not price it. The stamp lands at capture,
+    /// so a rollup of old lines reports the prices those runs actually
+    /// ran under.
+    #[must_use]
+    pub fn with_price_table(mut self, table: std::sync::Arc<crate::pricing::PriceTable>) -> Self {
+        self.prices = Some(table);
+        self
     }
 
     /// Set the maximum characters of query text kept per
@@ -482,6 +522,7 @@ impl LoopObserver for EventLedgerObserver {
         state.run_id = state.run_id.saturating_add(1);
         state.seq = 0;
         state.run_open = true;
+        state.current_model = None;
         state.session_id = Some(ctx.session_id.to_string());
         self.append(
             &mut state,
@@ -515,6 +556,7 @@ impl LoopObserver for EventLedgerObserver {
     /// [`with_capture_limit`](Self::with_capture_limit) tunes it.
     fn on_turn_start(&self, ctx: &TurnStartContext) {
         let mut state = recover_guard(self.state.lock());
+        state.current_model = None;
         self.append(
             &mut state,
             TrajectoryEventKind::TurnStarted,
@@ -523,16 +565,41 @@ impl LoopObserver for EventLedgerObserver {
         );
     }
 
+    /// Remembers the turn's served model for its cost stamp.
+    ///
+    /// No line of its own — stream success is one of the excluded
+    /// kinds — but a table-carrying observer needs the model the
+    /// current turn is actually being served by (a fallback switch
+    /// changes it mid-run), and this callback is the one place the
+    /// engine names it per request. Without a table the callback is
+    /// the default no-op and this override costs nothing.
+    fn on_stream_success(&self, ctx: &StreamContext) {
+        let mut state = recover_guard(self.state.lock());
+        state.current_model = Some(ctx.model.clone());
+    }
+
     /// Records the turn's accounting.
     ///
-    /// Stop reason, token totals, and duration land in `data`.
+    /// Stop reason, token totals, duration, and — when a price table
+    /// is installed — the turn's cost stamp land in `data`.
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         let mut state = recover_guard(self.state.lock());
+        let mut data = turn_ended_data(ctx);
+        if let Some(table) = &self.prices {
+            let as_of = rfc3339_now().get(0..10).unwrap_or_default().to_string();
+            stamp_turn_cost(
+                &mut data,
+                table,
+                state.current_model.as_deref(),
+                ctx,
+                &as_of,
+            );
+        }
         self.append(
             &mut state,
             TrajectoryEventKind::TurnEnded,
             Some(ctx.turn),
-            turn_ended_data(ctx),
+            data,
         );
     }
 
@@ -691,6 +758,72 @@ fn turn_ended_data(ctx: &TurnEndContext) -> Value {
         "output_tokens": ctx.output_tokens,
         "stop_reason": ctx.stop_reason,
     })
+}
+
+/// Attach the turn's cost stamp to its `turn.ended` payload.
+///
+/// The capture-time half of the cost plane: the turn's usage classes
+/// price through `table` under the model the turn's stream served,
+/// and the line keeps the estimate it was computed under — per-class
+/// micro-dollars, the priced family, the table's version and date,
+/// and a `stale` flag measured against the line's own date. A model
+/// the table does not price stamps `cost: null` with a note naming
+/// it, and a turn with no recorded model (it never saw a successful
+/// stream) says that instead — either way the line never carries a
+/// guessed number.
+fn stamp_turn_cost(
+    data: &mut Value,
+    table: &crate::pricing::PriceTable,
+    model: Option<&str>,
+    ctx: &TurnEndContext,
+    as_of: &str,
+) {
+    let usage = turn_usage(ctx);
+    let cost = model.and_then(|model| table.cost(model, usage));
+    let stamp = match (model, cost) {
+        (Some(_), Some(cost)) => serde_json::json!({
+            "cost": {
+                "total_usd_micro": cost.total_usd_micro,
+                "input_usd_micro": cost.input_usd_micro,
+                "output_usd_micro": cost.output_usd_micro,
+                "cache_read_usd_micro": cost.cache_read_usd_micro,
+                "cache_write_usd_micro": cost.cache_write_usd_micro,
+                "model": cost.model,
+                "table_version": cost.table_version,
+                "pricing_updated": cost.pricing_updated,
+                "stale": table.is_stale(as_of),
+            }
+        }),
+        (Some(model), None) => serde_json::json!({
+            "cost": Value::Null,
+            "cost_note": format!("unpriced model: {model}"),
+        }),
+        (None, _) => serde_json::json!({
+            "cost": Value::Null,
+            "cost_note": "no served model recorded for this turn",
+        }),
+    };
+    if let Some(stamp_object) = stamp.as_object()
+        && let Some(data_object) = data.as_object_mut()
+    {
+        for (key, value) in stamp_object {
+            data_object.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// The turn's usage classes as one report, for pricing.
+///
+/// Rebuilt from the context's counters — the same figures the engine
+/// reported, widened back from `u64` with saturation at `u32`'s top,
+/// far past any real report.
+fn turn_usage(ctx: &TurnEndContext) -> crate::stream::Usage {
+    crate::stream::Usage::new(
+        u32::try_from(ctx.input_tokens).unwrap_or(u32::MAX),
+        u32::try_from(ctx.output_tokens).unwrap_or(u32::MAX),
+    )
+    .with_cached_input(u32::try_from(ctx.cached_input_tokens).unwrap_or(u32::MAX))
+    .with_cache_write(u32::try_from(ctx.cache_write_tokens).unwrap_or(u32::MAX))
 }
 
 /// The `compaction` payload: the pass's payload-comparable token facts.
@@ -1520,5 +1653,248 @@ mod tests {
             serde_json::from_str::<TrajectoryEvent>(run_lines[0]).is_err(),
             "a per-run record must not parse as an event line"
         );
+    }
+
+    /// One turn-end context carrying the given usage classes.
+    ///
+    /// The fields the cost stamp reads, with the rest at inert values;
+    /// in-crate construction is the test tree's right even where the
+    /// context is `#[non_exhaustive]` to hosts.
+    fn turn_end_usage(
+        turn: usize,
+        input: u64,
+        output: u64,
+        cached_input: u64,
+        cache_write: u64,
+    ) -> TurnEndContext {
+        TurnEndContext {
+            turn,
+            success: true,
+            error: None,
+            duration_ms: 5,
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: cached_input,
+            cache_write_tokens: cache_write,
+            reasoning_tokens: 0,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
+            context_tokens: input.saturating_add(output),
+            context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
+        }
+    }
+
+    /// A priced test table, dated to order.
+    ///
+    /// `2999-01-01` keeps every stamp fresh and `2000-01-01` keeps
+    /// every stamp stale, on any day the test runs — the wall clock
+    /// never decides these asserts.
+    fn stamp_table(pricing_updated: &str) -> std::sync::Arc<crate::pricing::PriceTable> {
+        let json = format!(
+            r#"{{ "table_version": "stamp-table", "pricing_updated": "{pricing_updated}",
+                "models": {{ "gpt-4o": {{ "input_per_mtok": 2.5, "output_per_mtok": 10.0,
+                                          "cache_read_per_mtok": 1.25 }} }} }}"#
+        );
+        std::sync::Arc::new(
+            crate::pricing::PriceTable::from_json(&json).expect("valid stamp table"),
+        )
+    }
+
+    /// Drive one priced turn through an observer: run, turn, stream
+    /// success naming the served model, turn end carrying the usage.
+    fn drive_priced_turn(observer: &EventLedgerObserver, model: &str) {
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "price me".to_string(),
+        });
+        observer.on_stream_success(&StreamContext::new(0, model.to_string(), 50, 25));
+        observer.on_turn_end(&turn_end_usage(0, 50, 25, 10, 5));
+        observer.on_run_end(&RunEndContext::new(true, None, 1, 5));
+    }
+
+    /// The one `turn.ended` line of a driven observer, as a JSON value.
+    fn turn_ended_payload(observer: &EventLedgerObserver) -> Value {
+        let events = read_events(observer);
+        events
+            .iter()
+            .find(|event| event.kind == TrajectoryEventKind::TurnEnded)
+            .map(|event| event.data.clone())
+            .expect("the driven run wrote exactly one turn.ended line")
+    }
+
+    #[test]
+    fn cost_stamped_at_capture_with_table_version() {
+        let dir = temp_dir("cost-stamped");
+        let observer =
+            EventLedgerObserver::writing_to(&dir).with_price_table(stamp_table("2999-01-01"));
+        drive_priced_turn(&observer, "gpt-4o-2024-08-06");
+        let data = turn_ended_payload(&observer);
+        let cost = data
+            .get("cost")
+            .expect("a table-carrying ledger stamps the turn's cost")
+            .as_object()
+            .expect("a priced stamp is an object");
+        assert_eq!(
+            cost.get("model").and_then(Value::as_str),
+            Some("gpt-4o"),
+            "the dated id prices under its family key"
+        );
+        assert_eq!(
+            cost.get("table_version").and_then(Value::as_str),
+            Some("stamp-table"),
+            "the stamp carries the table version it was computed under"
+        );
+        assert_eq!(
+            cost.get("pricing_updated").and_then(Value::as_str),
+            Some("2999-01-01")
+        );
+        assert_eq!(
+            cost.get("stale").and_then(Value::as_bool),
+            Some(false),
+            "a future-dated table stamps fresh on any day the test runs"
+        );
+        assert_eq!(
+            cost.get("input_usd_micro").and_then(Value::as_u64),
+            Some(87)
+        );
+        assert_eq!(
+            cost.get("cache_read_usd_micro").and_then(Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            cost.get("cache_write_usd_micro").and_then(Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            cost.get("output_usd_micro").and_then(Value::as_u64),
+            Some(250)
+        );
+        assert_eq!(
+            cost.get("total_usd_micro").and_then(Value::as_u64),
+            Some(361)
+        );
+        assert!(
+            data.get("cost_note").is_none(),
+            "a priced stamp carries no note"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_model_costs_null_with_warning_not_a_guess() {
+        let dir = temp_dir("cost-null");
+        let observer =
+            EventLedgerObserver::writing_to(&dir).with_price_table(stamp_table("2999-01-01"));
+        drive_priced_turn(&observer, "my-fine-tune-9000");
+        let data = turn_ended_payload(&observer);
+        assert!(
+            data.get("cost").is_some_and(Value::is_null),
+            "an unpriced model stamps cost null, never a number: {:?}",
+            data.get("cost")
+        );
+        assert_eq!(
+            data.get("cost_note").and_then(Value::as_str),
+            Some("unpriced model: my-fine-tune-9000"),
+            "the note names the model the table does not price"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_table_flags_its_stamps() {
+        let dir = temp_dir("cost-stale");
+        let observer =
+            EventLedgerObserver::writing_to(&dir).with_price_table(stamp_table("2000-01-01"));
+        drive_priced_turn(&observer, "gpt-4o");
+        let data = turn_ended_payload(&observer);
+        assert_eq!(
+            data.get("cost")
+                .and_then(|cost| cost.get("stale"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "a table decades past its pricing date flags every stamp it writes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_table_less_ledger_writes_no_cost_field_at_all() {
+        let dir = temp_dir("cost-absent");
+        let observer = EventLedgerObserver::writing_to(&dir);
+        drive_priced_turn(&observer, "gpt-4o");
+        let data = turn_ended_payload(&observer);
+        assert!(
+            data.get("cost").is_none() && data.get("cost_note").is_none(),
+            "without a table the line carries exactly the fields it always did"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_turn_without_a_served_model_says_so_instead_of_guessing() {
+        let dir = temp_dir("cost-nomodel");
+        let observer =
+            EventLedgerObserver::writing_to(&dir).with_price_table(stamp_table("2999-01-01"));
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "a turn that never saw a successful stream".to_string(),
+        });
+        observer.on_turn_end(&turn_end_usage(0, 50, 25, 0, 0));
+        observer.on_run_end(&RunEndContext::new(false, None, 0, 5));
+        let data = turn_ended_payload(&observer);
+        assert!(
+            data.get("cost").is_some_and(Value::is_null),
+            "a turn with no recorded model stamps null, never a guess"
+        );
+        assert_eq!(
+            data.get("cost_note").and_then(Value::as_str),
+            Some("no served model recorded for this turn")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_turn_after_a_served_one_costs_null_not_the_previous_model() {
+        let dir = temp_dir("cost-stale-model");
+        let observer =
+            EventLedgerObserver::writing_to(&dir).with_price_table(stamp_table("2999-01-01"));
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "served fine".to_string(),
+        });
+        observer.on_stream_success(&StreamContext::new(0, "gpt-6.1-sol".to_string(), 50, 25));
+        observer.on_turn_end(&turn_end_usage(0, 50, 25, 0, 0));
+        observer.on_turn_start(&TurnStartContext {
+            turn: 1,
+            query: "this model call dies".to_string(),
+        });
+        observer.on_turn_end(&turn_end_usage(1, 30, 0, 0, 0));
+        observer.on_run_end(&RunEndContext::new(false, None, 1, 5));
+
+        let events = read_events(&observer);
+        let failed_turn = events
+            .iter()
+            .find(|event| event.kind == TrajectoryEventKind::TurnEnded && event.turn == Some(1))
+            .expect("the failed turn still writes its turn.ended line");
+        assert!(
+            failed_turn.data.get("cost").is_some_and(Value::is_null),
+            "a failed model call prices nothing — never under the previous \
+             turn's model: {:?}",
+            failed_turn.data.get("cost")
+        );
+        assert_eq!(
+            failed_turn.data.get("cost_note").and_then(Value::as_str),
+            Some("no served model recorded for this turn")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

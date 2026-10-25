@@ -1,0 +1,92 @@
+name: Price drift
+
+on:
+  schedule:
+    # 03:17 UTC nightly — off the top of the hour to dodge load spikes.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: price-drift
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch the OpenRouter listing
+        run: |
+          curl -sSf --retry 3 --max-time 60 \
+            https://openrouter.ai/api/v1/models -o /tmp/models.json
+          python3 -c "import json; json.load(open('/tmp/models.json'))"
+
+      - name: Convert and compare against the vendored table
+        id: convert
+        run: |
+          set +e
+          cargo run -q --example import_openrouter_prices -- \
+            --date "$(date -u +%F)" \
+            --check src/pricing/curated_prices.json \
+            /tmp/models.json > /tmp/fresh-table.json
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "changed=false" >> "$GITHUB_OUTPUT";;
+            3) echo "changed=true" >> "$GITHUB_OUTPUT";;
+            *)  echo "conversion failed with status $status"; exit "$status";;
+          esac
+
+      - name: Open a refresh pull request
+        if: steps.convert.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh auth setup-git
+          cp /tmp/fresh-table.json src/pricing/curated_prices.json
+          branch=chore/price-drift
+          summary=$(git diff --numstat src/pricing/curated_prices.json)
+          git config user.name "loopctl price canary"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout -B "$branch"
+          git commit -am "chore: refresh curated prices to $(date -u +%F)"
+          git push -f origin "$branch"
+          body=$(cat <<'EOF'
+          The nightly canary converted OpenRouter's models listing and found
+          price or family drift against the vendored table.
+
+          - Review the diff like a golden regeneration: this is price data,
+            and it feeds budget enforcement.
+          - The table's date and version change with it; the structural pins
+            (`the_curated_seed_holds_a_well_formed_openrouter_table`,
+            `same_prices_ignores_vintage_and_detects_real_drift`) and the
+            fixture-based doctests keep this PR green through routine drift.
+            One pin names a real family —
+            `prefix_resolution_strips_bedrock_spellings`
+            (claude-sonnet-4-5): a rename of that family is the one
+            expected follow-up edit.
+          - Never auto-merge: a human reviews and merges.
+          EOF
+          )
+          gh pr create \
+            --title "chore: refresh curated prices to $(date -u +%F)" \
+            --body "$body" \
+            --base master \
+            --head "$branch" \
+          || gh pr edit "$branch" \
+            --title "chore: refresh curated prices to $(date -u +%F)" \
+            --body "$body
+          ---
+          Re-run of the nightly canary; diffstat of the latest run:
+          ${summary}"

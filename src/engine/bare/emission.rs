@@ -546,6 +546,7 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Result<(), LoopError> {
         let served = self.routed_or_client_model()?;
         self.managers.fallback().record_success()?;
+        let raw_usage = usage;
         let usage = TurnUsage::from_report(usage);
         let TurnUsage {
             input_tokens: in_tok,
@@ -572,6 +573,7 @@ impl<C: ApiClient> BareLoop<C> {
         }
         if let Some(gate) = &self.budget_gate {
             gate.observe_usage(in_tok, out_tok);
+            gate.observe_cost(&served, raw_usage);
         }
         self.managers.observers().on_stream_success(
             &StreamContext::new(turn, served, in_tok, out_tok).with_usage_detail(

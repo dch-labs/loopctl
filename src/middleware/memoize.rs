@@ -25,6 +25,7 @@
 //! on a hit before the inner dispatch fires:
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the surrounding bindings are elided
 //! use loopctl::middleware::{MemoizingMiddleware, PathExtractor, ToolPipeline};
 //! use std::sync::Arc;
 //!
@@ -113,6 +114,7 @@ pub trait PathExtractor: Send + Sync {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use std::sync::Arc;
 /// use loopctl::middleware::{MemoizingMiddleware, NoopPathExtractor};
 ///

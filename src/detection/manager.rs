@@ -57,29 +57,29 @@
 //!
 //! # Quick Start
 //!
-//! ```rust,ignore
-//! use loopctl::detection::manager::{
-//!     DetectionConfig, DetectionManager, DetectedPattern,
-//! };
+//! ```
+//! use loopctl::detection::manager::{DetectionManager, DetectedPattern};
 //!
 //! // Create with defaults (loop threshold 3, convergence threshold 0.95)
-//! let dm = DetectionManager::new();
+//! let dm = DetectionManager::new().expect("default config is valid");
 //!
 //! // Record tool calls each turn
-//! dm.record_tool_call("Read", 42);
-//! let pattern = dm.record_tool_call("Read", 42);
+//! dm.record_tool_call("Read", 42).expect("lock is healthy");
+//! let pattern = dm.record_tool_call("Read", 42).expect("lock is healthy");
 //! assert!(matches!(pattern, DetectedPattern::NoPattern));
 //!
 //! // Record assistant responses for convergence checking
-//! dm.record_response("I'm working on the file.");
+//! dm.record_response("I'm working on the file.").expect("lock is healthy");
 //!
 //! // Inspect current state at any time
-//! if let DetectedPattern::LoopDetected { repetitions, .. } = dm.check_current_pattern() {
+//! if let DetectedPattern::LoopDetected { repetitions, .. } =
+//!     dm.check_current_pattern().expect("lock is healthy")
+//! {
 //!     println!("Agent is looping — {repetitions} repetitions seen");
 //! }
 //!
 //! // Reset between tasks
-//! dm.reset();
+//! dm.reset().expect("lock is healthy");
 //! ```
 //!
 //! # See Also
@@ -115,16 +115,22 @@ pub use super::loop_detector::LoopStatus;
 ///
 /// The recommended approach is to handle each variant explicitly:
 ///
-/// ```rust,ignore
-/// match pattern {
-///     DetectedPattern::LoopDetected { repetitions, pattern_description } => {
-///         tracing::warn!("Loop detected: {pattern_description} (×{repetitions})");
+/// ```
+/// use loopctl::detection::manager::DetectedPattern;
+///
+/// fn report(pattern: &DetectedPattern) {
+///     match pattern {
+///         DetectedPattern::LoopDetected { repetitions, pattern_description } => {
+///             tracing::warn!("Loop detected: {pattern_description} (x{repetitions})");
+///         }
+///         DetectedPattern::ConvergenceDetected { similarity, consecutive_count } => {
+///             tracing::info!("Responses converged ({similarity:.2}, {consecutive_count} in a row)");
+///         }
+///         DetectedPattern::NoPattern => { /* agent is making progress */ }
 ///     }
-///     DetectedPattern::ConvergenceDetected { similarity, consecutive_count } => {
-///         tracing::info!("Responses converged (similarity={similarity:.2})");
-///     }
-///     DetectedPattern::NoPattern => { /* agent is making progress */ }
 /// }
+///
+/// report(&DetectedPattern::NoPattern);
 /// ```
 ///
 /// # See Also
@@ -154,8 +160,16 @@ pub enum DetectedPattern {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use loopctl::detection::{DetectedPattern, DetectionManager, Operation};
+    ///
     /// // After calling Read("/etc/hosts") 3 times with identical results:
+    /// let dm = DetectionManager::new().expect("default config is valid");
+    /// let mut pattern = DetectedPattern::NoPattern;
+    /// for _ in 0..3 {
+    ///     let op = Operation::new("Read", "/etc/hosts");
+    ///     pattern = dm.record_operation(op).expect("lock is healthy");
+    /// }
     /// if let DetectedPattern::LoopDetected { repetitions, pattern_description } = pattern {
     ///     assert_eq!(pattern_description, "Read(/etc/hosts)");
     ///     assert!(repetitions >= 3);
@@ -252,13 +266,15 @@ pub enum DetectedPattern {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
+/// use loopctl::detection::manager::{DetectionConfig, DetectionManager};
+///
 /// let config = DetectionConfig {
 ///     loop_threshold: 5,          // allow more repetition before flagging
 ///     convergence_threshold: 0.9, // looser similarity threshold
 ///     ..DetectionConfig::default()
 /// };
-/// let dm = DetectionManager::new_with_config(config);
+/// let dm = DetectionManager::new_with_config(config).expect("config is in range");
 /// ```
 ///
 /// # See Also
@@ -401,8 +417,11 @@ impl DetectionConfig {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let stats = dm.stats();
+/// ```
+/// use loopctl::detection::manager::DetectionManager;
+///
+/// let dm = DetectionManager::new().expect("default config is valid");
+/// let stats = dm.stats().expect("lock is healthy");
 /// println!("Turns: {}", stats.turns_analyzed);
 /// println!("Loops: {}", stats.loops_detected);
 /// println!("Convergences: {}", stats.convergences_detected);
@@ -499,24 +518,27 @@ pub struct DetectionStats {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let dm = DetectionManager::new();
+/// ```
+/// use loopctl::detection::manager::{DetectionManager, DetectedPattern};
+///
+/// let dm = DetectionManager::new().expect("default config is valid");
 ///
 /// // Record tool calls
-/// let pattern = dm.record_tool_call("Read", file_hash);
+/// let pattern = dm.record_tool_call("Read", 42).expect("lock is healthy");
 /// if let DetectedPattern::LoopDetected { repetitions, .. } = pattern {
 ///     tracing::warn!("Loop after {repetitions} reps");
 /// }
 ///
 /// // Record responses
-/// dm.record_response("Working on step 1...");
+/// dm.record_response("Working on step 1...").expect("lock is healthy");
 ///
 /// // Query at any time
-/// let stats = dm.stats();
+/// let stats = dm.stats().expect("lock is healthy");
 /// println!("Turns: {}, Loops: {}", stats.turns_analyzed, stats.loops_detected);
 ///
 /// // Reset between tasks
-/// dm.reset();
+/// dm.reset().expect("lock is healthy");
+/// assert!(matches!(dm.check_current_pattern().expect("lock is healthy"), DetectedPattern::NoPattern));
 /// ```
 ///
 /// # Thread Safety
@@ -576,8 +598,10 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let dm = DetectionManager::new();
+    /// ```
+    /// use loopctl::detection::manager::DetectionManager;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
     /// ```
     ///
     /// # Errors
@@ -595,12 +619,14 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use loopctl::detection::manager::{DetectionConfig, DetectionManager};
+    ///
     /// let config = DetectionConfig {
     ///     loop_threshold: 5,
     ///     ..DetectionConfig::default()
     /// };
-    /// let dm = DetectionManager::new_with_config(config);
+    /// let dm = DetectionManager::new_with_config(config).expect("config is in range");
     /// ```
     ///
     /// # Errors
@@ -635,9 +661,20 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let ld = LoopDetector::new(ld_config, my_signature);
-    /// let dm = DetectionManager::new_with_loop_detector(config, ld);
+    /// ```
+    /// use std::sync::Arc;
+    /// use loopctl::detection::manager::{DetectionConfig, DetectionManager};
+    /// use loopctl::detection::{LoopDetector, LoopDetectorConfig, NoOpToolSignature};
+    ///
+    /// let ld = LoopDetector::new(
+    ///     LoopDetectorConfig::default(),
+    ///     Arc::new(NoOpToolSignature),
+    /// );
+    /// let dm = DetectionManager::new_with_loop_detector(
+    ///     DetectionConfig::default(),
+    ///     ld,
+    /// )
+    /// .expect("default config is valid");
     /// ```
     ///
     /// # Errors
@@ -666,9 +703,13 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let signature = Arc::new(MyToolSignature);
-    /// let dm = DetectionManager::new_with_signature(signature);
+    /// ```
+    /// use std::sync::Arc;
+    /// use loopctl::detection::manager::DetectionManager;
+    /// use loopctl::detection::NoOpToolSignature;
+    ///
+    /// let dm = DetectionManager::new_with_signature(Arc::new(NoOpToolSignature))
+    ///     .expect("default config is valid");
     /// ```
     ///
     /// # See Also
@@ -727,11 +768,15 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use loopctl::detection::manager::{DetectionManager, DetectedPattern};
+    /// use loopctl::detection::Operation;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
     /// let op = Operation::new("Read", "/etc/hosts");
-    /// match dm.record_operation(op) {
+    /// match dm.record_operation(op).expect("lock is healthy") {
     ///     DetectedPattern::LoopDetected { repetitions, pattern_description } => {
-    ///         tracing::warn!("Loop: {pattern_description} (×{repetitions})");
+    ///         tracing::warn!("Loop: {pattern_description} (x{repetitions})");
     ///     }
     ///     _ => { /* no loop yet */ }
     /// }
@@ -851,8 +896,12 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let pattern = dm.record_tool_call("Bash", 0xABCD);
+    /// ```
+    /// use loopctl::detection::manager::{DetectionManager, DetectedPattern};
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
+    /// let pattern = dm.record_tool_call("Bash", 0xABCD).expect("lock is healthy");
+    /// assert!(matches!(pattern, DetectedPattern::NoPattern));
     /// ```
     ///
     /// # See Also
@@ -907,13 +956,17 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use loopctl::detection::manager::DetectionManager;
+    /// use loopctl::detection::hash_result;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
     /// // Same tool + input, different results → not a loop
     /// for i in 0..5 {
     ///     let result = hash_result(&format!("output {i}"));
-    ///     dm.record_tool_call_with_result("Bash", 42, result);
+    ///     dm.record_tool_call_with_result("Bash", 42, result).expect("lock is healthy");
     /// }
-    /// assert!(matches!(dm.check_loop().is_looping, false));
+    /// assert!(!dm.check_loop().is_looping);
     /// ```
     ///
     /// # See Also
@@ -956,10 +1009,13 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use loopctl::detection::manager::DetectionManager;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
     /// let status = dm.check_loop();
     /// if status.should_stop {
-    ///     tracing::error!("Forcing stop — loop detected: {:?}", status.warning);
+    ///     tracing::error!("Forcing stop: loop detected, {}", status.repetition_count);
     /// }
     /// ```
     ///
@@ -1091,7 +1147,10 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use loopctl::detection::manager::DetectionManager;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
     /// let ld = dm.loop_detector();
     /// println!("Turns seen by loop detector: {}", ld.turn_count());
     /// ```
@@ -1127,9 +1186,15 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use loopctl::detection::manager::DetectionManager;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
     /// let cd = dm.convergence_detector();
-    /// let status = cd.lock().unwrap().check_convergence();
+    /// let status = cd
+    ///     .lock()
+    ///     .unwrap_or_else(std::sync::PoisonError::into_inner)
+    ///     .check_convergence();
     /// ```
     ///
     /// # See Also
@@ -1172,8 +1237,11 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let pattern = dm.record_response("I'm still working on the task.");
+    /// ```
+    /// use loopctl::detection::manager::{DetectionManager, DetectedPattern};
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
+    /// let pattern = dm.record_response("I'm still working on the task.").expect("lock is healthy");
     /// if let DetectedPattern::ConvergenceDetected { similarity, .. } = pattern {
     ///     tracing::warn!("Responses converging (similarity={similarity:.2})");
     /// }
@@ -1235,8 +1303,11 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let status = dm.check_convergence();
+    /// ```
+    /// use loopctl::detection::manager::DetectionManager;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
+    /// let status = dm.check_convergence().expect("lock is healthy");
     /// println!("Similarity: {:.2}", status.similarity_score);
     /// ```
     ///
@@ -1287,8 +1358,11 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// match dm.check_current_pattern() {
+    /// ```
+    /// use loopctl::detection::manager::{DetectionManager, DetectedPattern};
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
+    /// match dm.check_current_pattern().expect("lock is healthy") {
     ///     DetectedPattern::LoopDetected { repetitions, .. } => {
     ///         tracing::warn!("Loop detected: {repetitions} reps");
     ///     }
@@ -1341,8 +1415,11 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let stats = dm.stats();
+    /// ```
+    /// use loopctl::detection::manager::DetectionManager;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
+    /// let stats = dm.stats().expect("lock is healthy");
     /// println!("Turns: {}, Loops: {}, Convergences: {}",
     ///     stats.turns_analyzed,
     ///     stats.loops_detected,
@@ -1379,7 +1456,10 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use loopctl::detection::manager::DetectionManager;
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
     /// let cfg = dm.config();
     /// if !cfg.enable_loop_detection {
     ///     tracing::info!("Loop detection is disabled");
@@ -1420,12 +1500,15 @@ impl DetectionManager {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// dm.record_tool_call("Read", 42);
-    /// dm.record_response("Working on step 1...");
-    /// dm.reset();
-    /// assert!(matches!(dm.check_current_pattern(), DetectedPattern::NoPattern));
-    /// assert_eq!(dm.stats().turns_analyzed, 0);
+    /// ```
+    /// use loopctl::detection::manager::{DetectionManager, DetectedPattern};
+    ///
+    /// let dm = DetectionManager::new().expect("default config is valid");
+    /// dm.record_tool_call("Read", 42).expect("lock is healthy");
+    /// dm.record_response("Working on step 1...").expect("lock is healthy");
+    /// dm.reset().expect("lock is healthy");
+    /// assert!(matches!(dm.check_current_pattern().expect("lock is healthy"), DetectedPattern::NoPattern));
+    /// assert_eq!(dm.stats().expect("lock is healthy").turns_analyzed, 0);
     /// ```
     ///
     /// # See Also

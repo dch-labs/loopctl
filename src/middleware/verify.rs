@@ -137,6 +137,7 @@ pub struct VerifyResult {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use std::sync::Arc;
 /// use loopctl::middleware::{NoopVerifier, Verifier, VerifyMiddleware};
 ///
@@ -181,6 +182,7 @@ impl Verifier for NoopVerifier {
 /// result on the way out:
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use loopctl::middleware::{VerifyMiddleware, ToolPipeline};
 /// use std::sync::Arc;
 ///

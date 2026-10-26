@@ -51,6 +51,7 @@
 //! - **Testing** — swap `LoopManagers` for a stub that implements only the
 //!   traits under test.
 //! ```rust,ignore
+//! // ignore — schematic fragment — the client/registry/config bindings are elided
 //! let managers = LoopManagers::new()
 //!     .with_fallback(FallbackManager::for_model("llm-70b"))
 //!     .with_detection(DetectionManager::default())
@@ -332,6 +333,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// let managers = LoopManagers::new()
     ///     .with_observer(Arc::new(logging_observer))
     ///     .with_observer(Arc::new(metrics_observer))
@@ -355,6 +357,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// let managers = LoopManagers::new()
     ///     .with_pipeline(builder.build()?)
     /// ```
@@ -383,6 +386,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// let managers = LoopManagers::new()
     ///     .with_stream_handler(handler)
     /// ```
@@ -408,6 +412,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — references a user-defined type the fence does not define
     /// use loopctl::observer::LoopObserver;
     /// use std::sync::Arc;
     ///
@@ -434,6 +439,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// let managers = LoopManagers::new()
     ///     .with_context_manager(Arc::new(manager))
     /// ```
@@ -489,6 +495,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// use loopctl::memory::InMemoryStore;
     /// use std::sync::Arc;
     ///
@@ -526,6 +533,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// use loopctl::compact::demote::{DemotionSink, MemoryDemotionSink};
     /// use loopctl::memory::InMemoryStore;
     /// use std::sync::Arc;
@@ -571,6 +579,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// use loopctl::determinism::FixedClock;
     /// use std::sync::Arc;
     /// use std::time::UNIX_EPOCH;
@@ -617,6 +626,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// use loopctl::determinism::SeededIdGen;
     /// use std::sync::Arc;
     ///
@@ -659,6 +669,7 @@ impl LoopManagers {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// use loopctl::ask::{ApprovalChannel, AskResolution};
     /// use loopctl::managers::LoopManagers;
     ///

@@ -1,4 +1,4 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama conformance check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama conformance check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check doc-census
 
 ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check client-check
 
@@ -30,6 +30,14 @@ windows-check:
 
 fmt:
 	cargo fmt --all -- --check
+
+doc-census:
+	@total=$$(grep -rn '```rust' src/ --include='*.rs' | wc -l); \
+	ignored=$$(grep -rn 'rust,ignore' src/ --include='*.rs' | wc -l); \
+	runnable=$$((total - ignored)); \
+	echo "doc blocks: $$total | runnable fences: $$runnable | rust,ignore: $$ignored"; \
+	out=$$(cargo test --test doctest_census 2>&1); status=$$?; \
+	printf '%s\n' "$$out" | tail -1; exit $$status
 
 lint:
 	cargo fmt --all

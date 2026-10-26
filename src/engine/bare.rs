@@ -35,6 +35,7 @@
 //! # Quick Start
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the client/registry/config bindings are elided
 //! use loopctl::engine::BareLoop;
 //! use loopctl::tool::ToolRegistry;
 //! use loopctl::config::SessionConfig;
@@ -153,6 +154,7 @@ pub use model_switch::ModelSwitch;
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the client/registry/config bindings are elided
 /// use loopctl::engine::BareLoop;
 /// use loopctl::tool::ToolRegistry;
 /// use loopctl::config::SessionConfig;
@@ -1056,6 +1058,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// let mut agent = BareLoop::new(
     ///     Arc::new(my_client),
     ///     ToolRegistry::new(),
@@ -1092,6 +1095,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// let managers = LoopManagers::new()
     ///     .with_detection(DetectionManager::default())
     ///     .with_fallback(FallbackManager::default());
@@ -1989,6 +1993,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// let signal = agent.cancel_signal();
     ///
     /// // From another task:
@@ -2041,6 +2046,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// a different context window or token limit:
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// # use loopctl::engine::BareLoop;
     /// # use loopctl::config::SessionConfig;
     /// # use loopctl::tool::registry::ToolRegistry;
@@ -2056,6 +2062,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// For simple cases where you just want to swap the model name:
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// # use loopctl::engine::BareLoop;
     /// # use loopctl::config::SessionConfig;
     /// # use loopctl::tool::registry::ToolRegistry;

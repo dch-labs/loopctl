@@ -46,6 +46,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — references a user-defined type the fence does not define
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_reflector(Arc::new(MyReflector));
     /// ```
@@ -67,6 +68,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — references a user-defined type the fence does not define
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_recovery_strategy(Arc::new(MyStrategy));
     /// ```
@@ -94,9 +96,18 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
     /// use loopctl::compact::{ContextManager, TruncatingCompactor};
-    /// use std::sync::Arc;
     ///
     /// let compactor = TruncatingCompactor::new()
     ///     .with_preserve_recent(4)
@@ -107,6 +118,11 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_context_manager(Arc::new(manager));
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     pub fn set_context_manager(&mut self, manager: Arc<ContextManager>) {
         self.debug_assert_idle();
@@ -251,12 +267,26 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
     /// use loopctl::compact::RatioTokenCounter;
-    /// use std::sync::Arc;
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_token_counter(Arc::new(RatioTokenCounter::anthropic()));
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     pub fn set_token_counter(&mut self, counter: Arc<dyn crate::compact::TokenCounter>) {
         self.debug_assert_idle();
@@ -286,9 +316,24 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
     /// let mut agent = BareLoop::new(client, registry, config)
     ///     .with_temp_dir("/var/cache/myapp/sessions");
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     #[must_use]
     pub fn with_temp_dir(mut self, base: impl Into<PathBuf>) -> Self {
@@ -333,7 +378,18 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
+    /// use std::time::Duration;
     /// use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig};
     ///
     /// let handler = StreamHandler::new().with_timeout_config(
@@ -345,6 +401,11 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_stream_handler(handler);
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     pub fn set_stream_handler(&mut self, handler: StreamHandler) {
         self.debug_assert_idle();
@@ -368,13 +429,27 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
     /// use loopctl::hooks::HookExecutor;
-    /// use std::sync::Arc;
     ///
     /// let executor = HookExecutor::new();
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_hook_executor(Arc::new(executor));
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     #[cfg(feature = "hooks")]
     pub fn set_hook_executor(&mut self, executor: Arc<HookExecutor>) {
@@ -397,13 +472,27 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
     /// use loopctl::tool::health::ToolHealthRegistry;
-    /// use std::sync::Arc;
     ///
-    /// let registry = ToolHealthRegistry::new();
-    /// let mut agent = BareLoop::new(client, tools, config);
-    /// agent.set_health_registry(Arc::new(registry));
+    /// let health = ToolHealthRegistry::new();
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_health_registry(Arc::new(health));
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     #[cfg(feature = "tool_health")]
     pub fn set_health_registry(&mut self, registry: Arc<ToolHealthRegistry>) {
@@ -424,12 +513,26 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
     /// use loopctl::memory::InMemoryStore;
-    /// use std::sync::Arc;
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_memory(Arc::new(InMemoryStore::new()));
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     pub fn set_memory(&mut self, memory: Arc<dyn crate::memory::LoopMemory>) {
         self.debug_assert_idle();
@@ -450,14 +553,28 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
     /// use loopctl::compact::demote::MemoryDemotionSink;
     /// use loopctl::memory::InMemoryStore;
-    /// use std::sync::Arc;
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// let memory = Arc::new(InMemoryStore::new());
     /// agent.set_demotion_sink(Arc::new(MemoryDemotionSink::new(memory)));
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     pub fn set_demotion_sink(&mut self, sink: Arc<dyn crate::compact::demote::DemotionSink>) {
         self.debug_assert_idle();
@@ -488,7 +605,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```
     /// # #[cfg(feature = "testing")]
     /// # fn example() {
     /// # use std::sync::Arc;
@@ -542,6 +659,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — references a user-defined type the fence does not define
     /// use loopctl::observer::LoopObserver;
     /// use std::sync::Arc;
     ///
@@ -571,15 +689,31 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use std::sync::{Arc, Mutex};
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
+    /// # use std::sync::Mutex;
     ///
     /// let buffer = Arc::new(Mutex::new(String::new()));
     /// let buf = Arc::clone(&buffer);
+    /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_text_streamer(Arc::new(move |delta| {
     ///     print!("{delta}");
     ///     buf.lock().unwrap_or_else(|e| e.into_inner()).push_str(delta);
     /// }));
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     pub fn set_text_streamer(&mut self, f: TextStreamer) {
         self.debug_assert_idle();
@@ -612,9 +746,26 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
+    /// use loopctl::presets::GoalReminder;
+    ///
     /// let mut agent = BareLoop::new(client, registry, config);
-    /// agent.add_contributor(Box::new(GoalReminder::new("ship the demo")));
+    /// agent.add_contributor(Box::new(GoalReminder::new(5)));
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     pub fn add_contributor(&mut self, contributor: Box<dyn ContextContributor>) {
         self.debug_assert_idle();
@@ -817,13 +968,28 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
     /// use loopctl::structured::{RequestOptions, ToolConstraint};
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_request_options(
     ///     RequestOptions::new().with_tool_constraint(ToolConstraint::Strict),
     /// );
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     ///
     /// Like every `set_*` configurator, this asserts the loop has not
@@ -864,11 +1030,26 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use loopctl::engine::{BareLoop, TurnMode};
+    /// ```
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// # let client = Arc::new(MockApiClient::new("test-model"));
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
+    /// use loopctl::engine::TurnMode;
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_turn_mode(TurnMode::NonStreaming);
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     pub fn set_turn_mode(&mut self, mode: TurnMode) {
         self.debug_assert_idle();

@@ -23,6 +23,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the surrounding bindings are elided
 //! use loopctl::middleware::{RedactingMiddleware, SecretPatternSet, ToolPipeline};
 //! use loopctl::tool::ToolRegistry;
 //! use std::sync::Arc;
@@ -718,6 +719,7 @@ fn shannon_entropy(token: &str) -> f64 {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use loopctl::middleware::{RedactingMiddleware, SecretPatternSet, ToolPipeline};
 /// use loopctl::tool::ToolRegistry;
 /// use std::sync::Arc;

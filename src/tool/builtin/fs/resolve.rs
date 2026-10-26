@@ -1452,7 +1452,7 @@ mod verify_tests {
         // nested path is a workspace sibling (or system) instead.
         let cwd = Path::new("/home/dch/repos/loopctl");
         assert_ne!(
-            classify_escape("/tmp/.tmpln/AGENTS.md", cwd, false),
+            classify_escape("/tmp/.tmpln/NESTED.md", cwd, false),
             "temp scratch"
         );
     }
@@ -1461,7 +1461,7 @@ mod verify_tests {
     fn a_neighbor_repo_is_a_sibling_workspace() {
         let cwd = Path::new("/home/dch/repos/loopctl");
         assert_eq!(
-            classify_escape("/home/dch/repos/AGENTS.md", cwd, false),
+            classify_escape("/home/dch/repos/CONTEXT.md", cwd, false),
             "sibling workspace"
         );
     }

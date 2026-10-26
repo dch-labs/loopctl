@@ -26,6 +26,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — fragment — the client binding is elided
 //! use loopctl::compact::structured_summarizer::StructuredSummarizer;
 //! use loopctl::compact::structured_summarizer::StructuredSummaryConfig;
 //! use loopctl::compact::ContextManager;
@@ -818,6 +819,7 @@ impl Default for StructuredSummaryConfig {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — fragment — the client binding is elided
 /// use loopctl::compact::structured_summarizer::{
 ///     StructuredSummarizer, StructuredSummaryConfig,
 /// };

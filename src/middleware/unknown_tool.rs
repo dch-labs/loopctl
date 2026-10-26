@@ -23,6 +23,7 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use std::sync::Arc;
 /// use loopctl::tool::registry::ToolRegistry;
 /// use loopctl::middleware::unknown_tool::UnknownToolMiddleware;

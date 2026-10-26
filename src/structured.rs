@@ -28,6 +28,7 @@
 //! # Quick Start
 //!
 //! ```rust,ignore
+//! // ignore — API-shape fragment — an illustrative method body, not self-contained
 //! use loopctl::structured::{StructuredOutput, request_structured};
 //! use serde::{Deserialize, Serialize};
 //! use serde_json::json;
@@ -83,6 +84,7 @@ use crate::message::Message;
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// use loopctl::structured::StructuredOutput;
 /// use serde::{Deserialize, Serialize};
 /// use serde_json::json;
@@ -186,6 +188,7 @@ impl ResponseFormat {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — references a user-defined type the fence does not define
     /// use loopctl::structured::{ResponseFormat, StructuredOutput};
     ///
     /// let rf = ResponseFormat::from_type::<MyOutput>();
@@ -680,6 +683,7 @@ pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use loopctl::structured::tighten_json_schema;
 /// use serde_json::json;
 ///

@@ -14,6 +14,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the client/registry/config bindings are elided
 //! use loopctl::ask::{ApprovalChannel, AskResolution};
 //! use loopctl::managers::LoopManagers;
 //!

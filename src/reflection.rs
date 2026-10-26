@@ -860,6 +860,7 @@ pub trait RecoveryStrategy: Send + Sync {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// # tokio_test::block_on(async {
 /// let reflector = NoopReflector;
 /// let context = ReflectionContext {

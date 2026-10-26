@@ -29,6 +29,7 @@
 //! # Quick Start
 //!
 //! ```rust,ignore
+//! // ignore — API-shape fragment — an illustrative method body, not self-contained
 //! use loopctl::tool::{Tool, ToolContext, ToolOutput, ToolError, ToolSchema};
 //! use serde_json::{Value, json};
 //! use std::pin::Pin;
@@ -109,6 +110,7 @@ pub use selector::{KeywordSelector, SelectionContext, StaticSelector, ToolSelect
 /// [`ToolSchema::new`](Self::new):
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// fn schema(&self) -> ToolSchema {
 ///     ToolSchema::new(
 ///         "read_file",
@@ -220,6 +222,7 @@ impl ToolSchema {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use loopctl::tool::{ToolOutput, DisplayHint};
 ///
 /// // An Edit tool that produces a unified diff:
@@ -338,6 +341,7 @@ pub enum Retention {
 /// Use the named constructors rather than building the struct directly:
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// // Success
 /// let ok = ToolOutput::text("hello world");
 /// let ok = ToolOutput::success(structured_content);
@@ -556,6 +560,7 @@ impl ToolOutput {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// use loopctl::tool::{ToolOutput, DisplayHint};
     ///
     /// let out = ToolOutput::text(diff).with_hint(DisplayHint::Diff);
@@ -695,6 +700,7 @@ impl ToolOutput {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// use loopctl::tool::ToolOutput;
     /// use loopctl::structured::StructuredOutput;
     ///
@@ -1055,6 +1061,7 @@ fn gate_precedence(verdict: GateVerdict) -> u8 {
 /// inside tool implementations:
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// let data = tokio::fs::read_to_string(&path).await?;  // io::Error → ToolError
 /// let parsed: Value = serde_json::from_str(&data)?;    // json::Error → ToolError
 /// ```
@@ -1421,6 +1428,7 @@ impl ToolContext {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — references a user-defined type the fence does not define
     /// ctx.set_extension(Arc::new(my_callback_fn));
     /// ctx.set_extension(MyConfig { max_retries: 3 });
     /// ```
@@ -1441,6 +1449,7 @@ impl ToolContext {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — references a user-defined type the fence does not define
     /// if let Some(cb) = ctx.get_extension::<MyCallback>() {
     ///     cb.invoke();
     /// }
@@ -1565,6 +1574,7 @@ impl Default for ToolContext {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// struct ReadFileTool;
 ///
 /// impl Tool for ReadFileTool {
@@ -1602,6 +1612,7 @@ impl Default for ToolContext {
 /// methods, building the JSON Schema statically from the fields:
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// use loopctl::Tool;
 /// use loopctl::tool::{ToolContext, ToolError, ToolOutput};
 /// use serde::Deserialize;
@@ -1715,6 +1726,7 @@ pub trait Tool: Send + Sync {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — API-shape fragment — an illustrative method body, not self-contained
     /// fn call(&self, input: Value, ctx: &ToolContext)
     ///     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>
     /// {
@@ -1771,6 +1783,7 @@ pub trait Tool: Send + Sync {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — API-shape fragment — an illustrative method body, not self-contained
     /// // A write tool that allows concurrent writes to different files:
     /// fn is_safe_for_concurrent_execution(&self, input: &Value) -> bool {
     ///     // Track which files are in-flight; only block on same-file writes
@@ -1798,6 +1811,7 @@ pub trait Tool: Send + Sync {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — API-shape fragment — an illustrative method body, not self-contained
     /// fn resource_key(&self, input: &Value) -> Option<String> {
     ///     input.get("path").and_then(|p| p.as_str()).map(String::from)
     /// }
@@ -1825,6 +1839,7 @@ pub trait Tool: Send + Sync {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — API-shape fragment — an illustrative method body, not self-contained
     /// // A grep-like tool that only reads files:
     /// fn is_read_only(&self) -> bool { true }
     /// ```
@@ -1848,6 +1863,7 @@ pub trait Tool: Send + Sync {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — API-shape fragment — an illustrative method body, not self-contained
     /// // A bash tool that advises the LLM on style:
     /// fn system_prompt(&self) -> Option<String> {
     ///     Some("Prefer single-line bash commands over multi-line scripts.".into())

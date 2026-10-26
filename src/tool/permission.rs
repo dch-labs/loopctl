@@ -22,6 +22,7 @@ use serde_json::Value;
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// let check = PermissionCheck::deny("dangerous operation");
 /// if check.is_deny() {
 ///     return Err(ToolError::Permission("blocked by policy".into()));
@@ -200,6 +201,7 @@ impl PermissionCheck {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// if check.is_allow() {
     ///     let result = tool.call(input, &ctx).await;
     /// }
@@ -219,6 +221,7 @@ impl PermissionCheck {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// if check.is_deny() {
     ///     return Err(ToolError::Permission("blocked by policy".into()));
     /// }
@@ -239,6 +242,7 @@ impl PermissionCheck {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// if check.is_ask() {
     ///     println!("Tool requests approval: {}", prompt);
     /// }
@@ -257,6 +261,7 @@ impl PermissionCheck {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// if let PermissionCheck::Modify { modified_input } = check {
     ///     let result = tool.call(modified_input, &ctx).await;
     /// }

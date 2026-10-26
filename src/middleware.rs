@@ -34,6 +34,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the surrounding bindings are elided
 //! use loopctl::middleware::{
 //!     ToolPipeline, ToolCallMiddleware, PermissionMiddleware, TimeoutMiddleware,
 //! };
@@ -293,6 +294,7 @@ pub struct ToolDispatchContext {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// struct LoggingMiddleware;
 ///
 /// impl ToolMiddleware for LoggingMiddleware {
@@ -409,6 +411,7 @@ pub enum PipelineError {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// let pipeline = ToolPipeline::builder()
 ///     .with_middleware(PermissionMiddleware::deny_all())
 ///     .with_middleware(TimeoutMiddleware::from_secs(120))
@@ -588,6 +591,7 @@ impl ToolPipeline {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// let pipeline = ToolPipeline::builder()
 ///     .with_middleware(PermissionMiddleware::deny_all())
 ///     .with_middleware(TimeoutMiddleware::from_secs(120))

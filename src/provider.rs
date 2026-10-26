@@ -32,6 +32,7 @@
 //! # Quick Start
 //!
 //! ```rust,ignore
+//! // ignore — constructing the client reads its credential from the environment
 //! use loopctl::provider;
 //! use loopctl::engine::BareLoop;
 //! use loopctl::engine::RunConfig;
@@ -1227,6 +1228,7 @@ pub fn self_hosted_builder(model: &str) -> OpenAiClientBuilder {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — constructing the client reads its credential from the environment
 /// use loopctl::provider;
 ///
 /// // Local:
@@ -1290,6 +1292,7 @@ pub fn deepseek_builder() -> OpenAiClientBuilder {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — constructing the client reads its credential from the environment
 /// use loopctl::provider;
 ///
 /// let client = provider::deepseek()?;
@@ -1407,6 +1410,7 @@ fn validate_azure_resource(resource: &str) -> Result<(), ApiError> {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — constructing the client reads its credential from the environment
 /// use loopctl::provider;
 ///
 /// let client = provider::azure("my-resource")?;
@@ -1469,6 +1473,7 @@ pub fn moonshot_builder() -> OpenAiClientBuilder {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — constructing the client reads its credential from the environment
 /// use loopctl::provider;
 ///
 /// let client = provider::moonshot()?;
@@ -1529,6 +1534,7 @@ pub fn grok_builder() -> OpenAiClientBuilder {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — constructing the client reads its credential from the environment
 /// use loopctl::provider;
 ///
 /// let client = provider::grok()?;
@@ -1595,6 +1601,7 @@ pub fn zai_builder() -> AnthropicClientBuilder {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — constructing the client reads its credential from the environment
 /// use loopctl::provider;
 ///
 /// let client = provider::zai()?;
@@ -1621,10 +1628,13 @@ pub fn zai() -> Result<AnthropicClient, ApiError> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
 /// use loopctl::provider;
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let client = provider::self_hosted("http://localhost:8080/v1", "my-model")?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Errors

@@ -42,6 +42,7 @@ use super::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// let mut registry = ToolRegistry::new();
 /// registry.register(ReadFileTool);
 /// registry.register(WriteFileTool);
@@ -130,6 +131,7 @@ impl ToolRegistry {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// registry.register(ReadFileTool);
     /// registry.register(WriteFileTool);
     /// ```
@@ -256,6 +258,7 @@ impl ToolRegistry {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// if let Some(tool) = registry.get("read_file") {
     ///     let result = tool.call(input, &ctx).await;
     /// }
@@ -277,6 +280,7 @@ impl ToolRegistry {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// if registry.contains("bash") {
     ///     // Safe to call registry.get("bash")
     /// }
@@ -303,6 +307,7 @@ impl ToolRegistry {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// let schemas = registry.all_schemas();
     /// for schema in &schemas {
     ///     println!("  - {}: {}", schema.tool, schema.description);
@@ -343,6 +348,7 @@ impl ToolRegistry {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// assert_eq!(registry.len(), 3); // three tools registered
     /// ```
     #[must_use]
@@ -358,6 +364,7 @@ impl ToolRegistry {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — references a user-defined type the fence does not define
     /// let registry = ToolRegistry::new();
     /// assert!(registry.is_empty());
     /// registry.register(MyTool);
@@ -469,6 +476,7 @@ pub type ResourceKeyFn = fn(&Value) -> Option<String>;
 /// [`FnTool`] supports a builder pattern for optional properties:
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// let tool = FnTool::new("my_tool".into(), "Does a thing".into(),
 ///     json!({"type": "object", "properties": {"text": {"type": "string"}}}),
 ///     my_tool as ToolFn)
@@ -483,6 +491,7 @@ pub type ResourceKeyFn = fn(&Value) -> Option<String>;
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// fn my_tool(input: Value, _ctx: &ToolContext)
 ///     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'static>>
 /// {
@@ -586,6 +595,7 @@ impl FnTool {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// let tool = FnTool::new(
     ///     "grep".into(),
     ///     "Search files for a pattern".into(),
@@ -622,6 +632,7 @@ impl FnTool {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// let tool = FnTool::new(/* ... */)
     ///     .concurrency_safe();
     /// ```
@@ -641,6 +652,7 @@ impl FnTool {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — API-shape fragment — an illustrative method body, not self-contained
     /// fn can_run_concurrently(input: &Value) -> bool {
     ///     // Only safe if writing to different files
     ///     input.get("append").is_none()
@@ -663,6 +675,7 @@ impl FnTool {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — API-shape fragment — an illustrative method body, not self-contained
     /// fn path_key(input: &Value) -> Option<String> {
     ///     input.get("path").and_then(|p| p.as_str()).map(String::from)
     /// }
@@ -689,6 +702,7 @@ impl FnTool {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// let tool = FnTool::new(/* ... */)
     ///     .read_only();
     /// ```
@@ -713,6 +727,7 @@ impl FnTool {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// let tool = FnTool::new(/* ... */)
     ///     .with_system_prompt("Always use absolute paths.".into());
     /// ```

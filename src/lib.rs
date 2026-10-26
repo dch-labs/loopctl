@@ -42,6 +42,49 @@
 //!
 //! - **[`engine`]** — The core agentic loop ([`BareLoop`](engine::BareLoop)) that orchestrates the full agent lifecycle.
 //!
+//!
+//! # Quick Start
+//!
+//! A complete agent loop in one block — this is the fastest path from
+//! nothing to a finished run. It uses the `testing` feature's mock
+//! client, so it runs offline (the doctest executes it in CI):
+//!
+//! ```
+//! # #[cfg(feature = "testing")]
+//! # async fn example() {
+//! use std::sync::Arc;
+//! use loopctl::config::SessionConfig;
+//! use loopctl::engine::core::Loop;
+//! use loopctl::engine::BareLoop;
+//! use loopctl::testing::MockApiClient;
+//! use loopctl::tool::ToolRegistry;
+//!
+//! // Any `ApiClient` drives the loop; the mock serves canned text.
+//! let client = MockApiClient::new("test-model").with_text_response("all done");
+//! let registry = ToolRegistry::new();
+//! let config = SessionConfig::default();
+//!
+//! let mut agent = BareLoop::new(
+//!     Arc::new(client),
+//!     registry,
+//!     config,
+//! );
+//! let run = agent
+//!     .run("say something", &loopctl::engine::RunConfig::default())
+//!     .await
+//!     .expect("the mock always answers");
+//! assert_eq!(run.output.as_deref(), Some("all done"));
+//! # }
+//! # fn main() {
+//! # #[cfg(feature = "testing")]
+//! # tokio::runtime::Runtime::new().unwrap().block_on(example());
+//! # }
+//! ```
+//!
+//! Swap `MockApiClient` for a provider client (`loopctl::provider::openai`
+//! and friends, behind their feature flags) and the same loop runs
+//! against a live model.
+//!
 //! ## Support
 //!
 //! - **[`memory::builtin`]** — Reference [`InMemoryStore`](memory::builtin::InMemoryStore) implementation.

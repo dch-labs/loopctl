@@ -11,6 +11,7 @@
 //! The composition shape is a chain-leading stage:
 //!
 //! ```rust,ignore
+//! // ignore — fragment — the client binding is elided
 //! use loopctl::compact::rolling::RollingCompactor;
 //! use loopctl::compact::rolling::RollingConfig;
 //! use loopctl::compact::FallbackCompactor;
@@ -271,6 +272,7 @@ struct RollingState {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — fragment — the client binding is elided
 /// use loopctl::compact::rolling::{RollingCompactor, RollingConfig};
 ///
 /// let rolling = RollingCompactor::new(client, RollingConfig::default().with_age_turns(8));

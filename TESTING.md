@@ -139,3 +139,25 @@ proves stale conformance. Provider drift therefore re-enters the
 system only through this deliberate act: re-record, re-run the replay
 suites and the conformance battery, and regenerate the matrix. A
 release never ships on a corpus older than the release before it.
+
+## 14. Doctests: the census
+
+Every doc example either runs in CI or says why it cannot. Three rules,
+all enforced by `tests/doctest_census.rs` (a plain integration test, so
+every `make ci` test leg runs it; `make doc-census` prints the live
+totals):
+
+- **An ignored fence states its reason.** `rust,ignore` blocks open with
+  `// ignore — <why>` as their first body line — the reason lives inside
+  the block, because a fence line carrying prose is not a doctest at all
+  (rustdoc drops it). The marker must start the line: a string or a
+  trailing comment carrying the text is code, not a reason.
+- **An example that defines `fn example` must call it.** Rustdoc wraps a
+  doctest body in its own `fn main`, so a hidden wrapper nothing drives
+  is dead code: the block compiles, "passes", and asserts nothing. Sync
+  examples end with `# fn main() { # example(); # }` (the `testing` gate
+  rides the call); async ones are driven through
+  `# tokio::runtime::Runtime::new().unwrap().block_on(example())`.
+- **The census reads everything it walks.** An unreadable path under
+  `src/` fails the test naming it — a silent skip reports a clean tree
+  the census never read.

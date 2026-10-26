@@ -83,6 +83,7 @@ const PATH_FIELDS: &[&str] = &["path", "file_path", "filename", "filepath"];
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use std::sync::Arc;
 /// use loopctl::middleware::{CommandVerifier, VerifyMiddleware};
 ///

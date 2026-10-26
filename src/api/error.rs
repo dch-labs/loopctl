@@ -616,6 +616,7 @@ pub(crate) fn bounded_header_value(value: &str, max: usize) -> Option<String> {
 /// Use [`ApiError::is_retryable`] to decide whether to retry an operation:
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// if error.is_retryable() {
 ///     tokio::time::sleep(backoff).await;
 ///     continue;
@@ -1791,6 +1792,7 @@ pub fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// use loopctl::api::error::{ApiError, ErrorCode};
 /// fn load_config() -> Result<Config> {
 ///     let text = std::fs::read_to_string("loopctl.toml")

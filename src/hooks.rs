@@ -161,7 +161,11 @@ pub trait Hook: Send + Sync {
     /// the turn a follow-up injects runs with this consult disarmed, so
     /// a hook whose follow-up also ends cleanly is not asked again — a
     /// hook that injects turns is a recursion primitive, and the bound
-    /// is the engine's contract rather than each policy's care.
+    /// is the engine's contract rather than each policy's care. The
+    /// injected turn also spends from the run's own `max_turns` budget
+    /// and continues its turn sequence — the engine offers the consult
+    /// only when the budget still has room, and the injected turn
+    /// indexes as the run's next turn, never a restarted run.
     fn on_run_followup(&self, _ctx: &RunEndContext) -> Option<PostRunAction> {
         None
     }

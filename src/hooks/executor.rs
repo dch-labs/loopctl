@@ -301,13 +301,15 @@ impl HookExecutor {
     /// Consult the hooks for a follow-up turn after a clean run end.
     ///
     /// Asks each hook's [`Hook::on_run_followup`] in registration
-    /// order and stops at the first `Some` — the same short-circuit the
-    /// pre-tool-use consult applies, so a safety hook registered first
-    /// both sees the offer first and can decline it for everyone by
-    /// returning `None` after its own decision. The caller drives at
-    /// most one injected turn per run and never consults again for
-    /// that turn's own end: the one-follow-up bound lives in the
-    /// engine's run loop, not in the policies.
+    /// order and stops at the first `Some` — the same short-circuit
+    /// the pre-tool-use consult applies. Declining is a pass, not a
+    /// veto: a hook that returns `None` simply hands the offer to the
+    /// next hook, and only an acceptance ends the consult — a policy
+    /// that wants the final say registers first and accepts or
+    /// declines on its own decision. The caller drives at most one
+    /// injected turn per run and never consults again for that turn's
+    /// own end: the one-follow-up bound lives in the engine's run
+    /// loop, not in the policies.
     #[must_use]
     pub fn run_followup(&self, ctx: &RunEndContext) -> Option<PostRunAction> {
         for hook in &self.hooks {

@@ -920,6 +920,28 @@ impl<C: ApiClient> BareLoop<C> {
         self.prepared_turn = Some(prepared);
     }
 
+    /// Arm the continuation turn a follow-up injected, at its true index.
+    ///
+    /// The follow-up counterpart of [`arm_first_turn`](Self::arm_first_turn):
+    /// prepares the next turn of the run's sequence — memory retrieval,
+    /// contributors, and tool schemas keyed on the follow-up prompt, which
+    /// `turn_input` reads as the newest history message — and feeds the
+    /// fresh context estimate before the step loop resumes. The injected
+    /// turn gets the same preparation a user turn would, at the index the
+    /// run's counter already reached.
+    #[cfg(feature = "hooks")]
+    async fn arm_followup_turn(&mut self) {
+        let turn = self.machine.turns_taken();
+        let prepared = self.prepare_turn(turn).await;
+        let estimate = self.context_figure(
+            self.count_context(&self.machine.full_history())
+                .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
+                .saturating_add(self.count_context(&prepared.messages)),
+        );
+        self.machine.set_context_tokens(estimate);
+        self.prepared_turn = Some(prepared);
+    }
+
     /// Drive the machine's steps until the run's turn sequence ends.
     ///
     /// One pass of the run's core: model calls, tool dispatch, and
@@ -3113,13 +3135,16 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 return Err(e);
             }
             #[cfg(feature = "hooks")]
-            if let Some(action) = self.collect_followup() {
+            if self.machine.turns_taken() < run_config.max_turns
+                && let Some(action) = self.collect_followup()
+            {
                 let crate::hooks::PostRunAction::FollowUp { prompt, origin } = action;
                 if let Some(run) = self.session.current_run_mut() {
                     run.followup_origin = Some(origin);
+                    run.output = None;
                 }
-                self.machine.accept_input(&prompt);
-                self.arm_first_turn().await;
+                self.machine.accept_followup(&prompt);
+                self.arm_followup_turn().await;
                 if let Err(e) = self.drive_steps(run_config).await {
                     self.finalize(Some(&e)).await?;
                     return Err(e);

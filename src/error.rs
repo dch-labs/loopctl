@@ -317,8 +317,10 @@ pub enum LoopError {
     /// recoverable: more spend is
     /// exactly what the line exists to prevent, so a retry with the
     /// same inputs would repeat the refusal. The dimension names
-    /// which line (tokens, turns, or wall-clock); `spent` and
-    /// `limit` carry the numbers for diagnostics and reporting.
+    /// which line (tokens, turns, wall-clock, or usd); `spent` and
+    /// `limit` carry the numbers for diagnostics and reporting, in the
+    /// dimension's own unit — plain counts for tokens and turns,
+    /// milliseconds for wall-clock, micro-dollars for usd.
     #[error("Budget exhausted: {dimension} spent {spent} of {limit}")]
     BudgetExhausted {
         /// The budget line that was crossed.

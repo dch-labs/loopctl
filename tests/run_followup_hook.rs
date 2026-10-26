@@ -305,6 +305,141 @@ mod followup_tests {
     }
 
     #[tokio::test]
+    async fn the_injected_turn_continues_the_run_wide_turn_sequence() {
+        // The injected turn is the run's next turn, not a restarted run:
+        // the record's turn indexes continue (0 then 1), the follow-up
+        // prompt is what the second turn was prepared and recorded under
+        // — memory retrieval and the turn record see the hook's prompt,
+        // not the run's original input — and the pair shares one
+        // `max_turns` budget of two.
+        let client = MockApiClient::new("test-model")
+            .with_text_response("the first answer")
+            .with_text_response("the follow-up answer");
+        let hook = Arc::new(OfferingHook::new("offerer", "close the list"));
+        let mut agent = loop_with(
+            client,
+            Some(Arc::new(
+                HookExecutor::new().with_hook(Arc::clone(&hook) as Arc<dyn Hook>),
+            )),
+        );
+
+        let run = agent
+            .run("the prompt", &RunConfig::default().with_max_turns(2))
+            .await
+            .expect("both turns fit the shared budget of two");
+
+        let indexes: Vec<usize> = run.turns.iter().map(|turn| turn.index).collect();
+        assert_eq!(
+            indexes,
+            vec![0, 1],
+            "the follow-up continues the turn sequence — a restarted \
+             counter would record turn 0 twice"
+        );
+        assert_eq!(
+            run.turns[0].input, "the prompt",
+            "the first turn is recorded under the run's input"
+        );
+        assert_eq!(
+            run.turns[1].input, "close the list",
+            "the injected turn is recorded under the follow-up prompt, \
+             never the original input"
+        );
+        assert_eq!(
+            run.output.as_deref(),
+            Some("the follow-up answer"),
+            "the run's output is the injected turn's answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_turn_budget_is_not_offered_a_followup() {
+        // The injected turn spends from the run's own budget: when the
+        // budget is spent, the consult never happens — the run stands
+        // as it completed, its answer intact, no origin on the record.
+        let client = MockApiClient::new("test-model").with_text_response("the only answer");
+        let handle = client.clone();
+        let hook = Arc::new(OfferingHook::new("offerer", "close the list"));
+        let mut agent = loop_with(
+            client,
+            Some(Arc::new(
+                HookExecutor::new().with_hook(Arc::clone(&hook) as Arc<dyn Hook>),
+            )),
+        );
+
+        let run = agent
+            .run("the prompt", &RunConfig::default().with_max_turns(1))
+            .await
+            .expect("the run completes on its single turn");
+
+        assert_eq!(
+            served_requests(&handle).len(),
+            1,
+            "no follow-up ran — the budget had no room to offer"
+        );
+        assert_eq!(
+            run.output.as_deref(),
+            Some("the only answer"),
+            "the clean run's answer stands"
+        );
+        assert_eq!(
+            run.followup_origin, None,
+            "no origin — nothing was injected"
+        );
+        assert_eq!(
+            hook.consults.load(Ordering::SeqCst),
+            0,
+            "the hook was never asked: an offer with no budget behind it \
+             is not an offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_followup_leaves_no_output_on_the_run_record() {
+        // The first pass's answer is provisional the moment a follow-up
+        // is accepted: if the injected turn fails, the run record must
+        // not present that answer as the run's output — a failed run
+        // carries its error, not the superseded text.
+        let client = MockApiClient::new("test-model")
+            .with_text_response("the first answer")
+            .with_errors(vec![
+                None,
+                Some("the follow-up provider call refused".to_string()),
+            ]);
+        let hook = Arc::new(OfferingHook::new("offerer", "close the list"));
+        let mut agent = loop_with(
+            client,
+            Some(Arc::new(
+                HookExecutor::new().with_hook(Arc::clone(&hook) as Arc<dyn Hook>),
+            )),
+        );
+
+        let error = agent
+            .run("the prompt", &RunConfig::default().with_max_turns(4))
+            .await
+            .expect_err("the injected turn fails the run");
+
+        assert!(
+            error.to_string().contains("refused"),
+            "the failure is the follow-up's own error: {error}"
+        );
+        let run = agent
+            .session()
+            .runs
+            .first()
+            .expect("the failed run's record survives for inspection");
+        assert_eq!(
+            run.output, None,
+            "the superseded first answer is gone — a failed run does not \
+             present it as its output"
+        );
+        assert_eq!(
+            run.followup_origin.as_deref(),
+            Some("hook:offerer"),
+            "the record still names the hook whose turn failed the run"
+        );
+    }
+
+    #[tokio::test]
     async fn a_run_without_an_executor_behaves_as_before() {
         // No executor, no offers: the feature-gated stage is a no-op, and
         // the run's shape — one request, the model's answer as the output,

@@ -483,6 +483,35 @@ impl LoopMachine {
         self.deferred_compaction = false;
     }
 
+    /// Reopen a cleanly completed machine for one continuation turn.
+    ///
+    /// The follow-up counterpart of [`accept_input`](Self::accept_input):
+    /// pushes `prompt` as the next user message and returns the machine
+    /// to [`Start`](MachineState::Start), while preserving the run-wide
+    /// turn counter and context estimate — the continuation's turn
+    /// indexes continue the run's sequence and its model calls spend
+    /// from the same [`max_turns`](MachinePolicy::max_turns) budget,
+    /// so an injected turn never restarts the run it extends. Only a
+    /// machine that completed cleanly may be reopened: cancellation,
+    /// failure, and budget exhaustion are terminal ends a follow-up
+    /// cannot paper over.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics when the machine is not
+    /// [`Terminal`](MachineState::Terminal) with
+    /// [`Completed`](MachineOutcome::Completed) — the driver calls
+    /// this only after a clean `Done`, and any other caller is a
+    /// state-machine violation worth failing fast on.
+    pub fn accept_followup(&mut self, prompt: &str) {
+        debug_assert!(matches!(
+            self.state,
+            MachineState::Terminal(MachineOutcome::Completed { .. })
+        ));
+        self.pending.push(Message::user(prompt));
+        self.state = MachineState::Start;
+    }
+
     /// Feed a driver-measured context estimate into the machine.
     ///
     /// The estimate is the payload the provider would receive — history
@@ -2047,6 +2076,49 @@ mod tests {
             machine.next_step(test_policy(5)),
             MachineStep::CallLLM { turn: 1 }
         ));
+    }
+
+    #[test]
+    fn accept_followup_continues_the_turn_sequence_within_the_shared_budget() {
+        let mut machine = small_machine();
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::CallLLM { turn: 0 }
+        ));
+        machine.model_response(text_response("first", 10, 5), 15);
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::Done(MachineOutcome::Completed { .. })
+        ));
+
+        machine.accept_followup("one more");
+        assert!(
+            !machine.is_terminal(),
+            "a completed machine reopens for its continuation turn"
+        );
+        assert!(
+            matches!(
+                machine.next_step(test_policy(3)),
+                MachineStep::CallLLM { turn: 1 }
+            ),
+            "the continuation's turn index continues the run's sequence — \
+             turn 1, never a restarted turn 0"
+        );
+        machine.model_response(text_response("second", 10, 5), 15);
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::Done(MachineOutcome::Completed { .. })
+        ));
+
+        machine.accept_followup("and another");
+        assert!(
+            matches!(
+                machine.next_step(test_policy(2)),
+                MachineStep::Done(MachineOutcome::MaxTurnsExceeded)
+            ),
+            "the continuation spends from the same turn budget — two turns \
+             taken against a limit of two refuse a third, no second grant"
+        );
     }
 
     #[test]

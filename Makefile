@@ -32,11 +32,9 @@ fmt:
 	cargo fmt --all -- --check
 
 doc-census:
-	@total=$$(grep -rn '```rust' src/ --include='*.rs' | wc -l); \
-	ignored=$$(grep -rn 'rust,ignore' src/ --include='*.rs' | wc -l); \
-	runnable=$$((total - ignored)); \
-	echo "doc blocks: $$total | runnable fences: $$runnable | rust,ignore: $$ignored"; \
-	out=$$(cargo test --test doctest_census 2>&1); status=$$?; \
+	@out=$$(cargo test --test doctest_census 2>&1); status=$$?; \
+	totals=$$(cargo test --test doctest_census -- --nocapture the_census_reports_live_totals 2>&1 | grep '^doc blocks:'); \
+	printf '%s\n' "$${totals:-doc blocks: n/a — the census failed}"; \
 	printf '%s\n' "$$out" | tail -1; exit $$status
 
 lint:

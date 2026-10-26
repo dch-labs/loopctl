@@ -2,17 +2,23 @@
 //!
 //! Two sweeps over every doc-comment fence in `src/`:
 //!
-//! 1. **Reasoned ignores.** Every `rust,ignore` fence must open with a
-//!    reason comment as its first body line: `// ignore — <why>`. An
-//!    ignored doctest is documentation that never compiles; the reason
-//!    is what keeps that honest — and the marker must *start* the line,
-//!    so a string or trailing comment carrying the text cannot impersonate
-//!    a reason.
+//! 1. **Reasoned ignores.** Every `rust,ignore` fence — the `ignore`
+//!    token read comma-by-comma, so modifiers like
+//!    `rust,ignore,edition2021` cannot escape — must open with a reason
+//!    comment as its first body line: `// ignore — <why>`. An ignored
+//!    doctest is documentation that never compiles; the reason is what
+//!    keeps that honest — and the marker must *start* the line, so a
+//!    string or trailing comment carrying the text cannot impersonate a
+//!    reason. Prose on the fence line itself (`rust,ignore — why`) voids
+//!    the attribute the way rustdoc parses it and silently deletes the
+//!    doctest, so that shape is reported too.
 //! 2. **Live examples.** Every non-ignored fence that defines a hidden
-//!    `fn example` must also *drive* it (a `fn main` caller or a
-//!    `block_on`). Rustdoc wraps a doctest body in its own `fn main`, so
-//!    a nested `example()` nothing calls is dead code: the block
-//!    compiles, "passes", and asserts nothing — an example that lies.
+//!    `fn example` must also *drive* it — a line that actually calls
+//!    `example()`, bare or inside `block_on`; a definition-shaped empty
+//!    `fn main` and an unrelated `block_on` drive nothing. Rustdoc wraps
+//!    a doctest body in its own `fn main`, so a nested `example()`
+//!    nothing calls is dead code: the block compiles, "passes", and
+//!    asserts nothing — an example that lies.
 //!
 //! Both gates are one-directional: they fail what is broken, not what is
 //! merely old. Driving the ignore count down is conversion work
@@ -34,9 +40,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// The exact fence attribute this census polices.
-const IGNORED_FENCE: &str = "rust,ignore";
-
 /// The reason comment a reasoned block opens with — at the START of the
 /// line, after doc markers are stripped, so code cannot impersonate it.
 const REASON_PREFIX: &str = "// ignore — ";
@@ -57,18 +60,72 @@ struct Fence {
     body: Vec<String>,
 }
 
-/// A fence is an ignore when its attrs are exactly `rust,ignore`.
-///
-/// A fence carrying trailing prose is not a doctest at all (rustdoc drops
-/// it), and the reason convention forbids that shape — so it is not read
-/// as a reasoned ignore either.
-fn is_ignored_fence(attrs: &str) -> bool {
-    attrs.trim() == IGNORED_FENCE
+/// Info-string tokens that keep a fence Rust in rustdoc's attribute
+/// parser: bare attributes (```` ```no_run ````, ```` ```ignore ````) are
+/// Rust code with an attribute, not another language.
+const RUST_KEEP_LANGUAGE_ATTRS: [&str; 8] = [
+    "no_run",
+    "compile_fail",
+    "should_panic",
+    "ignore",
+    "edition2015",
+    "edition2018",
+    "edition2021",
+    "edition2024",
+];
+
+/// The first comma-separated token of an info string.
+fn first_attr(attrs: &str) -> &str {
+    attrs
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches(' ')
+        .trim_end()
 }
 
-/// A fence is meant to run when its attrs say nothing about ignoring.
+/// A fence is a Rust doctest candidate when its attributes are empty
+/// (plain ```` ``` ````, which rustdoc treats as Rust) or its first token
+/// names Rust or a rustdoc attribute — the comma-token reading of an
+/// info string, matching rustdoc's own attribute parse.
+fn is_rust_fence(attrs: &str) -> bool {
+    let trimmed = attrs.trim();
+    trimmed.is_empty()
+        || first_attr(trimmed) == "rust"
+        || RUST_KEEP_LANGUAGE_ATTRS.contains(&first_attr(trimmed))
+}
+
+/// A Rust fence is an ignore when its comma-separated attributes carry
+/// the exact `ignore` token — `rust,ignore`, `rust,ignore,edition2021`,
+/// `rust,no_run,ignore`, bare `ignore`. Token-by-token matching is what
+/// closes the modifiers hole: an exact-string comparison let
+/// `rust,ignore,edition2021` skip the reason check entirely.
+fn is_ignored_fence(attrs: &str) -> bool {
+    is_rust_fence(attrs) && attrs.split(',').map(str::trim).any(|attr| attr == "ignore")
+}
+
+/// `true` when a Rust fence's `ignore` token carries trailing prose
+/// (`rust,ignore — needs credentials`). rustdoc parses comma-separated
+/// attributes and stops at the first whitespace, so prose on the fence
+/// line voids the `ignore` — and the fence vanishes from the suite
+/// without a build error. The shape the reason convention forbids is
+/// exactly the shape that silently deletes a doctest, so the census
+/// reports it instead of skipping it.
+fn has_malformed_ignore_prose(attrs: &str) -> bool {
+    is_rust_fence(attrs)
+        && attrs.split(',').map(str::trim).any(|attr| {
+            attr.strip_prefix("ignore")
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        })
+}
+
+/// A fence is meant to run when it is a Rust fence that neither the
+/// ignore reading nor the malformed reading claims. Non-Rust fences
+/// (`text`, `sh`, …) are doctests in no language the census speaks and
+/// stay outside both sweeps; the malformed shape is neither executable
+/// nor a reasoned ignore — its own gate in the reason test owns it.
 fn is_executable_fence(attrs: &str) -> bool {
-    !attrs.contains("ignore")
+    is_rust_fence(attrs) && !is_ignored_fence(attrs) && !has_malformed_ignore_prose(attrs)
 }
 
 /// The reason a first body line states, or `None`.
@@ -86,19 +143,45 @@ fn ignore_reason(first_body_line: &str) -> Option<&str> {
     (reason.len() >= MIN_REASON_PROSE).then_some(reason)
 }
 
+/// Whether `code` shows the example being *called*: the name driven by
+/// call parens, at a clean token boundary, and not the `fn example(`
+/// definition line (nor a same-named method on a receiver, which is
+/// someone else's `example`).
+fn calls_example(code: &str) -> bool {
+    const NAME: &str = "example";
+    code.match_indices(NAME).any(|(index, _)| {
+        if !code[index + NAME.len()..].trim_start().starts_with('(') {
+            return false;
+        }
+        let before = &code[..index];
+        let word_char = |c: char| c.is_alphanumeric() || c == '_';
+        let clean_boundary = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| !word_char(c) && c != '.');
+        let definition = before
+            .trim_end()
+            .strip_suffix("fn")
+            .is_some_and(|head| head.chars().next_back().is_none_or(|c| !word_char(c)));
+        clean_boundary && !definition
+    })
+}
+
 /// Whether a fence body defines a hidden example nothing drives.
 ///
 /// Detection reads code lines only (comment prose may name anything),
-/// after stripping the hidden-line `#` marker. A body drives its example
-/// with a `fn main` caller or a `block_on`; a nested `fn example` with no
-/// driver is dropped by rustdoc's own `fn main` wrapper and never runs.
+/// after stripping the hidden-line `#` marker. Driving means *calling*
+/// `example()` — bare, or inside `block_on`; a definition-shaped `fn main`
+/// with an empty body and an unrelated `block_on(something_else)` prove
+/// nothing, and a nested `fn example` no line calls is dropped by
+/// rustdoc's own `fn main` wrapper and never runs.
 fn example_wrapper_goes_uncalled(body: &[String]) -> bool {
     let defines_example = body
         .iter()
         .any(|line| code_line(line).is_some_and(|code| code.contains("fn example(")));
-    let drives_it = body.iter().any(|line| {
-        code_line(line).is_some_and(|code| code.contains("fn main(") || code.contains("block_on"))
-    });
+    let drives_it = body
+        .iter()
+        .any(|line| code_line(line).is_some_and(calls_example));
     defines_example && !drives_it
 }
 
@@ -205,7 +288,8 @@ fn scratch_tree(name: &str) -> PathBuf {
 
 #[test]
 fn every_ignored_doctest_states_its_reason() {
-    let unreasoned: Vec<String> = all_fences()
+    let fences = all_fences();
+    let unreasoned: Vec<String> = fences
         .iter()
         .filter(|fence| is_ignored_fence(&fence.attrs))
         .filter(|fence| {
@@ -216,10 +300,23 @@ fn every_ignored_doctest_states_its_reason() {
         })
         .map(|fence| format!("{}:{}", fence.path.display(), fence.line))
         .collect();
+    let malformed: Vec<String> = fences
+        .iter()
+        .filter(|fence| has_malformed_ignore_prose(&fence.attrs))
+        .map(|fence| format!("{}:{}", fence.path.display(), fence.line))
+        .collect();
     assert!(
         unreasoned.is_empty(),
         "rust,ignore fences without a stated reason — open the block with \
          `// ignore — <why>`, convert it, or delete it: {unreasoned:?}"
+    );
+    assert!(
+        malformed.is_empty(),
+        "ignore fences with prose on the fence line — rustdoc parses \
+         comma-separated attributes and stops at whitespace, so the prose \
+         voids the ignore and the doctest silently leaves the suite; put \
+         the reason inside the block as `// ignore — <why>` instead: \
+         {malformed:?}"
     );
 }
 
@@ -272,13 +369,55 @@ fn the_census_reads_each_reason_shape_correctly() {
     );
     assert!(is_ignored_fence("rust,ignore"));
     assert!(
-        !is_ignored_fence("rust,ignore — needs a key"),
-        "prose on the fence line is not a doctest at all — rustdoc drops \
-         such fences, so the census must not read them as reasoned ignores"
+        is_ignored_fence("rust,ignore,edition2021"),
+        "modifiers after the ignore token must not read the fence back as executable"
     );
-    assert!(!is_executable_fence("rust,ignore"));
-    assert!(is_executable_fence(""));
+    assert!(is_ignored_fence("rust,no_run,ignore"));
+    assert!(
+        !is_ignored_fence("rust,edition2021"),
+        "a plain modifier is not an ignore"
+    );
+    assert!(
+        !is_ignored_fence("rust,ignore — needs a key"),
+        "prose on the fence line voids the ignore token — its own malformed \
+         gate owns that shape"
+    );
+    assert!(
+        is_ignored_fence("ignore"),
+        "a bare `ignore` attribute is still rustdoc-Rust — an ignored
+         doctest in the language the census polices"
+    );
+    assert!(!is_ignored_fence("text,ignore"), "non-Rust is outside");
+    assert!(has_malformed_ignore_prose("rust,ignore — needs a key"));
+    assert!(
+        has_malformed_ignore_prose("rust,no_run,ignore — needs a key"),
+        "the prose arm is found wherever the ignore token sits"
+    );
+    assert!(!has_malformed_ignore_prose("rust,ignore"));
+    assert!(
+        !has_malformed_ignore_prose("rust,ignore2021"),
+        "a fused suffix is a malformed token, not ignore-with-prose"
+    );
+    assert!(is_executable_fence(""), "a plain fence is Rust by default");
     assert!(is_executable_fence("rust,no_run"));
+    assert!(
+        is_executable_fence("no_run"),
+        "a bare rustdoc attribute is Rust — dropping it would silently
+         shrink the sweep"
+    );
+    assert!(!is_executable_fence("rust,ignore"), "an ignore never runs");
+    assert!(
+        !is_executable_fence("rust,ignore,edition2021"),
+        "modifiers cannot smuggle an ignore into the runnable count"
+    );
+    assert!(
+        !is_executable_fence("rust,ignore — needs a key"),
+        "the malformed shape runs nothing — rustdoc drops the fence"
+    );
+    assert!(
+        !is_executable_fence("sh"),
+        "a shell fence is not a Rust doctest"
+    );
 }
 
 #[test]
@@ -306,6 +445,26 @@ fn the_census_reads_each_wrapper_shape_correctly() {
         "# }".to_string(),
     ];
     let no_example = vec!["let x = 1;".to_string()];
+    let empty_main = vec![
+        "# fn example() {".to_string(),
+        "assert_eq!(1 + 1, 2);".to_string(),
+        "# }".to_string(),
+        "# fn main() {}".to_string(),
+    ];
+    let unrelated_block_on = vec![
+        "# async fn example() {".to_string(),
+        "work().await;".to_string(),
+        "# }".to_string(),
+        "# fn main() {".to_string(),
+        "# block_on(some_other_future());".to_string(),
+        "# }".to_string(),
+    ];
+    let method_call = vec![
+        "# fn example() {".to_string(),
+        "assert_eq!(1 + 1, 2);".to_string(),
+        "# }".to_string(),
+        "# let done = thing.example();".to_string(),
+    ];
     let comment_only = vec![
         "// call fn example() from main".to_string(),
         "let x = 1;".to_string(),
@@ -315,8 +474,87 @@ fn the_census_reads_each_wrapper_shape_correctly() {
     assert!(!example_wrapper_goes_uncalled(&async_driven));
     assert!(!example_wrapper_goes_uncalled(&no_example));
     assert!(
+        example_wrapper_goes_uncalled(&empty_main),
+        "a definition-shaped `fn main` that never calls the example \
+         leaves it dead — the driver must be a call"
+    );
+    assert!(
+        example_wrapper_goes_uncalled(&unrelated_block_on),
+        "an unrelated `block_on` drives a different future, not the example"
+    );
+    assert!(
+        example_wrapper_goes_uncalled(&method_call),
+        "a `.example()` on a receiver is someone else's method — the \
+         hidden wrapper still goes uncalled"
+    );
+    assert!(
         !example_wrapper_goes_uncalled(&comment_only),
         "prose inside a comment names no wrapper — only code lines count"
+    );
+}
+
+#[test]
+fn the_census_reports_live_totals() {
+    // `make doc-census` runs this test with --nocapture and prints the
+    // line it emits: totals from the census parser — plain `` ``` ``
+    // fences counted (rustdoc's Rust default), non-Rust and malformed
+    // fences excluded — where a grep over ```` ```rust ```` lines counted
+    // neither the plain fences nor anything the classifier rejects.
+    let planted = [
+        ("empty attrs run", "", true, false),
+        ("explicit rust runs", "rust", true, false),
+        ("no_run compiles", "rust,no_run", true, false),
+        ("ignored counts separately", "rust,ignore", false, true),
+        (
+            "modifiers cannot escape the ignore",
+            "rust,ignore,edition2021",
+            false,
+            true,
+        ),
+        (
+            "prose fences run nothing",
+            "rust,ignore — why",
+            false,
+            false,
+        ),
+        ("shell is not Rust", "sh", false, false),
+    ];
+    let counts = |attrs: &str| {
+        (
+            usize::from(is_executable_fence(attrs)),
+            usize::from(is_ignored_fence(attrs)),
+        )
+    };
+    for (what, attrs, expect_runnable, expect_ignored) in planted {
+        let (runnable, ignored) = counts(attrs);
+        assert_eq!(
+            (runnable, ignored),
+            (usize::from(expect_runnable), usize::from(expect_ignored)),
+            "the totals classifier mis-reads {what}: {attrs:?}"
+        );
+    }
+    let fences = all_fences();
+    let runnable: usize = fences
+        .iter()
+        .filter(|fence| is_executable_fence(&fence.attrs))
+        .count();
+    let ignored: usize = fences
+        .iter()
+        .filter(|fence| is_ignored_fence(&fence.attrs))
+        .count();
+    let malformed: usize = fences
+        .iter()
+        .filter(|fence| has_malformed_ignore_prose(&fence.attrs))
+        .count();
+    assert_eq!(
+        malformed, 0,
+        "malformed fences must fail the reason gate, never reach the totals"
+    );
+    println!(
+        "doc blocks: {} | runnable fences: {} | rust,ignore: {}",
+        runnable + ignored,
+        runnable,
+        ignored
     );
 }
 

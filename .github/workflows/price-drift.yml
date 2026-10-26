@@ -51,7 +51,7 @@ jobs:
       - name: Open a refresh pull request
         if: steps.convert.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PRICE_DRIFT_TOKEN }}
         run: |
           gh auth setup-git
           cp /tmp/fresh-table.json src/pricing/curated_prices.json
@@ -76,6 +76,10 @@ jobs:
             `prefix_resolution_strips_bedrock_spellings`
             (claude-sonnet-4-5): a rename of that family is the one
             expected follow-up edit.
+          - A red nightly with `refusing` in the log is the fence, not
+            drift: the importer refuses a conversion that lands zero
+            families or drops more than half the current rows, so a
+            broken listing fails the job instead of emptying the table.
           - Never auto-merge: a human reviews and merges.
           EOF
           )

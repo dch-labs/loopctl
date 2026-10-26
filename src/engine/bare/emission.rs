@@ -699,7 +699,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`Error`](RunEndReason::Error), and `None` to
     /// [`Complete`](RunEndReason::Complete).
     #[cfg(feature = "hooks")]
-    fn run_end_reason(&self, error: Option<&LoopError>) -> RunEndReason {
+    pub(crate) fn run_end_reason(&self, error: Option<&LoopError>) -> RunEndReason {
         if self.is_cancelled() {
             return RunEndReason::Cancelled;
         }

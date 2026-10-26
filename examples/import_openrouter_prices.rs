@@ -20,7 +20,11 @@
 //! rows alone (vintage ignored), exit `0` means no drift (nothing is
 //! written), exit `3` means a family or price moved (the fresh table
 //! lands on stdout, ready to replace the file), and exit `1` is a
-//! failure. The nightly workflow is this mode plus a pull request.
+//! failure — the fence included: a conversion that lands zero priced
+//! families, or that would drop more than half the rows the checked
+//! table carries, refuses to publish, so a broken listing fails the
+//! run rather than emptying the vendored file. The nightly workflow
+//! is this mode plus a pull request.
 //!
 //! Then review the diff like code: the table is pinned, dated data,
 //! and a price change should be as visible as any other change.
@@ -60,8 +64,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         buffer
     };
     let table = loopctl::pricing::PriceTable::from_openrouter(&listing, &date)?;
+    if table.row_count() == 0 {
+        eprintln!(
+            "the listing converted to zero priced families — a fetch or \
+             listing-shape failure, not drift; refusing to write a table"
+        );
+        std::process::exit(1);
+    }
     if let Some(existing_path) = check {
         let existing = loopctl::pricing::PriceTable::from_file(&existing_path)?;
+        let dropped = existing.row_count().saturating_sub(table.row_count());
+        if existing.row_count() > 0 && table.row_count().saturating_mul(2) < existing.row_count() {
+            eprintln!(
+                "the conversion would drop {dropped} of {} family rows — a credible \
+                 refresh keeps at least half; re-vendor deliberately if the \
+                 catalog really shrank",
+                existing.row_count()
+            );
+            std::process::exit(1);
+        }
         if table.same_prices(&existing) {
             eprintln!(
                 "no drift: {} families unchanged since {}",

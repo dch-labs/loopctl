@@ -431,8 +431,10 @@ impl PriceTable {
     /// alike: `{ "table_version", "pricing_updated", "models": { family:
     /// { "input_per_mtok", "output_per_mtok", "cache_read_per_mtok"?,
     /// "cache_write_per_mtok"? } } }`, rates in US dollars per million
-    /// tokens. Unknown keys are ignored, so a fuller cost-map file drops
-    /// in and the known columns are read from it.
+    /// tokens. Unknown keys within this shape are ignored, so a host's
+    /// extra columns ride along harmlessly; a foreign cost-map layout
+    /// does not parse — host numbers go in this shape, which the
+    /// [`OpenRouter`](https://openrouter.ai) importer renders.
     ///
     /// # Errors
     ///
@@ -679,6 +681,19 @@ impl PriceTable {
         left == right
     }
 
+    /// How many family rows the table carries, every spelling counted.
+    ///
+    /// The counted basis of the refresh fence: the importer refuses a
+    /// conversion that lands zero rows or drops most of the rows the
+    /// checked table carries, so the figure counts spellings the way
+    /// the fence reads them — a dual-keyed family is two rows.
+    /// [`same_prices`](Self::same_prices) answers equality; this
+    /// answers scale.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
     /// The empty table: no rows, epoch-dated.
     ///
     /// The additive identity of [`with_overrides`](Self::with_overrides)
@@ -911,8 +926,8 @@ static CURATED: LazyLock<PriceTable> = LazyLock::new(|| {
 /// The wire shape of one table file.
 ///
 /// Rates arrive as the published dollars-per-million decimals and scale
-/// into micro-dollars at parse; unknown keys are ignored so richer
-/// cost-map files load with the known columns read.
+/// into micro-dollars at parse; unknown keys within this shape are
+/// ignored, so a host's extra columns ride along harmlessly.
 #[derive(Deserialize)]
 struct RawTable {
     /// The file's version identity.
@@ -1450,6 +1465,23 @@ mod tests {
         assert!(
             fixture.same_prices(&reconverted),
             "row order from the listing is order-insensitive in the comparison"
+        );
+    }
+
+    #[test]
+    fn row_count_counts_every_spelling() {
+        assert_eq!(
+            PriceTable::empty().row_count(),
+            0,
+            "the empty table carries no rows"
+        );
+        let table =
+            PriceTable::from_openrouter(&openrouter_fixture(), "2026-01-01").expect("converts");
+        assert_eq!(
+            table.row_count(),
+            8,
+            "two dual-keyed models plus the dotted spelling's four keys — \
+             the figure the refresh fence counts"
         );
     }
 

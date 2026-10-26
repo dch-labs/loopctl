@@ -313,8 +313,8 @@ pub enum LoopError {
     /// A budget line was crossed, refusing the next model request.
     ///
     /// The run's spend reached a configured hard ceiling, and the
-    /// budget gate refused the request before it was sent — the
-    /// litellm `max_budget` shape. Not recoverable: more spend is
+    /// budget gate refused the request before it was sent. Not
+    /// recoverable: more spend is
     /// exactly what the line exists to prevent, so a retry with the
     /// same inputs would repeat the refusal. The dimension names
     /// which line (tokens, turns, or wall-clock); `spent` and

@@ -607,6 +607,17 @@ pub struct Run {
     /// turn-level fact and never appears here.
     #[serde(skip)]
     pub stop_reason: Option<LoopError>,
+
+    /// Who asked for this run's injected follow-up turn, if it had one.
+    ///
+    /// `None` on every ordinary run. When a hook extends a clean run by
+    /// one turn ([`PostRunAction::FollowUp`](crate::hooks::PostRunAction)),
+    /// the engine stamps the action's `origin` here (`"hook:<name>"` by
+    /// convention), so a serialized run record says which hook's turn
+    /// rode inside it. Serialized only when set: old records deserialize
+    /// as ordinary runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_origin: Option<String>,
 }
 
 impl Run {
@@ -648,6 +659,7 @@ impl Run {
             output: None,
             config: config.clone(),
             stop_reason: None,
+            followup_origin: None,
         }
     }
 

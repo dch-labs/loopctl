@@ -147,6 +147,57 @@ pub trait Hook: Send + Sync {
     /// Fires at the end of each `run()` call. Use for cleanup, teardown,
     /// or final metric emission.
     fn on_run_end(&self, _ctx: &RunEndContext) {}
+
+    /// Offer this hook one follow-up turn after a run ends cleanly.
+    ///
+    /// Consulted only when a run completes without an error, before the
+    /// run's results are finalized: returning
+    /// [`Some(PostRunAction::FollowUp)`](PostRunAction::FollowUp) injects
+    /// one more turn driven by `prompt` inside the same `run()` call —
+    /// same run accumulator, same session, one `on_run_start`/`on_run_end`
+    /// pair. Returning `None` (the default) ends the run as it stood.
+    ///
+    /// The consult is bound by the executor to one follow-up per run:
+    /// the turn a follow-up injects runs with this consult disarmed, so
+    /// a hook whose follow-up also ends cleanly is not asked again — a
+    /// hook that injects turns is a recursion primitive, and the bound
+    /// is the engine's contract rather than each policy's care. The
+    /// injected turn also spends from the run's own `max_turns` budget
+    /// and continues its turn sequence — the engine offers the consult
+    /// only when the budget still has room, and the injected turn
+    /// indexes as the run's next turn, never a restarted run.
+    fn on_run_followup(&self, _ctx: &RunEndContext) -> Option<PostRunAction> {
+        None
+    }
+}
+
+/// The turn a hook may inject after a run ends cleanly.
+///
+/// Returned from [`Hook::on_run_followup`] when
+/// the hook wants the run extended by one more turn. The executor
+/// applies the engine-level one-follow-up bound; see the method's
+/// documentation for what the injected turn joins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostRunAction {
+    /// Run one more turn with `prompt` as its input.
+    ///
+    /// The injected turn joins the run that just ended — the same run
+    /// record, session, and observer lanes — and `origin` names who
+    /// asked for it (`"hook:<name>"` by convention), so hosts and
+    /// records can tell a hook's turn from a user's.
+    FollowUp {
+        /// The prompt the injected turn runs with.
+        ///
+        /// Reaches the provider exactly as a user prompt would; the
+        /// run's committed history gains it as the turn's input.
+        prompt: String,
+
+        /// Who asked for the turn, for hosts and records to read.
+        ///
+        /// Conventionally `"hook:<name>"`; the engine does not parse
+        /// it, it only carries the hook's attribution outward.
+        origin: String,
+    },
 }
 
 /// Whether the session can interact with a human operator.

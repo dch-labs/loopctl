@@ -313,12 +313,14 @@ pub enum LoopError {
     /// A budget line was crossed, refusing the next model request.
     ///
     /// The run's spend reached a configured hard ceiling, and the
-    /// budget gate refused the request before it was sent — the
-    /// litellm `max_budget` shape. Not recoverable: more spend is
+    /// budget gate refused the request before it was sent. Not
+    /// recoverable: more spend is
     /// exactly what the line exists to prevent, so a retry with the
     /// same inputs would repeat the refusal. The dimension names
-    /// which line (tokens, turns, or wall-clock); `spent` and
-    /// `limit` carry the numbers for diagnostics and reporting.
+    /// which line (tokens, turns, wall-clock, or usd); `spent` and
+    /// `limit` carry the numbers for diagnostics and reporting, in the
+    /// dimension's own unit — plain counts for tokens and turns,
+    /// milliseconds for wall-clock, micro-dollars for usd.
     #[error("Budget exhausted: {dimension} spent {spent} of {limit}")]
     BudgetExhausted {
         /// The budget line that was crossed.

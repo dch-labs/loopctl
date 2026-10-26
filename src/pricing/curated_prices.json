@@ -1,0 +1,5092 @@
+{
+  "models": {
+    "aion-2-0": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.6
+    },
+    "aion-2.0": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.6
+    },
+    "aion-3-0": {
+      "cache_read_per_mtok": 0.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 6
+    },
+    "aion-3-0-mini": {
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 1.4
+    },
+    "aion-3-5": {
+      "cache_read_per_mtok": 0.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 6
+    },
+    "aion-3-5-mini": {
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 1.4
+    },
+    "aion-3.0": {
+      "cache_read_per_mtok": 0.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 6
+    },
+    "aion-3.0-mini": {
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 1.4
+    },
+    "aion-3.5": {
+      "cache_read_per_mtok": 0.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 6
+    },
+    "aion-3.5-mini": {
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 1.4
+    },
+    "aion-labs/aion-2-0": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.6
+    },
+    "aion-labs/aion-2.0": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.6
+    },
+    "aion-labs/aion-3-0": {
+      "cache_read_per_mtok": 0.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 6
+    },
+    "aion-labs/aion-3-0-mini": {
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 1.4
+    },
+    "aion-labs/aion-3-5": {
+      "cache_read_per_mtok": 0.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 6
+    },
+    "aion-labs/aion-3-5-mini": {
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 1.4
+    },
+    "aion-labs/aion-3.0": {
+      "cache_read_per_mtok": 0.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 6
+    },
+    "aion-labs/aion-3.0-mini": {
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 1.4
+    },
+    "aion-labs/aion-3.5": {
+      "cache_read_per_mtok": 0.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 6
+    },
+    "aion-labs/aion-3.5-mini": {
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 1.4
+    },
+    "aion-labs/aion-rp-llama-3-1-8b": {
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.6
+    },
+    "aion-labs/aion-rp-llama-3.1-8b": {
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.6
+    },
+    "aion-rp-llama-3-1-8b": {
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.6
+    },
+    "aion-rp-llama-3.1-8b": {
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.6
+    },
+    "amazon/nova-2-lite-v1": {
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "amazon/nova-lite-v1": {
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.24
+    },
+    "amazon/nova-micro-v1": {
+      "input_per_mtok": 0.035,
+      "output_per_mtok": 0.14
+    },
+    "amazon/nova-premier-v1": {
+      "cache_read_per_mtok": 0.625,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 12.5
+    },
+    "amazon/nova-pro-v1": {
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 3.2
+    },
+    "anthracite-org/magnum-v4-72b": {
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 5
+    },
+    "anthropic/claude-fable-5": {
+      "cache_read_per_mtok": 1,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "anthropic/claude-fable-5-1": {
+      "cache_read_per_mtok": 0.25,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "anthropic/claude-fable-5.1": {
+      "cache_read_per_mtok": 0.25,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "anthropic/claude-haiku-4-5": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 1.25,
+      "input_per_mtok": 1,
+      "output_per_mtok": 5
+    },
+    "anthropic/claude-haiku-4.5": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 1.25,
+      "input_per_mtok": 1,
+      "output_per_mtok": 5
+    },
+    "anthropic/claude-haiku-5-5": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.5
+    },
+    "anthropic/claude-haiku-5.5": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.5
+    },
+    "anthropic/claude-opus-4-1": {
+      "cache_read_per_mtok": 1.5,
+      "cache_write_per_mtok": 18.75,
+      "input_per_mtok": 15,
+      "output_per_mtok": 75
+    },
+    "anthropic/claude-opus-4-5": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-4-6": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-4-7": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-4-8": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-4.1": {
+      "cache_read_per_mtok": 1.5,
+      "cache_write_per_mtok": 18.75,
+      "input_per_mtok": 15,
+      "output_per_mtok": 75
+    },
+    "anthropic/claude-opus-4.5": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-4.6": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-4.7": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-4.8": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-5": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "anthropic/claude-opus-5-5": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "anthropic/claude-opus-5.5": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "anthropic/claude-sonnet-4-5": {
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "anthropic/claude-sonnet-4-6": {
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "anthropic/claude-sonnet-4.5": {
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "anthropic/claude-sonnet-4.6": {
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "anthropic/claude-sonnet-5": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "anthropic/claude-sonnet-5-5": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "anthropic/claude-sonnet-5.5": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "arcee-ai/trinity-large-thinking": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.8
+    },
+    "beam-1-0-501b-a23b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1
+    },
+    "beam-1.0-501b-a23b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1
+    },
+    "bytedance-seed/seed-1-6": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "bytedance-seed/seed-1-6-flash": {
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.3
+    },
+    "bytedance-seed/seed-1.6": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "bytedance-seed/seed-1.6-flash": {
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.3
+    },
+    "bytedance-seed/seed-2-0-code": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "bytedance-seed/seed-2-0-lite": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "bytedance-seed/seed-2-0-mini": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "bytedance-seed/seed-2-1-turbo": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 2.5
+    },
+    "bytedance-seed/seed-2.0-code": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "bytedance-seed/seed-2.0-lite": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "bytedance-seed/seed-2.0-mini": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "bytedance/ui-tars-1-5-7b": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "bytedance/ui-tars-1.5-7b": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "claude-fable-5": {
+      "cache_read_per_mtok": 1,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "claude-fable-5-1": {
+      "cache_read_per_mtok": 0.25,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "claude-fable-5.1": {
+      "cache_read_per_mtok": 0.25,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "claude-haiku-4-5": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 1.25,
+      "input_per_mtok": 1,
+      "output_per_mtok": 5
+    },
+    "claude-haiku-4.5": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 1.25,
+      "input_per_mtok": 1,
+      "output_per_mtok": 5
+    },
+    "claude-haiku-5-5": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.5
+    },
+    "claude-haiku-5.5": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.5
+    },
+    "claude-opus-4-1": {
+      "cache_read_per_mtok": 1.5,
+      "cache_write_per_mtok": 18.75,
+      "input_per_mtok": 15,
+      "output_per_mtok": 75
+    },
+    "claude-opus-4-5": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-4-6": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-4-7": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-4-8": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-4.1": {
+      "cache_read_per_mtok": 1.5,
+      "cache_write_per_mtok": 18.75,
+      "input_per_mtok": 15,
+      "output_per_mtok": 75
+    },
+    "claude-opus-4.5": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-4.6": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-4.7": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-4.8": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-5": {
+      "cache_read_per_mtok": 0.5,
+      "cache_write_per_mtok": 6.25,
+      "input_per_mtok": 5,
+      "output_per_mtok": 25
+    },
+    "claude-opus-5-5": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "claude-opus-5.5": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "claude-sonnet-4-5": {
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "claude-sonnet-4-6": {
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "claude-sonnet-4.5": {
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "claude-sonnet-4.6": {
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "claude-sonnet-5": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "claude-sonnet-5-5": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "claude-sonnet-5.5": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "codestral-2508": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.9
+    },
+    "cognitivecomputations/dolphin-mistral-24b-venice-edition": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.9
+    },
+    "cohere/command-a": {
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "cohere/command-a-plus": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.5
+    },
+    "cohere/command-r-08-2024": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "cohere/command-r-plus-08-2024": {
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "cohere/command-r7b-12-2024": {
+      "input_per_mtok": 0.0375,
+      "output_per_mtok": 0.15
+    },
+    "command-a": {
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "command-a-plus": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.5
+    },
+    "command-r-08-2024": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "command-r-plus-08-2024": {
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "command-r7b-12-2024": {
+      "input_per_mtok": 0.0375,
+      "output_per_mtok": 0.15
+    },
+    "cydonia-24b-v4-1": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.5
+    },
+    "cydonia-24b-v4.1": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.5
+    },
+    "deepseek-chat": {
+      "input_per_mtok": 0.2574,
+      "output_per_mtok": 1.0287
+    },
+    "deepseek-chat-v3-0324": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.29,
+      "output_per_mtok": 1.14
+    },
+    "deepseek-chat-v3-1": {
+      "cache_read_per_mtok": 0.13,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.95
+    },
+    "deepseek-chat-v3.1": {
+      "cache_read_per_mtok": 0.13,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.95
+    },
+    "deepseek-r1-0528": {
+      "cache_read_per_mtok": 0.35,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 2.15
+    },
+    "deepseek-v3-1-terminus": {
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 1
+    },
+    "deepseek-v3-2": {
+      "cache_read_per_mtok": 0.028,
+      "input_per_mtok": 0.28,
+      "output_per_mtok": 0.42
+    },
+    "deepseek-v3-2-exp": {
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 0.41
+    },
+    "deepseek-v3.1-terminus": {
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 1
+    },
+    "deepseek-v3.2": {
+      "cache_read_per_mtok": 0.028,
+      "input_per_mtok": 0.28,
+      "output_per_mtok": 0.42
+    },
+    "deepseek-v3.2-exp": {
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 0.41
+    },
+    "deepseek-v4-1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.02,
+      "output_per_mtok": 1
+    },
+    "deepseek-v4-1-flash-1017": {
+      "cache_read_per_mtok": 0.003,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "deepseek-v4-flash": {
+      "cache_read_per_mtok": 0.0182,
+      "input_per_mtok": 0.091,
+      "output_per_mtok": 0.182
+    },
+    "deepseek-v4-flash-0731": {
+      "cache_read_per_mtok": 0.001414,
+      "input_per_mtok": 0.04444,
+      "output_per_mtok": 0.13332
+    },
+    "deepseek-v4-flash-vision-exp": {
+      "cache_read_per_mtok": 0.00686,
+      "input_per_mtok": 0.2156,
+      "output_per_mtok": 0.6468
+    },
+    "deepseek-v4-pro": {
+      "cache_read_per_mtok": 0.0174,
+      "input_per_mtok": 0.2088,
+      "output_per_mtok": 0.4176
+    },
+    "deepseek-v4-pro-0813": {
+      "cache_read_per_mtok": 0.022,
+      "input_per_mtok": 0.66,
+      "output_per_mtok": 1.98
+    },
+    "deepseek-v4.1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.02,
+      "output_per_mtok": 1
+    },
+    "deepseek-v4.1-flash-1017": {
+      "cache_read_per_mtok": 0.003,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "deepseek/deepseek-chat": {
+      "input_per_mtok": 0.2574,
+      "output_per_mtok": 1.0287
+    },
+    "deepseek/deepseek-chat-v3-0324": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.29,
+      "output_per_mtok": 1.14
+    },
+    "deepseek/deepseek-chat-v3-1": {
+      "cache_read_per_mtok": 0.13,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.95
+    },
+    "deepseek/deepseek-chat-v3.1": {
+      "cache_read_per_mtok": 0.13,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.95
+    },
+    "deepseek/deepseek-r1-0528": {
+      "cache_read_per_mtok": 0.35,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 2.15
+    },
+    "deepseek/deepseek-v3-1-terminus": {
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 1
+    },
+    "deepseek/deepseek-v3-2": {
+      "cache_read_per_mtok": 0.028,
+      "input_per_mtok": 0.28,
+      "output_per_mtok": 0.42
+    },
+    "deepseek/deepseek-v3-2-exp": {
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 0.41
+    },
+    "deepseek/deepseek-v3.1-terminus": {
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 1
+    },
+    "deepseek/deepseek-v3.2": {
+      "cache_read_per_mtok": 0.028,
+      "input_per_mtok": 0.28,
+      "output_per_mtok": 0.42
+    },
+    "deepseek/deepseek-v3.2-exp": {
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 0.41
+    },
+    "deepseek/deepseek-v4-1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.02,
+      "output_per_mtok": 1
+    },
+    "deepseek/deepseek-v4-1-flash-1017": {
+      "cache_read_per_mtok": 0.003,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "deepseek/deepseek-v4-flash": {
+      "cache_read_per_mtok": 0.0182,
+      "input_per_mtok": 0.091,
+      "output_per_mtok": 0.182
+    },
+    "deepseek/deepseek-v4-flash-0731": {
+      "cache_read_per_mtok": 0.001414,
+      "input_per_mtok": 0.04444,
+      "output_per_mtok": 0.13332
+    },
+    "deepseek/deepseek-v4-flash-vision-exp": {
+      "cache_read_per_mtok": 0.00686,
+      "input_per_mtok": 0.2156,
+      "output_per_mtok": 0.6468
+    },
+    "deepseek/deepseek-v4-pro": {
+      "cache_read_per_mtok": 0.0174,
+      "input_per_mtok": 0.2088,
+      "output_per_mtok": 0.4176
+    },
+    "deepseek/deepseek-v4-pro-0813": {
+      "cache_read_per_mtok": 0.022,
+      "input_per_mtok": 0.66,
+      "output_per_mtok": 1.98
+    },
+    "deepseek/deepseek-v4.1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.02,
+      "output_per_mtok": 1
+    },
+    "deepseek/deepseek-v4.1-flash-1017": {
+      "cache_read_per_mtok": 0.003,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "devstral-2512": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 2
+    },
+    "dolphin-mistral-24b-venice-edition": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.9
+    },
+    "elorian/glimpse": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 3
+    },
+    "ember-1": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "fireworks/ember-1": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "fugu-max": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "fugu-ultra": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "fugu-ultra-v2": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "gemini-2-5-flash": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "gemini-2-5-flash-image": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "gemini-2-5-flash-lite": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "gemini-2-5-pro": {
+      "cache_read_per_mtok": 0.125,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gemini-2-5-pro-preview": {
+      "cache_read_per_mtok": 0.125,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gemini-2.5-flash": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "gemini-2.5-flash-image": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "gemini-2.5-flash-lite": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "gemini-2.5-pro": {
+      "cache_read_per_mtok": 0.125,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gemini-2.5-pro-preview": {
+      "cache_read_per_mtok": 0.125,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gemini-3-1-flash-image": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "gemini-3-1-flash-image-preview": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "gemini-3-1-flash-lite": {
+      "cache_read_per_mtok": 0.025,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "gemini-3-1-flash-lite-image": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "gemini-3-1-flash-lite-preview": {
+      "cache_read_per_mtok": 0.025,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "gemini-3-1-pro-preview": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gemini-3-1-pro-preview-customtools": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gemini-3-5-flash": {
+      "cache_read_per_mtok": 0.15,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 9
+    },
+    "gemini-3-5-flash-lite": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "gemini-3-6-flash": {
+      "cache_read_per_mtok": 0.075,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 3.75
+    },
+    "gemini-3-7-flash": {
+      "cache_read_per_mtok": 0.075,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 3.75
+    },
+    "gemini-3-8-flash": {
+      "cache_read_per_mtok": 0.0825,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.825,
+      "output_per_mtok": 4.125
+    },
+    "gemini-3-flash-preview": {
+      "cache_read_per_mtok": 0.05,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "gemini-3-pro-image": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gemini-3-pro-image-preview": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gemini-3.1-flash-image": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "gemini-3.1-flash-image-preview": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "gemini-3.1-flash-lite": {
+      "cache_read_per_mtok": 0.025,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "gemini-3.1-flash-lite-image": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "gemini-3.1-flash-lite-preview": {
+      "cache_read_per_mtok": 0.025,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "gemini-3.1-pro-preview": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gemini-3.1-pro-preview-customtools": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gemini-3.5-flash": {
+      "cache_read_per_mtok": 0.15,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 9
+    },
+    "gemini-3.5-flash-lite": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "gemini-3.6-flash": {
+      "cache_read_per_mtok": 0.075,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 3.75
+    },
+    "gemini-3.7-flash": {
+      "cache_read_per_mtok": 0.075,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 3.75
+    },
+    "gemini-3.8-flash": {
+      "cache_read_per_mtok": 0.0825,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.825,
+      "output_per_mtok": 4.125
+    },
+    "gemini-4-argon": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 0.1875,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "gemini-nano-banana-2-1": {
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 7.5
+    },
+    "gemini-nano-banana-2.1": {
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 7.5
+    },
+    "gemma-2-27b-it": {
+      "input_per_mtok": 0.65,
+      "output_per_mtok": 0.65
+    },
+    "gemma-3-12b-it": {
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.15
+    },
+    "gemma-3-27b-it": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.08,
+      "output_per_mtok": 0.35
+    },
+    "gemma-3-4b-it": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.04,
+      "output_per_mtok": 0.05
+    },
+    "gemma-4-26b-a4b-it": {
+      "cache_read_per_mtok": 0.0375,
+      "input_per_mtok": 0.0675,
+      "output_per_mtok": 0.225
+    },
+    "gemma-4-31b-it": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.4
+    },
+    "glimpse": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 3
+    },
+    "glm-4-5": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.2
+    },
+    "glm-4-5-air": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.13,
+      "output_per_mtok": 0.85
+    },
+    "glm-4-5v": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 1.8
+    },
+    "glm-4-6": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.55,
+      "output_per_mtok": 2.2
+    },
+    "glm-4-6v": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.9
+    },
+    "glm-4-7": {
+      "cache_read_per_mtok": 0.099,
+      "input_per_mtok": 0.54,
+      "output_per_mtok": 1.98
+    },
+    "glm-4-7-flash": {
+      "input_per_mtok": 0.0605,
+      "output_per_mtok": 0.4
+    },
+    "glm-4.5": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.2
+    },
+    "glm-4.5-air": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.13,
+      "output_per_mtok": 0.85
+    },
+    "glm-4.5v": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 1.8
+    },
+    "glm-4.6": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.55,
+      "output_per_mtok": 2.2
+    },
+    "glm-4.6v": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.9
+    },
+    "glm-4.7": {
+      "cache_read_per_mtok": 0.099,
+      "input_per_mtok": 0.54,
+      "output_per_mtok": 1.98
+    },
+    "glm-4.7-flash": {
+      "input_per_mtok": 0.0605,
+      "output_per_mtok": 0.4
+    },
+    "glm-5": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1,
+      "output_per_mtok": 3.2
+    },
+    "glm-5-1": {
+      "cache_read_per_mtok": 0.26,
+      "input_per_mtok": 1.4,
+      "output_per_mtok": 4.4
+    },
+    "glm-5-2": {
+      "cache_read_per_mtok": 0.033,
+      "input_per_mtok": 0.0341,
+      "output_per_mtok": 7
+    },
+    "glm-5-3": {
+      "cache_read_per_mtok": 0.078,
+      "input_per_mtok": 0.079,
+      "output_per_mtok": 1.4
+    },
+    "glm-5-3-flash": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.5
+    },
+    "glm-5-3-flashx": {
+      "cache_read_per_mtok": 0.09,
+      "input_per_mtok": 0.37,
+      "output_per_mtok": 1.25
+    },
+    "glm-5-3-prime": {
+      "cache_read_per_mtok": 0.56,
+      "input_per_mtok": 2.8,
+      "output_per_mtok": 8.8
+    },
+    "glm-5-turbo": {
+      "cache_read_per_mtok": 0.24,
+      "input_per_mtok": 1.2,
+      "output_per_mtok": 4
+    },
+    "glm-5.1": {
+      "cache_read_per_mtok": 0.26,
+      "input_per_mtok": 1.4,
+      "output_per_mtok": 4.4
+    },
+    "glm-5.2": {
+      "cache_read_per_mtok": 0.033,
+      "input_per_mtok": 0.0341,
+      "output_per_mtok": 7
+    },
+    "glm-5.3": {
+      "cache_read_per_mtok": 0.078,
+      "input_per_mtok": 0.079,
+      "output_per_mtok": 1.4
+    },
+    "glm-5.3-flash": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.5
+    },
+    "glm-5.3-flashx": {
+      "cache_read_per_mtok": 0.09,
+      "input_per_mtok": 0.37,
+      "output_per_mtok": 1.25
+    },
+    "glm-5.3-prime": {
+      "cache_read_per_mtok": 0.56,
+      "input_per_mtok": 2.8,
+      "output_per_mtok": 8.8
+    },
+    "glm-5v-turbo": {
+      "cache_read_per_mtok": 0.24,
+      "input_per_mtok": 1.2,
+      "output_per_mtok": 4
+    },
+    "google/gemini-2-5-flash": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "google/gemini-2-5-flash-image": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "google/gemini-2-5-flash-lite": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "google/gemini-2-5-pro": {
+      "cache_read_per_mtok": 0.125,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "google/gemini-2-5-pro-preview": {
+      "cache_read_per_mtok": 0.125,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "google/gemini-2.5-flash": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "google/gemini-2.5-flash-image": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "google/gemini-2.5-flash-lite": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "google/gemini-2.5-pro": {
+      "cache_read_per_mtok": 0.125,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "google/gemini-2.5-pro-preview": {
+      "cache_read_per_mtok": 0.125,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "google/gemini-3-1-flash-image": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "google/gemini-3-1-flash-image-preview": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "google/gemini-3-1-flash-lite": {
+      "cache_read_per_mtok": 0.025,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "google/gemini-3-1-flash-lite-image": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "google/gemini-3-1-flash-lite-preview": {
+      "cache_read_per_mtok": 0.025,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "google/gemini-3-1-pro-preview": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "google/gemini-3-1-pro-preview-customtools": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "google/gemini-3-5-flash": {
+      "cache_read_per_mtok": 0.15,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 9
+    },
+    "google/gemini-3-5-flash-lite": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "google/gemini-3-6-flash": {
+      "cache_read_per_mtok": 0.075,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 3.75
+    },
+    "google/gemini-3-7-flash": {
+      "cache_read_per_mtok": 0.075,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 3.75
+    },
+    "google/gemini-3-8-flash": {
+      "cache_read_per_mtok": 0.0825,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.825,
+      "output_per_mtok": 4.125
+    },
+    "google/gemini-3-flash-preview": {
+      "cache_read_per_mtok": 0.05,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "google/gemini-3-pro-image": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "google/gemini-3-pro-image-preview": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "google/gemini-3.1-flash-image": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "google/gemini-3.1-flash-image-preview": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "google/gemini-3.1-flash-lite": {
+      "cache_read_per_mtok": 0.025,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "google/gemini-3.1-flash-lite-image": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "google/gemini-3.1-flash-lite-preview": {
+      "cache_read_per_mtok": 0.025,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1.5
+    },
+    "google/gemini-3.1-pro-preview": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "google/gemini-3.1-pro-preview-customtools": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "google/gemini-3.5-flash": {
+      "cache_read_per_mtok": 0.15,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 9
+    },
+    "google/gemini-3.5-flash-lite": {
+      "cache_read_per_mtok": 0.03,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "google/gemini-3.6-flash": {
+      "cache_read_per_mtok": 0.075,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 3.75
+    },
+    "google/gemini-3.7-flash": {
+      "cache_read_per_mtok": 0.075,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 3.75
+    },
+    "google/gemini-3.8-flash": {
+      "cache_read_per_mtok": 0.0825,
+      "cache_write_per_mtok": 0.041667,
+      "input_per_mtok": 0.825,
+      "output_per_mtok": 4.125
+    },
+    "google/gemini-4-argon": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 0.1875,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "google/gemini-nano-banana-2-1": {
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 7.5
+    },
+    "google/gemini-nano-banana-2.1": {
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 7.5
+    },
+    "google/gemma-2-27b-it": {
+      "input_per_mtok": 0.65,
+      "output_per_mtok": 0.65
+    },
+    "google/gemma-3-12b-it": {
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.15
+    },
+    "google/gemma-3-27b-it": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.08,
+      "output_per_mtok": 0.35
+    },
+    "google/gemma-3-4b-it": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.04,
+      "output_per_mtok": 0.05
+    },
+    "google/gemma-4-26b-a4b-it": {
+      "cache_read_per_mtok": 0.0375,
+      "input_per_mtok": 0.0675,
+      "output_per_mtok": 0.225
+    },
+    "google/gemma-4-31b-it": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.4
+    },
+    "gpt-3-5-turbo-0613": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 2
+    },
+    "gpt-3-5-turbo-16k": {
+      "input_per_mtok": 3,
+      "output_per_mtok": 4
+    },
+    "gpt-3.5-turbo-0613": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 2
+    },
+    "gpt-3.5-turbo-16k": {
+      "input_per_mtok": 3,
+      "output_per_mtok": 4
+    },
+    "gpt-4": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 60
+    },
+    "gpt-4-1": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "gpt-4-1-mini": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 1.6
+    },
+    "gpt-4-1-nano": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "gpt-4-turbo": {
+      "input_per_mtok": 10,
+      "output_per_mtok": 30
+    },
+    "gpt-4.1": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "gpt-4.1-mini": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 1.6
+    },
+    "gpt-4.1-nano": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "gpt-4o": {
+      "cache_read_per_mtok": 1.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "gpt-4o-2024-05-13": {
+      "input_per_mtok": 5,
+      "output_per_mtok": 15
+    },
+    "gpt-4o-2024-08-06": {
+      "cache_read_per_mtok": 1.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "gpt-4o-2024-11-20": {
+      "cache_read_per_mtok": 1.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "gpt-4o-mini": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "gpt-4o-mini-2024-07-18": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "gpt-5": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gpt-5-1": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gpt-5-1-codex": {
+      "cache_read_per_mtok": 0.13,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gpt-5-1-codex-max": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gpt-5-1-codex-mini": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "gpt-5-2": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "gpt-5-2-chat": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "gpt-5-2-codex": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "gpt-5-2-pro": {
+      "input_per_mtok": 21,
+      "output_per_mtok": 168
+    },
+    "gpt-5-3-codex": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "gpt-5-4": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 15
+    },
+    "gpt-5-4-image-2": {
+      "cache_read_per_mtok": 2,
+      "input_per_mtok": 8,
+      "output_per_mtok": 15
+    },
+    "gpt-5-4-mini": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 4.5
+    },
+    "gpt-5-4-nano": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.25
+    },
+    "gpt-5-4-pro": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 180
+    },
+    "gpt-5-5": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "gpt-5-5-pro": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 180
+    },
+    "gpt-5-6-luna": {
+      "cache_read_per_mtok": 0.02,
+      "cache_write_per_mtok": 0.25,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.2
+    },
+    "gpt-5-6-luna-pro": {
+      "cache_read_per_mtok": 0.02,
+      "cache_write_per_mtok": 0.25,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.2
+    },
+    "gpt-5-6-sol": {
+      "cache_read_per_mtok": 0.4,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "gpt-5-6-sol-pro": {
+      "cache_read_per_mtok": 0.4,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "gpt-5-6-terra": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gpt-5-6-terra-pro": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gpt-5-image": {
+      "cache_read_per_mtok": 1.25,
+      "input_per_mtok": 10,
+      "output_per_mtok": 10
+    },
+    "gpt-5-image-mini": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 2
+    },
+    "gpt-5-mini": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "gpt-5-nano": {
+      "cache_read_per_mtok": 0.005,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.4
+    },
+    "gpt-5-pro": {
+      "input_per_mtok": 15,
+      "output_per_mtok": 120
+    },
+    "gpt-5.1": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gpt-5.1-codex": {
+      "cache_read_per_mtok": 0.13,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gpt-5.1-codex-max": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "gpt-5.1-codex-mini": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "gpt-5.2": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "gpt-5.2-chat": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "gpt-5.2-codex": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "gpt-5.2-pro": {
+      "input_per_mtok": 21,
+      "output_per_mtok": 168
+    },
+    "gpt-5.3-codex": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "gpt-5.4": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 15
+    },
+    "gpt-5.4-image-2": {
+      "cache_read_per_mtok": 2,
+      "input_per_mtok": 8,
+      "output_per_mtok": 15
+    },
+    "gpt-5.4-mini": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 4.5
+    },
+    "gpt-5.4-nano": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.25
+    },
+    "gpt-5.4-pro": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 180
+    },
+    "gpt-5.5": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "gpt-5.5-pro": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 180
+    },
+    "gpt-5.6-luna": {
+      "cache_read_per_mtok": 0.02,
+      "cache_write_per_mtok": 0.25,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.2
+    },
+    "gpt-5.6-luna-pro": {
+      "cache_read_per_mtok": 0.02,
+      "cache_write_per_mtok": 0.25,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.2
+    },
+    "gpt-5.6-sol": {
+      "cache_read_per_mtok": 0.4,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "gpt-5.6-sol-pro": {
+      "cache_read_per_mtok": 0.4,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "gpt-5.6-terra": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gpt-5.6-terra-pro": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "gpt-6-1-sol": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "gpt-6-1-sol-pro": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "gpt-6-astra": {
+      "cache_read_per_mtok": 1,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "gpt-6-astra-pro": {
+      "cache_read_per_mtok": 1,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "gpt-6-luna": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.5
+    },
+    "gpt-6-luna-pro": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.5
+    },
+    "gpt-6-sol": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "gpt-6-sol-pro": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "gpt-6.1-sol": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "gpt-6.1-sol-pro": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "gpt-audio": {
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "gpt-audio-mini": {
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.4
+    },
+    "gpt-chat-latest": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "gpt-oss-120b": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "gpt-oss-20b": {
+      "cache_read_per_mtok": 0.009,
+      "input_per_mtok": 0.018,
+      "output_per_mtok": 0.09
+    },
+    "gpt-oss-safeguard-20b": {
+      "cache_read_per_mtok": 0.0375,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.3
+    },
+    "granite-4-0-h-micro": {
+      "input_per_mtok": 0.017,
+      "output_per_mtok": 0.112
+    },
+    "granite-4-2-8b": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.25
+    },
+    "granite-4.0-h-micro": {
+      "input_per_mtok": 0.017,
+      "output_per_mtok": 0.112
+    },
+    "granite-4.2-8b": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.25
+    },
+    "grok-4-20": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "grok-4-20-multi-agent": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "grok-4-3": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "grok-4-5": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "grok-4-6": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "grok-4-7": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "grok-4.20": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "grok-4.20-multi-agent": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "grok-4.3": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "grok-4.5": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "grok-4.6": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "grok-4.7": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "grok-build-0-1": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1,
+      "output_per_mtok": 2
+    },
+    "grok-build-0.1": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1,
+      "output_per_mtok": 2
+    },
+    "gryphe/mythomax-l2-13b": {
+      "input_per_mtok": 0.08,
+      "output_per_mtok": 0.11
+    },
+    "hermes-3-llama-3-1-405b": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 1
+    },
+    "hermes-3-llama-3-1-70b": {
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 0.7
+    },
+    "hermes-3-llama-3.1-405b": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 1
+    },
+    "hermes-3-llama-3.1-70b": {
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 0.7
+    },
+    "hermes-4-405b": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 3
+    },
+    "hunyuan-a13b-instruct": {
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 0.57
+    },
+    "hy-mt2-1-8b": {
+      "input_per_mtok": 0.044,
+      "output_per_mtok": 0.177
+    },
+    "hy-mt2-1.8b": {
+      "input_per_mtok": 0.044,
+      "output_per_mtok": 0.177
+    },
+    "hy-mt2-30b-a3b": {
+      "input_per_mtok": 0.074,
+      "output_per_mtok": 0.295
+    },
+    "hy-mt2-7b": {
+      "input_per_mtok": 0.074,
+      "output_per_mtok": 0.295
+    },
+    "hy3": {
+      "cache_read_per_mtok": 0.020625,
+      "input_per_mtok": 0.0825,
+      "output_per_mtok": 0.33
+    },
+    "hy3-preview": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.18,
+      "output_per_mtok": 0.6
+    },
+    "hy4-preview": {
+      "cache_read_per_mtok": 0.0378,
+      "input_per_mtok": 0.7506,
+      "output_per_mtok": 2.2509
+    },
+    "ibm-granite/granite-4-0-h-micro": {
+      "input_per_mtok": 0.017,
+      "output_per_mtok": 0.112
+    },
+    "ibm-granite/granite-4-2-8b": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.25
+    },
+    "ibm-granite/granite-4.0-h-micro": {
+      "input_per_mtok": 0.017,
+      "output_per_mtok": 0.112
+    },
+    "ibm-granite/granite-4.2-8b": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.25
+    },
+    "inception/mercury-2": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.75
+    },
+    "inception/mercury-2-5": {
+      "cache_read_per_mtok": 0.004,
+      "input_per_mtok": 0.04,
+      "output_per_mtok": 0.15
+    },
+    "inception/mercury-2.5": {
+      "cache_read_per_mtok": 0.004,
+      "input_per_mtok": 0.04,
+      "output_per_mtok": 0.15
+    },
+    "inception/mercury-3": {
+      "cache_read_per_mtok": 0.01,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.35
+    },
+    "inclusionai/ling-3-0-flash": {
+      "cache_read_per_mtok": 0.0042,
+      "input_per_mtok": 0.021,
+      "output_per_mtok": 0.063
+    },
+    "inclusionai/ling-3-0-flash-vl": {
+      "cache_read_per_mtok": 0.012,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.18
+    },
+    "inclusionai/ling-3-1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.225
+    },
+    "inclusionai/ling-3.0-flash": {
+      "cache_read_per_mtok": 0.0042,
+      "input_per_mtok": 0.021,
+      "output_per_mtok": 0.063
+    },
+    "inclusionai/ling-3.0-flash-vl": {
+      "cache_read_per_mtok": 0.012,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.18
+    },
+    "inclusionai/ling-3.1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.225
+    },
+    "inference-net/schematron-v2-small": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.23
+    },
+    "inference-net/schematron-v2-turbo": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.03,
+      "output_per_mtok": 0.15
+    },
+    "inkling": {
+      "cache_read_per_mtok": 0.17,
+      "input_per_mtok": 1,
+      "output_per_mtok": 4.05
+    },
+    "inkling-small": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.45,
+      "output_per_mtok": 1.2
+    },
+    "kimi-k2": {
+      "input_per_mtok": 0.57,
+      "output_per_mtok": 2.3
+    },
+    "kimi-k2-0905": {
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.5
+    },
+    "kimi-k2-5": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 2.5
+    },
+    "kimi-k2-6": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.65,
+      "output_per_mtok": 3.41
+    },
+    "kimi-k2-7-code": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.6712,
+      "output_per_mtok": 3.35
+    },
+    "kimi-k2-thinking": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.5
+    },
+    "kimi-k2.5": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 2.5
+    },
+    "kimi-k2.6": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.65,
+      "output_per_mtok": 3.41
+    },
+    "kimi-k2.7-code": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.6712,
+      "output_per_mtok": 3.35
+    },
+    "kimi-k3": {
+      "cache_read_per_mtok": 0.21,
+      "input_per_mtok": 0.239,
+      "output_per_mtok": 10.8
+    },
+    "kimi-k3-1-pro": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "kimi-k3.1-pro": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "l3-1-euryale-70b": {
+      "input_per_mtok": 0.85,
+      "output_per_mtok": 0.85
+    },
+    "l3-lunaris-8b": {
+      "input_per_mtok": 0.04,
+      "output_per_mtok": 0.05
+    },
+    "l3.1-euryale-70b": {
+      "input_per_mtok": 0.85,
+      "output_per_mtok": 0.85
+    },
+    "laguna-s-2-1": {
+      "cache_read_per_mtok": 0.009,
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 0.18
+    },
+    "laguna-s-2.1": {
+      "cache_read_per_mtok": 0.009,
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 0.18
+    },
+    "laguna-xs-2-1": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.12
+    },
+    "laguna-xs-2.1": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.12
+    },
+    "lfm-2-5-2-6b": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.35,
+      "output_per_mtok": 0.5
+    },
+    "lfm-2-5-24b-a2b": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.7
+    },
+    "lfm-2.5-2.6b": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.35,
+      "output_per_mtok": 0.5
+    },
+    "lfm-2.5-24b-a2b": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.7
+    },
+    "ling-3-0-flash": {
+      "cache_read_per_mtok": 0.0042,
+      "input_per_mtok": 0.021,
+      "output_per_mtok": 0.063
+    },
+    "ling-3-0-flash-vl": {
+      "cache_read_per_mtok": 0.012,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.18
+    },
+    "ling-3-1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.225
+    },
+    "ling-3.0-flash": {
+      "cache_read_per_mtok": 0.0042,
+      "input_per_mtok": 0.021,
+      "output_per_mtok": 0.063
+    },
+    "ling-3.0-flash-vl": {
+      "cache_read_per_mtok": 0.012,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.18
+    },
+    "ling-3.1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.225
+    },
+    "liquid/lfm-2-5-2-6b": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.35,
+      "output_per_mtok": 0.5
+    },
+    "liquid/lfm-2-5-24b-a2b": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.7
+    },
+    "liquid/lfm-2.5-2.6b": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.35,
+      "output_per_mtok": 0.5
+    },
+    "liquid/lfm-2.5-24b-a2b": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.7
+    },
+    "llama-3-1-70b-instruct": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 0.4
+    },
+    "llama-3-1-8b-instruct": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.08
+    },
+    "llama-3-2-1b-instruct": {
+      "input_per_mtok": 0.027,
+      "output_per_mtok": 0.201
+    },
+    "llama-3-2-3b-instruct": {
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.33
+    },
+    "llama-3-3-70b-instruct": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.32
+    },
+    "llama-3.1-70b-instruct": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 0.4
+    },
+    "llama-3.1-8b-instruct": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.08
+    },
+    "llama-3.2-1b-instruct": {
+      "input_per_mtok": 0.027,
+      "output_per_mtok": 0.201
+    },
+    "llama-3.2-3b-instruct": {
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.33
+    },
+    "llama-3.3-70b-instruct": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.32
+    },
+    "llama-4-maverick": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.1875,
+      "output_per_mtok": 0.6525
+    },
+    "llama-4-scout": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.3
+    },
+    "llama-guard-4-12b": {
+      "input_per_mtok": 0.18,
+      "output_per_mtok": 0.18
+    },
+    "longcat-2-0": {
+      "cache_read_per_mtok": 0.006,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "longcat-2.0": {
+      "cache_read_per_mtok": 0.006,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "magnum-v4-72b": {
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 5
+    },
+    "mancer/weaver": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 0.75
+    },
+    "meituan/longcat-2-0": {
+      "cache_read_per_mtok": 0.006,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "meituan/longcat-2.0": {
+      "cache_read_per_mtok": 0.006,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "mercury-2": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.75
+    },
+    "mercury-2-5": {
+      "cache_read_per_mtok": 0.004,
+      "input_per_mtok": 0.04,
+      "output_per_mtok": 0.15
+    },
+    "mercury-2.5": {
+      "cache_read_per_mtok": 0.004,
+      "input_per_mtok": 0.04,
+      "output_per_mtok": 0.15
+    },
+    "mercury-3": {
+      "cache_read_per_mtok": 0.01,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.35
+    },
+    "meta-llama/llama-3-1-70b-instruct": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 0.4
+    },
+    "meta-llama/llama-3-1-8b-instruct": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.08
+    },
+    "meta-llama/llama-3-2-1b-instruct": {
+      "input_per_mtok": 0.027,
+      "output_per_mtok": 0.201
+    },
+    "meta-llama/llama-3-2-3b-instruct": {
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.33
+    },
+    "meta-llama/llama-3-3-70b-instruct": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.32
+    },
+    "meta-llama/llama-3.1-70b-instruct": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 0.4
+    },
+    "meta-llama/llama-3.1-8b-instruct": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.08
+    },
+    "meta-llama/llama-3.2-1b-instruct": {
+      "input_per_mtok": 0.027,
+      "output_per_mtok": 0.201
+    },
+    "meta-llama/llama-3.2-3b-instruct": {
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.33
+    },
+    "meta-llama/llama-3.3-70b-instruct": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.32
+    },
+    "meta-llama/llama-4-maverick": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.1875,
+      "output_per_mtok": 0.6525
+    },
+    "meta-llama/llama-4-scout": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.3
+    },
+    "meta-llama/llama-guard-4-12b": {
+      "input_per_mtok": 0.18,
+      "output_per_mtok": 0.18
+    },
+    "meta/muse-glimmer-30b": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "meta/muse-spark-1-1": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "meta/muse-spark-1-2": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "meta/muse-spark-1-2-contributor": {
+      "cache_read_per_mtok": 0.002,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "meta/muse-spark-1-3": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "meta/muse-spark-1-3-contributor": {
+      "cache_read_per_mtok": 0.002,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "meta/muse-spark-1.1": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "meta/muse-spark-1.2": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "meta/muse-spark-1.2-contributor": {
+      "cache_read_per_mtok": 0.002,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "meta/muse-spark-1.3": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "meta/muse-spark-1.3-contributor": {
+      "cache_read_per_mtok": 0.002,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "meta/muse-spark-open": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "meta/muse-wonder": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "microsoft/phi-4": {
+      "input_per_mtok": 0.07,
+      "output_per_mtok": 0.14
+    },
+    "mimo-v2-5": {
+      "cache_read_per_mtok": 0.00255,
+      "input_per_mtok": 0.119,
+      "output_per_mtok": 0.238
+    },
+    "mimo-v2-5-pro": {
+      "cache_read_per_mtok": 0.0028,
+      "input_per_mtok": 0.3045,
+      "output_per_mtok": 0.609
+    },
+    "mimo-v2-6-flash": {
+      "cache_read_per_mtok": 0.0028,
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 0.28
+    },
+    "mimo-v2-6-pro": {
+      "cache_read_per_mtok": 0.0036,
+      "input_per_mtok": 0.435,
+      "output_per_mtok": 0.87
+    },
+    "mimo-v2-6-pro-ultraspeed": {
+      "cache_read_per_mtok": 0.036,
+      "input_per_mtok": 4.35,
+      "output_per_mtok": 8.7
+    },
+    "mimo-v2.5": {
+      "cache_read_per_mtok": 0.00255,
+      "input_per_mtok": 0.119,
+      "output_per_mtok": 0.238
+    },
+    "mimo-v2.5-pro": {
+      "cache_read_per_mtok": 0.0028,
+      "input_per_mtok": 0.3045,
+      "output_per_mtok": 0.609
+    },
+    "mimo-v2.6-flash": {
+      "cache_read_per_mtok": 0.0028,
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 0.28
+    },
+    "mimo-v2.6-pro": {
+      "cache_read_per_mtok": 0.0036,
+      "input_per_mtok": 0.435,
+      "output_per_mtok": 0.87
+    },
+    "mimo-v2.6-pro-ultraspeed": {
+      "cache_read_per_mtok": 0.036,
+      "input_per_mtok": 4.35,
+      "output_per_mtok": 8.7
+    },
+    "minimax-01": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.1
+    },
+    "minimax-m1": {
+      "input_per_mtok": 0.55,
+      "output_per_mtok": 2.2
+    },
+    "minimax-m2": {
+      "input_per_mtok": 0.255,
+      "output_per_mtok": 1.02
+    },
+    "minimax-m2-1": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax-m2-5": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax-m2-7": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax-m2-her": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax-m2.1": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax-m2.5": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax-m2.7": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax-m3": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax-m3-1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "minimax-m3.1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "minimax/minimax-01": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.1
+    },
+    "minimax/minimax-m1": {
+      "input_per_mtok": 0.55,
+      "output_per_mtok": 2.2
+    },
+    "minimax/minimax-m2": {
+      "input_per_mtok": 0.255,
+      "output_per_mtok": 1.02
+    },
+    "minimax/minimax-m2-1": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax/minimax-m2-5": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax/minimax-m2-7": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax/minimax-m2-her": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax/minimax-m2.1": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax/minimax-m2.5": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax/minimax-m2.7": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax/minimax-m3": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "minimax/minimax-m3-1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "minimax/minimax-m3.1-flash": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "ministral-14b-2512": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.2
+    },
+    "ministral-3b-2512": {
+      "cache_read_per_mtok": 0.01,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.1
+    },
+    "ministral-8b-2512": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.15
+    },
+    "mistral-large": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "mistral-large-2407": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "mistral-large-2512": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 1.5
+    },
+    "mistral-large-4-0": {
+      "cache_read_per_mtok": 0.14,
+      "input_per_mtok": 1.36,
+      "output_per_mtok": 4.18
+    },
+    "mistral-medium-3": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 2
+    },
+    "mistral-medium-3-1": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 2
+    },
+    "mistral-medium-3-5": {
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 7.5
+    },
+    "mistral-medium-3.1": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 2
+    },
+    "mistral-nemo": {
+      "input_per_mtok": 0.029,
+      "output_per_mtok": 0.03
+    },
+    "mistral-saba": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.6
+    },
+    "mistral-small-24b-instruct-2501": {
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.08
+    },
+    "mistral-small-2603": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "mistral-small-3-1-24b-instruct": {
+      "input_per_mtok": 0.351,
+      "output_per_mtok": 0.555
+    },
+    "mistral-small-3-2-24b-instruct": {
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.2
+    },
+    "mistral-small-3.1-24b-instruct": {
+      "input_per_mtok": 0.351,
+      "output_per_mtok": 0.555
+    },
+    "mistral-small-3.2-24b-instruct": {
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.2
+    },
+    "mistralai/codestral-2508": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.9
+    },
+    "mistralai/devstral-2512": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 2
+    },
+    "mistralai/ministral-14b-2512": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.2
+    },
+    "mistralai/ministral-3b-2512": {
+      "cache_read_per_mtok": 0.01,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.1
+    },
+    "mistralai/ministral-8b-2512": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.15
+    },
+    "mistralai/mistral-large": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "mistralai/mistral-large-2407": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "mistralai/mistral-large-2512": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 1.5
+    },
+    "mistralai/mistral-large-4-0": {
+      "cache_read_per_mtok": 0.14,
+      "input_per_mtok": 1.36,
+      "output_per_mtok": 4.18
+    },
+    "mistralai/mistral-medium-3": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 2
+    },
+    "mistralai/mistral-medium-3-1": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 2
+    },
+    "mistralai/mistral-medium-3-5": {
+      "input_per_mtok": 1.5,
+      "output_per_mtok": 7.5
+    },
+    "mistralai/mistral-medium-3.1": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 2
+    },
+    "mistralai/mistral-nemo": {
+      "input_per_mtok": 0.029,
+      "output_per_mtok": 0.03
+    },
+    "mistralai/mistral-saba": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.6
+    },
+    "mistralai/mistral-small-24b-instruct-2501": {
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.08
+    },
+    "mistralai/mistral-small-2603": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "mistralai/mistral-small-3-1-24b-instruct": {
+      "input_per_mtok": 0.351,
+      "output_per_mtok": 0.555
+    },
+    "mistralai/mistral-small-3-2-24b-instruct": {
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.2
+    },
+    "mistralai/mistral-small-3.1-24b-instruct": {
+      "input_per_mtok": 0.351,
+      "output_per_mtok": 0.555
+    },
+    "mistralai/mistral-small-3.2-24b-instruct": {
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.2
+    },
+    "mistralai/mixtral-8x22b-instruct": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "mistralai/voxtral-small-24b-2507": {
+      "cache_read_per_mtok": 0.01,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.3
+    },
+    "mixtral-8x22b-instruct": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "moondream/moondream3-1-9b-a2b": {
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "moondream/moondream3-preview": {
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "moondream/moondream3.1-9b-a2b": {
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "moondream3-1-9b-a2b": {
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "moondream3-preview": {
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "moondream3.1-9b-a2b": {
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "moonshotai/kimi-k2": {
+      "input_per_mtok": 0.57,
+      "output_per_mtok": 2.3
+    },
+    "moonshotai/kimi-k2-0905": {
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.5
+    },
+    "moonshotai/kimi-k2-5": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 2.5
+    },
+    "moonshotai/kimi-k2-6": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.65,
+      "output_per_mtok": 3.41
+    },
+    "moonshotai/kimi-k2-7-code": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.6712,
+      "output_per_mtok": 3.35
+    },
+    "moonshotai/kimi-k2-thinking": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.5
+    },
+    "moonshotai/kimi-k2.5": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 2.5
+    },
+    "moonshotai/kimi-k2.6": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.65,
+      "output_per_mtok": 3.41
+    },
+    "moonshotai/kimi-k2.7-code": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.6712,
+      "output_per_mtok": 3.35
+    },
+    "moonshotai/kimi-k3": {
+      "cache_read_per_mtok": 0.21,
+      "input_per_mtok": 0.239,
+      "output_per_mtok": 10.8
+    },
+    "moonshotai/kimi-k3-1-pro": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "moonshotai/kimi-k3.1-pro": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "morph-v3-fast": {
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.2
+    },
+    "morph-v3-large": {
+      "input_per_mtok": 0.9,
+      "output_per_mtok": 1.9
+    },
+    "morph/morph-v3-fast": {
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1.2
+    },
+    "morph/morph-v3-large": {
+      "input_per_mtok": 0.9,
+      "output_per_mtok": 1.9
+    },
+    "muse-glimmer-30b": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.2
+    },
+    "muse-spark-1-1": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "muse-spark-1-2": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "muse-spark-1-2-contributor": {
+      "cache_read_per_mtok": 0.002,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "muse-spark-1-3": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "muse-spark-1-3-contributor": {
+      "cache_read_per_mtok": 0.002,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "muse-spark-1.1": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "muse-spark-1.2": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "muse-spark-1.2-contributor": {
+      "cache_read_per_mtok": 0.002,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "muse-spark-1.3": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "muse-spark-1.3-contributor": {
+      "cache_read_per_mtok": 0.002,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "muse-spark-open": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 4.25
+    },
+    "muse-wonder": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "mythomax-l2-13b": {
+      "input_per_mtok": 0.08,
+      "output_per_mtok": 0.11
+    },
+    "nemotron-3-5-content-safety": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.2
+    },
+    "nemotron-3-5-lightning": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.07,
+      "output_per_mtok": 0.2
+    },
+    "nemotron-3-5-super-vl": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.5
+    },
+    "nemotron-3-nano-30b-a3b": {
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.24
+    },
+    "nemotron-3-super-120b-a12b": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.4
+    },
+    "nemotron-3-ultra-550b-a55b": {
+      "cache_read_per_mtok": 0.12,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.4
+    },
+    "nemotron-3.5-content-safety": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.2
+    },
+    "nemotron-3.5-lightning": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.07,
+      "output_per_mtok": 0.2
+    },
+    "nemotron-3.5-super-vl": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.5
+    },
+    "nex-agi/nex-n2-5-mini": {
+      "cache_read_per_mtok": 0.0025,
+      "input_per_mtok": 0.025,
+      "output_per_mtok": 0.1
+    },
+    "nex-agi/nex-n2-5-pro": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.25
+    },
+    "nex-agi/nex-n2.5-mini": {
+      "cache_read_per_mtok": 0.0025,
+      "input_per_mtok": 0.025,
+      "output_per_mtok": 0.1
+    },
+    "nex-agi/nex-n2.5-pro": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.25
+    },
+    "nex-n2-5-mini": {
+      "cache_read_per_mtok": 0.0025,
+      "input_per_mtok": 0.025,
+      "output_per_mtok": 0.1
+    },
+    "nex-n2-5-pro": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.25
+    },
+    "nex-n2.5-mini": {
+      "cache_read_per_mtok": 0.0025,
+      "input_per_mtok": 0.025,
+      "output_per_mtok": 0.1
+    },
+    "nex-n2.5-pro": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.25
+    },
+    "nousresearch/hermes-3-llama-3-1-405b": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 1
+    },
+    "nousresearch/hermes-3-llama-3-1-70b": {
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 0.7
+    },
+    "nousresearch/hermes-3-llama-3.1-405b": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 1
+    },
+    "nousresearch/hermes-3-llama-3.1-70b": {
+      "input_per_mtok": 0.7,
+      "output_per_mtok": 0.7
+    },
+    "nousresearch/hermes-4-405b": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 3
+    },
+    "nova-2-lite-v1": {
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.5
+    },
+    "nova-lite-v1": {
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.24
+    },
+    "nova-micro-v1": {
+      "input_per_mtok": 0.035,
+      "output_per_mtok": 0.14
+    },
+    "nova-premier-v1": {
+      "cache_read_per_mtok": 0.625,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 12.5
+    },
+    "nova-pro-v1": {
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 3.2
+    },
+    "nvidia/nemotron-3-5-content-safety": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.2
+    },
+    "nvidia/nemotron-3-5-lightning": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.07,
+      "output_per_mtok": 0.2
+    },
+    "nvidia/nemotron-3-5-super-vl": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.5
+    },
+    "nvidia/nemotron-3-nano-30b-a3b": {
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.24
+    },
+    "nvidia/nemotron-3-super-120b-a12b": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 2.4
+    },
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+      "cache_read_per_mtok": 0.12,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.4
+    },
+    "nvidia/nemotron-3.5-content-safety": {
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 0.2
+    },
+    "nvidia/nemotron-3.5-lightning": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.07,
+      "output_per_mtok": 0.2
+    },
+    "nvidia/nemotron-3.5-super-vl": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.5
+    },
+    "o1": {
+      "cache_read_per_mtok": 7.5,
+      "input_per_mtok": 15,
+      "output_per_mtok": 60
+    },
+    "o1-pro": {
+      "input_per_mtok": 150,
+      "output_per_mtok": 600
+    },
+    "o3": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "o3-mini": {
+      "cache_read_per_mtok": 0.55,
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 4.4
+    },
+    "o3-mini-high": {
+      "cache_read_per_mtok": 0.55,
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 4.4
+    },
+    "o3-pro": {
+      "input_per_mtok": 20,
+      "output_per_mtok": 80
+    },
+    "o4-mini": {
+      "cache_read_per_mtok": 0.275,
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 4.4
+    },
+    "o4-mini-high": {
+      "cache_read_per_mtok": 0.275,
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 4.4
+    },
+    "openai/gpt-3-5-turbo-0613": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 2
+    },
+    "openai/gpt-3-5-turbo-16k": {
+      "input_per_mtok": 3,
+      "output_per_mtok": 4
+    },
+    "openai/gpt-3.5-turbo-0613": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 2
+    },
+    "openai/gpt-3.5-turbo-16k": {
+      "input_per_mtok": 3,
+      "output_per_mtok": 4
+    },
+    "openai/gpt-4": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 60
+    },
+    "openai/gpt-4-1": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "openai/gpt-4-1-mini": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 1.6
+    },
+    "openai/gpt-4-1-nano": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "openai/gpt-4-turbo": {
+      "input_per_mtok": 10,
+      "output_per_mtok": 30
+    },
+    "openai/gpt-4.1": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "openai/gpt-4.1-mini": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 1.6
+    },
+    "openai/gpt-4.1-nano": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "openai/gpt-4o": {
+      "cache_read_per_mtok": 1.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-4o-2024-05-13": {
+      "input_per_mtok": 5,
+      "output_per_mtok": 15
+    },
+    "openai/gpt-4o-2024-08-06": {
+      "cache_read_per_mtok": 1.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-4o-2024-11-20": {
+      "cache_read_per_mtok": 1.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-4o-mini": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "openai/gpt-4o-mini-2024-07-18": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "openai/gpt-5": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-5-1": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-5-1-codex": {
+      "cache_read_per_mtok": 0.13,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-5-1-codex-max": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-5-1-codex-mini": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "openai/gpt-5-2": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "openai/gpt-5-2-chat": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "openai/gpt-5-2-codex": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "openai/gpt-5-2-pro": {
+      "input_per_mtok": 21,
+      "output_per_mtok": 168
+    },
+    "openai/gpt-5-3-codex": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "openai/gpt-5-4": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 15
+    },
+    "openai/gpt-5-4-image-2": {
+      "cache_read_per_mtok": 2,
+      "input_per_mtok": 8,
+      "output_per_mtok": 15
+    },
+    "openai/gpt-5-4-mini": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 4.5
+    },
+    "openai/gpt-5-4-nano": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.25
+    },
+    "openai/gpt-5-4-pro": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 180
+    },
+    "openai/gpt-5-5": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "openai/gpt-5-5-pro": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 180
+    },
+    "openai/gpt-5-6-luna": {
+      "cache_read_per_mtok": 0.02,
+      "cache_write_per_mtok": 0.25,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.2
+    },
+    "openai/gpt-5-6-luna-pro": {
+      "cache_read_per_mtok": 0.02,
+      "cache_write_per_mtok": 0.25,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.2
+    },
+    "openai/gpt-5-6-sol": {
+      "cache_read_per_mtok": 0.4,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "openai/gpt-5-6-sol-pro": {
+      "cache_read_per_mtok": 0.4,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "openai/gpt-5-6-terra": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "openai/gpt-5-6-terra-pro": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "openai/gpt-5-image": {
+      "cache_read_per_mtok": 1.25,
+      "input_per_mtok": 10,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-5-image-mini": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 2
+    },
+    "openai/gpt-5-mini": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "openai/gpt-5-nano": {
+      "cache_read_per_mtok": 0.005,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.4
+    },
+    "openai/gpt-5-pro": {
+      "input_per_mtok": 15,
+      "output_per_mtok": 120
+    },
+    "openai/gpt-5.1": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-5.1-codex": {
+      "cache_read_per_mtok": 0.13,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-5.1-codex-max": {
+      "cache_read_per_mtok": 0.125,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-5.1-codex-mini": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "openai/gpt-5.2": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "openai/gpt-5.2-chat": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "openai/gpt-5.2-codex": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "openai/gpt-5.2-pro": {
+      "input_per_mtok": 21,
+      "output_per_mtok": 168
+    },
+    "openai/gpt-5.3-codex": {
+      "cache_read_per_mtok": 0.175,
+      "input_per_mtok": 1.75,
+      "output_per_mtok": 14
+    },
+    "openai/gpt-5.4": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 15
+    },
+    "openai/gpt-5.4-image-2": {
+      "cache_read_per_mtok": 2,
+      "input_per_mtok": 8,
+      "output_per_mtok": 15
+    },
+    "openai/gpt-5.4-mini": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.75,
+      "output_per_mtok": 4.5
+    },
+    "openai/gpt-5.4-nano": {
+      "cache_read_per_mtok": 0.02,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.25
+    },
+    "openai/gpt-5.4-pro": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 180
+    },
+    "openai/gpt-5.5": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "openai/gpt-5.5-pro": {
+      "input_per_mtok": 30,
+      "output_per_mtok": 180
+    },
+    "openai/gpt-5.6-luna": {
+      "cache_read_per_mtok": 0.02,
+      "cache_write_per_mtok": 0.25,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.2
+    },
+    "openai/gpt-5.6-luna-pro": {
+      "cache_read_per_mtok": 0.02,
+      "cache_write_per_mtok": 0.25,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.2
+    },
+    "openai/gpt-5.6-sol": {
+      "cache_read_per_mtok": 0.4,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "openai/gpt-5.6-sol-pro": {
+      "cache_read_per_mtok": 0.4,
+      "cache_write_per_mtok": 5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 20
+    },
+    "openai/gpt-5.6-terra": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "openai/gpt-5.6-terra-pro": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 12
+    },
+    "openai/gpt-6-1-sol": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-6-1-sol-pro": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-6-astra": {
+      "cache_read_per_mtok": 1,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "openai/gpt-6-astra-pro": {
+      "cache_read_per_mtok": 1,
+      "cache_write_per_mtok": 12.5,
+      "input_per_mtok": 10,
+      "output_per_mtok": 50
+    },
+    "openai/gpt-6-luna": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.5
+    },
+    "openai/gpt-6-luna-pro": {
+      "cache_read_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.5
+    },
+    "openai/gpt-6-sol": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-6-sol-pro": {
+      "cache_read_per_mtok": 0.2,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-6.1-sol": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-6.1-sol-pro": {
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 2.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-audio": {
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 10
+    },
+    "openai/gpt-audio-mini": {
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.4
+    },
+    "openai/gpt-chat-latest": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "openai/gpt-oss-120b": {
+      "cache_read_per_mtok": 0.075,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "openai/gpt-oss-20b": {
+      "cache_read_per_mtok": 0.009,
+      "input_per_mtok": 0.018,
+      "output_per_mtok": 0.09
+    },
+    "openai/gpt-oss-safeguard-20b": {
+      "cache_read_per_mtok": 0.0375,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.3
+    },
+    "openai/o1": {
+      "cache_read_per_mtok": 7.5,
+      "input_per_mtok": 15,
+      "output_per_mtok": 60
+    },
+    "openai/o1-pro": {
+      "input_per_mtok": 150,
+      "output_per_mtok": 600
+    },
+    "openai/o3": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "openai/o3-mini": {
+      "cache_read_per_mtok": 0.55,
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 4.4
+    },
+    "openai/o3-mini-high": {
+      "cache_read_per_mtok": 0.55,
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 4.4
+    },
+    "openai/o3-pro": {
+      "input_per_mtok": 20,
+      "output_per_mtok": 80
+    },
+    "openai/o4-mini": {
+      "cache_read_per_mtok": 0.275,
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 4.4
+    },
+    "openai/o4-mini-high": {
+      "cache_read_per_mtok": 0.275,
+      "input_per_mtok": 1.1,
+      "output_per_mtok": 4.4
+    },
+    "palmyra-x5": {
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 6
+    },
+    "pareto-26-10": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 3.2
+    },
+    "pareto-26-9": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 7.5
+    },
+    "pareto-26.10": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 3.2
+    },
+    "pareto-26.9": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 7.5
+    },
+    "perceptron-mk1": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 1.5
+    },
+    "perceptron-mk1-5": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 1.5
+    },
+    "perceptron-mk1.5": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 1.5
+    },
+    "perceptron/perceptron-mk1": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 1.5
+    },
+    "perceptron/perceptron-mk1-5": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 1.5
+    },
+    "perceptron/perceptron-mk1.5": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 1.5
+    },
+    "perplexity/sonar": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 1
+    },
+    "perplexity/sonar-deep-research": {
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "perplexity/sonar-pro": {
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "perplexity/sonar-pro-search": {
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "perplexity/sonar-reasoning-pro": {
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "phi-4": {
+      "input_per_mtok": 0.07,
+      "output_per_mtok": 0.14
+    },
+    "poolside/laguna-s-2-1": {
+      "cache_read_per_mtok": 0.009,
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 0.18
+    },
+    "poolside/laguna-s-2.1": {
+      "cache_read_per_mtok": 0.009,
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 0.18
+    },
+    "poolside/laguna-xs-2-1": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.12
+    },
+    "poolside/laguna-xs-2.1": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.06,
+      "output_per_mtok": 0.12
+    },
+    "prism-ml/ternary-bonsai-2-27b": {
+      "cache_read_per_mtok": 0.0375,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.5
+    },
+    "qwen-2-5-72b-instruct": {
+      "input_per_mtok": 0.36,
+      "output_per_mtok": 0.4
+    },
+    "qwen-2-5-7b-instruct": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "qwen-2-5-coder-32b-instruct": {
+      "input_per_mtok": 0.66,
+      "output_per_mtok": 1
+    },
+    "qwen-2.5-72b-instruct": {
+      "input_per_mtok": 0.36,
+      "output_per_mtok": 0.4
+    },
+    "qwen-2.5-7b-instruct": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "qwen-2.5-coder-32b-instruct": {
+      "input_per_mtok": 0.66,
+      "output_per_mtok": 1
+    },
+    "qwen-plus": {
+      "cache_read_per_mtok": 0.052,
+      "cache_write_per_mtok": 0.325,
+      "input_per_mtok": 0.26,
+      "output_per_mtok": 0.78
+    },
+    "qwen/qwen-2-5-72b-instruct": {
+      "input_per_mtok": 0.36,
+      "output_per_mtok": 0.4
+    },
+    "qwen/qwen-2-5-7b-instruct": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "qwen/qwen-2-5-coder-32b-instruct": {
+      "input_per_mtok": 0.66,
+      "output_per_mtok": 1
+    },
+    "qwen/qwen-2.5-72b-instruct": {
+      "input_per_mtok": 0.36,
+      "output_per_mtok": 0.4
+    },
+    "qwen/qwen-2.5-7b-instruct": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "qwen/qwen-2.5-coder-32b-instruct": {
+      "input_per_mtok": 0.66,
+      "output_per_mtok": 1
+    },
+    "qwen/qwen-plus": {
+      "cache_read_per_mtok": 0.052,
+      "cache_write_per_mtok": 0.325,
+      "input_per_mtok": 0.26,
+      "output_per_mtok": 0.78
+    },
+    "qwen/qwen2-5-vl-72b-instruct": {
+      "cache_read_per_mtok": 0.4,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1
+    },
+    "qwen/qwen2.5-vl-72b-instruct": {
+      "cache_read_per_mtok": 0.4,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1
+    },
+    "qwen/qwen3-14b": {
+      "input_per_mtok": 0.12,
+      "output_per_mtok": 0.24
+    },
+    "qwen/qwen3-235b-a22b-2507": {
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 0.55
+    },
+    "qwen/qwen3-235b-a22b-thinking-2507": {
+      "input_per_mtok": 0.45,
+      "output_per_mtok": 3.5
+    },
+    "qwen/qwen3-30b-a3b": {
+      "input_per_mtok": 0.12,
+      "output_per_mtok": 0.5
+    },
+    "qwen/qwen3-30b-a3b-instruct-2507": {
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 0.3
+    },
+    "qwen/qwen3-32b": {
+      "input_per_mtok": 0.08,
+      "output_per_mtok": 0.28
+    },
+    "qwen/qwen3-5-122b-a10b": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 3.2
+    },
+    "qwen/qwen3-5-27b": {
+      "cache_read_per_mtok": 0.27,
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 2.16
+    },
+    "qwen/qwen3-5-35b-a3b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 1
+    },
+    "qwen/qwen3-5-397b-a17b": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3.6
+    },
+    "qwen/qwen3-5-9b": {
+      "input_per_mtok": 0.17,
+      "output_per_mtok": 0.25
+    },
+    "qwen/qwen3-5-flash-02-23": {
+      "input_per_mtok": 0.065,
+      "output_per_mtok": 0.26
+    },
+    "qwen/qwen3-5-plus-02-15": {
+      "input_per_mtok": 0.26,
+      "output_per_mtok": 1.56
+    },
+    "qwen/qwen3-5-plus-20260420": {
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.8
+    },
+    "qwen/qwen3-6-27b": {
+      "input_per_mtok": 0.32,
+      "output_per_mtok": 3.2
+    },
+    "qwen/qwen3-6-35b-a3b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.95
+    },
+    "qwen/qwen3-6-flash": {
+      "cache_write_per_mtok": 0.234375,
+      "input_per_mtok": 0.1875,
+      "output_per_mtok": 1.125
+    },
+    "qwen/qwen3-6-plus": {
+      "cache_write_per_mtok": 0.40625,
+      "input_per_mtok": 0.325,
+      "output_per_mtok": 1.95
+    },
+    "qwen/qwen3-7-flash": {
+      "cache_read_per_mtok": 0.006,
+      "cache_write_per_mtok": 0.038,
+      "input_per_mtok": 0.03,
+      "output_per_mtok": 0.13
+    },
+    "qwen/qwen3-7-max": {
+      "cache_read_per_mtok": 0.295,
+      "cache_write_per_mtok": 1.84375,
+      "input_per_mtok": 1.475,
+      "output_per_mtok": 4.425
+    },
+    "qwen/qwen3-7-plus": {
+      "cache_read_per_mtok": 0.064,
+      "cache_write_per_mtok": 0.4,
+      "input_per_mtok": 0.32,
+      "output_per_mtok": 1.28
+    },
+    "qwen/qwen3-8-2-4t-a95b": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "qwen/qwen3-8-27b": {
+      "cache_read_per_mtok": 0.09,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 2.5
+    },
+    "qwen/qwen3-8-flash": {
+      "cache_read_per_mtok": 0.016,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.47
+    },
+    "qwen/qwen3-8-max-0902": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "qwen/qwen3-8-max-prime": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 12
+    },
+    "qwen/qwen3-8-omni-flash": {
+      "cache_read_per_mtok": 0.016,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.47
+    },
+    "qwen/qwen3-coder": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1
+    },
+    "qwen/qwen3-coder-30b-a3b-instruct": {
+      "input_per_mtok": 0.07,
+      "output_per_mtok": 0.28
+    },
+    "qwen/qwen3-coder-flash": {
+      "cache_read_per_mtok": 0.039,
+      "cache_write_per_mtok": 0.24375,
+      "input_per_mtok": 0.195,
+      "output_per_mtok": 0.975
+    },
+    "qwen/qwen3-coder-next": {
+      "cache_read_per_mtok": 0.07,
+      "input_per_mtok": 0.12,
+      "output_per_mtok": 0.8
+    },
+    "qwen/qwen3-next-80b-a3b-instruct": {
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 1.1
+    },
+    "qwen/qwen3-next-80b-a3b-thinking": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 1.2
+    },
+    "qwen/qwen3-vl-235b-a22b-instruct": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.21,
+      "output_per_mtok": 1.9
+    },
+    "qwen/qwen3-vl-30b-a3b-instruct": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "qwen/qwen3-vl-30b-a3b-thinking": {
+      "input_per_mtok": 0.29,
+      "output_per_mtok": 1
+    },
+    "qwen/qwen3-vl-8b-instruct": {
+      "cache_read_per_mtok": 0.12,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.75
+    },
+    "qwen/qwen3.5-122b-a10b": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 3.2
+    },
+    "qwen/qwen3.5-27b": {
+      "cache_read_per_mtok": 0.27,
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 2.16
+    },
+    "qwen/qwen3.5-35b-a3b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 1
+    },
+    "qwen/qwen3.5-397b-a17b": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3.6
+    },
+    "qwen/qwen3.5-9b": {
+      "input_per_mtok": 0.17,
+      "output_per_mtok": 0.25
+    },
+    "qwen/qwen3.5-flash-02-23": {
+      "input_per_mtok": 0.065,
+      "output_per_mtok": 0.26
+    },
+    "qwen/qwen3.5-plus-02-15": {
+      "input_per_mtok": 0.26,
+      "output_per_mtok": 1.56
+    },
+    "qwen/qwen3.5-plus-20260420": {
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.8
+    },
+    "qwen/qwen3.6-27b": {
+      "input_per_mtok": 0.32,
+      "output_per_mtok": 3.2
+    },
+    "qwen/qwen3.6-35b-a3b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.95
+    },
+    "qwen/qwen3.6-flash": {
+      "cache_write_per_mtok": 0.234375,
+      "input_per_mtok": 0.1875,
+      "output_per_mtok": 1.125
+    },
+    "qwen/qwen3.6-plus": {
+      "cache_write_per_mtok": 0.40625,
+      "input_per_mtok": 0.325,
+      "output_per_mtok": 1.95
+    },
+    "qwen/qwen3.7-flash": {
+      "cache_read_per_mtok": 0.006,
+      "cache_write_per_mtok": 0.038,
+      "input_per_mtok": 0.03,
+      "output_per_mtok": 0.13
+    },
+    "qwen/qwen3.7-max": {
+      "cache_read_per_mtok": 0.295,
+      "cache_write_per_mtok": 1.84375,
+      "input_per_mtok": 1.475,
+      "output_per_mtok": 4.425
+    },
+    "qwen/qwen3.7-plus": {
+      "cache_read_per_mtok": 0.064,
+      "cache_write_per_mtok": 0.4,
+      "input_per_mtok": 0.32,
+      "output_per_mtok": 1.28
+    },
+    "qwen/qwen3.8-2.4t-a95b": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "qwen/qwen3.8-27b": {
+      "cache_read_per_mtok": 0.09,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 2.5
+    },
+    "qwen/qwen3.8-flash": {
+      "cache_read_per_mtok": 0.016,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.47
+    },
+    "qwen/qwen3.8-max-0902": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "qwen/qwen3.8-max-prime": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 12
+    },
+    "qwen/qwen3.8-omni-flash": {
+      "cache_read_per_mtok": 0.016,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.47
+    },
+    "qwen2-5-vl-72b-instruct": {
+      "cache_read_per_mtok": 0.4,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1
+    },
+    "qwen2.5-vl-72b-instruct": {
+      "cache_read_per_mtok": 0.4,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 1
+    },
+    "qwen3-14b": {
+      "input_per_mtok": 0.12,
+      "output_per_mtok": 0.24
+    },
+    "qwen3-235b-a22b-2507": {
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 0.55
+    },
+    "qwen3-235b-a22b-thinking-2507": {
+      "input_per_mtok": 0.45,
+      "output_per_mtok": 3.5
+    },
+    "qwen3-30b-a3b": {
+      "input_per_mtok": 0.12,
+      "output_per_mtok": 0.5
+    },
+    "qwen3-30b-a3b-instruct-2507": {
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 0.3
+    },
+    "qwen3-32b": {
+      "input_per_mtok": 0.08,
+      "output_per_mtok": 0.28
+    },
+    "qwen3-5-122b-a10b": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 3.2
+    },
+    "qwen3-5-27b": {
+      "cache_read_per_mtok": 0.27,
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 2.16
+    },
+    "qwen3-5-35b-a3b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 1
+    },
+    "qwen3-5-397b-a17b": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3.6
+    },
+    "qwen3-5-9b": {
+      "input_per_mtok": 0.17,
+      "output_per_mtok": 0.25
+    },
+    "qwen3-5-flash-02-23": {
+      "input_per_mtok": 0.065,
+      "output_per_mtok": 0.26
+    },
+    "qwen3-5-plus-02-15": {
+      "input_per_mtok": 0.26,
+      "output_per_mtok": 1.56
+    },
+    "qwen3-5-plus-20260420": {
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.8
+    },
+    "qwen3-6-27b": {
+      "input_per_mtok": 0.32,
+      "output_per_mtok": 3.2
+    },
+    "qwen3-6-35b-a3b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.95
+    },
+    "qwen3-6-flash": {
+      "cache_write_per_mtok": 0.234375,
+      "input_per_mtok": 0.1875,
+      "output_per_mtok": 1.125
+    },
+    "qwen3-6-plus": {
+      "cache_write_per_mtok": 0.40625,
+      "input_per_mtok": 0.325,
+      "output_per_mtok": 1.95
+    },
+    "qwen3-7-flash": {
+      "cache_read_per_mtok": 0.006,
+      "cache_write_per_mtok": 0.038,
+      "input_per_mtok": 0.03,
+      "output_per_mtok": 0.13
+    },
+    "qwen3-7-max": {
+      "cache_read_per_mtok": 0.295,
+      "cache_write_per_mtok": 1.84375,
+      "input_per_mtok": 1.475,
+      "output_per_mtok": 4.425
+    },
+    "qwen3-7-plus": {
+      "cache_read_per_mtok": 0.064,
+      "cache_write_per_mtok": 0.4,
+      "input_per_mtok": 0.32,
+      "output_per_mtok": 1.28
+    },
+    "qwen3-8-2-4t-a95b": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "qwen3-8-27b": {
+      "cache_read_per_mtok": 0.09,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 2.5
+    },
+    "qwen3-8-flash": {
+      "cache_read_per_mtok": 0.016,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.47
+    },
+    "qwen3-8-max-0902": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "qwen3-8-max-prime": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 12
+    },
+    "qwen3-8-omni-flash": {
+      "cache_read_per_mtok": 0.016,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.47
+    },
+    "qwen3-coder": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1
+    },
+    "qwen3-coder-30b-a3b-instruct": {
+      "input_per_mtok": 0.07,
+      "output_per_mtok": 0.28
+    },
+    "qwen3-coder-flash": {
+      "cache_read_per_mtok": 0.039,
+      "cache_write_per_mtok": 0.24375,
+      "input_per_mtok": 0.195,
+      "output_per_mtok": 0.975
+    },
+    "qwen3-coder-next": {
+      "cache_read_per_mtok": 0.07,
+      "input_per_mtok": 0.12,
+      "output_per_mtok": 0.8
+    },
+    "qwen3-next-80b-a3b-instruct": {
+      "input_per_mtok": 0.09,
+      "output_per_mtok": 1.1
+    },
+    "qwen3-next-80b-a3b-thinking": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 1.2
+    },
+    "qwen3-vl-235b-a22b-instruct": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.21,
+      "output_per_mtok": 1.9
+    },
+    "qwen3-vl-30b-a3b-instruct": {
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "qwen3-vl-30b-a3b-thinking": {
+      "input_per_mtok": 0.29,
+      "output_per_mtok": 1
+    },
+    "qwen3-vl-8b-instruct": {
+      "cache_read_per_mtok": 0.12,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.75
+    },
+    "qwen3.5-122b-a10b": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 3.2
+    },
+    "qwen3.5-27b": {
+      "cache_read_per_mtok": 0.27,
+      "input_per_mtok": 0.27,
+      "output_per_mtok": 2.16
+    },
+    "qwen3.5-35b-a3b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 1
+    },
+    "qwen3.5-397b-a17b": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3.6
+    },
+    "qwen3.5-9b": {
+      "input_per_mtok": 0.17,
+      "output_per_mtok": 0.25
+    },
+    "qwen3.5-flash-02-23": {
+      "input_per_mtok": 0.065,
+      "output_per_mtok": 0.26
+    },
+    "qwen3.5-plus-02-15": {
+      "input_per_mtok": 0.26,
+      "output_per_mtok": 1.56
+    },
+    "qwen3.5-plus-20260420": {
+      "cache_write_per_mtok": 0.375,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 1.8
+    },
+    "qwen3.6-27b": {
+      "input_per_mtok": 0.32,
+      "output_per_mtok": 3.2
+    },
+    "qwen3.6-35b-a3b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.95
+    },
+    "qwen3.6-flash": {
+      "cache_write_per_mtok": 0.234375,
+      "input_per_mtok": 0.1875,
+      "output_per_mtok": 1.125
+    },
+    "qwen3.6-plus": {
+      "cache_write_per_mtok": 0.40625,
+      "input_per_mtok": 0.325,
+      "output_per_mtok": 1.95
+    },
+    "qwen3.7-flash": {
+      "cache_read_per_mtok": 0.006,
+      "cache_write_per_mtok": 0.038,
+      "input_per_mtok": 0.03,
+      "output_per_mtok": 0.13
+    },
+    "qwen3.7-max": {
+      "cache_read_per_mtok": 0.295,
+      "cache_write_per_mtok": 1.84375,
+      "input_per_mtok": 1.475,
+      "output_per_mtok": 4.425
+    },
+    "qwen3.7-plus": {
+      "cache_read_per_mtok": 0.064,
+      "cache_write_per_mtok": 0.4,
+      "input_per_mtok": 0.32,
+      "output_per_mtok": 1.28
+    },
+    "qwen3.8-2.4t-a95b": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "qwen3.8-27b": {
+      "cache_read_per_mtok": 0.09,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 2.5
+    },
+    "qwen3.8-flash": {
+      "cache_read_per_mtok": 0.016,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.47
+    },
+    "qwen3.8-max-0902": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "qwen3.8-max-prime": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 4,
+      "output_per_mtok": 12
+    },
+    "qwen3.8-omni-flash": {
+      "cache_read_per_mtok": 0.016,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.47
+    },
+    "reflection/beam-1-0-501b-a23b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1
+    },
+    "reflection/beam-1.0-501b-a23b": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 1
+    },
+    "reka-edge": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.1
+    },
+    "reka-flash-3": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "rekaai/reka-edge": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.1
+    },
+    "rekaai/reka-flash-3": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "relace-apply-3": {
+      "input_per_mtok": 0.85,
+      "output_per_mtok": 1.25
+    },
+    "relace-search": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 3
+    },
+    "relace/relace-apply-3": {
+      "input_per_mtok": 0.85,
+      "output_per_mtok": 1.25
+    },
+    "relace/relace-search": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 3
+    },
+    "remm-slerp-l2-13b": {
+      "input_per_mtok": 0.35,
+      "output_per_mtok": 0.65
+    },
+    "sakana-namazu": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.95,
+      "output_per_mtok": 4
+    },
+    "sakana/fugu-max": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "sakana/fugu-ultra": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "sakana/fugu-ultra-v2": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 5,
+      "output_per_mtok": 30
+    },
+    "sakana/sakana-namazu": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.95,
+      "output_per_mtok": 4
+    },
+    "sao10k/l3-1-euryale-70b": {
+      "input_per_mtok": 0.85,
+      "output_per_mtok": 0.85
+    },
+    "sao10k/l3-lunaris-8b": {
+      "input_per_mtok": 0.04,
+      "output_per_mtok": 0.05
+    },
+    "sao10k/l3.1-euryale-70b": {
+      "input_per_mtok": 0.85,
+      "output_per_mtok": 0.85
+    },
+    "schematron-v2-small": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.23
+    },
+    "schematron-v2-turbo": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.03,
+      "output_per_mtok": 0.15
+    },
+    "seed-1-6": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "seed-1-6-flash": {
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.3
+    },
+    "seed-1.6": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "seed-1.6-flash": {
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.3
+    },
+    "seed-2-0-code": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "seed-2-0-lite": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "seed-2-0-mini": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "seed-2-1-turbo": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 2.5
+    },
+    "seed-2.0-code": {
+      "input_per_mtok": 0.5,
+      "output_per_mtok": 3
+    },
+    "seed-2.0-lite": {
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 2
+    },
+    "seed-2.0-mini": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.4
+    },
+    "skyfall-36b-v2": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 0.55,
+      "output_per_mtok": 0.8
+    },
+    "solar-mini4": {
+      "cache_read_per_mtok": 0.005,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.2
+    },
+    "solar-pro-3": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "solar-pro4": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "sonar": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 1
+    },
+    "sonar-deep-research": {
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "sonar-pro": {
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "sonar-pro-search": {
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
+    "sonar-reasoning-pro": {
+      "input_per_mtok": 2,
+      "output_per_mtok": 8
+    },
+    "step-3-5-flash": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.3
+    },
+    "step-3-7-flash": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.15
+    },
+    "step-3.5-flash": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.3
+    },
+    "step-3.7-flash": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.15
+    },
+    "step-5-preview": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 1,
+      "output_per_mtok": 2.7
+    },
+    "stepfun/step-3-5-flash": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.3
+    },
+    "stepfun/step-3-7-flash": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.15
+    },
+    "stepfun/step-3.5-flash": {
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.3
+    },
+    "stepfun/step-3.7-flash": {
+      "cache_read_per_mtok": 0.04,
+      "input_per_mtok": 0.2,
+      "output_per_mtok": 1.15
+    },
+    "stepfun/step-5-preview": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 1,
+      "output_per_mtok": 2.7
+    },
+    "tencent/hunyuan-a13b-instruct": {
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 0.57
+    },
+    "tencent/hy-mt2-1-8b": {
+      "input_per_mtok": 0.044,
+      "output_per_mtok": 0.177
+    },
+    "tencent/hy-mt2-1.8b": {
+      "input_per_mtok": 0.044,
+      "output_per_mtok": 0.177
+    },
+    "tencent/hy-mt2-30b-a3b": {
+      "input_per_mtok": 0.074,
+      "output_per_mtok": 0.295
+    },
+    "tencent/hy-mt2-7b": {
+      "input_per_mtok": 0.074,
+      "output_per_mtok": 0.295
+    },
+    "tencent/hy3": {
+      "cache_read_per_mtok": 0.020625,
+      "input_per_mtok": 0.0825,
+      "output_per_mtok": 0.33
+    },
+    "tencent/hy3-preview": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.18,
+      "output_per_mtok": 0.6
+    },
+    "tencent/hy4-preview": {
+      "cache_read_per_mtok": 0.0378,
+      "input_per_mtok": 0.7506,
+      "output_per_mtok": 2.2509
+    },
+    "ternary-bonsai-2-27b": {
+      "cache_read_per_mtok": 0.0375,
+      "input_per_mtok": 0.075,
+      "output_per_mtok": 0.5
+    },
+    "thedrummer/cydonia-24b-v4-1": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.5
+    },
+    "thedrummer/cydonia-24b-v4.1": {
+      "cache_read_per_mtok": 0.15,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.5
+    },
+    "thedrummer/skyfall-36b-v2": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 0.55,
+      "output_per_mtok": 0.8
+    },
+    "thedrummer/unslopnemo-12b": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 0.4
+    },
+    "thinkingmachines/inkling": {
+      "cache_read_per_mtok": 0.17,
+      "input_per_mtok": 1,
+      "output_per_mtok": 4.05
+    },
+    "thinkingmachines/inkling-small": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.45,
+      "output_per_mtok": 1.2
+    },
+    "trinity-large-thinking": {
+      "cache_read_per_mtok": 0.06,
+      "input_per_mtok": 0.25,
+      "output_per_mtok": 0.8
+    },
+    "ui-tars-1-5-7b": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "ui-tars-1.5-7b": {
+      "cache_read_per_mtok": 0.1,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.2
+    },
+    "unbiased/pareto-26-10": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 3.2
+    },
+    "unbiased/pareto-26-9": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 7.5
+    },
+    "unbiased/pareto-26.10": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.8,
+      "output_per_mtok": 3.2
+    },
+    "unbiased/pareto-26.9": {
+      "cache_read_per_mtok": 0.25,
+      "input_per_mtok": 2.5,
+      "output_per_mtok": 7.5
+    },
+    "undi95/remm-slerp-l2-13b": {
+      "input_per_mtok": 0.35,
+      "output_per_mtok": 0.65
+    },
+    "unslopnemo-12b": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 0.4
+    },
+    "upstage/solar-mini4": {
+      "cache_read_per_mtok": 0.005,
+      "input_per_mtok": 0.05,
+      "output_per_mtok": 0.2
+    },
+    "upstage/solar-pro-3": {
+      "cache_read_per_mtok": 0.015,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "upstage/solar-pro4": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
+    },
+    "voxtral-small-24b-2507": {
+      "cache_read_per_mtok": 0.01,
+      "input_per_mtok": 0.1,
+      "output_per_mtok": 0.3
+    },
+    "weaver": {
+      "input_per_mtok": 0.4,
+      "output_per_mtok": 0.75
+    },
+    "writer/palmyra-x5": {
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 6
+    },
+    "x-ai/grok-4-20": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "x-ai/grok-4-20-multi-agent": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "x-ai/grok-4-3": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "x-ai/grok-4-5": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "x-ai/grok-4-6": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "x-ai/grok-4-7": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "x-ai/grok-4.20": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "x-ai/grok-4.20-multi-agent": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "x-ai/grok-4.3": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1.25,
+      "output_per_mtok": 2.5
+    },
+    "x-ai/grok-4.5": {
+      "cache_read_per_mtok": 0.3,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "x-ai/grok-4.6": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "x-ai/grok-4.7": {
+      "cache_read_per_mtok": 0.5,
+      "input_per_mtok": 2,
+      "output_per_mtok": 6
+    },
+    "x-ai/grok-build-0-1": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1,
+      "output_per_mtok": 2
+    },
+    "x-ai/grok-build-0.1": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1,
+      "output_per_mtok": 2
+    },
+    "xiaomi/mimo-v2-5": {
+      "cache_read_per_mtok": 0.00255,
+      "input_per_mtok": 0.119,
+      "output_per_mtok": 0.238
+    },
+    "xiaomi/mimo-v2-5-pro": {
+      "cache_read_per_mtok": 0.0028,
+      "input_per_mtok": 0.3045,
+      "output_per_mtok": 0.609
+    },
+    "xiaomi/mimo-v2-6-flash": {
+      "cache_read_per_mtok": 0.0028,
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 0.28
+    },
+    "xiaomi/mimo-v2-6-pro": {
+      "cache_read_per_mtok": 0.0036,
+      "input_per_mtok": 0.435,
+      "output_per_mtok": 0.87
+    },
+    "xiaomi/mimo-v2-6-pro-ultraspeed": {
+      "cache_read_per_mtok": 0.036,
+      "input_per_mtok": 4.35,
+      "output_per_mtok": 8.7
+    },
+    "xiaomi/mimo-v2.5": {
+      "cache_read_per_mtok": 0.00255,
+      "input_per_mtok": 0.119,
+      "output_per_mtok": 0.238
+    },
+    "xiaomi/mimo-v2.5-pro": {
+      "cache_read_per_mtok": 0.0028,
+      "input_per_mtok": 0.3045,
+      "output_per_mtok": 0.609
+    },
+    "xiaomi/mimo-v2.6-flash": {
+      "cache_read_per_mtok": 0.0028,
+      "input_per_mtok": 0.14,
+      "output_per_mtok": 0.28
+    },
+    "xiaomi/mimo-v2.6-pro": {
+      "cache_read_per_mtok": 0.0036,
+      "input_per_mtok": 0.435,
+      "output_per_mtok": 0.87
+    },
+    "xiaomi/mimo-v2.6-pro-ultraspeed": {
+      "cache_read_per_mtok": 0.036,
+      "input_per_mtok": 4.35,
+      "output_per_mtok": 8.7
+    },
+    "z-ai/glm-4-5": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.2
+    },
+    "z-ai/glm-4-5-air": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.13,
+      "output_per_mtok": 0.85
+    },
+    "z-ai/glm-4-5v": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 1.8
+    },
+    "z-ai/glm-4-6": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.55,
+      "output_per_mtok": 2.2
+    },
+    "z-ai/glm-4-6v": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.9
+    },
+    "z-ai/glm-4-7": {
+      "cache_read_per_mtok": 0.099,
+      "input_per_mtok": 0.54,
+      "output_per_mtok": 1.98
+    },
+    "z-ai/glm-4-7-flash": {
+      "input_per_mtok": 0.0605,
+      "output_per_mtok": 0.4
+    },
+    "z-ai/glm-4.5": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 2.2
+    },
+    "z-ai/glm-4.5-air": {
+      "cache_read_per_mtok": 0.025,
+      "input_per_mtok": 0.13,
+      "output_per_mtok": 0.85
+    },
+    "z-ai/glm-4.5v": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 1.8
+    },
+    "z-ai/glm-4.6": {
+      "cache_read_per_mtok": 0.11,
+      "input_per_mtok": 0.55,
+      "output_per_mtok": 2.2
+    },
+    "z-ai/glm-4.6v": {
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.3,
+      "output_per_mtok": 0.9
+    },
+    "z-ai/glm-4.7": {
+      "cache_read_per_mtok": 0.099,
+      "input_per_mtok": 0.54,
+      "output_per_mtok": 1.98
+    },
+    "z-ai/glm-4.7-flash": {
+      "input_per_mtok": 0.0605,
+      "output_per_mtok": 0.4
+    },
+    "z-ai/glm-5": {
+      "cache_read_per_mtok": 0.2,
+      "input_per_mtok": 1,
+      "output_per_mtok": 3.2
+    },
+    "z-ai/glm-5-1": {
+      "cache_read_per_mtok": 0.26,
+      "input_per_mtok": 1.4,
+      "output_per_mtok": 4.4
+    },
+    "z-ai/glm-5-2": {
+      "cache_read_per_mtok": 0.033,
+      "input_per_mtok": 0.0341,
+      "output_per_mtok": 7
+    },
+    "z-ai/glm-5-3": {
+      "cache_read_per_mtok": 0.078,
+      "input_per_mtok": 0.079,
+      "output_per_mtok": 1.4
+    },
+    "z-ai/glm-5-3-flash": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.5
+    },
+    "z-ai/glm-5-3-flashx": {
+      "cache_read_per_mtok": 0.09,
+      "input_per_mtok": 0.37,
+      "output_per_mtok": 1.25
+    },
+    "z-ai/glm-5-3-prime": {
+      "cache_read_per_mtok": 0.56,
+      "input_per_mtok": 2.8,
+      "output_per_mtok": 8.8
+    },
+    "z-ai/glm-5-turbo": {
+      "cache_read_per_mtok": 0.24,
+      "input_per_mtok": 1.2,
+      "output_per_mtok": 4
+    },
+    "z-ai/glm-5.1": {
+      "cache_read_per_mtok": 0.26,
+      "input_per_mtok": 1.4,
+      "output_per_mtok": 4.4
+    },
+    "z-ai/glm-5.2": {
+      "cache_read_per_mtok": 0.033,
+      "input_per_mtok": 0.0341,
+      "output_per_mtok": 7
+    },
+    "z-ai/glm-5.3": {
+      "cache_read_per_mtok": 0.078,
+      "input_per_mtok": 0.079,
+      "output_per_mtok": 1.4
+    },
+    "z-ai/glm-5.3-flash": {
+      "cache_read_per_mtok": 0.03,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.5
+    },
+    "z-ai/glm-5.3-flashx": {
+      "cache_read_per_mtok": 0.09,
+      "input_per_mtok": 0.37,
+      "output_per_mtok": 1.25
+    },
+    "z-ai/glm-5.3-prime": {
+      "cache_read_per_mtok": 0.56,
+      "input_per_mtok": 2.8,
+      "output_per_mtok": 8.8
+    },
+    "z-ai/glm-5v-turbo": {
+      "cache_read_per_mtok": 0.24,
+      "input_per_mtok": 1.2,
+      "output_per_mtok": 4
+    }
+  },
+  "pricing_updated": "2026-10-25",
+  "table_version": "openrouter-2026-10-25"
+}

@@ -1652,6 +1652,7 @@ mod async_tests {
                     tokens: Some(0),
                     turns: None,
                     duration: None,
+                    usd: None,
                 },
             );
             let selected = selector
@@ -1682,6 +1683,7 @@ mod async_tests {
                     tokens: None,
                     turns: None,
                     duration: Some(std::time::Duration::from_millis(1)),
+                    usd: None,
                 },
             );
             let ctx = SelectionContext {

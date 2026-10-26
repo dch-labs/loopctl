@@ -81,11 +81,13 @@ use crate::contributor::{ContextContributor, ContributorContext};
 #[cfg(all(test, feature = "hooks"))]
 use crate::hooks::Hook;
 #[cfg(feature = "hooks")]
+use crate::hooks::context::RunEndContext as HookRunEndContext;
+#[cfg(all(test, feature = "hooks"))]
+use crate::hooks::context::RunEndReason;
+#[cfg(feature = "hooks")]
 use crate::hooks::context::{
     CompactTrigger, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
 };
-#[cfg(all(test, feature = "hooks"))]
-use crate::hooks::context::{RunEndContext as HookRunEndContext, RunEndReason};
 #[cfg(feature = "hooks")]
 use crate::hooks::{HookAction, HookExecutor};
 use crate::managers::LoopManagers;
@@ -900,6 +902,125 @@ impl EstimateCalibration {
 }
 
 impl<C: ApiClient> BareLoop<C> {
+    /// Prepare the run's first turn and record its context estimate.
+    ///
+    /// The prologue every turn-driving pass shares: the machine has just
+    /// accepted an input (the user's prompt, or a hook-injected follow-up),
+    /// and the first model call needs its prepared tools and a context
+    /// estimate before [`next_step`](crate::engine::core::LoopMachine::next_step)
+    /// can answer. Runs before each pass of [`drive_steps`](Self::drive_steps).
+    async fn arm_first_turn(&mut self) {
+        let prepared = self.prepare_turn(0).await;
+        let estimate = self.context_figure(
+            self.count_context(&self.machine.full_history())
+                .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
+                .saturating_add(self.count_context(&prepared.messages)),
+        );
+        self.machine.set_context_tokens(estimate);
+        self.prepared_turn = Some(prepared);
+    }
+
+    /// Arm the continuation turn a follow-up injected, at its true index.
+    ///
+    /// The follow-up counterpart of [`arm_first_turn`](Self::arm_first_turn):
+    /// prepares the next turn of the run's sequence — memory retrieval,
+    /// contributors, and tool schemas keyed on the follow-up prompt, which
+    /// `turn_input` reads as the newest history message — and feeds the
+    /// fresh context estimate before the step loop resumes. The injected
+    /// turn gets the same preparation a user turn would, at the index the
+    /// run's counter already reached.
+    #[cfg(feature = "hooks")]
+    async fn arm_followup_turn(&mut self) {
+        let turn = self.machine.turns_taken();
+        let prepared = self.prepare_turn(turn).await;
+        let estimate = self.context_figure(
+            self.count_context(&self.machine.full_history())
+                .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
+                .saturating_add(self.count_context(&prepared.messages)),
+        );
+        self.machine.set_context_tokens(estimate);
+        self.prepared_turn = Some(prepared);
+    }
+
+    /// Drive the machine's steps until the run's turn sequence ends.
+    ///
+    /// One pass of the run's core: model calls, tool dispatch, and
+    /// compaction, in the machine's chosen order, until the machine
+    /// reports `Done`. Errors are recorded into the machine's error
+    /// state (where the arm applies one) and returned for the caller
+    /// to finalize — the finalize sequence itself stays in
+    /// [`run`](Self::run), so every end, ordinary or injected or
+    /// failed, funnels through one place.
+    ///
+    /// # Errors
+    ///
+    /// The step's [`LoopError`] verbatim; the caller finalizes the run
+    /// with it.
+    async fn drive_steps(&mut self, run_config: &RunConfig) -> Result<(), LoopError> {
+        loop {
+            let policy = self.machine_policy();
+            match self.machine.next_step(policy) {
+                MachineStep::CallLLM { turn } => {
+                    if let Err(e) = self.handle_call_llm(turn).await {
+                        self.set_error_state(&e);
+                        return Err(e);
+                    }
+                }
+                MachineStep::CallTools { turn, calls } => {
+                    if let Err(e) = self.handle_call_tools(turn, &calls).await {
+                        self.set_error_state(&e);
+                        return Err(e);
+                    }
+                }
+                MachineStep::Compact { reason } => {
+                    self.prepared_turn = None;
+                    if let Err(e) = self.handle_compact(reason).await {
+                        self.set_error_state(&e);
+                        return Err(e);
+                    }
+                }
+                MachineStep::Done(outcome) => match outcome {
+                    MachineOutcome::Completed { final_text } => {
+                        if let Some(run) = self.session.current_run_mut() {
+                            run.output = Some(final_text);
+                        }
+                        return Ok(());
+                    }
+                    other => {
+                        if let Some(err) = other.to_loop_error(run_config.max_turns) {
+                            return Err(err);
+                        }
+                        return Err(LoopError::Internal(format!(
+                            "unmapped terminal outcome: {other:?}"
+                        )));
+                    }
+                },
+            }
+        }
+    }
+
+    /// Ask the registered hooks for one follow-up turn.
+    ///
+    /// The consult half of the hook follow-up: builds the run-end
+    /// context the hooks see (the same shape the `on_run_end`
+    /// notification later fires) and offers the clean run's end to the
+    /// executor, which short-circuits at the first hook that accepts.
+    /// `None` when no executor is configured or every hook declines.
+    /// The no-loop bound is the caller's single consult — this method
+    /// is called exactly once per `run()`, on the first clean end.
+    #[cfg(feature = "hooks")]
+    fn collect_followup(&self) -> Option<crate::hooks::PostRunAction> {
+        let executor = crate::capabilities::Hookable::hook_executor(&self.managers)?;
+        let run = self.session.current_run()?;
+        let ctx = HookRunEndContext {
+            session_id: self.session.id,
+            reason: self.run_end_reason(None),
+            total_turns: run.turn_count(),
+            total_tokens: run.total_tokens(),
+            duration_secs: run.duration().as_secs(),
+        };
+        executor.run_followup(&ctx)
+    }
     /// The hard ceiling on tool-recovery retry attempts.
     ///
     /// This single value is the retry budget, enforced at **two** points that
@@ -1780,6 +1901,7 @@ impl<C: ApiClient> BareLoop<C> {
             output: None,
             config: config.clone(),
             stop_reason: None,
+            followup_origin: None,
         }
     }
 
@@ -3007,63 +3129,25 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 self.finalize(Some(&e)).await?;
                 return Err(e);
             }
-            let prepared = self.prepare_turn(0).await;
-            let estimate = self.context_figure(
-                self.count_context(&self.machine.full_history())
-                    .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
-                    .saturating_add(self.count_context(&prepared.messages)),
-            );
-            self.machine.set_context_tokens(estimate);
-            self.prepared_turn = Some(prepared);
-
-            loop {
-                let policy = self.machine_policy();
-                match self.machine.next_step(policy) {
-                    MachineStep::CallLLM { turn } => {
-                        if let Err(e) = self.handle_call_llm(turn).await {
-                            self.set_error_state(&e);
-                            self.finalize(Some(&e)).await?;
-                            return Err(e);
-                        }
-                    }
-                    MachineStep::CallTools { turn, calls } => {
-                        if let Err(e) = self.handle_call_tools(turn, &calls).await {
-                            self.set_error_state(&e);
-                            self.finalize(Some(&e)).await?;
-                            return Err(e);
-                        }
-                    }
-                    MachineStep::Compact { reason } => {
-                        self.prepared_turn = None;
-                        if let Err(e) = self.handle_compact(reason).await {
-                            self.set_error_state(&e);
-                            self.finalize(Some(&e)).await?;
-                            return Err(e);
-                        }
-                    }
-                    MachineStep::Done(outcome) => match outcome {
-                        MachineOutcome::Completed { final_text } => {
-                            if let Some(run) = self.session.current_run_mut() {
-                                run.output = Some(final_text);
-                            }
-                            break;
-                        }
-                        other => {
-                            if let Some(err) = other.to_loop_error(run_config.max_turns) {
-                                self.finalize(Some(&err)).await?;
-                                return Err(err);
-                            }
-                            // MachineOutcome is non_exhaustive: a future
-                            // variant that maps to no error must not fall
-                            // through to finalize(None) and commit as a
-                            // successful run.
-                            let err = LoopError::Internal(format!(
-                                "unmapped terminal outcome: {other:?}"
-                            ));
-                            self.finalize(Some(&err)).await?;
-                            return Err(err);
-                        }
-                    },
+            self.arm_first_turn().await;
+            if let Err(e) = self.drive_steps(run_config).await {
+                self.finalize(Some(&e)).await?;
+                return Err(e);
+            }
+            #[cfg(feature = "hooks")]
+            if self.machine.turns_taken() < run_config.max_turns
+                && let Some(action) = self.collect_followup()
+            {
+                let crate::hooks::PostRunAction::FollowUp { prompt, origin } = action;
+                if let Some(run) = self.session.current_run_mut() {
+                    run.followup_origin = Some(origin);
+                    run.output = None;
+                }
+                self.machine.accept_followup(&prompt);
+                self.arm_followup_turn().await;
+                if let Err(e) = self.drive_steps(run_config).await {
+                    self.finalize(Some(&e)).await?;
+                    return Err(e);
                 }
             }
 

@@ -38,6 +38,7 @@ use std::sync::Arc;
 use crate::hooks::Hook;
 use crate::hooks::HookAction;
 use crate::hooks::Interactivity;
+use crate::hooks::PostRunAction;
 use crate::hooks::context::{
     CompactResult, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
     RunEndContext, RunStartContext,
@@ -295,6 +296,28 @@ impl HookExecutor {
         for hook in &self.hooks {
             hook.on_run_end(ctx);
         }
+    }
+
+    /// Consult the hooks for a follow-up turn after a clean run end.
+    ///
+    /// Asks each hook's [`Hook::on_run_followup`] in registration
+    /// order and stops at the first `Some` — the same short-circuit
+    /// the pre-tool-use consult applies. Declining is a pass, not a
+    /// veto: a hook that returns `None` simply hands the offer to the
+    /// next hook, and only an acceptance ends the consult — a policy
+    /// that wants the final say registers first and accepts or
+    /// declines on its own decision. The caller drives at most one
+    /// injected turn per run and never consults again for that turn's
+    /// own end: the one-follow-up bound lives in the engine's run
+    /// loop, not in the policies.
+    #[must_use]
+    pub fn run_followup(&self, ctx: &RunEndContext) -> Option<PostRunAction> {
+        for hook in &self.hooks {
+            if let Some(action) = hook.on_run_followup(ctx) {
+                return Some(action);
+            }
+        }
+        None
     }
 
     /// Async wrapper for [`notify_post_compact`](Self::notify_post_compact).

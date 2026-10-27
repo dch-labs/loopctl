@@ -57,6 +57,7 @@ use crate::tool::shield::{SafetyAction, ShieldContext, ToolSafetyShield};
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use loopctl::middleware::{SafetyShieldMiddleware, ToolPipeline};
 /// use loopctl::tool::shield::UnixShield;
 /// use std::sync::Arc;

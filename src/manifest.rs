@@ -17,6 +17,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the surrounding bindings are elided
 //! let document = ManifestDocument::parse(&yaml_text)?;
 //! let resolved = document.resolve(Some("cheap"), &EnvVars)?;
 //! println!("pinned config hash: {}", resolved.config_hash());

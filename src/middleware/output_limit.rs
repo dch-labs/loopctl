@@ -26,6 +26,7 @@ use std::pin::Pin;
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use loopctl::middleware::OutputLimitMiddleware;
 ///
 /// let pipeline = ToolPipeline::builder()

@@ -33,6 +33,7 @@ use crate::message::Message;
 /// # Examples
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use loopctl::contributor::{ContextContributor, ContributorContext};
 /// use loopctl::message::{Message, MessagePart, Role};

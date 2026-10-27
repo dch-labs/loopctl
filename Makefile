@@ -1,4 +1,4 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama conformance check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama conformance check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check doc-census
 
 ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check client-check
 
@@ -30,6 +30,13 @@ windows-check:
 
 fmt:
 	cargo fmt --all -- --check
+
+doc-census:
+	@out=$$(cargo test --test doctest_census 2>&1); status=$$?; \
+	totals=$$(cargo test --test doctest_census -- --nocapture the_census_reports_live_totals 2>&1 | grep '^doc blocks:'); \
+	printf '%s\n' "$${totals:-doc blocks: n/a — the census failed}"; \
+	if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; else printf '%s\n' "$$out" | tail -1; fi; \
+	exit $$status
 
 lint:
 	cargo fmt --all

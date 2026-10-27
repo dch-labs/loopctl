@@ -7,6 +7,7 @@
 //! # Construction
 //!
 //! ```rust,ignore
+//! // ignore — constructing the client reads its credential from the environment
 //! use loopctl::provider::GeminiClient;
 //!
 //! // From environment (GEMINI_API_KEY or GOOGLE_API_KEY):

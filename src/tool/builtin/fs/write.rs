@@ -1068,7 +1068,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("member-repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
-        let sibling = dir.path().join("AGENTS.md");
+        let sibling = dir.path().join("CONTEXT.md");
         std::fs::write(&sibling, "neighbor context").expect("sibling");
         let session = FileSession::new(repo.clone());
         let error = write_inner(

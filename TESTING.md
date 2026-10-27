@@ -139,3 +139,39 @@ proves stale conformance. Provider drift therefore re-enters the
 system only through this deliberate act: re-record, re-run the replay
 suites and the conformance battery, and regenerate the matrix. A
 release never ships on a corpus older than the release before it.
+
+## 14. Doctests: the census
+
+Every doc example either runs in CI or says why it cannot. Three rules,
+all enforced by `tests/doctest_census.rs` (a plain integration test, so
+every `make ci` test leg runs it; `make doc-census` prints the live
+totals — counted by the same parser the gates use, so plain `` ``` ``
+fences count as the Rust doctests they are):
+
+- **An ignored fence states its reason.** Ignored Rust fences — the
+  `ignore` word read one at a time, comma- or space-separated, so
+  modifiers like `rust,ignore,edition2021` and `rust ignore` cannot
+  escape the rule — open with `// ignore — <why>` as their first body
+  line — the reason lives inside the block, because rustdoc extracts
+  nothing from a fence whose info string carries any non-ASCII
+  character (an em dash typed before a reason deletes the doctest
+  silently); the census fails that shape as malformed. The marker must
+  start the line: a string or a trailing comment carrying the text is
+  code, not a reason.
+- **An example that defines `fn example` must call it.** Rustdoc wraps a
+  doctest body in its own `fn main`, so a hidden wrapper nothing drives
+  is dead code: the block compiles, "passes", and asserts nothing.
+  Driving means an actual `example()` call in code — a string literal or
+  a comment merely naming the call drives nothing, and a
+  definition-shaped empty `fn main` or an unrelated `block_on` proves
+  nothing. Sync examples end
+  with `# fn main() { # example(); # }` (the `testing` gate rides the
+  call); async ones are driven through
+  `# tokio::runtime::Runtime::new().unwrap().block_on(example())`.
+- **The census reads everything it walks.** An unreadable path under
+  `src/` fails the test naming it — a silent skip reports a clean tree
+  the census never read. Fence boundaries follow the CommonMark rules
+  rustdoc follows: a closing marker matches its opener's length and
+  carries no trailing text, and an unterminated fence ends with its doc
+  block at the first non-doc line, so it cannot swallow the next
+  item's examples.

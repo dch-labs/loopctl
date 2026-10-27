@@ -40,6 +40,7 @@ pub(crate) const UNSUPPORTED_LISTING_MESSAGE: &str =
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the search_tool binding is elided
 /// use loopctl::api::StreamRequest;
 ///
 /// let req = StreamRequest::new(vec![Message::user("hi")])
@@ -182,6 +183,7 @@ pub struct NonStreamingResponse {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — references a user-defined type the fence does not define
 /// struct MyProviderClient {
 ///     api_key: String,
 ///     model: String,
@@ -585,6 +587,7 @@ pub(crate) fn unsupported_structured_output_error(
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — references a user-defined type the fence does not define
 /// let client: BoxedApiClient = Box::new(MyProviderClient::new(api_key));
 /// assert_eq!(client.model(), "llm-1");
 /// ```
@@ -601,6 +604,7 @@ pub type BoxedApiClient = Box<dyn ApiClient>;
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — references a user-defined type the fence does not define
 /// let client: SharedApiClient = Arc::new(MyProviderClient::new(api_key));
 /// let agent_client = client.clone();
 /// let metrics_client = client.clone();

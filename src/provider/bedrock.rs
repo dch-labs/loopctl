@@ -91,6 +91,7 @@ struct Credentials {
 /// # Construction
 ///
 /// ```rust,ignore
+/// // ignore — constructing the client reads its credential from the environment
 /// use loopctl::provider::BedrockClient;
 ///
 /// // From AWS env vars (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,

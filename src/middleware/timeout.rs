@@ -66,6 +66,7 @@ impl Default for TimeoutConfig {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// let mw = TimeoutMiddleware::from_secs(120);
 /// let mw = TimeoutMiddleware::new(TimeoutConfig {
 ///     timeout: Duration::from_secs(60),

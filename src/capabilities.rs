@@ -24,6 +24,7 @@
 //! without pulling in the full [`LoopManagers`](crate::managers::LoopManagers):
 //!
 //! ```rust,ignore
+//! // ignore — API-shape fragment — an illustrative method body, not self-contained
 //! fn check_patterns(runtime: &impl Detectable) {
 //!     let pattern = runtime.detection().record_tool_call("Read", hash);
 //! }
@@ -59,6 +60,7 @@ use crate::tool::health::ToolHealthRegistry;
 /// events but don't need any other infrastructure capabilities.
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// fn run_step(runtime: &impl Observable) {
 ///     runtime.observers().on_turn_start(&ctx);
 ///     // ... do work ...
@@ -91,6 +93,7 @@ pub trait Observable {
 /// and check whether a loop or convergence pattern has been detected.
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// fn check_patterns(runtime: &impl Detectable) {
 ///     let pattern = runtime.detection().record_tool_call("Read", hash);
 ///     if let DetectedPattern::LoopDetected { .. } = pattern {
@@ -122,6 +125,7 @@ pub trait Detectable {
 /// whether the circuit breaker has tripped.
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// fn handle_stream_error(runtime: &impl FallbackCapable) {
 ///     let tripped = runtime.fallback().record_failure(loopctl::fallback::FailureKind::Transient);
 ///     if tripped {
@@ -265,6 +269,7 @@ pub trait Hookable {
 /// optional middleware.
 ///
 /// ```rust,ignore
+/// // ignore — API-shape fragment — an illustrative method body, not self-contained
 /// async fn dispatch(runtime: &impl PipelineAware, ctx: ToolDispatchContext) {
 ///     if let Some(pipeline) = runtime.pipeline() {
 ///         pipeline.invoke(ctx).await

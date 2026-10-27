@@ -43,6 +43,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the surrounding bindings are elided
 //! use loopctl::tool::shield::{UnixShield, ToolSafetyShield, ShieldContext};
 //!
 //! let shield = UnixShield::new();
@@ -1086,6 +1087,7 @@ impl ToolSafetyShield for UnixShield {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// use loopctl::tool::shield::{UnixShield, RiskPattern, CombinationRule};
 ///
 /// let shield = UnixShield::builder()

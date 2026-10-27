@@ -17,6 +17,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the client/registry/config bindings are elided
 //! use loopctl::engine::BareLoop;
 //! use loopctl::presets::ConstrainedProfile;
 //! use loopctl::tool::ToolRegistry;
@@ -255,6 +256,7 @@ impl ConstrainedProfile {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// use loopctl::engine::BareLoop;
     /// use loopctl::presets::ConstrainedProfile;
     /// use loopctl::tool::ToolRegistry;
@@ -350,6 +352,7 @@ impl FrontierProfile {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the client/registry/config bindings are elided
     /// let mut agent = BareLoop::new(client, tools, config);
     /// FrontierProfile::apply(&mut agent).unwrap();
     /// ```

@@ -7,6 +7,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the surrounding bindings are elided
 //! use loopctl::cancel::CancelSignal;
 //! use std::sync::Arc;
 //!
@@ -99,6 +100,7 @@ impl CancelSignal {
     /// Use inside `tokio::select!` alongside the actual work future:
     ///
     /// ```rust,ignore
+    /// // ignore — schematic fragment — the surrounding bindings are elided
     /// tokio::select! {
     ///     r = work_future => r,
     ///     _ = signal.notified() => Err("cancelled"),

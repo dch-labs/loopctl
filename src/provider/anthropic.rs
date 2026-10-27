@@ -6,6 +6,7 @@
 //! # Construction
 //!
 //! ```rust,ignore
+//! // ignore — constructing the client reads its credential from the environment
 //! use loopctl::provider::AnthropicClient;
 //!
 //! // From environment (ANTHROPIC_API_KEY):

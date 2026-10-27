@@ -884,6 +884,7 @@ pub type RunResult = Result<Run, LoopError>;
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — references a user-defined type the fence does not define
 /// use loopctl::engine::core::Loop;
 /// use loopctl::engine::RunConfig;
 /// use loopctl::engine::core::{MachineState, Run};

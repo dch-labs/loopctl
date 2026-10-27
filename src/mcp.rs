@@ -67,7 +67,7 @@
 //! `examples/mcp_server.rs` for serving a registry over stdio. The client
 //! direction in short:
 //!
-//! ```rust,ignore
+//! ```
 //! use loopctl::mcp::{McpClient, McpToolProvider};
 //! use loopctl::tool::ToolRegistry;
 //!
@@ -828,6 +828,7 @@ impl McpToolProvider {
     /// # Example
     ///
     /// ```rust,ignore
+    /// // ignore — fragment — the client binding is elided
     /// let provider = McpToolProvider::connect(client, None).await?;
     /// for tool in provider.tools() {
     ///     println!("{}: {}", tool.name(), tool.description());

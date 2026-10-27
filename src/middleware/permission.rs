@@ -49,6 +49,7 @@ pub type AskResolverFn =
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — schematic fragment — the surrounding bindings are elided
 /// // Deny all by default
 /// let mw = PermissionMiddleware::deny_all();
 ///

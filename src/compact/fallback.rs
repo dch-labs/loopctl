@@ -37,6 +37,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — fragment — the client binding is elided
 //! use loopctl::compact::FallbackCompactor;
 //! use loopctl::compact::ContextManager;
 //! use std::sync::Arc;

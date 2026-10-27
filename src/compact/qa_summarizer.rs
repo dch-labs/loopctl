@@ -28,6 +28,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — fragment — the client binding is elided
 //! use loopctl::compact::qa_summarizer::{QaSummarizer, QaSummarizerConfig};
 //! use loopctl::compact::ContextManager;
 //! use std::sync::Arc;
@@ -532,6 +533,7 @@ impl Default for QaSummarizerConfig {
 /// # Example
 ///
 /// ```rust,ignore
+/// // ignore — fragment — the client binding is elided
 /// use loopctl::compact::qa_summarizer::{QaSummarizer, QaSummarizerConfig};
 /// use loopctl::compact::ContextManager;
 /// use std::sync::Arc;

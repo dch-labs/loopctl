@@ -9,6 +9,7 @@
 //! # Construction
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the client/registry/config bindings are elided
 //! use loopctl::reflection::LlmReflector;
 //! use std::sync::Arc;
 //!

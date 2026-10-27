@@ -8,6 +8,7 @@
 //! # Construction
 //!
 //! ```rust,ignore
+//! // ignore — constructing the client reads its credential from the environment
 //! use loopctl::provider::OpenAiClient;
 //!
 //! // From environment (OPENAI_API_KEY, optional OPENAI_BASE_URL):

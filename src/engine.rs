@@ -19,6 +19,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — schematic fragment — the client/registry/config bindings are elided
 //! use loopctl::engine::BareLoop;
 //! use loopctl::engine::RunConfig;
 //! use loopctl::tool::ToolRegistry;

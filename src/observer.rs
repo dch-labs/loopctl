@@ -32,6 +32,7 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! // ignore — API-shape fragment — an illustrative method body, not self-contained
 //! use loopctl::observer::{LoopObserver, RunStartContext};
 //!
 //! struct MetricsObserver;

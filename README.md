@@ -32,6 +32,7 @@ and tool implementations; the framework handles the rest.
 | [`fallback`](https://docs.rs/loopctl/latest/loopctl/fallback/index.html) | Circuit-breaker pattern for automatic API model fallback (`FallbackManager`) |
 | [`memory`](https://docs.rs/loopctl/latest/loopctl/memory/index.html) | `LoopMemory` trait and entry types; `memory::builtin` provides `InMemoryStore`; `memory::search_tool` provides `SearchMemoriesTool` — a read-only `Tool` the model itself calls (`search_memories`) to query any `LoopMemory` store mid-turn, the active complement to the engine's bounded per-turn retrieval, rendering results under the same provenance framing as the passive path and excluding `provider-derived` entries unless opted in; `memory::trajectory` captures runs as `TrajectoryRecord`s (JSONL or in-memory) via `TrajectoryObserver`; `memory::consolidate` decays, clusters, merges, and prunes entries (`consolidate_entries`); `memory::extractor` mines learned memories from recorded trajectories (`extract`, `ExtractionObserver`) |
 | [`message`](https://docs.rs/loopctl/latest/loopctl/message/index.html) | Conversation types: `Message`, `MessagePart`, `ToolContent`, roles |
+| [`metrics`](https://docs.rs/loopctl/latest/loopctl/metrics/index.html) | Per-run metrics snapshot types behind the `metrics` feature: `AgentMetrics` (turn counts, `LatencyHistogram` percentiles, per-tool `ToolStats`, `TokenTotals` with cache/reasoning detail) and the metric registry catalog (`registry::all`/`lookup`/`validate` — every emitted signal with kind and closed label set) |
 | [`middleware`](https://docs.rs/loopctl/latest/loopctl/middleware/index.html) | Tool dispatch pipeline: timeouts, permissions, output limits, unknown-tool handling |
 | [`observer`](https://docs.rs/loopctl/latest/loopctl/observer/index.html) | `LoopObserver` trait and `ObserverHost` for lifecycle event observation |
 | [`presets`](https://docs.rs/loopctl/latest/loopctl/presets/index.html) | Small-model runtime profiles: `ConstrainedProfile`, `FrontierProfile`, `GoalReminder` |
@@ -230,6 +231,7 @@ async fn demo(
 | `mcp` | No | `rmcp`, `reqwest`, `async-stream`, `jsonschema` | MCP client + server adapters — adapt foreign MCP servers' tools as `Tool` impls (`McpToolProvider`), or serve a `ToolRegistry` over MCP/stdio to any MCP client (`McpServerAdapter`; served schemas are validated with `jsonschema`, external refs refused) |
 
 | `manifest` | No | `serde_yaml_ng`, `schemars` | The v1 `loop.yaml` manifest model: `manifest::ManifestDocument` parsing, interpolation, merge, and validation through `ResolvedManifest` |
+| `metrics` | No | — | Run metrics value types: `metrics::AgentMetrics` per-run snapshot (turn counts, fixed-bucket latency percentiles, per-tool stats, token totals with cache/reasoning detail; serde round-trip) and `metrics::registry` — the static catalog of every emitted metric name with kind and closed label set, validated through `registry::validate` |
 
 ### Streaming vs non-streaming
 

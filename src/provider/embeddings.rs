@@ -397,7 +397,8 @@ fn optional_env_dimension(name: &str) -> Result<Option<usize>, ApiError> {
     )
 }
 
-/// Emit the `loopctl.embed.batch` metric event for one settled batch.
+/// Emit the `loopctl.embed.batch.duration_ms` metric event for one settled
+/// batch (registry name per the metric catalog).
 ///
 /// One event per HTTP batch on both the success and failure paths, with
 /// the usage pair recorded when the provider reports one — the intake
@@ -414,7 +415,7 @@ fn emit_batch_metric(
 ) {
     tracing::debug!(
         target: "loopctl::metrics",
-        metric = "loopctl.embed.batch",
+        metric = "loopctl.embed.batch.duration_ms",
         provider,
         model,
         dim,

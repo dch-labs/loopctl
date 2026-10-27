@@ -70,6 +70,7 @@ vector_memory = ["vector_index"]
 derive = ["dep:loopctl-derive"]
 hooks = []
 testing = []
+metrics = []
 file_memory = []
 file_grants = []
 tool_health = []
@@ -139,6 +140,10 @@ required-features = ["mcp"]
 [[example]]
 name = "mcp_server"
 required-features = ["mcp"]
+
+[[test]]
+name = "metrics"
+required-features = ["metrics"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -35,7 +35,8 @@ doc-census:
 	@out=$$(cargo test --test doctest_census 2>&1); status=$$?; \
 	totals=$$(cargo test --test doctest_census -- --nocapture the_census_reports_live_totals 2>&1 | grep '^doc blocks:'); \
 	printf '%s\n' "$${totals:-doc blocks: n/a — the census failed}"; \
-	printf '%s\n' "$$out" | tail -1; exit $$status
+	if [ $$status -ne 0 ]; then printf '%s\n' "$$out"; else printf '%s\n' "$$out" | tail -1; fi; \
+	exit $$status
 
 lint:
 	cargo fmt --all

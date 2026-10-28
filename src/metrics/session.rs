@@ -415,6 +415,30 @@ impl LatencyHistogram {
             .fold(0_u64, |acc, c| acc.saturating_add(*c))
     }
 
+    /// Per-slot counts, one per bucket plus the overflow slot.
+    ///
+    /// The raw side of the [`buckets`](Self::buckets) bounds: element
+    /// `i` counts samples at or below `buckets()[i]`, and the final
+    /// element counts overflow above the last bound. Length is always
+    /// one more than the bounds' — the invariant exporters rely on when
+    /// re-rendering the distribution.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use loopctl::metrics::LatencyHistogram;
+    ///
+    /// let mut h = LatencyHistogram::with_buckets(vec![10, 100]);
+    /// h.record(5);
+    /// h.record(50);
+    /// h.record(5_000);
+    /// assert_eq!(h.counts(), &[1, 1, 1]);
+    /// ```
+    #[must_use]
+    pub fn counts(&self) -> &[u64] {
+        &self.counts
+    }
+
     /// The `pct`-th percentile: the bucket bound holding the rank's sample.
     ///
     /// The sampled rank is `floor(N * pct / 100) + 1` — strict
@@ -422,8 +446,10 @@ impl LatencyHistogram {
     /// value". The reading names the upper bound of the bucket holding
     /// that sample; a sample in the overflow slot reads the last bound
     /// (an index the bound lookup answers with the last element rather
-    /// than a slot that has no bound of its own). `None` for an empty
-    /// histogram or a rank outside 1..=100.
+    /// than a slot that has no bound of its own). Rank 100 clamps to
+    /// the total, so it reads the bucket of the largest sample — every
+    /// rank in 1..=100 answers on a non-empty histogram. `None` for an
+    /// empty histogram or a rank outside 1..=100.
     ///
     /// # Examples
     ///
@@ -449,7 +475,8 @@ impl LatencyHistogram {
         let target = total
             .saturating_mul(u64::from(pct))
             .div_euclid(100)
-            .saturating_add(1);
+            .saturating_add(1)
+            .min(total);
         let mut cumulative = 0_u64;
         for (slot, count) in self.counts.iter().enumerate() {
             cumulative = cumulative.saturating_add(*count);
@@ -697,8 +724,10 @@ pub struct AgentMetrics {
 
     /// Terminal error class, if the run ended in error.
     ///
-    /// From [`RunEndContext::error`](crate::observer::RunEndContext::error);
-    /// `None` exactly when [`run_success`](Self::run_success) is `true`.
+    /// From [`RunEndContext::error`](crate::observer::RunEndContext::error)
+    /// — a successful run reports `None` there, so runs that end
+    /// through the engine carry the detail only beside a failed
+    /// [`run_success`](Self::run_success).
     #[serde(default)]
     pub run_error: Option<String>,
 
@@ -958,6 +987,31 @@ mod tests {
     }
 
     #[test]
+    fn rank_100_reads_the_bucket_of_the_largest_sample() {
+        let mut h = LatencyHistogram::new();
+        h.record(6);
+        h.record(40);
+        h.record(70_000);
+        assert_eq!(
+            h.percentile(100).map(|p| p.value_ms),
+            h.buckets().last().copied(),
+            "rank 100 lands in the overflow slot, read as the last bucket bound"
+        );
+        let mut small = LatencyHistogram::new();
+        small.record(6);
+        assert_eq!(
+            small.percentile(100).map(|p| p.value_ms),
+            small.percentile(99).map(|p| p.value_ms),
+            "rank 100 on one sample answers where the pre-clamp formula fell through"
+        );
+        let empty = LatencyHistogram::new();
+        assert!(
+            empty.percentile(100).is_none(),
+            "an empty histogram answers nothing"
+        );
+    }
+
+    #[test]
     fn empty_percentiles_are_none() {
         let h = LatencyHistogram::new();
         assert_eq!(h.count(), 0);
@@ -1087,6 +1141,7 @@ mod tests {
         };
         m.record_tool("read", 10, false);
         m.record_tool("exec", 50, true);
+        m.run_success = false;
         m.run_error = Some("tool_timeout".to_string());
         let json = serde_json::to_string(&m).unwrap();
         let back: AgentMetrics = serde_json::from_str(&json).unwrap();

@@ -19,7 +19,7 @@
 //!
 //! let d = registry::lookup("loopctl.tools.calls").expect("declared");
 //! assert_eq!(d.kind, loopctl::metrics::MetricKind::Counter);
-//! assert!(registry::validate("loopctl.tools.calls", &["tool"]).is_some());
+//! assert!(registry::validate("loopctl.tools.calls", &["tool", "outcome"]).is_some());
 //! ```
 
 use core::cmp::Ordering;
@@ -29,7 +29,7 @@ use core::cmp::Ordering;
 /// Only these three signal types carry stored values in the telemetry
 /// contract; spans, events, and observer callbacks are lifecycle
 /// surfaces and never registry entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MetricKind {
     /// Monotonic count.
     ///
@@ -98,38 +98,41 @@ pub const REGISTRY: &[MetricDescriptor] = &[
     c("loopctl.memory.extracted", &["category"]),
     c("loopctl.memory.extract.attempts", &["outcome"]),
     h("loopctl.memory.extract.duration_ms", &[]),
-    c("loopctl.memory.consolidated", &["action"]),
+    c("loopctl.memory.consolidated", &[]),
     c("loopctl.memory.persist.writes", &["backend"]),
     h("loopctl.memory.persist.flush.duration_ms", &["backend"]),
     g("loopctl.memory.persist.file_bytes", &["backend"]),
     g("loopctl.memory.entries", &["store"]),
     c("loopctl.memory.stored", &["origin", "category"]),
-    c(
-        "loopctl.memory.retrieve.results",
-        &["store", "origin", "trigger"],
-    ),
+    c("loopctl.memory.retrieve.results", &["trigger", "outcome"]),
     h("loopctl.memory.retrieve.duration_ms", &["store"]),
     c("loopctl.embed.inputs", &["provider"]),
     c("loopctl.embed.requests", &["provider", "outcome"]),
-    h("loopctl.embed.batch.duration_ms", &["provider"]),
+    h("loopctl.embed.batch.duration_ms", &["provider", "outcome"]),
     c("loopctl.vector.provision.errors", &["backend"]),
     c("loopctl.vector.provision", &["backend"]),
-    h("loopctl.vector.embed", &["store"]),
-    h("loopctl.vector.index.search", &["store"]),
-    h("loopctl.memory.store.retrieve", &["store"]),
-    h("loopctl.memory.store.consolidate", &["store"]),
+    h("loopctl.vector.embed", &["provider"]),
+    h("loopctl.vector.index.search", &[]),
+    h("loopctl.memory.store.retrieve", &[]),
+    h("loopctl.memory.store.consolidate", &[]),
     c("loopctl.memoize.hits", &[]),
     c("loopctl.memoize.misses", &[]),
-    c("loopctl.compaction.passes", &["reason", "tier"]),
+    c("loopctl.compaction.passes", &["stage"]),
     c("loopctl.compaction.degradations", &["from", "to"]),
-    c("loopctl.compaction.summarizer.tokens", &["direction"]),
-    c("loopctl.compaction.structured.sections", &["section"]),
+    c(
+        "loopctl.compaction.summarizer.tokens",
+        &["direction", "estimated"],
+    ),
+    c(
+        "loopctl.compaction.structured.sections",
+        &["section", "state"],
+    ),
     c("loopctl.compaction.evicted.messages", &[]),
     c("loopctl.compaction.no_action", &[]),
     g("loopctl.compaction.headroom_pct", &[]),
     h("loopctl.compaction.tokens_saved", &[]),
     h("loopctl.compaction.summarize.duration_ms", &[]),
-    c("loopctl.tools.calls", &["tool"]),
+    c("loopctl.tools.calls", &["tool", "outcome"]),
     c("loopctl.tools.first_calls", &[]),
     c("loopctl.verify.passes", &["outcome"]),
     c("loopctl.demotion.delivered", &["sink"]),
@@ -140,8 +143,8 @@ pub const REGISTRY: &[MetricDescriptor] = &[
     h("loopctl.attachments.tokens_estimate", &["kind"]),
     c("loopctl.compaction.attachments.carried_count", &[]),
     c("loopctl.compaction.attachments.carried_bytes", &[]),
-    c("loopctl.mcp.structured", &["outcome"]),
-    c("loopctl.mcp.structured.emitted", &[]),
+    c("loopctl.mcp.structured", &["outcome", "tool"]),
+    c("loopctl.mcp.structured.emitted", &["tool"]),
     c("loopctl.tools.registry.mutations", &["op"]),
     c("loopctl.tools.registry.inflight_drains", &[]),
     g("loopctl.tools.registered", &[]),
@@ -232,10 +235,11 @@ pub fn lookup(name: &str) -> Option<&'static MetricDescriptor> {
 /// Validate an observed emission against its declaration.
 ///
 /// The name must be registered and the observed label keys must be
-/// **exactly** the declared set (order insensitive). Returns the
-/// descriptor on success and `None` for an unregistered name or any
-/// label-set mismatch, so callers count the refusal instead of storing
-/// data under a shape nobody declared.
+/// **exactly** the declared set (order insensitive, no duplicates — a
+/// key carried twice is a doubled identity, not the declared one).
+/// Returns the descriptor on success and `None` for an unregistered
+/// name or any label-set mismatch, so callers count the refusal instead
+/// of storing data under a shape nobody declared.
 ///
 /// # Examples
 ///
@@ -244,11 +248,14 @@ pub fn lookup(name: &str) -> Option<&'static MetricDescriptor> {
 ///
 /// assert!(registry::validate("loopctl.embed.requests", &["provider", "outcome"]).is_some());
 /// assert!(registry::validate("loopctl.embed.requests", &["provider"]).is_none());
+/// assert!(registry::validate("loopctl.embed.requests", &["provider", "provider", "outcome"]).is_none());
 /// ```
 #[must_use]
 pub fn validate(name: &str, label_keys: &[&str]) -> Option<&'static MetricDescriptor> {
     let d = lookup(name)?;
-    matches!(cmp_label_sets(d.labels, label_keys), Ordering::Equal).then_some(d)
+    let exact = label_keys.len() == d.labels.len()
+        && matches!(cmp_label_sets(d.labels, label_keys), Ordering::Equal);
+    exact.then_some(d)
 }
 
 /// Order-insensitive set comparison of declared against observed label keys.
@@ -352,27 +359,40 @@ mod tests {
 
     #[test]
     fn validate_requires_exact_closed_label_set() {
-        let d = validate(
-            "loopctl.memory.retrieve.results",
-            &["origin", "store", "trigger"],
-        );
+        let d = validate("loopctl.memory.retrieve.results", &["outcome", "trigger"]);
         assert!(d.is_some(), "declared set must validate (any order)");
         assert!(
             validate(
                 "loopctl.memory.retrieve.results",
-                &["store", "origin", "trigger", "model"]
+                &["trigger", "outcome", "store"],
             )
             .is_none(),
-            "superset (extra `model` label) must be rejected"
+            "superset (extra `store` label) must be rejected"
         );
         assert!(
-            validate("loopctl.memory.retrieve.results", &["store"]).is_none(),
+            validate("loopctl.memory.retrieve.results", &["trigger"]).is_none(),
             "subset must be rejected"
         );
-        assert!(validate("loopctl.tools.calls", &["tool"]).is_some());
+        assert!(validate("loopctl.tools.calls", &["tool", "outcome"]).is_some());
+        assert!(
+            validate("loopctl.tools.calls", &["tool"]).is_none(),
+            "the released emission carries the outcome split; a partial set is not it"
+        );
         assert!(validate("loopctl.prune.cleared", &[]).is_some());
         assert!(validate("loopctl.prune.cleared", &["tool"]).is_none());
         assert!(validate("loopctl.unregistered.name", &[]).is_none());
+    }
+
+    #[test]
+    fn duplicate_observed_keys_never_validate() {
+        assert!(
+            validate("loopctl.tools.calls", &["tool", "outcome", "outcome"]).is_none(),
+            "a key carried twice is a doubled identity, not the declared set"
+        );
+        assert!(
+            validate("loopctl.compaction.passes", &["stage", "stage"]).is_none(),
+            "duplicating the only declared key must not pass the set test"
+        );
     }
 
     #[test]

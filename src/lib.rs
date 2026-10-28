@@ -97,6 +97,7 @@
 //!   [`ExtractionObserver`](memory::extractor::ExtractionObserver) for automated best-effort at run end).
 //! - **hooks** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
 //! - **testing** — Test utilities and fixtures. *Requires `testing` feature.*
+//! - **[`tracing_spans`]** — Engine span hierarchy (`agent.run`/`agent.turn`/`agent.tool`) with OTel-GenAI-shaped fields at emission, plus the level/target contract for `RUST_LOG`.
 
 // Relax strict lints in test code. The crate enforces a strict no-panic /
 // no-unwrap policy in production code, but test code legitimately uses
@@ -174,3 +175,4 @@ pub mod structured;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool;
+pub mod tracing_spans;

@@ -64,6 +64,8 @@ const SCAN_ROOTS: &[&str] = &[
     "crates/sqlite",
     "crates/hnsw",
     "crates/client",
+    "crates/otel",
+    "crates/langfuse",
 ];
 
 fn root() -> PathBuf {

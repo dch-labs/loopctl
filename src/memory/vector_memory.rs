@@ -483,6 +483,7 @@ impl LoopMemory for VectorMemoryStore {
             tracing::debug!(
                 target: "loopctl::metrics",
                 metric = "loopctl.memory.store.retrieve",
+                value = selected.len(),
                 k_requested = limit,
                 k_returned = selected.len(),
                 top_score = %top_score,
@@ -637,6 +638,7 @@ impl LoopMemory for VectorMemoryStore {
             tracing::debug!(
                 target: "loopctl::metrics",
                 metric = "loopctl.memory.store.consolidate",
+                value = removed_total,
                 removed = removed_total,
                 entries_after = entries_after,
                 "vector memory consolidation complete"

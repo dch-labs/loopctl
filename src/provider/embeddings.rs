@@ -22,7 +22,7 @@
 //! `Debug` output), bounded response bodies, and typed [`ApiError`]
 //! failures. Batches split at 256 inputs per request — and, on OpenAI,
 //! at a conservative estimated token sum per request as well — and every
-//! batch settles one `loopctl.embed.batch` metric event.
+//! batch settles one `loopctl.embed.batch.duration_ms` metric event.
 //!
 //! # Embedding models are not interchangeable
 //!
@@ -607,7 +607,7 @@ impl OllamaEmbedder {
     /// the results in input order.
     ///
     /// An empty slice returns an empty vector without touching the wire.
-    /// Each batch settles one `loopctl.embed.batch` metric event, success or
+    /// Each batch settles one `loopctl.embed.batch.duration_ms` metric event, success or
     /// failure; a failed batch aborts the call with its error (partial
     /// results are never returned — a caller cannot mistake them for a
     /// complete embedding of the input set).
@@ -1170,7 +1170,7 @@ impl OpenAiEmbedder {
     /// An empty slice returns an empty vector without touching the wire;
     /// every input passes the token guard before any HTTP traffic, and
     /// batches close at the input-count or estimated-token bound,
-    /// whichever comes first. Each batch settles one `loopctl.embed.batch`
+    /// whichever comes first. Each batch settles one `loopctl.embed.batch.duration_ms`
     /// metric event — carrying the request's usage pair when the server
     /// reports one — and a failed batch aborts the call (partial results
     /// are never returned).

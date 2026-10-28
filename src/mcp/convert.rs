@@ -720,4 +720,106 @@ mod tests {
             "empty registry is called out: {msg}"
         );
     }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn bridged_structured_emissions_validate_against_the_catalog() {
+        struct BridgeCapture {
+            seen: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        }
+        impl tracing::Subscriber for BridgeCapture {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target() == "loopctl::metrics"
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct V {
+                    metric: Option<String>,
+                    keys: Vec<String>,
+                }
+                impl tracing::field::Visit for V {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        match field.name() {
+                            "metric" => self.metric = Some(value.to_string()),
+                            "message" => {}
+                            other => self.keys.push(other.to_string()),
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        match field.name() {
+                            "metric" => {
+                                self.metric =
+                                    Some(format!("{value:?}").trim_matches('"').to_string());
+                            }
+                            "message" => {}
+                            other => self.keys.push(other.to_string()),
+                        }
+                    }
+                }
+                let mut v = V {
+                    metric: None,
+                    keys: Vec::new(),
+                };
+                event.record(&mut v);
+                if let Some(metric) = v.metric {
+                    self.seen.lock().expect("lock").push((metric, v.keys));
+                }
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
+        let capture = std::sync::Arc::new(BridgeCapture {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"],
+        });
+
+        tracing::subscriber::with_default(capture.clone(), || {
+            // Bridge direction: a server's structuredContent, schema-valid.
+            let mut res = CallToolResult::success(vec![ContentBlock::text("ok")]);
+            res.structured_content = Some(serde_json::json!({ "answer": "42" }));
+            let out = bridge_result("echo", res, Some(&schema), StructuredContentPolicy::Error)
+                .expect("valid structuredContent bridges");
+            assert!(
+                matches!(out.display_hint, Some(DisplayHint::Json)),
+                "valid structuredContent marks the json lane"
+            );
+
+            // Dispatch direction: Json-hinted loopctl output gains the lane.
+            let tool_out =
+                crate::tool::ToolOutput::text(r#"{"answer":"42"}"#).with_hint(DisplayHint::Json);
+            let _ = dispatch_result_to_call_tool("echo", Ok(tool_out));
+        });
+
+        let seen = capture.seen.lock().expect("lock");
+        assert!(!seen.is_empty(), "bridging emits its metrics");
+        for (name, keys) in seen.iter() {
+            let held: Vec<&str> = keys.iter().map(String::as_str).collect();
+            assert!(
+                crate::metrics::registry::validate(name, &held).is_some(),
+                "{name} with labels {keys:?} is not exact-catalog-conformant"
+            );
+        }
+        let names: Vec<&str> = seen.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"loopctl.mcp.structured"),
+            "bridge-side signal missing from {names:?}"
+        );
+        assert!(
+            names.contains(&"loopctl.mcp.structured.emitted"),
+            "dispatch-side signal missing from {names:?}"
+        );
+    }
 }

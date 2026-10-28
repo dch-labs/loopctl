@@ -75,11 +75,15 @@ fn snapshot_round_trips_through_json() {
 
 #[test]
 fn catalog_answers_through_the_public_path() {
-    assert!(validate("loopctl.tools.calls", &["tool"]).is_some());
+    assert!(validate("loopctl.tools.calls", &["tool", "outcome"]).is_some());
     assert!(validate("loopctl.tools.calls", &["tool", "model"]).is_none());
     let d = lookup("loopctl.trajectory.jsonl_bytes").unwrap();
     assert_eq!(d.kind, MetricKind::Gauge);
-    assert!(all().len() >= 60);
+    assert_eq!(
+        all().len(),
+        65,
+        "the catalog is pinned at its exact size — an entry silently vanishing fails here"
+    );
     assert!(
         lookup("loopctl.reasoning.blocks").is_some(),
         "reasoning surface is declared"

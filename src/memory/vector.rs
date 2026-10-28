@@ -486,6 +486,7 @@ impl VectorIndex for LinearVectorIndex {
             tracing::debug!(
                 target: "loopctl::metrics",
                 metric = "loopctl.vector.index.search",
+                value = %started.elapsed().as_millis(),
                 k,
                 returned = matches.len(),
                 top_score = %top_score,
@@ -630,6 +631,7 @@ impl EmbeddingProvider for HashingEmbedder {
             tracing::debug!(
                 target: "loopctl::metrics",
                 metric = "loopctl.vector.embed",
+                value = %started.elapsed().as_millis(),
                 provider = "hashing",
                 model = "hashing",
                 dim = self.dim,

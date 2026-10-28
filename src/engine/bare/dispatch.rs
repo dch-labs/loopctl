@@ -44,6 +44,7 @@ use crate::tool::{GateDecision, GateRuleSource, GateVerdict};
 use crate::observer::{ToolPostContext, ToolPreContext};
 use crate::reflection::{Correction, CorrectionResult};
 use crate::tool::ToolRegistry;
+use tracing::Instrument as _;
 
 use futures::FutureExt;
 use std::collections::HashSet;
@@ -627,7 +628,68 @@ impl<C: ApiClient> BareLoop<C> {
     /// on cancellation, [`LoopError::LoopDetected`] on a hard detection
     /// stop, or any hard error from
     /// [`dispatch_tool`](Self::dispatch_tool).
+    ///
+    /// The settled dispatch is decorated with an `agent.tool` span: the
+    /// span wraps the whole attempt through
+    /// [`Instrument`](tracing::Instrument) — never an entered guard
+    /// across the dispatch `await`, which a work-stealing runtime could
+    /// migrate — and records the settled outcome, duration, and error
+    /// class while the handle is alive, so a collector sees the span
+    /// complete. The inner path's `loopctl.tools.calls` counter event is
+    /// the same fact at the metric signal; the span adds parentage and
+    /// the `GenAI` field names.
     async fn execute_tool_call(
+        &self,
+        tc: ToolCall,
+        turn_idx: usize,
+    ) -> Result<ToolDispatchResult, LoopError> {
+        let span = crate::tracing_spans::tool_span(&crate::observer::ToolPreContext {
+            turn: turn_idx,
+            tool: tc.tool.clone(),
+            tool_call_id: tc.id.clone(),
+        });
+        let settled = self
+            .execute_tool_call_inner(tc, turn_idx)
+            .instrument(span.clone())
+            .await;
+        match &settled {
+            Ok(result) => {
+                span.record(
+                    crate::tracing_spans::fields::OUTCOME,
+                    if result.is_error { "error" } else { "ok" },
+                );
+                span.record(
+                    crate::tracing_spans::fields::DURATION_MS,
+                    u64::try_from(result.duration.as_millis()).unwrap_or(u64::MAX),
+                );
+                if result.is_error {
+                    span.record(crate::tracing_spans::fields::ERROR_TYPE, "tool_error");
+                }
+            }
+            Err(e) => {
+                span.record(crate::tracing_spans::fields::OUTCOME, "error");
+                span.record(
+                    crate::tracing_spans::fields::ERROR_TYPE,
+                    crate::tracing_spans::error_type(e),
+                );
+            }
+        }
+        settled
+    }
+
+    /// The retry-and-settle body behind
+    /// [`execute_tool_call`](Self::execute_tool_call).
+    ///
+    /// Carries the unchanged dispatch loop; the span wrapper decides
+    /// nothing here, so every early return keeps its exact current
+    /// meaning and the tracing layer stays outside the control flow.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as the wrapper: [`LoopError::Cancelled`] on
+    /// cancellation, [`LoopError::LoopDetected`] on a hard detection
+    /// stop, or any hard error from [`dispatch_tool`](Self::dispatch_tool).
+    async fn execute_tool_call_inner(
         &self,
         mut tc: ToolCall,
         turn_idx: usize,

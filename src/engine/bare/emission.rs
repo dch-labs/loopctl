@@ -392,6 +392,15 @@ impl<C: ApiClient> BareLoop<C> {
         {
             gate.observe_turn_end();
         }
+        crate::tracing_spans::record_turn_end(
+            data.success,
+            Self::millis_u64(data.duration),
+            data.input_tokens,
+            data.output_tokens,
+            data.cached_input_tokens,
+            data.cache_write_tokens,
+            data.reasoning_tokens,
+        );
         self.managers.observers().on_turn_end(&TurnEndContext {
             turn: data.turn,
             success: data.success,

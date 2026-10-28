@@ -15,11 +15,15 @@ test:
 	cargo test -p loopctl-derive
 	cargo test -p loopctl-sqlite
 	cargo test -p loopctl-hnsw
+	cargo test -p loopctl-otel
+	cargo test -p loopctl-langfuse
 
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo clippy --all-targets -p loopctl-sqlite -- -D warnings
 	cargo clippy --all-targets -p loopctl-hnsw -- -D warnings
+	cargo clippy --all-targets -p loopctl-otel -- -D warnings
+	cargo clippy --all-targets -p loopctl-langfuse -- -D warnings
 
 darwin-clippy:
 	cargo clippy --target aarch64-apple-darwin --features fs_tools -- -D warnings
@@ -49,6 +53,8 @@ docs:
 examples:
 	cargo build --examples --all-features
 	cargo build -p loopctl-sqlite --examples
+	cargo build -p loopctl-otel --examples
+	cargo build -p loopctl-langfuse --examples
 	cargo build -p loopctl-hnsw --examples
 
 define PROBE_TEXT

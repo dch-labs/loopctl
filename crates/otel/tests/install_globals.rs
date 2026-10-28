@@ -18,6 +18,7 @@
 )]
 
 use loopctl_otel::{OtelConfig, OtelInstallError};
+use opentelemetry::trace::Tracer as _;
 
 /// A dead-loopback endpoint: the exporter builds fine, nothing listens.
 const DEAD_ENDPOINT: &str = "http://127.0.0.1:43191";
@@ -46,6 +47,22 @@ fn a_refused_second_install_leaves_the_first_running() {
     first
         .force_flush()
         .expect("the first install still flushes");
+
+    // And the global provider still routes to that first installation:
+    // a span built through the global tracer lands in the first
+    // provider's batch, so flushing the guard tries the dead endpoint
+    // and fails loudly. A rejection that had swapped the global would
+    // leave the first provider's batch empty and this flush Ok.
+    let probe = opentelemetry::global::tracer("install-contract");
+    probe.in_span("global-still-first", |_context| {});
+    let flushed = first.force_flush();
+    assert!(
+        flushed.is_err(),
+        "the global-tracer span reached the first provider (its dead endpoint \
+         answered the flush with an error) — the guard-only flush above proves \
+         an empty batch flushes Ok, so this error is the routing itself: \
+         {flushed:?}"
+    );
 
     // Teardown of the surviving installation completes cleanly.
     drop(first);

@@ -38,8 +38,9 @@ static EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static AUTH_OK: AtomicBool = AtomicBool::new(true);
 static STOP: AtomicBool = AtomicBool::new(false);
 
-fn spawn_mock(port: u16) {
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
+fn spawn_mock() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind on an ephemeral port");
+    let port = listener.local_addr().expect("assigned port").port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             if STOP.load(Ordering::SeqCst) {
@@ -51,6 +52,7 @@ fn spawn_mock(port: u16) {
             }
         }
     });
+    port
 }
 
 fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
@@ -142,8 +144,7 @@ fn tool_turn_then_terminal() -> Vec<MockResponse> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn the_cloud_would_receive_traces_observations_and_scores() {
-    let port = 47_831;
-    spawn_mock(port);
+    let port = spawn_mock();
     let observer = Arc::new(MetricsObserver::new());
 
     let (layer, guard) = install(LangfuseConfig {
@@ -182,7 +183,8 @@ async fn the_cloud_would_receive_traces_observations_and_scores() {
         let failing_registry = ToolRegistry::new();
         failing_registry.register(EchoTool);
         let mut failing_engine =
-            BareLoop::new(failing_client, failing_registry, SessionConfig::default());
+            BareLoop::new(failing_client, failing_registry, SessionConfig::default())
+                .with_observer(Arc::<MetricsObserver>::clone(&observer));
         let failed = failing_engine
             .run("langfuse failing run", &RunConfig::default())
             .await;
@@ -285,6 +287,31 @@ async fn the_cloud_would_receive_traces_observations_and_scores() {
     assert!(
         tool_obs["body"]["parentObservationId"].is_null(),
         "tool executions attach to the trace root (engine span tree)"
+    );
+
+    // The turn observation's metadata never carries the assembled
+    // prompt: the engine records `query` on DEBUG turn spans for hosts
+    // that opt into content capture, and the exporter must not upload
+    // that text (or the PII inside it) as free-form metadata.
+    assert!(
+        turn_obs["body"]["metadata"].get("query").is_none(),
+        "the turn's prompt text never rides the exported metadata: {}",
+        turn_obs["body"]["metadata"]
+    );
+
+    // The failed run's trace carries its OWN outcome score — the
+    // shared observer's read at that trace's close reflects the failed
+    // run, never the successful run before it.
+    let failed_trace_id = errored[0]["body"]["id"].as_str().expect("failed trace id");
+    let failed_outcome = scores
+        .iter()
+        .find(|score| {
+            score["body"]["traceId"] == failed_trace_id && score["body"]["name"] == "outcome"
+        })
+        .expect("the failed trace carries an outcome score");
+    assert_eq!(
+        failed_outcome["body"]["stringValue"], "error",
+        "the failed run's outcome score reads its own run"
     );
 
     // Scores ride the trace and cover the contract set.

@@ -165,7 +165,7 @@ async fn reset_hands_the_next_run_a_clean_ledger() {
 }
 
 #[tokio::test]
-async fn an_observer_shared_across_sessions_accumulates_until_reset() {
+async fn an_observer_shared_across_sessions_reports_each_run_alone() {
     let observer = Arc::new(MetricsObserver::default());
     observer.on_run_start(&RunStartContext {
         session_id: uuid::Uuid::new_v4(),
@@ -174,23 +174,27 @@ async fn an_observer_shared_across_sessions_accumulates_until_reset() {
     let mut first = scripted_loop(Arc::clone(&observer), terminal_only());
     first.run("one", &RunConfig::default()).await.expect("one");
 
-    // No reset between runs: every counter — turns included — keeps
-    // accumulating until the next reset, and the run-boundary fields
-    // (outcome, duration) land fresh from the second run. This is the
-    // contract of an observer carried across runs inside one session.
-    let mut second = scripted_loop(Arc::clone(&observer), terminal_only());
+    // No reset and no `reset_managers` between runs: the observer still
+    // opens a fresh ledger at each run start, so the boundary read is
+    // the run that just ended — never that run plus the runs before it.
+    let mut second = scripted_loop(Arc::clone(&observer), tool_turn_then_terminal());
     second.run("two", &RunConfig::default()).await.expect("two");
 
     let m = observer.snapshot();
     assert_eq!(
         m.turn_latency.count(),
         2,
-        "both runs sampled into one histogram"
+        "the second run's own turns, sampled fresh at its start"
     );
     assert_eq!(
         m.total_turns, 2,
-        "turns accumulate across runs like every other field — the run-end boundary \
-         records outcome, never a count overwrite"
+        "the boundary read carries the second run's turns only — a reused \
+         observer is per-run without anyone resetting it"
+    );
+    assert_eq!(
+        m.tools.get("echo").map(|s| s.calls),
+        Some(1),
+        "the first run's tools stay out of the second run's record"
     );
     assert!(m.run_success, "the last run's outcome is the boundary read");
 }

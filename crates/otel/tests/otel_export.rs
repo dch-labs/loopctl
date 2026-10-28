@@ -165,7 +165,7 @@ async fn the_collector_sees_genai_shaped_spans() {
         None,
     )
     .with_stamper(Stamper {
-        observer: Arc::<MetricsObserver>::clone(&observer),
+        observer: Some(Arc::<MetricsObserver>::clone(&observer)),
         registry: Some(Arc::<MetricsRegistry>::clone(&store)),
         span_attributes: true,
     });
@@ -279,7 +279,7 @@ async fn the_collector_sees_genai_shaped_spans() {
                 None,
             )
             .with_stamper(Stamper {
-                observer: Arc::<MetricsObserver>::clone(&observer),
+                observer: Some(Arc::<MetricsObserver>::clone(&observer)),
                 registry: Some(Arc::<MetricsRegistry>::clone(&store)),
                 span_attributes: true,
             }),
@@ -318,13 +318,14 @@ async fn the_collector_sees_genai_shaped_spans() {
         "the outcome attribute rides alongside the status"
     );
 
-    // Scenario 3: two runs on one sustained observer, one flush — each
-    // run span must carry its OWN run's rollup. The stamp is written at
-    // the run-end record (inside the span's scope, after that run's
+    // Scenario 3: two runs on one observer, one flush — each run span
+    // must carry its OWN run's rollup. The stamp is written at the
+    // run-end record (inside the span's scope, after that run's
     // observer callbacks); an export-time stamp would read the observer
-    // at flush time and print the session total on both. A fresh
-    // observer keeps the arithmetic legible after the turns the earlier
-    // scenarios already fed a shared one.
+    // at flush time and print the newest run's numbers on both. The
+    // second run takes a tool turn plus its terminal reply (two turns)
+    // against the first run's single turn, so the two readings differ
+    // and the assertion can tell them apart.
     EXPORTED.lock().unwrap().clear();
     let multi_observer = Arc::new(MetricsObserver::new());
     let multi_subscriber = Registry::default()
@@ -335,7 +336,7 @@ async fn the_collector_sees_genai_shaped_spans() {
                 None,
             )
             .with_stamper(Stamper {
-                observer: Arc::<MetricsObserver>::clone(&multi_observer),
+                observer: Some(Arc::<MetricsObserver>::clone(&multi_observer)),
                 registry: Some(Arc::<MetricsRegistry>::clone(&store)),
                 span_attributes: true,
             }),
@@ -344,8 +345,11 @@ async fn the_collector_sees_genai_shaped_spans() {
         .with(
             tracing_subscriber::filter::Targets::new().with_target("loopctl", LevelFilter::DEBUG),
         );
-    let multi_client =
-        Arc::new(MockApiClient::new("test-model").with_responses(vec![terminal(), terminal()]));
+    let multi_responses = vec![terminal()]
+        .into_iter()
+        .chain(tool_turn_then_terminal())
+        .collect();
+    let multi_client = Arc::new(MockApiClient::new("test-model").with_responses(multi_responses));
     let multi_registry = ToolRegistry::new();
     multi_registry.register(EchoTool);
     let mut multi_engine = BareLoop::new(multi_client, multi_registry, SessionConfig::default())
@@ -379,6 +383,58 @@ async fn the_collector_sees_genai_shaped_spans() {
         "each run span carries its own run's rollup — the flush-time session \
          total would read 2 on both"
     );
+
+    // Scenario 4: a registry-only stamper — no observer configured —
+    // still stamps its series onto the run span, and stamps no rollup.
+    // Stamp readers that gate on an observer would omit every series a
+    // `SpanAttributes` host actually collected.
+    EXPORTED.lock().unwrap().clear();
+    let bare_store = Arc::new(MetricsRegistry::default());
+    let bare_subscriber = Registry::default()
+        .with(
+            OtelTracingLayer::new(
+                tracing_opentelemetry::layer().with_tracer(provider.tracer("test")),
+                provider.clone(),
+                None,
+            )
+            .with_stamper(Stamper {
+                observer: None,
+                registry: Some(Arc::<MetricsRegistry>::clone(&bare_store)),
+                span_attributes: true,
+            }),
+        )
+        .with(MetricsLayer::new(Arc::<MetricsRegistry>::clone(
+            &bare_store,
+        )))
+        .with(
+            tracing_subscriber::filter::Targets::new().with_target("loopctl", LevelFilter::DEBUG),
+        );
+    let bare_client =
+        Arc::new(MockApiClient::new("test-model").with_responses(tool_turn_then_terminal()));
+    let bare_registry = ToolRegistry::new();
+    bare_registry.register(EchoTool);
+    let mut bare_engine = BareLoop::new(bare_client, bare_registry, SessionConfig::default());
+    {
+        let _guard = tracing::subscriber::set_default(bare_subscriber);
+        bare_engine
+            .run("registry only", &RunConfig::default())
+            .await
+            .expect("run completes");
+    }
+    provider.force_flush().unwrap();
+    let bare_spans = EXPORTED.lock().unwrap().clone();
+    let bare_run = find_span(&bare_spans, "invoke_agent").expect("the registry-only run span");
+    assert!(
+        bare_run
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str().starts_with("loopctl.tools.calls")),
+        "the registry's series ride the run span without an observer"
+    );
+    assert!(
+        attr(bare_run, "loopctl.run.turns").is_none(),
+        "no observer, no rollup — the stamp claims nothing it cannot read"
+    );
 }
 
 #[test]
@@ -406,13 +462,22 @@ fn pipeline_exports_registry_series_to_the_meter() {
     store.histogram_record(calibration, BTreeMap::new(), 0.12);
     store.histogram_record(calibration, BTreeMap::new(), 0.9);
 
-    loopctl_otel::export_metrics(None, &store).expect("pipeline installed");
+    // A run rollup with a total past `i32::MAX` rides the same export:
+    // the gauge it lands on must keep the magnitude, not cap at the
+    // `i32` ceiling where distinct large totals are indistinguishable.
+    let wide_run = loopctl::metrics::AgentMetrics {
+        total_turns: 5_000_000_000,
+        ..loopctl::metrics::AgentMetrics::default()
+    };
+
+    loopctl_otel::export_metrics(Some(&wide_run), &store).expect("pipeline installed");
     provider.force_flush().expect("flush");
 
     let resource_metrics = exporter.get_finished_metrics().expect("exported");
     let mut names: Vec<String> = Vec::new();
     let mut counter_total = None;
     let mut histogram_count = None;
+    let mut wide_turns = None;
     for rm in &resource_metrics {
         for sm in rm.scope_metrics() {
             for metric in sm.metrics() {
@@ -433,6 +498,12 @@ fn pipeline_exports_registry_series_to_the_meter() {
                             .next()
                             .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count);
                     }
+                    ("loopctl.run.turns", AggregatedMetrics::F64(MetricData::Gauge(gauge))) => {
+                        wide_turns = gauge
+                            .data_points()
+                            .next()
+                            .map(opentelemetry_sdk::metrics::data::GaugeDataPoint::value);
+                    }
                     _ => {}
                 }
             }
@@ -452,4 +523,9 @@ fn pipeline_exports_registry_series_to_the_meter() {
     }
     assert_eq!(counter_total, Some(3), "counter total");
     assert_eq!(histogram_count, Some(2), "histogram sample count");
+    let wide_turns = wide_turns.unwrap_or_default();
+    assert!(
+        (wide_turns - 5_000_000_000.0).abs() < 1.0,
+        "a run counter past i32::MAX exports at its true magnitude: {wide_turns}"
+    );
 }

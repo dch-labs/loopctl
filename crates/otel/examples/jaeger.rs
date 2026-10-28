@@ -7,8 +7,11 @@
 //! ```
 //!
 //! Expect one `invoke_agent` trace per run with an `agent.turn` and an
-//! `execute_tool echo` child, the `gen_ai.*` attributes, and the run
-//! rollup (`loopctl.run.*`) stamped on the root span.
+//! `execute_tool echo` child, the `gen_ai.*` attributes, the run
+//! rollup (`loopctl.run.*`) stamped on the root span, and the
+//! subsystem registry series (`loopctl.tools.calls.*` and kin) riding
+//! the same stamp — the example composes a `MetricsLayer` over the
+//! registry so the engine's metric events actually reach it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,7 +22,8 @@ use loopctl::engine::{BareLoop, RunConfig, core::Loop};
 use loopctl::metrics::{MetricsObserver, MetricsRegistry};
 use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
 use loopctl::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema};
-use loopctl_otel::{OtelConfig, OtelMetricsMode};
+use loopctl_otel::SpecExporter;
+use loopctl_otel::layer::{OtelTracingLayer, Stamper};
 
 struct EchoTool;
 
@@ -48,15 +52,50 @@ impl Tool for EchoTool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
     let observer = Arc::new(MetricsObserver::new());
     let registry = Arc::new(MetricsRegistry::default());
-    let _guard = loopctl_otel::install(&OtelConfig {
-        service_name: "loopctl-example".to_string(),
-        metrics: Some(OtelMetricsMode::SpanAttributes),
+    // Composed by hand rather than through `install`: the example's
+    // registry only fills if a `MetricsLayer` rides the same subscriber
+    // as the OTel layer, and the one-call `install` owns its subscriber
+    // internally. The provider is held here so the end-of-main flush can
+    // ship the last batch before the process exits.
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint("http://localhost:4318")
+        .with_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(SpecExporter::new(exporter))
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name("loopctl-example")
+                .build(),
+        )
+        .build();
+    let otel = OtelTracingLayer::new(
+        tracing_opentelemetry::layer().with_tracer(provider.tracer("loopctl-example")),
+        provider.clone(),
+        None,
+    )
+    .with_stamper(Stamper {
         observer: Some(Arc::<MetricsObserver>::clone(&observer)),
         registry: Some(Arc::<MetricsRegistry>::clone(&registry)),
-        ..OtelConfig::default()
-    })?;
+        span_attributes: true,
+    });
+    let subscriber = tracing_subscriber::registry()
+        .with(otel)
+        .with(loopctl::metrics::MetricsLayer::new(
+            Arc::<MetricsRegistry>::clone(&registry),
+        ))
+        .with(
+            tracing_subscriber::filter::Targets::new()
+                .with_target("loopctl", tracing::level_filters::LevelFilter::DEBUG),
+        );
+    tracing::subscriber::set_global_default(subscriber)?;
 
     let client = Arc::new(MockApiClient::new("claude-test").with_responses(vec![
         MockResponse {
@@ -85,6 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot rides the run span's stamp (`loopctl.*` attributes on the
     // `invoke_agent` root). A `Pipeline` config is the one that exports
     // through the meter provider instead.
+
+    provider.force_flush()?;
 
     println!("exported one trace; check http://localhost:16686");
     Ok(())

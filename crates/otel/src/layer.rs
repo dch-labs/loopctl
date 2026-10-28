@@ -33,6 +33,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::mapping;
 use crate::metrics::{registry_attributes, run_attributes};
+use loopctl::metrics::RegistrySnapshot;
 
 /// The target the metrics layer's emissions use; never an `OTel` span event.
 ///
@@ -41,23 +42,59 @@ use crate::metrics::{registry_attributes, run_attributes};
 /// events, which keeps one signal from being reported twice.
 const METRICS_TARGET: &str = "loopctl::metrics";
 
+/// Registry series attributes a single run span will carry.
+///
+/// The `OTel` SDK caps a span at 128 attributes and drops later
+/// additions silently, so the stamp bounds its registry share: the run
+/// rollup (≈21–30 attributes), the engine's own span fields, and the
+/// five diagnostics that always ride stay inside the budget, and a
+/// large registry cannot push them off the span. The bound takes the
+/// snapshot's own sorted order, so two identical registries stamp
+/// identically.
+const MAX_STAMPED_SERIES_ATTRIBUTES: usize = 64;
+
+/// The registry share of a run-span stamp, bounded.
+///
+/// Series attributes ride in the snapshot's deterministic order up to
+/// [`MAX_STAMPED_SERIES_ATTRIBUTES`]; the `loopctl.telemetry.*`
+/// diagnostics are re-appended when the cut lands on them, because
+/// drift visibility is the one part of the registry share a span
+/// should never lose to size.
+fn bounded_registry_attributes(snapshot: &RegistrySnapshot) -> Vec<KeyValue> {
+    let flattened = registry_attributes(snapshot);
+    let mut bounded: Vec<KeyValue> =
+        Vec::with_capacity(MAX_STAMPED_SERIES_ATTRIBUTES.saturating_add(5));
+    let mut diagnostics = Vec::new();
+    for kv in flattened {
+        if kv.key.as_str().starts_with("loopctl.telemetry.") {
+            diagnostics.push(kv);
+        } else if bounded.len() < MAX_STAMPED_SERIES_ATTRIBUTES {
+            bounded.push(kv);
+        }
+    }
+    bounded.extend(diagnostics);
+    bounded
+}
+
 /// Sources the bridge polls when a run span closes.
 ///
-/// Bundles everything the run-end stamp needs: the session rollup
-/// stamped onto the run span and — in `SpanAttributes` mode — the
-/// subsystem registry whose series flatten alongside it. Built from
-/// [`OtelConfig`](crate::OtelConfig) only when an observer is configured,
-/// and consumed by [`OtelTracingLayer`], which polls it when the engine
-/// records the run's outcome — after that run's observer callbacks, so
-/// the stamp reads the span's **own** run's rollup.
+/// Bundles everything the run-end stamp needs: the optional session
+/// rollup source stamped onto the run span, and — in
+/// `SpanAttributes` mode — the subsystem registry whose series
+/// flatten alongside it. Built from
+/// [`OtelConfig`](crate::OtelConfig) whenever an observer or a
+/// registry is configured, and consumed by [`OtelTracingLayer`],
+/// which polls it when the engine records the run's outcome — after
+/// that run's observer callbacks, so the stamp reads the span's
+/// **own** run's rollup.
 #[derive(Clone)]
 pub struct Stamper {
-    /// Session rollup source (the metrics observer).
+    /// Session rollup source (the metrics observer), when one exists.
     ///
     /// Snapshotted at the run-end record — the closing run is the last
-    /// run included; present by construction, since the stamper itself
-    /// exists only when a host supplied one.
-    pub observer: Arc<MetricsObserver>,
+    /// run included. A registry-only stamper leaves this `None` and
+    /// stamps nothing but its series.
+    pub observer: Option<Arc<MetricsObserver>>,
 
     /// Subsystem registry, for `SpanAttributes` mode.
     ///
@@ -353,19 +390,32 @@ impl OtelTracingLayer {
                 return;
             };
             let otel_span = otel_cx.span();
-            for kv in run_attributes(&stamper.observer.snapshot()) {
-                otel_span.set_attribute(kv);
+            if let Some(observer) = &stamper.observer {
+                for kv in run_attributes(&observer.snapshot()) {
+                    otel_span.set_attribute(kv);
+                }
             }
             if stamper.span_attributes
                 && let Some(registry) = &stamper.registry
             {
-                for kv in registry_attributes(&registry.snapshot()) {
+                for kv in bounded_registry_attributes(&registry.snapshot()) {
                     otel_span.set_attribute(kv);
                 }
             }
         });
     }
 }
+
+/// Marker that the composed layer requires `LookupSpan`-capable hosts.
+///
+/// A compile-time-only assertion: it instantiates a bound check proving
+/// the pinned host type satisfies the stock bridge's registry
+/// requirements, so a future generalization cannot compile away the
+/// capability the layer depends on. Nothing reaches production code.
+const _: fn() = || {
+    fn assert_layer<S: Subscriber + for<'a> LookupSpan<'a>>() {}
+    let _ = assert_layer::<Registry>;
+};
 
 /// Field probe answering whether a record carries the run's outcome.
 ///
@@ -437,13 +487,59 @@ impl Layer<Registry> for OtelTracingLayer {
     }
 }
 
-/// Marker that the composed layer requires `LookupSpan`-capable hosts.
-///
-/// A compile-time-only assertion: it instantiates a bound check proving
-/// the pinned host type satisfies the stock bridge's registry
-/// requirements, so a future generalization cannot compile away the
-/// capability the layer depends on. Nothing reaches production code.
-const _: fn() = || {
-    fn assert_layer<S: Subscriber + for<'a> LookupSpan<'a>>() {}
-    let _ = assert_layer::<Registry>;
-};
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::missing_panics_doc)]
+
+    use super::*;
+
+    /// A snapshot past the stamp bound keeps its diagnostics and loses
+    /// only series attributes — the SDK's 128-attribute span budget is
+    /// shared with the run rollup and the engine's own fields, which an
+    /// unbounded stamp would silently push off the span.
+    #[test]
+    fn registry_stamping_is_bounded_and_keeps_diagnostics() {
+        let series = (0..200_u32).map(|index| {
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert("tool", format!("tool-{index}"));
+            loopctl::metrics::SeriesSnapshot {
+                name: "loopctl.tools.calls",
+                kind: loopctl::metrics::MetricKind::Counter,
+                labels,
+                value: loopctl::metrics::SeriesValue::Counter { total: 1 },
+            }
+        });
+        let snapshot = RegistrySnapshot {
+            series: series.collect(),
+            unknown_metric: 1,
+            ..RegistrySnapshot::default()
+        };
+        let attrs = bounded_registry_attributes(&snapshot);
+        let series_attrs = attrs
+            .iter()
+            .filter(|kv| kv.key.as_str().starts_with("loopctl.tools.calls"))
+            .count();
+        assert_eq!(
+            series_attrs, MAX_STAMPED_SERIES_ATTRIBUTES,
+            "the registry share of the stamp is bounded"
+        );
+        for diagnostic in [
+            "loopctl.telemetry.unknown_metric",
+            "loopctl.telemetry.unknown_labels",
+            "loopctl.telemetry.missing_labels",
+            "loopctl.telemetry.numeric_on_counter",
+            "loopctl.telemetry.ambiguous_scalar",
+        ] {
+            assert!(
+                attrs.iter().any(|kv| kv.key.as_str() == diagnostic),
+                "drift visibility never yields its seat to size"
+            );
+        }
+        let bounded_again = bounded_registry_attributes(&snapshot);
+        assert_eq!(
+            attrs.len(),
+            bounded_again.len(),
+            "the cut is deterministic in the snapshot's own order"
+        );
+    }
+}

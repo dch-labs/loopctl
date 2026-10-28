@@ -385,22 +385,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// Takes the turn-end data as a single [`TurnEnd`] so call sites name every
     /// field by key — eliminating the transposition risk of seven positional
     /// arguments. `duration_ms` is derived from the [`Duration`] inside the
-    /// struct when the observer context is built.
+    /// struct when the observer context is built. The turn span settles here
+    /// too (see [`settle_turn_span`](Self::settle_turn_span)), so every
+    /// settlement path — tool-phase success, dispatch failure, LLM-phase
+    /// failure, tool-free turns — records the outcome the notification
+    /// carries.
     pub(super) fn notify_turn_end(&self, data: &TurnEnd) {
         if data.success
             && let Some(gate) = &self.budget_gate
         {
             gate.observe_turn_end();
         }
-        crate::tracing_spans::record_turn_end(
-            data.success,
-            Self::millis_u64(data.duration),
-            data.input_tokens,
-            data.output_tokens,
-            data.cached_input_tokens,
-            data.cache_write_tokens,
-            data.reasoning_tokens,
-        );
+        self.settle_turn_span(data);
         self.managers.observers().on_turn_end(&TurnEndContext {
             turn: data.turn,
             success: data.success,
@@ -416,6 +412,39 @@ impl<C: ApiClient> BareLoop<C> {
             context_window: data.context_window,
             history: Arc::clone(&data.history),
         });
+    }
+
+    /// Settle the turn span this notification closes.
+    ///
+    /// A tool-bearing turn's span is held open past the model phase (the
+    /// driver stashes it in the engine's hold slot when the committed
+    /// turn carries tool calls); its settlement lands on that held span
+    /// with the final outcome — an `ok` recorded before the tool phase
+    /// ran could be falsified by a dispatch failure. Every other
+    /// notification — tool-free turns, LLM-phase failures — settles on
+    /// the current span, where the turn-span name check keeps foreign
+    /// scopes silent.
+    fn settle_turn_span(&self, data: &TurnEnd) {
+        let held = self
+            .open_turn_span
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|(turn, _)| *turn == data.turn);
+        let settlement = crate::tracing_spans::TurnSettlement {
+            success: data.success,
+            duration_ms: Self::millis_u64(data.duration),
+            input_tokens: data.input_tokens,
+            output_tokens: data.output_tokens,
+            cached_input_tokens: data.cached_input_tokens,
+            cache_write_tokens: data.cache_write_tokens,
+            reasoning_tokens: data.reasoning_tokens,
+        };
+        match held {
+            Some((_, span)) => {
+                crate::tracing_spans::record_turn_end_on(&span, settlement);
+            }
+            None => crate::tracing_spans::record_turn_end(settlement),
+        }
     }
 
     /// Fire [`on_response`](crate::observer::LoopObserver::on_response).

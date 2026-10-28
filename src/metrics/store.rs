@@ -42,6 +42,15 @@ use super::lock;
 use super::registry::MetricDescriptor;
 use super::{MetricKind, Percentile, session::LatencyHistogram};
 
+/// Distinct label-sets a single metric name may store before excess
+/// first-seen sets collapse onto one shared overflow series.
+///
+/// The bound holds runtime label churn — a host registering unbounded
+/// tool names — against the store's lifetime accumulation: series past
+/// the cap route to the name's `series=overflow` row instead of
+/// growing the map (and every snapshot's traversal) without end.
+pub const MAX_SERIES_PER_METRIC: usize = 256;
+
 /// One stored series value, per the catalog's declared kind.
 ///
 /// The variant mirrors the [`MetricKind`] declared for the series name;
@@ -124,8 +133,9 @@ pub enum SeriesValue {
         /// The accumulated total.
         ///
         /// The sum of every increment the store has recorded for this
-        /// series — `+1` per event for the catalog's counter-kind
-        /// signals, which is what a counter counts (passes, not units).
+        /// series — `+1` per event for the counter-kind signals that
+        /// count passes, or the event's unit-named magnitude for the
+        /// few that count units (`loopctl.compaction.summarizer.tokens`).
         total: u64,
     },
 
@@ -313,10 +323,12 @@ fn bump(counter: &AtomicU64) {
 ///
 /// The multi-key twin of [`bump`]: one emission can refuse on several
 /// omitted keys at once, and the accounting stays overflow-honest in a
-/// single pass.
+/// single pass — an add that would overflow saturates at
+/// [`u64::MAX`], never stalls one short of the ceiling.
 fn bump_by(counter: &AtomicU64, count: u64) {
     let mut current = counter.load(Ordering::Relaxed);
-    while let Some(next) = current.checked_add(count) {
+    loop {
+        let next = current.saturating_add(count);
         match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(seen) => current = seen,
@@ -374,6 +386,33 @@ fn counter_sum(
     found.then_some(total)
 }
 
+/// The key a write lands on after the cardinality bound.
+///
+/// A label-set the store already holds, or a name still under
+/// [`MAX_SERIES_PER_METRIC`] distinct sets, keys itself; a first-seen
+/// set past the bound routes to the name's shared overflow series —
+/// the single synthetic pair `series=overflow` — so excess label
+/// churn (a host registering unbounded tool names) folds into one
+/// visible row instead of growing the store, and every snapshot of
+/// it, without end. Existing series are never re-routed.
+fn routed_key(
+    store: &BTreeMap<SeriesKey, MetricValue>,
+    name: &'static str,
+    labels: BTreeMap<&'static str, String>,
+) -> SeriesKey {
+    let key = (name, labels);
+    if store.contains_key(&key) {
+        return key;
+    }
+    let distinct = store.keys().filter(|(seen, _)| *seen == name).count();
+    if distinct < MAX_SERIES_PER_METRIC {
+        return key;
+    }
+    let mut overflow = BTreeMap::new();
+    overflow.insert("series", "overflow".to_string());
+    (name, overflow)
+}
+
 impl MetricsRegistry {
     /// Add `delta` to a counter series, creating it on first sight.
     ///
@@ -409,9 +448,8 @@ impl MetricsRegistry {
         delta: u64,
     ) {
         let mut store = lock(&self.series);
-        let value = store
-            .entry((descriptor.name, labels))
-            .or_insert(MetricValue::Counter(0));
+        let key = routed_key(&store, descriptor.name, labels);
+        let value = store.entry(key).or_insert(MetricValue::Counter(0));
         if let MetricValue::Counter(total) = value {
             *total = total.saturating_add(delta);
         }
@@ -450,7 +488,8 @@ impl MetricsRegistry {
         value: f64,
     ) {
         let mut store = lock(&self.series);
-        store.insert((descriptor.name, labels), MetricValue::Gauge(value));
+        let key = routed_key(&store, descriptor.name, labels);
+        store.insert(key, MetricValue::Gauge(value));
     }
 
     /// Record one sample on a histogram series, creating it on first sight.
@@ -486,8 +525,9 @@ impl MetricsRegistry {
     ) {
         let clamped = bucket_units(sample);
         let mut store = lock(&self.series);
+        let key = routed_key(&store, descriptor.name, labels);
         let value = store
-            .entry((descriptor.name, labels))
+            .entry(key)
             .or_insert_with(|| MetricValue::Histogram(LatencyHistogram::new()));
         if let MetricValue::Histogram(h) = value {
             h.record(clamped);
@@ -623,8 +663,8 @@ impl MetricsRegistry {
             if den == 0 {
                 return None;
             }
-            let n = f64::from(u32::try_from(num).unwrap_or(u32::MAX));
-            let d = f64::from(u32::try_from(den).unwrap_or(u32::MAX));
+            let n = super::wide_to_f64(num);
+            let d = super::wide_to_f64(den);
             Some(n / d)
         };
         match name {
@@ -643,8 +683,8 @@ impl MetricsRegistry {
                 }
                 let degraded =
                     counter_sum(&store, "loopctl.compaction.degradations", None, None).unwrap_or(0);
-                let d = f64::from(u32::try_from(degraded).unwrap_or(u32::MAX));
-                let p = f64::from(u32::try_from(passes).unwrap_or(u32::MAX));
+                let d = super::wide_to_f64(degraded);
+                let p = super::wide_to_f64(passes);
                 Some(1.0 - d / p)
             }
             "loopctl.compaction.summarize.ratio" => ratio(
@@ -856,6 +896,93 @@ mod tests {
             panic!("counter shape");
         };
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn bump_by_saturates_at_the_u64_ceiling() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        bump_by(&counter, 5);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u64::MAX,
+            "a diagnostic add that overflows saturates instead of stalling one short of the ceiling"
+        );
+    }
+
+    #[test]
+    fn derived_ratios_keep_their_magnitudes_past_u32_max() {
+        let store = MetricsRegistry::default();
+        let passes = lookup("loopctl.compaction.passes").unwrap();
+        store.counter_add(passes, labels(&[("stage", "threshold")]), 5_000_000_000);
+        let degrades = lookup("loopctl.compaction.degradations").unwrap();
+        store.counter_add(
+            degrades,
+            labels(&[("from", "threshold"), ("to", "truncate")]),
+            1_000_000_000,
+        );
+        assert!(
+            (store
+                .derived("loopctl.compaction.never_failed")
+                .expect("wide operands")
+                - 0.8)
+                .abs()
+                < 1e-12,
+            "1e9 degraded of 5e9 passes reads 0.8, not the saturated collapse to 0.0"
+        );
+        let summarizer = lookup("loopctl.compaction.summarizer.tokens").unwrap();
+        store.counter_add(summarizer, labels(&[("direction", "in")]), 2_500_000_000);
+        store.counter_add(summarizer, labels(&[("direction", "out")]), 5_000_000_000);
+        assert!(
+            (store
+                .derived("loopctl.compaction.summarize.ratio")
+                .expect("wide operands")
+                - 2.0)
+                .abs()
+                < 1e-12,
+            "5e9 out over 2.5e9 in reads 2.0 — unequal wide totals must not both flatten to one ceiling"
+        );
+    }
+
+    #[test]
+    fn runtime_label_cardinality_routes_excess_series_to_overflow() {
+        let store = MetricsRegistry::default();
+        let descriptor = lookup("loopctl.tools.calls").unwrap();
+        for index in 0..300_u32 {
+            let tool = format!("dynamic-{index}");
+            store.counter_add(descriptor, labels(&[("tool", &tool), ("outcome", "ok")]), 1);
+        }
+        let snap = store.snapshot();
+        let mut name_series = snap
+            .series
+            .iter()
+            .filter(|series| series.name == "loopctl.tools.calls");
+        assert_eq!(
+            name_series.clone().count(),
+            MAX_SERIES_PER_METRIC + 1,
+            "the bound plus one shared overflow series, never one series per churned name"
+        );
+        let overflow = name_series
+            .find(|series| series.labels.contains_key("series"))
+            .expect("the overflow series rides the snapshot");
+        let SeriesValue::Counter { total } = overflow.value else {
+            panic!("counter series");
+        };
+        assert_eq!(
+            total,
+            u64::from(
+                300_u32.saturating_sub(u32::try_from(MAX_SERIES_PER_METRIC).unwrap_or(u32::MAX))
+            ),
+            "every excess write accumulates on the shared overflow series"
+        );
+        let settled = snap
+            .series
+            .iter()
+            .find(|series| series.labels.get("tool").map(String::as_str) == Some("dynamic-0"))
+            .expect("the first-seen series keeps its own row");
+        let SeriesValue::Counter { total } = settled.value else {
+            panic!("counter series");
+        };
+        assert_eq!(total, 1, "existing series are never re-routed");
     }
 
     #[test]

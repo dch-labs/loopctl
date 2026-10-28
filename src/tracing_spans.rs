@@ -293,6 +293,61 @@ pub fn record_turn_query(query: &str) {
     span.record(fields::QUERY, query);
 }
 
+/// The settled figures one turn-span settlement records.
+///
+/// Built wherever a turn ends — the engine's notification funnel — and
+/// handed to [`record_turn_end`] (or [`record_turn_end_on`] for a span
+/// the driver holds open past the model phase), so the settlement
+/// sites and the span writers agree on one shape instead of seven
+/// positional figures.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnSettlement {
+    /// Whether the turn reached its intended completion.
+    ///
+    /// `false` for a hard failure — cancellation, dispatch error, a
+    /// recovery-exhausted tool; soft tool errors the model will see
+    /// stay `true`.
+    pub success: bool,
+
+    /// Wall-clock duration of the settled attempt, in milliseconds.
+    ///
+    /// Measured by the engine from the attempt's start — the model call
+    /// plus the tool phase for a tool-bearing turn — matching the
+    /// `duration_ms` metric events' unit.
+    pub duration_ms: u64,
+
+    /// Provider-reported input tokens for the attempt.
+    ///
+    /// The billing figure from the turn-end notification, never the
+    /// engine's local estimate; recorded verbatim onto the span.
+    pub input_tokens: u64,
+
+    /// Provider-reported output tokens for the attempt.
+    ///
+    /// The generated-token billing figure, paired with
+    /// [`input_tokens`](Self::input_tokens) on every settled turn.
+    pub output_tokens: u64,
+
+    /// Cache-read detail, zero where unreported.
+    ///
+    /// Presence-not-zero: a zero means the provider said nothing about
+    /// cache reads, so the span omits the field entirely.
+    pub cached_input_tokens: u64,
+
+    /// Cache-write detail, zero where unreported.
+    ///
+    /// Same presence rule as
+    /// [`cached_input_tokens`](Self::cached_input_tokens) — the
+    /// cache-creation share, recorded only where reported.
+    pub cache_write_tokens: u64,
+
+    /// Reasoning detail inside output, zero where unreported.
+    ///
+    /// The thinking subset of the output count; recorded only where the
+    /// provider reported it.
+    pub reasoning_tokens: u64,
+}
+
 /// Records a settled turn's outcome and usage on the current span.
 ///
 /// The turn-end boundary knows the figures; the span lives wherever the
@@ -308,16 +363,28 @@ pub fn record_turn_query(query: &str) {
 /// zero exactly where no report arrived, so a zero here would say
 /// "nothing cached" when the truth is "nothing said"). The headline
 /// input and output figures record on every settled turn.
-pub fn record_turn_end(
-    success: bool,
-    duration_ms: u64,
-    input_tokens: u64,
-    output_tokens: u64,
-    cached_input_tokens: u64,
-    cache_write_tokens: u64,
-    reasoning_tokens: u64,
-) {
-    let span = tracing::Span::current();
+pub fn record_turn_end(settlement: TurnSettlement) {
+    record_turn_end_on(&tracing::Span::current(), settlement);
+}
+
+/// Records a settled turn's outcome and usage on an explicit span.
+///
+/// The span-holding twin of [`record_turn_end`]: the driver keeps a
+/// tool-bearing turn's span open past the model phase and settles it
+/// from the turn-end notification after the tool phase ran, so the
+/// record names the span it belongs to instead of relying on whichever
+/// span is current where the notification fires. The same name check
+/// applies — a foreign span records nothing.
+pub fn record_turn_end_on(span: &tracing::Span, settlement: TurnSettlement) {
+    let TurnSettlement {
+        success,
+        duration_ms,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+    } = settlement;
     if span.metadata().is_none_or(|meta| meta.name() != TURN_SPAN) {
         return;
     }
@@ -333,6 +400,30 @@ pub fn record_turn_end(
     }
     if reasoning_tokens != 0 {
         span.record(fields::RESPONSE_REASONING_TOKENS, reasoning_tokens);
+    }
+}
+
+/// Records a settled run's outcome on the current `agent.run` span.
+///
+/// The run-span twin of [`record_turn_end`]: every `run()` exit path —
+/// clean completion, error, cancellation, a failed manager reset before
+/// the first turn — settles the span with its outcome, the
+/// engine-measured duration, and the bounded `error.type` class, so a
+/// collector never sees a failed run close as an outcome-less span. The
+/// name check keeps stray callers from writing run facts onto someone
+/// else's span.
+pub fn record_run_end(success: bool, duration_ms: u64, error: Option<&crate::error::LoopError>) {
+    let span = tracing::Span::current();
+    if span
+        .metadata()
+        .is_none_or(|meta| meta.name() != AGENT_RUN_SPAN)
+    {
+        return;
+    }
+    span.record(fields::OUTCOME, if success { "ok" } else { "error" });
+    span.record(fields::DURATION_MS, duration_ms);
+    if let Some(err) = error {
+        span.record(fields::ERROR_TYPE, error_type(err));
     }
 }
 

@@ -10,17 +10,23 @@
 //! ([`on_turn_end`](LoopObserver::on_turn_end)) and never from a
 //! run-boundary handover, so streaming detail counts events without
 //! touching the ledger; every counter saturates rather than wraps; and
-//! [`reset`](LoopObserver::reset) replaces the snapshot wholesale,
-//! because a fresh run is a fresh [`AgentMetrics`], not the old one
-//! zeroed field by field.
+//! each [`on_run_start`](LoopObserver::on_run_start) opens a fresh
+//! snapshot — a reused observer reports one run at a time, whatever
+//! [`RunConfig::reset_managers`](crate::engine::RunConfig::reset_managers)
+//! says — while [`reset`](LoopObserver::reset) remains the manual
+//! equivalent.
+//!
+//! Concurrent runs are the one shape this surface cannot separate: the
+//! observer callbacks carry no run identity (the session id is stable
+//! across a loop's runs by contract, and no per-turn callback carries
+//! one at all), so two engines sharing one observer interleave
+//! undistinguishably. Hosts running concurrent engines give each its
+//! own observer.
 //!
 //! Read the snapshot at any time with [`snapshot`](MetricsObserver::snapshot) —
 //! mid-run for live dashboards, after [`on_run_end`](LoopObserver::on_run_end)
-//! for the completed record. A sustained observer accumulates across
-//! every run until its next `reset`, so a boundary read is the session
-//! total so far — reset at the boundary (or set
-//! [`RunConfig::reset_managers`](crate::engine::RunConfig::reset_managers))
-//! for one snapshot per run.
+//! for the completed record; a sustained observer's boundary read is
+//! the run that just ended, never the runs before it.
 //!
 //! # Examples
 //!
@@ -50,11 +56,15 @@ use crate::observer::context::{
 
 /// The per-run [`AgentMetrics`] collector on the observer surface.
 ///
-/// One instance collects one run's snapshot; call
-/// [`snapshot`](Self::snapshot) whenever a read is wanted. The internal
+/// One instance collects one run's snapshot at a time: each
+/// [`on_run_start`](LoopObserver::on_run_start) opens a fresh
+/// [`AgentMetrics`], so a reused observer reports per-run records
+/// without anyone resetting it between runs. The internal
 /// [`Mutex`] is held only for field bumps — callbacks never run engine
 /// code under the lock — and poison is recovered, because the guarded
-/// data is plain counters.
+/// data is plain counters. Concurrent runs cannot share one: the
+/// callback surface carries no run identity, so hosts running
+/// concurrent engines attach one observer each (see the module docs).
 ///
 /// # Examples
 ///
@@ -123,7 +133,9 @@ impl LoopObserver for MetricsObserver {
     }
 
     fn on_run_start(&self, ctx: &RunStartContext) {
-        lock(&self.metrics).session_id = ctx.session_id;
+        let mut metrics = lock(&self.metrics);
+        *metrics = AgentMetrics::default();
+        metrics.session_id = ctx.session_id;
     }
 
     fn on_run_end(&self, ctx: &RunEndContext) {
@@ -394,6 +406,35 @@ mod tests {
         assert_eq!(m.convergences_detected, 1);
         assert_eq!(m.compactions, 1);
         assert_eq!(m.compaction_failures, 1);
+    }
+
+    #[test]
+    fn a_reused_observer_resets_at_each_run_start() {
+        let observer = MetricsObserver::new();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_end(&turn(0, true, 100, 10, 1));
+        observer.on_run_end(&RunEndContext::new(true, None, 1, 100));
+
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        let opened = observer.snapshot();
+        assert_eq!(
+            opened.total_turns, 0,
+            "the second run opens on a clean snapshot, not the first run's ledger"
+        );
+        assert_eq!(opened.tokens.input, 0);
+
+        observer.on_turn_end(&turn(0, true, 200, 20, 2));
+        observer.on_run_end(&RunEndContext::new(true, None, 1, 200));
+        let settled = observer.snapshot();
+        assert_eq!(
+            settled.total_turns, 1,
+            "the boundary read carries only this run's turns"
+        );
+        assert_eq!(settled.tokens.input, 20);
     }
 
     #[test]

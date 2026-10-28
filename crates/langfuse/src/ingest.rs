@@ -4,10 +4,11 @@
 //! `tokio` runtime: envelopes batch to `batch_size` (or a 250 ms tick),
 //! ship as one `{"batch":[…]}` body with Basic auth, and failures retry
 //! up to three times, backing off 250 → 500 → 1000 ms (event ids are
-//! idempotent, so a retry can never double-count). 4xx responses are
-//! dropped loudly — the payload is wrong, not the transport. Buffer
-//! overflow evicts the **oldest** event and counts the loss (the guard's
-//! `dropped_count`).
+//! idempotent, so a retry can never double-count). A 207 whose body
+//! names failed entries retries them; a 429 honors `Retry-After` for
+//! the same batch; other 4xx responses are dropped loudly — the
+//! payload is wrong, not the transport. Buffer overflow evicts the
+//! **oldest** event and counts the loss (the guard's `dropped_count`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -147,12 +148,18 @@ impl IngestSink {
 
     /// Queue one envelope, reporting whether the pipeline took it —
     /// `false` only once shutdown has closed the queue.
+    ///
+    /// The `closed` check runs **under** the queue lock: a pre-lock
+    /// check could pass, shutdown could then observe an empty queue
+    /// and let the worker exit, and this push would append to a queue
+    /// nobody will ever drain — a lost event. Under the lock, shutdown
+    /// cannot drain-and-exit between the check and the append.
     pub(crate) fn try_push(&self, event: Value) -> bool {
-        if self.buffer.closed.load(Ordering::SeqCst) {
-            return false;
-        }
         {
             let mut queue = self.buffer.lock();
+            if self.buffer.closed.load(Ordering::SeqCst) {
+                return false;
+            }
             while queue.len() >= BUFFER_CAP {
                 queue.pop_front();
                 self.buffer.dropped.fetch_add(1, Ordering::Relaxed);
@@ -173,12 +180,23 @@ impl IngestSink {
         self.buffer.dropped.load(Ordering::Relaxed)
     }
 
+    /// Close the queue without waiting for the drain.
+    ///
+    /// The current-thread-runtime drop path: parking the runtime's
+    /// only worker inside `Drop` would starve the flusher for the
+    /// whole bounded wait, so the queue closes (pushes refuse; a
+    /// runtime that keeps being driven drains what it can) and the
+    /// dropping thread returns at once.
+    pub(crate) fn close(&self) {
+        self.buffer.closed.store(true, Ordering::SeqCst);
+        self.buffer.woken.notify_waiters();
+    }
+
     /// Close the queue, let the worker flush what remains, and wait
     /// (bounded) for it to finish. For `Drop` and shutdown paths on
     /// ordinary threads — never call from a thread the runtime drives.
     pub(crate) fn shutdown_blocking(&self, timeout: Duration) {
-        self.buffer.closed.store(true, Ordering::SeqCst);
-        self.buffer.woken.notify_waiters();
+        self.close();
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(std::time::Instant::now);
@@ -297,13 +315,16 @@ where
 
 /// POST one ingestion batch, applying the transport's retry contract.
 ///
-/// A 2xx or Langfuse's 207 multi-status settles the batch; a 4xx is
-/// dropped with a warning (the payload is wrong, not the transport);
-/// 5xx answers and transport failures retry up to three times on a
-/// 250 → 500 → 1000 ms ladder. Envelope ids are idempotent
-/// server-side, so a retried batch can never double-count — a batch
-/// that exhausts the ladder is dropped with a warning and counted
-/// nowhere else.
+/// A 2xx settles the batch; Langfuse's 207 multi-status settles only
+/// when its body names no failed entries — a body carrying `errors`
+/// retries the same ids (idempotent server-side), and a body that
+/// cannot be parsed settles rather than guessing. A 429 honors the
+/// response's `Retry-After` (delta-seconds, capped at 5 s) and retries
+/// the same batch; other 4xx responses are dropped with a warning
+/// (the payload is wrong, not the transport); 5xx answers and
+/// transport failures retry up to three times on a 250 → 500 →
+/// 1000 ms ladder. A batch that exhausts the ladder is dropped with a
+/// warning and counted nowhere else.
 async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>) {
     if batch.is_empty() {
         return;
@@ -315,32 +336,62 @@ async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>
             .post(url)
             .header(reqwest::header::AUTHORIZATION, auth)
             .json(&body);
-        match request.send().await {
-            Ok(response) if response.status().is_success() || response.status().as_u16() == 207 => {
-                return;
-            }
-            Ok(response) if response.status().is_client_error() => {
-                tracing::warn!(
-                    target: "loopctl::langfuse",
-                    status = response.status().as_u16(),
-                    "langfuse rejected an ingest batch (dropped as unrecoverable)"
-                );
-                return;
-            }
-            Ok(response) => {
-                tracing::debug!(
-                    target: "loopctl::langfuse",
-                    status = response.status().as_u16(),
-                    attempt,
-                    "langfuse ingest failed, will retry"
-                );
-            }
+        let response = match request.send().await {
+            Ok(response) => response,
             Err(err) => {
                 tracing::debug!(
                     target: "loopctl::langfuse",
                     %err, attempt, "langfuse ingest transport failed, will retry"
                 );
+                if attempt.saturating_add(1) < 4 {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(5));
+                }
+                continue;
             }
+        };
+        let status = response.status();
+        if status.as_u16() == 207 {
+            let failed = multi_status_failures(response).await;
+            if failed == 0 {
+                return;
+            }
+            tracing::debug!(
+                target: "loopctl::langfuse",
+                failed,
+                attempt,
+                "langfuse 207 carried failed entries, will retry them"
+            );
+        } else if status.is_success() {
+            return;
+        } else if status.as_u16() == 429 {
+            if let Some(advised) = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(retry_after_delay)
+            {
+                delay = advised.min(Duration::from_secs(5));
+            }
+            tracing::debug!(
+                target: "loopctl::langfuse",
+                attempt,
+                "langfuse rate-limited the ingest, will retry the same batch"
+            );
+        } else if status.is_client_error() {
+            tracing::warn!(
+                target: "loopctl::langfuse",
+                status = status.as_u16(),
+                "langfuse rejected an ingest batch (dropped as unrecoverable)"
+            );
+            return;
+        } else {
+            tracing::debug!(
+                target: "loopctl::langfuse",
+                status = status.as_u16(),
+                attempt,
+                "langfuse ingest failed, will retry"
+            );
         }
         if attempt.saturating_add(1) < 4 {
             tokio::time::sleep(delay).await;
@@ -351,6 +402,31 @@ async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>
         target: "loopctl::langfuse",
         "langfuse ingest retries exhausted; batch dropped"
     );
+}
+
+/// Count the failed entries a 207 multi-status body names.
+///
+/// Langfuse answers a partially-accepted batch with
+/// `{"successes": […], "errors": […]}`; a body whose `errors` array
+/// is absent or empty settles the batch, and a body that cannot be
+/// parsed settles too — the client cannot distinguish failures it
+/// never read, and the envelope ids make any re-send idempotent, so
+/// settling a foreign shape never double-counts a well-formed retry
+/// path.
+async fn multi_status_failures(response: reqwest::Response) -> usize {
+    let parsed = response.json::<Value>().await.ok();
+    parsed
+        .and_then(|body| body.get("errors").and_then(Value::as_array).cloned())
+        .map_or(0, |errors| errors.len())
+}
+
+/// Parse a `Retry-After` value as delta-seconds.
+///
+/// Langfuse's rate-limit answers advise seconds — the documented
+/// shape. An `Option`-shaped `None` (HTTP-date, junk) falls back to
+/// the caller's ladder; the caller caps whatever parses.
+fn retry_after_delay(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 /// Encode the ingestion credentials as a Basic `Authorization` header.
@@ -436,7 +512,12 @@ fn civil_from_days(days: u64) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::missing_panics_doc)]
+    #![allow(clippy::missing_panics_doc, clippy::unwrap_used, clippy::expect_used)]
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -456,6 +537,150 @@ mod tests {
     #[test]
     fn basic_auth_uses_the_std_alphabet() {
         assert_eq!(basic_auth("pk", "sk"), "Basic cGs6c2s=");
+    }
+
+    /// Serve scripted one-shot responses, counting requests.
+    ///
+    /// Each accepted connection is read to its body (Content-Length),
+    /// counted, and answered with the round's status line, an optional
+    /// header, and body — the minimal collector the wire tests need.
+    fn serve_rounds(
+        listener: &TcpListener,
+        hits: &Arc<AtomicUsize>,
+        rounds: Vec<(String, Option<String>, String)>,
+    ) {
+        for (status, header, body) in rounds {
+            let Ok((mut stream, _peer)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            let header_text = String::from_utf8_lossy(&buf).to_string();
+            let length: usize = header_text
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|rest| rest.trim().parse().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            let mut request_body = vec![0_u8; length];
+            if length > 0 {
+                stream.read_exact(&mut request_body).unwrap_or(());
+            }
+            hits.fetch_add(1, Ordering::SeqCst);
+            let extra = header.map_or(String::new(), |value| format!("{value}\r\n"));
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra}\
+                 connection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap_or(());
+            stream.flush().unwrap_or(());
+        }
+    }
+
+    fn one_shot_endpoint(
+        rounds: Vec<(String, Option<String>, String)>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let addr = listener.local_addr().unwrap();
+        let counted = Arc::clone(&hits);
+        std::thread::spawn(move || serve_rounds(&listener, &counted, rounds));
+        (format!("http://{addr}/api/public/ingestion"), hits)
+    }
+
+    #[tokio::test]
+    async fn a_207_with_failed_entries_retries_the_batch() {
+        let (url, hits) = one_shot_endpoint(vec![
+            (
+                "207 Multi-Status".to_string(),
+                None,
+                r#"{"successes":[],"errors":[{"id":"e1","status":500,"message":"boom"}]}"#
+                    .to_string(),
+            ),
+            (
+                "207 Multi-Status".to_string(),
+                None,
+                r#"{"successes":[],"errors":[]}"#.to_string(),
+            ),
+        ]);
+        let client = reqwest::Client::new();
+        post(
+            &client,
+            &url,
+            &basic_auth("pk", "sk"),
+            vec![json!({ "n": 1 })],
+        )
+        .await;
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "the errored 207 must re-send the batch, not settle over failed entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_honors_retry_after_and_retries_the_same_batch() {
+        let (url, hits) = one_shot_endpoint(vec![
+            (
+                "429 Too Many Requests".to_string(),
+                Some("retry-after: 0".to_string()),
+                "{}".to_string(),
+            ),
+            (
+                "207 Multi-Status".to_string(),
+                None,
+                r#"{"successes":[],"errors":[]}"#.to_string(),
+            ),
+        ]);
+        let client = reqwest::Client::new();
+        post(
+            &client,
+            &url,
+            &basic_auth("pk", "sk"),
+            vec![json!({ "n": 1 })],
+        )
+        .await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the rate-limited batch retries once advised and settles on the clean 207"
+        );
+    }
+
+    #[test]
+    fn a_push_racing_shutdown_cannot_append_to_a_closed_queue() {
+        let buffer = Arc::new(Buffer {
+            queue: std::sync::Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            work_in_flight: AtomicBool::new(false),
+            woken: Notify::new(),
+        });
+        let holder = buffer.lock();
+        let pusher_sink = IngestSink {
+            buffer: Arc::clone(&buffer),
+        };
+        let pusher = std::thread::spawn(move || pusher_sink.try_push(json!({ "n": 1 })));
+        std::thread::sleep(Duration::from_millis(50));
+        buffer.closed.store(true, Ordering::SeqCst);
+        drop(holder);
+        let accepted = pusher.join().unwrap();
+        assert!(
+            !accepted,
+            "a push racing shutdown reports the queue as closed"
+        );
+        assert!(
+            buffer.lock().is_empty(),
+            "a push racing shutdown must not append to a closed queue"
+        );
     }
 
     #[test]

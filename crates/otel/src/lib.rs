@@ -71,9 +71,9 @@ pub enum OtelMetricsMode {
     /// Stamp the metrics onto spans instead of a metric pipeline.
     ///
     /// The closing `invoke_agent` span carries the
-    /// [`AgentMetrics`](loopctl::metrics::AgentMetrics) rollup and, from
+    /// [`AgentMetrics`] rollup and, from
     /// the configured
-    /// [`MetricsRegistry`](loopctl::metrics::MetricsRegistry), the
+    /// [`MetricsRegistry`], the
     /// subsystem snapshot as span attributes. One pipeline, zero extra
     /// threads.
     SpanAttributes,
@@ -347,7 +347,7 @@ pub fn export_metrics(
         for attr in metrics::run_attributes(agent) {
             let name = attr.key.as_str().to_string();
             let value = match attr.value {
-                opentelemetry::Value::I64(n) => f64::from(i32::try_from(n).unwrap_or(i32::MAX)),
+                opentelemetry::Value::I64(n) => metrics::wide_i64_to_f64(n),
                 opentelemetry::Value::F64(f) => f,
                 opentelemetry::Value::Bool(b) => f64::from(b),
                 _ => continue,
@@ -385,10 +385,7 @@ fn build_providers(
         .build();
     let meter_provider = match config.metrics {
         Some(OtelMetricsMode::Pipeline) => {
-            let exporter = opentelemetry_otlp::MetricExporter::builder()
-                .with_http()
-                .build()
-                .map_err(|err| OtelInstallError::Exporter(err.to_string()))?;
+            let exporter = build_metric_exporter(config)?;
             let reader = PeriodicReader::builder(exporter).build();
             Some(
                 SdkMeterProvider::builder()
@@ -438,20 +435,64 @@ fn build_span_exporter(
         .map_err(|err| OtelInstallError::Exporter(err.to_string()))
 }
 
+/// Construct the metric exporter for the configured transport — the
+/// meter-side twin of [`build_span_exporter`].
+///
+/// The metric pipeline honors the same endpoint and transport
+/// selection the span pipeline does, so a configured collector
+/// receives both signal kinds; before this mirroring the metric
+/// exporter silently targeted its own default endpoint over HTTP
+/// whatever `OtelConfig::endpoint` and `OtelConfig::use_grpc` said.
+///
+/// # Errors
+///
+/// [`OtelInstallError::Exporter`] when the OTLP builder rejects the
+/// endpoint or the `grpc` feature is missing while requested.
+fn build_metric_exporter(
+    config: &OtelConfig,
+) -> Result<opentelemetry_otlp::MetricExporter, OtelInstallError> {
+    use opentelemetry_otlp::WithExportConfig as _;
+    let endpoint = config.endpoint.clone();
+    #[cfg(feature = "grpc")]
+    if config.use_grpc {
+        return opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|err| OtelInstallError::Exporter(err.to_string()));
+    }
+    if config.use_grpc && !cfg!(feature = "grpc") {
+        return Err(OtelInstallError::Exporter(
+            "gRPC transport requires the `grpc` feature".to_string(),
+        ));
+    }
+    opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .with_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|err| OtelInstallError::Exporter(err.to_string()))
+}
+
 /// The close-time stamp sources, when configured.
 ///
-/// `None` without an observer: stamping exists to publish the session
-/// rollup, and a stamper without a rollup source has nothing to
-/// publish. The registry handle and the `SpanAttributes` flag ride
-/// along exactly as configured. The stamper feeds
+/// Built whenever an observer **or** a registry is configured: the
+/// registry-only shape (a `SpanAttributes` host that stamps subsystem
+/// series but tracks no session rollup) stamps exactly its series, so
+/// valid series never wait on an observer nobody configured. The
+/// registry handle and the `SpanAttributes` flag ride along exactly as
+/// configured. The stamper feeds
 /// [`OtelTracingLayer::with_stamper`](layer::OtelTracingLayer::with_stamper),
 /// which writes the rollup at the run-end record — not the exporter,
 /// whose later read of a sustained observer would fold every
 /// subsequent run's numbers into this span's stamp.
 fn stamper_for(config: &OtelConfig) -> Option<layer::Stamper> {
-    let observer = config.observer.clone()?;
+    if config.observer.is_none() && config.registry.is_none() {
+        return None;
+    }
     Some(layer::Stamper {
-        observer,
+        observer: config.observer.clone(),
         registry: config.registry.clone(),
         span_attributes: matches!(config.metrics, Some(OtelMetricsMode::SpanAttributes)),
     })
@@ -480,5 +521,47 @@ fn compose_layer(
     match stamper {
         Some(stamper) => composed.with_stamper(stamper),
         None => composed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::missing_panics_doc, clippy::expect_used)]
+
+    use super::*;
+
+    /// A registry-only `SpanAttributes` config still gets its stamper:
+    /// stamping series onto run spans must not wait on an observer the
+    /// host never configured.
+    #[test]
+    fn a_registry_only_config_still_builds_a_stamper() {
+        let config = OtelConfig {
+            metrics: Some(OtelMetricsMode::SpanAttributes),
+            registry: Some(Arc::new(MetricsRegistry::default())),
+            ..OtelConfig::default()
+        };
+        let stamper = stamper_for(&config).expect("registry-only configs stamp");
+        assert!(stamper.observer.is_none(), "no observer was configured");
+        assert!(stamper.span_attributes);
+
+        let bare = stamper_for(&OtelConfig::default());
+        assert!(bare.is_none(), "nothing to stamp, no stamper");
+    }
+
+    /// The metric pipeline honors the configured endpoint: an endpoint
+    /// no HTTP client can route must fail the pipeline build, exactly
+    /// as it fails the span exporter build.
+    #[test]
+    fn a_pipeline_with_an_unroutable_endpoint_fails_to_build() {
+        let config = OtelConfig {
+            endpoint: "::::not-a-url".to_string(),
+            metrics: Some(OtelMetricsMode::Pipeline),
+            ..OtelConfig::default()
+        };
+        assert!(
+            build_providers(&config).is_err(),
+            "the metric exporter must reject an unroutable endpoint instead of \
+             silently building against its own default"
+        );
     }
 }

@@ -49,6 +49,8 @@ docs:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p loopctl-sqlite
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p loopctl-hnsw
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p loopctl-otel
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p loopctl-langfuse
 
 examples:
 	cargo build --examples --all-features

@@ -4,7 +4,10 @@
 //! host's subscriber. It watches for events on the reserved metrics
 //! [`target`](MetricsLayer::TARGET), checks each against the
 //! [catalog](super::registry), and converts it into writes on a shared
-//! [`MetricsRegistry`]. The check runs in both directions of the closed
+//! [`MetricsRegistry`]. An event on the target that carries no `metric`
+//! field is not a metric event — the engine's own non-metric warnings
+//! ride the same target — and is ignored before any catalog check. The
+//! check runs in both directions of the closed
 //! label set: surplus keys are counted
 //! ([`unknown_labels`](super::RegistrySnapshot::unknown_labels)) and
 //! dropped, while an emission missing a declared key is refused
@@ -208,18 +211,13 @@ impl Visit for FieldVisitor<'_> {
 ///
 /// The f64 mantissa holds every integer up to 2^53 exactly, and above
 /// it the nearest-representable value is what `parse::<f64>` of the
-/// rendered digits answers too — so composing the value from its two
-/// 32-bit limbs (`mul_add`'s single fused rounding) makes the direct
-/// `record_u64` shape and the `%expr`-rendered shape of the same
-/// number land on one stored value everywhere, including past
-/// `u32::MAX` where a saturating conversion would fork them.
+/// rendered digits answers too — the shared construction lives in
+/// [`super::wide_to_f64`], so the direct `record_u64` shape and the
+/// `%expr`-rendered shape of the same number land on one stored value
+/// everywhere, including past `u32::MAX` where a saturating conversion
+/// would fork them.
 fn wide_u64_to_f64(value: u64) -> f64 {
-    let hi = value.div_euclid(4_294_967_296);
-    let lo = value.rem_euclid(4_294_967_296);
-    f64::from(u32::try_from(hi).unwrap_or(u32::MAX)).mul_add(
-        4_294_967_296.0,
-        f64::from(u32::try_from(lo).unwrap_or(u32::MAX)),
-    )
+    super::wide_to_f64(value)
 }
 
 /// Resolves the single scalar a gauge or histogram event is reporting.
@@ -242,6 +240,23 @@ fn resolve_scalar(metric_name: &str, numbers: &[(String, f64)]) -> Option<f64> {
         return numbers.first().map(|(_, value)| *value);
     }
     None
+}
+
+/// The unit-named numeric of a counter event, when it carries one.
+///
+/// A counter whose own unit name rides the event (`…summarizer.tokens`
+/// with `tokens = 60`) counts that magnitude as its delta rather than
+/// one pass — the same unit-in-name grammar [`resolve_scalar`] applies
+/// to gauges and histograms. Returns `None` when no such field rides
+/// the event, leaving the counter at its default `+1` pass count.
+fn unit_named_delta(metric_name: &str, numbers: &[(String, f64)]) -> Option<u64> {
+    let tail = metric_name.rsplit('.').next().unwrap_or(metric_name);
+    let (_, value) = numbers.iter().find(|(name, _)| name == tail)?;
+    if value.is_finite() && *value > 0.0 {
+        Some(format!("{value:.0}").parse().unwrap_or(u64::MAX))
+    } else {
+        Some(0)
+    }
 }
 
 /// Canonicalizes label pairs against a descriptor's declared keys.
@@ -346,16 +361,18 @@ impl MetricsLayer {
     /// The label check runs first and in both directions: surplus keys
     /// count as drift while the event still stores, but an emission
     /// missing a declared key is refused — counted per key, stored
-    /// nowhere. Counters count passes: exactly `+1` per event, with any
-    /// numeric fields it carries counted as a `numeric_on_counter`
-    /// diagnostic (the site and the declaration disagree about the unit
-    /// of the signal; guessing one is not the layer's job). Gauges and
-    /// histograms need a scalar; where [`resolve_scalar`] finds none
-    /// unambiguously, the `ambiguous_scalar` diagnostic records the
-    /// event instead of a fabricated value.
+    /// nowhere. Counters count passes — `+1` per event — except where
+    /// the event carries a numeric named as the metric's own unit
+    /// (`tokens` on `…summarizer.tokens`): that magnitude is the delta,
+    /// and every other numeric on a counter is counted as a
+    /// `numeric_on_counter` diagnostic (the site and the declaration
+    /// disagree about the unit of the signal; guessing one is not the
+    /// layer's job). Gauges and histograms need a scalar; where
+    /// [`resolve_scalar`] finds none unambiguously, the
+    /// `ambiguous_scalar` diagnostic records the event instead of a
+    /// fabricated value.
     fn dispatch(&self, collected: Collected) {
         let Some(metric_name) = collected.metric else {
-            self.registry.bump_unknown_metric();
             return;
         };
         let Some(descriptor) = registry::lookup(&metric_name) else {
@@ -370,10 +387,16 @@ impl MetricsLayer {
         let labels = canonical_labels(descriptor, &collected.strings, &self.registry);
         match descriptor.kind {
             super::MetricKind::Counter => {
-                if !collected.numbers.is_empty() {
-                    self.registry.bump_numeric_on_counter();
+                let unit = unit_named_delta(&metric_name, &collected.numbers);
+                for (name, _) in &collected.numbers {
+                    let is_unit =
+                        unit.is_some() && Some(name.as_str()) == metric_name.rsplit('.').next();
+                    if !is_unit {
+                        self.registry.bump_numeric_on_counter();
+                    }
                 }
-                self.registry.counter_add(descriptor, labels, 1);
+                self.registry
+                    .counter_add(descriptor, labels, unit.unwrap_or(1));
             }
             super::MetricKind::Gauge | super::MetricKind::Histogram => {
                 match resolve_scalar(&metric_name, &collected.numbers) {
@@ -399,6 +422,9 @@ impl<S: Subscriber> Layer<S> for MetricsLayer {
         event.record(&mut FieldVisitor {
             out: &mut collected,
         });
+        if collected.metric.is_none() {
+            return;
+        }
         self.dispatch(collected);
     }
 }
@@ -542,13 +568,92 @@ mod tests {
         assert_eq!(snap.unknown_metric, 0, "not even counted as drift");
     }
 
+    /// A counter whose own unit name rides the event counts that
+    /// magnitude, not one: `loopctl.compaction.summarizer.tokens`
+    /// carrying `tokens = 60` adds sixty, and the derived
+    /// summarize ratio becomes the token ratio it was declared to be.
+    /// A foreign numeric on a counter stays drift, exactly as before.
     #[test]
-    fn missing_metric_field_counts_unknown() {
+    fn a_unit_named_counter_field_is_its_delta() {
         let store = Arc::new(MetricsRegistry::default());
         capture(&store, || {
-            tracing::debug!(target: MetricsLayer::TARGET, value = 3_u64);
+            tracing::debug!(
+                target: MetricsLayer::TARGET,
+                metric = "loopctl.compaction.summarizer.tokens",
+                direction = "in",
+                estimated = true,
+                tokens = 60_u64,
+                "summarizer input tokens for one compaction pass"
+            );
+            tracing::debug!(
+                target: MetricsLayer::TARGET,
+                metric = "loopctl.compaction.summarizer.tokens",
+                direction = "out",
+                estimated = true,
+                tokens = 30_u64,
+                "summarizer output tokens for one compaction pass"
+            );
         });
-        assert_eq!(store.snapshot().unknown_metric, 1);
+        let snap = store.snapshot();
+        let input = snap
+            .series
+            .iter()
+            .find(|s| s.labels.get("direction").map(String::as_str) == Some("in"))
+            .expect("the input series stored");
+        match input.value {
+            super::super::store::SeriesValue::Counter { total } => assert_eq!(
+                total, 60,
+                "the unit-named field is the counter's delta, not a pass count"
+            ),
+            _ => panic!("counter series"),
+        }
+        assert_eq!(
+            snap.numeric_on_counter, 0,
+            "the metric's own unit-named numeric is the delta, never drift"
+        );
+        assert_eq!(
+            store.derived("loopctl.compaction.summarize.ratio"),
+            Some(0.5),
+            "the derived ratio reads tokens, not event passes"
+        );
+
+        capture(&store, || {
+            tracing::debug!(
+                target: MetricsLayer::TARGET,
+                metric = "loopctl.tools.calls",
+                tool = "read",
+                outcome = "ok",
+                duration_ms = %5_u64,
+            );
+        });
+        assert_eq!(
+            store.snapshot().numeric_on_counter,
+            1,
+            "a numeric the metric does not name stays drift"
+        );
+    }
+
+    /// The engine itself emits non-metric events on the reserved target
+    /// (the embedding dimension-mismatch warning); those are not metric
+    /// events and must not read as catalog drift.
+    #[test]
+    fn events_without_a_metric_field_are_ignored() {
+        let store = Arc::new(MetricsRegistry::default());
+        capture(&store, || {
+            tracing::warn!(
+                target: MetricsLayer::TARGET,
+                "embedding dimension mismatch: configured 256, served 128"
+            );
+        });
+        let snap = store.snapshot();
+        assert!(
+            snap.series.is_empty(),
+            "nothing without a metric name stores a series"
+        );
+        assert_eq!(
+            snap.unknown_metric, 0,
+            "a metric-less event on the target is not catalog drift"
+        );
     }
 
     #[test]

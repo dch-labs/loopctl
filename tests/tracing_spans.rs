@@ -27,6 +27,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use loopctl::config::SessionConfig;
 use loopctl::engine::{BareLoop, RunConfig, Steering, core::Loop};
@@ -42,6 +43,37 @@ use tracing_subscriber::registry::LookupSpan;
 
 /// A tool that echoes a fixed successful output.
 struct EchoTool;
+
+/// A tool whose dispatch outlives the run: it sleeps far past the
+/// cancel signal, so the dispatcher's own cancellation select is what
+/// ends it — the hard-failure path a tool phase can take.
+struct StalledTool;
+
+impl Tool for StalledTool {
+    fn name(&self) -> &'static str {
+        "stalled"
+    }
+    fn description(&self) -> &'static str {
+        "Sleeps past the cancel signal"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            self.name().to_string(),
+            self.description().to_string(),
+            serde_json::json!({"type": "object"}),
+        )
+    }
+    fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(ToolOutput::text("late"))
+        })
+    }
+}
 
 impl Tool for EchoTool {
     fn name(&self) -> &'static str {
@@ -422,7 +454,114 @@ async fn the_engine_emits_the_documented_span_tree() {
         "the failed run still measures its duration"
     );
 
-    // Scenario 1d: mid-run steering — the span's `query` and the
+    // Scenario 1d: a tool phase that fails hard settles its turn span
+    // with the failure vocabulary — the settlement a tool-bearing turn
+    // owes after the model phase, which an early `ok` recorded before
+    // dispatch would falsify. The scripted failure is a cancellation
+    // during dispatch (the dispatcher's own select ends a stalled
+    // tool): the hard-failure path every dispatch error takes.
+    let cancel_captures = Arc::new(Captures::default());
+    let cancel_subscriber =
+        tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&cancel_captures)));
+    let cancel_guard = tracing::subscriber::set_default(cancel_subscriber);
+    let cancel_client =
+        Arc::new(
+            MockApiClient::new("test-model").with_responses(vec![MockResponse {
+                text: "calling stalled".to_string(),
+                tool_call: Some(MockToolCall {
+                    id: "call_1".to_string(),
+                    name: "stalled".to_string(),
+                    input: serde_json::json!({}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            }]),
+        );
+    let cancel_registry = ToolRegistry::new();
+    cancel_registry.register(StalledTool);
+    let mut cancel_agent = BareLoop::new(cancel_client, cancel_registry, SessionConfig::default());
+    let cancel_signal = cancel_agent.cancel_signal();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel_signal.cancel();
+    });
+    let run_outcome = cancel_agent
+        .run("tool phase fails hard", &RunConfig::default())
+        .await;
+    canceller.await.expect("the canceller joins");
+    drop(cancel_guard);
+    assert!(
+        run_outcome.is_err(),
+        "the mid-dispatch cancel fails the run: {run_outcome:?}"
+    );
+    let cancel_spans = cancel_captures.spans.lock().expect("spans lock").clone();
+    let cancelled_turn = cancel_spans
+        .iter()
+        .find(|span| {
+            span.name == loopctl::tracing_spans::TURN_SPAN && span.field(fields::TURN) == Some("0")
+        })
+        .expect("the tool turn's span opened");
+    assert_eq!(
+        cancelled_turn.field(fields::OUTCOME),
+        Some("error"),
+        "the dispatch failure settles the turn span — never an ok recorded \
+         before the tool phase ran"
+    );
+    assert!(
+        cancelled_turn.field(fields::USAGE_INPUT_TOKENS).is_some(),
+        "the failure settlement still carries the attempt's usage"
+    );
+    assert!(
+        cancelled_turn.field(fields::DURATION_MS).is_some(),
+        "the failure settlement still carries the attempt's duration"
+    );
+
+    // Scenario 1e: the run-span settlement helper writes the failure
+    // vocabulary onto a run span — outcome, duration, and the bounded
+    // error class — and nothing at all onto a foreign span.
+    let helper_captures = Arc::new(Captures::default());
+    let helper_subscriber =
+        tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&helper_captures)));
+    let helper_guard = tracing::subscriber::set_default(helper_subscriber);
+    let run_span = loopctl::tracing_spans::agent_run_span(uuid::Uuid::new_v4(), "test-model");
+    run_span.in_scope(|| {
+        loopctl::tracing_spans::record_run_end(
+            false,
+            1_234,
+            Some(&loopctl::error::LoopError::Cancelled),
+        );
+    });
+    drop(run_span);
+    let turn_span = loopctl::tracing_spans::turn_span(&TurnStartContext {
+        turn: 0,
+        query: String::new(),
+    });
+    turn_span.in_scope(|| {
+        loopctl::tracing_spans::record_run_end(true, 5, None);
+    });
+    drop(turn_span);
+    drop(helper_guard);
+    let helper_spans = helper_captures.spans.lock().expect("spans lock").clone();
+    let settled_run = helper_spans
+        .iter()
+        .find(|span| span.name == loopctl::tracing_spans::AGENT_RUN_SPAN)
+        .expect("the run span opened");
+    assert_eq!(settled_run.field(fields::OUTCOME), Some("error"));
+    assert_eq!(settled_run.field(fields::DURATION_MS), Some("1234"));
+    assert_eq!(
+        settled_run.field(fields::ERROR_TYPE),
+        Some("cancelled"),
+        "the bounded class name lands, never the message text"
+    );
+    let foreign_turn = helper_spans
+        .iter()
+        .find(|span| span.name == loopctl::tracing_spans::TURN_SPAN)
+        .expect("the turn span opened");
+    assert!(
+        foreign_turn.field(fields::OUTCOME).is_none(),
+        "run facts never land on a foreign span"
+    );
+
+    // Scenario 1f: mid-run steering — the span's `query` and the
     // turn-start observer's query are the same string, the one computed
     // after the steering drain. A span built from a pre-drain snapshot
     // would show turn 0's tool-result text instead of the guidance.

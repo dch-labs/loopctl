@@ -82,6 +82,16 @@ struct InstrumentState {
     /// alone: a name with two label series must track each delta
     /// separately, or one series' growth silently swallows another's.
     counter_totals: Vec<(String, u64)>,
+
+    /// Last replayed per-bucket counts per canonical series identity.
+    ///
+    /// Registry snapshots are cumulative; the replay hands the
+    /// instrument only the samples added since the previous export, so
+    /// an unchanged snapshot adds zero new samples instead of
+    /// re-recording its whole distribution on every scrape — under
+    /// cumulative temporality the re-records would inflate the
+    /// exported counts and sums on each pass.
+    histogram_counts: Vec<(String, Vec<u64>)>,
 }
 
 impl MeterHandle {
@@ -168,22 +178,60 @@ pub(crate) fn active_meter() -> Option<Arc<MeterHandle>> {
 /// count cannot stall an export.
 const BUCKET_REPLAY_CAP: u64 = 10_000;
 
-/// The canonical identity of one stored series: its name plus its
-/// sorted `label=value` pairs, joined by dots.
+/// Converts a wide unsigned integer to `f64` — exact below 2^53,
+/// correctly rounded beyond.
 ///
-/// This is the exact key shape [`registry_attributes`] renders for
-/// span attributes, reused here so delta bookkeeping distinguishes
-/// `loopctl.tools.calls.tool=read` from `loopctl.tools.calls.tool=exec`
-/// the way the store itself does — counters keyed by name alone would
-/// export one series' growth against another's total and lose the
-/// difference silently.
+/// The limb-composed construction (one fused `mul_add` rounding) keeps
+/// exported magnitudes honest past `u32::MAX` — where a saturating
+/// conversion would flatten distinct totals onto one ceiling — without
+/// a lossy-cast lint to suppress. The core crate's metrics module uses
+/// the same construction for its ratios.
+fn wide_to_f64(value: u64) -> f64 {
+    let hi = value.div_euclid(4_294_967_296);
+    let lo = value.rem_euclid(4_294_967_296);
+    f64::from(u32::try_from(hi).unwrap_or(u32::MAX)).mul_add(
+        4_294_967_296.0,
+        f64::from(u32::try_from(lo).unwrap_or(u32::MAX)),
+    )
+}
+
+/// Converts a wide signed integer to `f64`, sign and magnitude both
+/// preserved.
+///
+/// The `Value::I64` readings the run rollup carries are billing-scale
+/// integers; the run-metric gauges re-record them, and a cap at
+/// `i32::MAX` would make distinct large totals indistinguishable.
+pub(crate) fn wide_i64_to_f64(value: i64) -> f64 {
+    let magnitude = wide_to_f64(value.unsigned_abs());
+    if value < 0 { -magnitude } else { magnitude }
+}
+
+/// Appends one length-prefixed part to a series key.
+///
+/// A part is its byte length in digits, a colon, then the bytes — a
+/// prefix code, so a chain of parts parses back to exactly the parts
+/// that built it and no label value (dot-laden, `=`-laden, or not) can
+/// alias another series' key.
+fn push_key_part(key: &mut String, part: &str) {
+    use std::fmt::Write as _;
+    write!(key, "{}:", part.len()).ok();
+    key.push_str(part);
+}
+
+/// The canonical identity of one stored series: its name and label
+/// parts, each length-prefixed.
+///
+/// Distinct series must key apart however their label values spell:
+/// a dot-and-equals join lets a value like `read.outcome=ok` collide
+/// with a genuinely richer label set, and one series' counter delta
+/// would silently swallow the other's. The length prefixes make the
+/// encoding collision-free by construction.
 fn series_key(series: &loopctl::metrics::SeriesSnapshot) -> String {
-    let mut key = String::from(series.name);
+    let mut key = String::new();
+    push_key_part(&mut key, series.name);
     for (label, value) in &series.labels {
-        key.push('.');
-        key.push_str(label);
-        key.push('=');
-        key.push_str(value);
+        push_key_part(&mut key, label);
+        push_key_part(&mut key, value);
     }
     key
 }
@@ -199,6 +247,7 @@ pub(crate) fn record_registry(meter: &MeterHandle, snapshot: &RegistrySnapshot) 
     let mut guard = meter.lock();
     let state: &mut InstrumentState = &mut guard;
     let mut totals_updates: Vec<(String, u64)> = Vec::new();
+    let mut histogram_updates: Vec<(String, Vec<u64>)> = Vec::new();
     for series in &snapshot.series {
         let labels: Vec<KeyValue> = series
             .labels
@@ -241,7 +290,22 @@ pub(crate) fn record_registry(meter: &MeterHandle, snapshot: &RegistrySnapshot) 
                 gauge.record(*value, &labels);
             }
             (Instruments::Histogram(histogram), SeriesValue::Histogram { summary }) => {
-                replay_buckets(histogram, &labels, &summary.bounds, &summary.counts);
+                let key = series_key(series);
+                let previous = state
+                    .histogram_counts
+                    .iter()
+                    .find(|(seen, _)| *seen == key)
+                    .map_or_else(Vec::new, |(_, seen)| seen.clone());
+                let deltas: Vec<u64> = summary
+                    .counts
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, count)| {
+                        count.saturating_sub(previous.get(slot).copied().unwrap_or(0))
+                    })
+                    .collect();
+                replay_buckets(histogram, &labels, &summary.bounds, &deltas);
+                histogram_updates.push((key, summary.counts.clone()));
             }
             _ => {}
         }
@@ -256,18 +320,32 @@ pub(crate) fn record_registry(meter: &MeterHandle, snapshot: &RegistrySnapshot) 
             None => state.counter_totals.push((key, total)),
         }
     }
+    for (key, counts) in histogram_updates {
+        match state
+            .histogram_counts
+            .iter_mut()
+            .find(|(seen, _)| *seen == key)
+        {
+            Some(seen) => seen.1 = counts,
+            None => state.histogram_counts.push((key, counts)),
+        }
+    }
     drop(guard);
     record_diagnostics(meter, snapshot);
 }
 
-/// Reconstruct a distribution from explicit bucket counts by recording the
-/// bucket midpoint once per sample the bucket holds.
+/// Reconstruct a distribution's growth from explicit bucket counts by
+/// recording the bucket midpoint once per **new** sample the bucket
+/// gained.
 ///
-/// The final (overflow) bucket has no upper bound, so its samples replay at
-/// the last known bound — an honest underestimate, capped at
-/// [`BUCKET_REPLAY_CAP`] per bucket so a pathological count cannot stall an
-/// export. Midpoint math rides saturating adds and euclid division, so no
-/// step can overflow or panic.
+/// The counts arriving here are per-export deltas (cumulative snapshot
+/// counts minus what the previous export already replayed), so an
+/// unchanged distribution records nothing. The final (overflow) bucket
+/// has no upper bound, so its samples replay at the last known bound —
+/// an honest underestimate, capped at [`BUCKET_REPLAY_CAP`] per bucket
+/// so a pathological count cannot stall an export. Midpoint math rides
+/// the magnitude-honest wide conversion, saturating adds, and euclid
+/// division, so no step can overflow or panic.
 fn replay_buckets(
     recorder: &mut Histogram<f64>,
     labels: &[KeyValue],
@@ -282,11 +360,9 @@ fn replay_buckets(
             bounds.get(slot),
             slot.checked_sub(1).and_then(|i| bounds.get(i)),
         ) {
-            (Some(hi), Some(lo)) => {
-                f64::from(u32::try_from(hi.saturating_add(*lo).div_euclid(2)).unwrap_or(u32::MAX))
-            }
-            (Some(hi), None) => f64::from(u32::try_from(hi.div_euclid(2)).unwrap_or(u32::MAX)),
-            (None, Some(lo)) => f64::from(u32::try_from(*lo).unwrap_or(u32::MAX)),
+            (Some(hi), Some(lo)) => wide_to_f64(hi.saturating_add(*lo).div_euclid(2)),
+            (Some(hi), None) => wide_to_f64(hi.div_euclid(2)),
+            (None, Some(lo)) => wide_to_f64(*lo),
             (None, None) => 0.0,
         };
         let samples = count.min(BUCKET_REPLAY_CAP);
@@ -316,7 +392,7 @@ fn record_diagnostics(meter: &MeterHandle, snapshot: &RegistrySnapshot) {
             snapshot.ambiguous_scalar,
         ),
     ] {
-        let value = f64::from(u32::try_from(value).unwrap_or(u32::MAX));
+        let value = wide_to_f64(value);
         meter.with_instrument(
             name,
             |m, key| Instruments::Gauge(m.f64_gauge(key).build()),
@@ -336,7 +412,8 @@ fn record_diagnostics(meter: &MeterHandle, snapshot: &RegistrySnapshot) {
 /// rates only when their denominators were nonzero, latency percentiles
 /// only when turns were recorded, and per-tool stats under
 /// `loopctl.tool.<name>.*`. Stamped onto the closing `invoke_agent`
-/// span at the run-end record by [`OtelTracingLayer::with_stamper`]
+/// span at the run-end record by
+/// [`OtelTracingLayer::with_stamper`](crate::layer::OtelTracingLayer::with_stamper)
 /// (and, from a pipeline, re-recorded as gauges by
 /// [`export_metrics`](crate::export_metrics)).
 #[must_use]
@@ -383,9 +460,10 @@ pub fn run_attributes(agent: &AgentMetrics) -> Vec<KeyValue> {
         attrs.push(KeyValue::new("loopctl.run.reasoning_share", share));
     }
     if let Some(LatencyPercentiles { p50, p90, p99 }) = agent.turn_latency_percentiles() {
-        attrs.push(KeyValue::new("loopctl.run.turn_p50_ms", ms(p50.value_ms)));
-        attrs.push(KeyValue::new("loopctl.run.turn_p90_ms", ms(p90.value_ms)));
-        attrs.push(KeyValue::new("loopctl.run.turn_p99_ms", ms(p99.value_ms)));
+        for (label, reading) in [("p50", p50), ("p90", p90), ("p99", p99)] {
+            let key = format!("loopctl.run.turn_{label}_ms");
+            push_percentile(&mut attrs, key, reading, ms);
+        }
     }
     if let Some(error) = &agent.run_error {
         attrs.push(KeyValue::new("loopctl.run.error", error.clone()));
@@ -397,17 +475,33 @@ pub fn run_attributes(agent: &AgentMetrics) -> Vec<KeyValue> {
             attrs.push(KeyValue::new(format!("{prefix}.errors"), ms(stats.errors)));
         }
         if let Some(percentiles) = stats.latency.percentiles() {
-            attrs.push(KeyValue::new(
-                format!("{prefix}.p50_ms"),
-                ms(percentiles.p50.value_ms),
-            ));
-            attrs.push(KeyValue::new(
-                format!("{prefix}.p99_ms"),
-                ms(percentiles.p99.value_ms),
-            ));
+            for (label, reading) in [("p50", percentiles.p50), ("p99", percentiles.p99)] {
+                let key = format!("{prefix}.{label}_ms");
+                push_percentile(&mut attrs, key, reading, ms);
+            }
         }
     }
     attrs
+}
+
+/// Files one percentile reading under `key`, omitting overflowed values.
+///
+/// A reading whose sample sat above the histogram's last bound is the
+/// bound standing in for an unbounded sample — "at least this much",
+/// not a measurement — so it never publishes as an ordinary finite
+/// value; a boolean `<key>.overflow` marker rides instead, and a
+/// dashboard can never read an exceeded objective as met.
+fn push_percentile(
+    attrs: &mut Vec<KeyValue>,
+    key: String,
+    reading: loopctl::metrics::Percentile,
+    ms: impl Fn(u64) -> i64,
+) {
+    if reading.overflow {
+        attrs.push(KeyValue::new(format!("{key}.overflow"), true));
+    } else {
+        attrs.push(KeyValue::new(key, ms(reading.value_ms)));
+    }
 }
 
 /// Registry snapshot flattened to span attributes (`SpanAttributes` mode).
@@ -437,8 +531,10 @@ pub fn registry_attributes(snapshot: &RegistrySnapshot) -> Vec<KeyValue> {
                 let count: u64 = summary.counts.iter().copied().sum();
                 attrs.push(KeyValue::new(format!("{key}.count"), ms(count)));
                 if let Some([p50, _p90, p99]) = summary.percentiles {
-                    attrs.push(KeyValue::new(format!("{key}.p50"), ms(p50.value_ms)));
-                    attrs.push(KeyValue::new(format!("{key}.p99"), ms(p99.value_ms)));
+                    for (label, reading) in [("p50", p50), ("p99", p99)] {
+                        let reading_key = format!("{key}.{label}");
+                        push_percentile(&mut attrs, reading_key, reading, ms);
+                    }
                 }
             }
         }
@@ -498,6 +594,232 @@ mod tests {
             Some(&opentelemetry::Value::F64(0.25))
         );
         assert!(find(&attrs, "loopctl.run.turn_p50_ms").is_some());
+    }
+
+    #[test]
+    fn overflowed_percentiles_omit_the_value_and_mark_the_overflow() {
+        let mut exceeded = AgentMetrics {
+            total_turns: 1,
+            ..AgentMetrics::default()
+        };
+        exceeded.turn_latency.record(120_000);
+        let attrs = run_attributes(&exceeded);
+        assert!(
+            find(&attrs, "loopctl.run.turn_p99_ms").is_none(),
+            "an overflowed reading never publishes as an ordinary latency"
+        );
+        assert_eq!(
+            find(&attrs, "loopctl.run.turn_p99_ms.overflow"),
+            Some(&opentelemetry::Value::Bool(true)),
+            "the marker says why the value is absent"
+        );
+
+        let mut bounded = AgentMetrics::default();
+        bounded.turn_latency.record(120);
+        let attrs = run_attributes(&bounded);
+        assert!(find(&attrs, "loopctl.run.turn_p50_ms").is_some());
+        assert!(
+            find(&attrs, "loopctl.run.turn_p50_ms.overflow").is_none(),
+            "a bounded reading carries no marker"
+        );
+    }
+
+    #[test]
+    fn wide_integers_keep_their_magnitude() {
+        let cases = [
+            (
+                wide_to_f64(u64::from(u32::MAX).saturating_add(5)),
+                f64::from(u32::MAX) + 5.0,
+            ),
+            (
+                wide_i64_to_f64(i64::from(i32::MAX).saturating_add(5)),
+                f64::from(i32::MAX) + 5.0,
+            ),
+            (wide_i64_to_f64(-5_000_000_000), -5_000_000_000.0),
+            (wide_to_f64(1_000_000_000), 1_000_000_000.0),
+        ];
+        for (converted, wanted) in cases {
+            assert!(
+                (converted - wanted).abs() < 1e-6,
+                "the conversion keeps the magnitude: {converted} vs {wanted}"
+            );
+        }
+    }
+
+    #[test]
+    fn colliding_label_spellings_keep_their_deltas_apart() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let handle = MeterHandle {
+            meter: provider.meter("collision-probe"),
+            state: Mutex::new(InstrumentState::default()),
+        };
+
+        let rich = |tool: &str, outcome: &str, total: u64| loopctl::metrics::SeriesSnapshot {
+            name: "loopctl.tools.calls",
+            kind: loopctl::metrics::MetricKind::Counter,
+            labels: std::collections::BTreeMap::from([
+                ("tool", tool.to_string()),
+                ("outcome", outcome.to_string()),
+            ]),
+            value: SeriesValue::Counter { total },
+        };
+        let sneaky = |tool: &str, total: u64| loopctl::metrics::SeriesSnapshot {
+            name: "loopctl.tools.calls",
+            kind: loopctl::metrics::MetricKind::Counter,
+            labels: std::collections::BTreeMap::from([("tool", tool.to_string())]),
+            value: SeriesValue::Counter { total },
+        };
+        let snapshot = |series: Vec<loopctl::metrics::SeriesSnapshot>| RegistrySnapshot {
+            series,
+            ..RegistrySnapshot::default()
+        };
+        let exported_totals = |probe: &InMemoryMetricExporter| -> Vec<(String, String, u64)> {
+            let mut points = Vec::new();
+            for resource in probe.get_finished_metrics().unwrap_or_default() {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics() {
+                        if metric.name() != "loopctl.tools.calls" {
+                            continue;
+                        }
+                        if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                            for point in sum.data_points() {
+                                let tool = point
+                                    .attributes()
+                                    .find(|kv| kv.key.as_str() == "tool")
+                                    .map(|kv| kv.value.as_str().into_owned())
+                                    .unwrap_or_default();
+                                let outcome = point
+                                    .attributes()
+                                    .find(|kv| kv.key.as_str() == "outcome")
+                                    .map(|kv| kv.value.as_str().into_owned())
+                                    .unwrap_or_default();
+                                points.push((tool, outcome, point.value()));
+                            }
+                        }
+                    }
+                }
+            }
+            points
+        };
+
+        record_registry(
+            &handle,
+            &snapshot(vec![rich("read", "ok", 3), sneaky("read.outcome=ok", 5)]),
+        );
+        assert!(provider.force_flush().is_ok(), "flush 1 lands");
+        record_registry(
+            &handle,
+            &snapshot(vec![rich("read", "ok", 4), sneaky("read.outcome=ok", 5)]),
+        );
+        assert!(provider.force_flush().is_ok(), "flush 2 lands");
+        let points = exported_totals(&exporter);
+        let rich_growth: Vec<u64> = points
+            .iter()
+            .filter(|(tool, outcome, _)| tool == "read" && outcome == "ok")
+            .map(|(_, _, value)| *value)
+            .collect();
+        assert!(
+            rich_growth.last() == Some(&4) || rich_growth.iter().sum::<u64>() == 4,
+            "the richer label set's growth 3 → 4 exports (delta: the increment; \
+             cumulative: the new total) — a colliding key swallows it: {points:?}"
+        );
+        let sneaky_last = points
+            .iter()
+            .filter(|(tool, outcome, _)| tool == "read.outcome=ok" && outcome.is_empty())
+            .map(|(_, _, value)| *value)
+            .next_back()
+            .unwrap_or_default();
+        assert_eq!(sneaky_last, 5, "the dot-laden series never drifts");
+    }
+
+    #[test]
+    fn unchanged_histograms_replay_only_new_samples() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let handle = MeterHandle {
+            meter: provider.meter("replay-probe"),
+            state: Mutex::new(InstrumentState::default()),
+        };
+
+        let histogram_series = |first: u64, second: u64| {
+            let mut histogram = loopctl::metrics::LatencyHistogram::with_buckets(vec![10, 100]);
+            for _ in 0..first {
+                histogram.record(5);
+            }
+            for _ in 0..second {
+                histogram.record(50);
+            }
+            let counts = histogram.counts().to_vec();
+            loopctl::metrics::SeriesSnapshot {
+                name: "loopctl.vector.embed",
+                kind: loopctl::metrics::MetricKind::Histogram,
+                labels: std::collections::BTreeMap::new(),
+                value: SeriesValue::Histogram {
+                    summary: loopctl::metrics::HistogramSummary {
+                        bounds: vec![10, 100],
+                        counts,
+                        percentiles: histogram.percentiles().map(|p| [p.p50, p.p90, p.p99]),
+                    },
+                },
+            }
+        };
+        let snapshot = |series: loopctl::metrics::SeriesSnapshot| RegistrySnapshot {
+            series: vec![series],
+            ..RegistrySnapshot::default()
+        };
+        let exported_counts = |probe: &InMemoryMetricExporter| -> Vec<u64> {
+            let mut counts = Vec::new();
+            for resource in probe.get_finished_metrics().unwrap_or_default() {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics() {
+                        if metric.name() != "loopctl.vector.embed" {
+                            continue;
+                        }
+                        if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) =
+                            metric.data()
+                        {
+                            for point in histogram.data_points() {
+                                counts.push(point.count());
+                            }
+                        }
+                    }
+                }
+            }
+            counts
+        };
+
+        record_registry(&handle, &snapshot(histogram_series(1, 1)));
+        assert!(provider.force_flush().is_ok(), "flush 1 lands");
+        record_registry(&handle, &snapshot(histogram_series(1, 1)));
+        assert!(provider.force_flush().is_ok(), "flush 2 lands");
+        record_registry(&handle, &snapshot(histogram_series(2, 3)));
+        assert!(provider.force_flush().is_ok(), "flush 3 lands");
+        let counts = exported_counts(&exporter);
+        assert!(
+            counts.iter().all(|count| *count <= 5),
+            "two samples then zero new then three new — no point may exceed the \
+             five true samples, got {counts:?}"
+        );
+        assert!(
+            counts.last() == Some(&5) || counts.iter().sum::<u64>() == 5,
+            "the exported aggregate ends at the true sample count (delta sums to \
+             it, cumulative ends at it): {counts:?}"
+        );
     }
 
     #[test]

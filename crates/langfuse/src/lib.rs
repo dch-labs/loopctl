@@ -119,12 +119,16 @@ pub enum LangfuseConfigError {
 
 impl LangfuseConfig {
     /// Read `LANGFUSE_HOST` (default cloud), `LANGFUSE_PUBLIC_KEY`, and
-    /// `LANGFUSE_SECRET_KEY`. Missing keys are an error for the caller to
-    /// log-and-continue on — observability that fails is optional.
+    /// `LANGFUSE_SECRET_KEY`. Missing or empty keys are an error for the
+    /// caller to log-and-continue on — observability that fails is
+    /// optional, and an empty key would otherwise ride to the server as
+    /// blank Basic-auth credentials that every batch is rejected on.
     ///
     /// # Errors
     ///
-    /// [`LangfuseConfigError::MissingEnv`] when either key is absent.
+    /// [`LangfuseConfigError::MissingEnv`] when either key is absent or
+    /// empty (the variant's own rule: an empty string counts as
+    /// missing).
     pub fn from_env() -> Result<Self, LangfuseConfigError> {
         let mut config = Self::default();
         if let Ok(host) = env::var("LANGFUSE_HOST")
@@ -133,9 +137,13 @@ impl LangfuseConfig {
             config.host = host;
         }
         config.public_key = env::var("LANGFUSE_PUBLIC_KEY")
-            .map_err(|_| LangfuseConfigError::MissingEnv("LANGFUSE_PUBLIC_KEY"))?;
+            .ok()
+            .filter(|key| !key.is_empty())
+            .ok_or(LangfuseConfigError::MissingEnv("LANGFUSE_PUBLIC_KEY"))?;
         config.secret_key = env::var("LANGFUSE_SECRET_KEY")
-            .map_err(|_| LangfuseConfigError::MissingEnv("LANGFUSE_SECRET_KEY"))?;
+            .ok()
+            .filter(|key| !key.is_empty())
+            .ok_or(LangfuseConfigError::MissingEnv("LANGFUSE_SECRET_KEY"))?;
         Ok(config)
     }
 }
@@ -180,11 +188,13 @@ pub enum LangfuseInstallError {
 ///
 /// **Runtime hazard:** `Drop` polls the drain by parking its dropping
 /// thread — fine on an ordinary thread, wrong on one the tokio runtime
-/// drives. On a current-thread runtime the flusher cannot run while
-/// `Drop` parks its only worker, so a pending queue is guaranteed to
-/// sit there the full 5 s and be lost. Hosts inside a runtime call
+/// drives. On a current-thread runtime `Drop` detects the flavor and
+/// **closes without waiting** (a warn names the loss and the `flush`
+/// remedy — parking the only worker guarantees the pending events are
+/// lost, because the flusher cannot run). Hosts inside a runtime call
 /// [`LangfuseGuard::flush`] (an `await`, so the flusher runs) before
-/// dropping.
+/// dropping; hosts on multi-thread runtimes may drop from any thread,
+/// parking one worker briefly while the rest keep the flusher alive.
 #[derive(Debug)]
 pub struct LangfuseGuard {
     /// The shared enqueue/shutdown handle the layer also holds.
@@ -247,6 +257,18 @@ impl LangfuseGuard {
 
 impl Drop for LangfuseGuard {
     fn drop(&mut self) {
+        let current_thread_runtime = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+        });
+        if current_thread_runtime {
+            tracing::warn!(
+                target: "loopctl::langfuse",
+                "guard dropped on a current-thread runtime: pending events cannot drain \
+                 while Drop parks the only worker — call flush().await before dropping"
+            );
+            self.sink.close();
+            return;
+        }
         self.sink.shutdown_blocking(Duration::from_secs(5));
     }
 }
@@ -305,4 +327,44 @@ pub fn install_simple(config: LangfuseConfig) -> Result<LangfuseGuard, LangfuseI
         .try_init()
         .map_err(|_| LangfuseInstallError::AlreadyInstalled)?;
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::missing_panics_doc)]
+
+    use super::*;
+
+    #[test]
+    fn empty_credentials_are_missing() {
+        let env = loopctl::testing::EnvGuard::acquire(&[
+            "LANGFUSE_HOST",
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+        ]);
+        env.remove("LANGFUSE_HOST");
+        env.set("LANGFUSE_PUBLIC_KEY", "");
+        env.set("LANGFUSE_SECRET_KEY", "sk-live");
+        assert!(matches!(
+            LangfuseConfig::from_env(),
+            Err(LangfuseConfigError::MissingEnv("LANGFUSE_PUBLIC_KEY"))
+        ));
+        env.set("LANGFUSE_PUBLIC_KEY", "pk-live");
+        env.set("LANGFUSE_SECRET_KEY", "");
+        assert!(matches!(
+            LangfuseConfig::from_env(),
+            Err(LangfuseConfigError::MissingEnv("LANGFUSE_SECRET_KEY"))
+        ));
+        env.remove("LANGFUSE_PUBLIC_KEY");
+        env.remove("LANGFUSE_SECRET_KEY");
+        assert!(matches!(
+            LangfuseConfig::from_env(),
+            Err(LangfuseConfigError::MissingEnv("LANGFUSE_PUBLIC_KEY"))
+        ));
+        env.set("LANGFUSE_PUBLIC_KEY", "pk-live");
+        env.set("LANGFUSE_SECRET_KEY", "sk-live");
+        let configured = LangfuseConfig::from_env().expect("present keys configure");
+        assert_eq!(configured.public_key, "pk-live");
+        assert_eq!(configured.secret_key, "sk-live");
+    }
 }

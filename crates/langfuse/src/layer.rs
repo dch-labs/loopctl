@@ -151,8 +151,10 @@ impl SpanMeta {
     /// recognizes route to their dedicated [`SpanMeta`] slot — session,
     /// model, and the five usage figures — while `error.type` and
     /// `outcome = "error"` set the failure flag with the value kept in
-    /// metadata for dashboards. Every other key lands in metadata under
-    /// its emitted name.
+    /// metadata for dashboards. The turn span's `query` maps to the
+    /// suppressed slot and is dropped: the assembled prompt never rides
+    /// the export. Every other key lands in metadata under its emitted
+    /// name.
     fn absorb(&mut self, key: &str, value: serde_json::Value) {
         match mapping::first_class(key) {
             Some(LangfuseField::SessionId) => {
@@ -192,6 +194,7 @@ impl SpanMeta {
                 }
                 self.metadata.insert(key.to_string(), value);
             }
+            Some(LangfuseField::Suppressed) => {}
             None => {
                 self.metadata.insert(key.to_string(), value);
             }

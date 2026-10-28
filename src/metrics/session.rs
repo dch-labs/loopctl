@@ -119,9 +119,9 @@ impl TokenTotals {
     /// `cached_input / input` — the share of input served from cache.
     ///
     /// `None` when no input tokens were reported, distinguishing
-    /// "nothing ran" from "nothing was cached". Conversions saturate
-    /// through `u32` so the `f64` arithmetic stays exact for any real
-    /// token count.
+    /// "nothing ran" from "nothing was cached". The conversion is
+    /// exact through 2^53 and correctly rounded beyond, so the ratio
+    /// stays true when an operand passes `u32::MAX`.
     ///
     /// # Examples
     ///
@@ -137,15 +137,16 @@ impl TokenTotals {
         if self.input == 0 {
             return None;
         }
-        let cached = f64::from(u32::try_from(self.cached_input).unwrap_or(u32::MAX));
-        let input = f64::from(u32::try_from(self.input).unwrap_or(u32::MAX));
+        let cached = super::wide_to_f64(self.cached_input);
+        let input = super::wide_to_f64(self.input);
         Some(cached / input)
     }
 
     /// `reasoning / output` — the share of output spent reasoning.
     ///
-    /// `None` when no output tokens were reported. Same exact-for-reals
-    /// `u32`-saturating conversion as [`TokenTotals::cache_hit_rate`].
+    /// `None` when no output tokens were reported. Same magnitude-honest
+    /// conversion as [`TokenTotals::cache_hit_rate`]: exact through 2^53,
+    /// correctly rounded beyond.
     ///
     /// # Examples
     ///
@@ -161,8 +162,8 @@ impl TokenTotals {
         if self.output == 0 {
             return None;
         }
-        let reasoning = f64::from(u32::try_from(self.reasoning).unwrap_or(u32::MAX));
-        let output = f64::from(u32::try_from(self.output).unwrap_or(u32::MAX));
+        let reasoning = super::wide_to_f64(self.reasoning);
+        let output = super::wide_to_f64(self.output);
         Some(reasoning / output)
     }
 }
@@ -185,6 +186,16 @@ pub struct Percentile {
     /// The upper bound of the bucket containing the rank's sample; for
     /// samples above the last bucket bound, that last bound itself.
     pub value_ms: u64,
+
+    /// Whether the rank's sample sat above the last bucket bound.
+    ///
+    /// `true` means [`value_ms`](Self::value_ms) is the scheme's last
+    /// bound standing in for an unbounded sample — "at least this
+    /// much", not a measurement of the sample — so an exporter can
+    /// refuse to publish the reading as an ordinary finite latency.
+    /// Serialized blobs written before the field read `false`.
+    #[serde(default)]
+    pub overflow: bool,
 }
 
 /// The headline p50/p90/p99 triple for one latency surface.
@@ -216,7 +227,8 @@ pub struct LatencyPercentiles {
 ///
 /// Bucket bounds are ascending upper bounds in ms; the trailing count
 /// slot collects samples above the last bound ("overflow"), and
-/// percentile reads report that last bound for overflow samples.
+/// percentile reads report that last bound for overflow samples —
+/// flagged on the reading itself by [`Percentile::overflow`].
 /// Agent-loop latencies span roughly 5 ms to 60 s, which the default
 /// scheme covers. Fixed buckets keep the dependency footprint at zero
 /// and per-sample [`record`](Self::record) branch-light: one binary
@@ -244,8 +256,10 @@ pub struct LatencyHistogram {
 /// Wire shape for deserialization of a [`LatencyHistogram`].
 ///
 /// Tolerates hand-edited or partial JSON by re-normalizing on the way
-/// in: bounds are sorted and de-duplicated (an empty set falls back to
-/// [`default_buckets`]) and counts are resized to the slot count, so a
+/// in: each written bound keeps its positional count while the bounds
+/// sort (an out-of-order document stays aligned), duplicate bounds
+/// merge by summing their counts, the count one past the last written
+/// bound is the overflow slot, and anything further is dropped — so a
 /// degraded document yields a valid, if conservative, histogram rather
 /// than an error or a panic.
 #[derive(Deserialize)]
@@ -257,24 +271,43 @@ struct LatencyHistogramWire {
     #[serde(default)]
     buckets: Vec<u64>,
 
-    /// Slot counts as written.
+    /// Slot counts as written, positionally paired with the bounds.
     ///
-    /// Short lists read zero-padded to the slot count; surplus entries
-    /// are dropped by the same conversion.
+    /// Short lists read zero-padded to the slot count; a count one past
+    /// the last bound lands in the overflow slot, and surplus entries
+    /// beyond that are dropped by the same conversion.
     #[serde(default)]
     counts: Vec<u64>,
 }
 
 impl From<LatencyHistogramWire> for LatencyHistogram {
     fn from(wire: LatencyHistogramWire) -> Self {
-        let mut buckets = wire.buckets;
-        buckets.sort_unstable();
-        buckets.dedup();
+        let overflow_count = wire.counts.get(wire.buckets.len()).copied().unwrap_or(0);
+        let mut pairs: Vec<(u64, u64)> = wire
+            .buckets
+            .into_iter()
+            .enumerate()
+            .map(|(slot, bound)| (bound, wire.counts.get(slot).copied().unwrap_or(0)))
+            .collect();
+        pairs.sort_unstable();
+        let mut buckets: Vec<u64> = Vec::with_capacity(pairs.len());
+        let mut counts: Vec<u64> = Vec::with_capacity(pairs.len().saturating_add(1));
+        for (bound, count) in pairs {
+            if buckets.last() == Some(&bound) {
+                if let Some(last) = counts.last_mut() {
+                    *last = last.saturating_add(count);
+                }
+            } else {
+                buckets.push(bound);
+                counts.push(count);
+            }
+        }
         if buckets.is_empty() {
             buckets = default_buckets();
+            counts = vec![0; buckets.len()];
         }
-        let mut counts = wire.counts;
-        counts.resize(buckets.len().saturating_add(1), 0);
+        counts.push(overflow_count);
+        counts.truncate(buckets.len().saturating_add(1));
         Self { buckets, counts }
     }
 }
@@ -445,11 +478,11 @@ impl LatencyHistogram {
     /// majority, "more than pct% of samples are at or below this
     /// value". The reading names the upper bound of the bucket holding
     /// that sample; a sample in the overflow slot reads the last bound
-    /// (an index the bound lookup answers with the last element rather
-    /// than a slot that has no bound of its own). Rank 100 clamps to
-    /// the total, so it reads the bucket of the largest sample — every
-    /// rank in 1..=100 answers on a non-empty histogram. `None` for an
-    /// empty histogram or a rank outside 1..=100.
+    /// and sets [`Percentile::overflow`], so the reading says "at least
+    /// this much" instead of masquerading as a measurement. Rank 100
+    /// clamps to the total, so it reads the bucket of the largest
+    /// sample — every rank in 1..=100 answers on a non-empty histogram.
+    /// `None` for an empty histogram or a rank outside 1..=100.
     ///
     /// # Examples
     ///
@@ -481,6 +514,7 @@ impl LatencyHistogram {
         for (slot, count) in self.counts.iter().enumerate() {
             cumulative = cumulative.saturating_add(*count);
             if cumulative >= target {
+                let overflow = slot >= self.buckets.len();
                 let value_ms = self
                     .buckets
                     .get(slot)
@@ -489,6 +523,7 @@ impl LatencyHistogram {
                 return Some(Percentile {
                     rank: pct,
                     value_ms,
+                    overflow,
                 });
             }
         }
@@ -665,8 +700,8 @@ impl ToolStats {
     ///
     /// An empty tool record reads as "no errors observed", not
     /// "unknown" — an absent tool is absent from the map, so this
-    /// function only ever sees tools that ran. Saturates through `u32`
-    /// like the token ratios: exact for any realistic per-run count.
+    /// function only ever sees tools that ran. Magnitude-honest like
+    /// the token ratios: exact through 2^53, correctly rounded beyond.
     ///
     /// # Examples
     ///
@@ -684,8 +719,8 @@ impl ToolStats {
         if self.calls == 0 {
             return 0.0;
         }
-        let errors = f64::from(u32::try_from(self.errors).unwrap_or(u32::MAX));
-        let calls = f64::from(u32::try_from(self.calls).unwrap_or(u32::MAX));
+        let errors = super::wide_to_f64(self.errors);
+        let calls = super::wide_to_f64(self.calls);
         errors / calls
     }
 }
@@ -1069,6 +1104,91 @@ mod tests {
             serde_json::from_str(r#"{"buckets":[10,5,5],"counts":[1]}"#).unwrap();
         assert_eq!(messy.buckets(), &[5, 10]);
         assert_eq!(messy.count(), 1);
+    }
+
+    #[test]
+    fn ratios_stay_true_when_one_operand_passes_u32_max() {
+        let cache = TokenTotals {
+            input: 5_000_000_000,
+            cached_input: 1_000_000_000,
+            ..TokenTotals::default()
+        };
+        let rate = cache.cache_hit_rate().expect("input reported");
+        assert!(
+            (rate - 0.2).abs() < 1e-12,
+            "1e9 cached of 5e9 input reads 0.2 — a conversion that saturates \
+             only-past-u32 operands flattens it to {rate}"
+        );
+        let reasoning = TokenTotals {
+            output: 5_000_000_000,
+            reasoning: 1_000_000_000,
+            ..TokenTotals::default()
+        };
+        let share = reasoning.reasoning_share().expect("output reported");
+        assert!(
+            (share - 0.2).abs() < 1e-12,
+            "the reasoning share keeps its magnitude past u32::MAX too: {share}"
+        );
+    }
+
+    #[test]
+    fn error_rate_keeps_its_ratio_past_u32_max() {
+        let mut stats = ToolStats::new("web");
+        stats.calls = 5_000_000_000;
+        stats.errors = 1_000_000_000;
+        assert!(
+            (stats.error_rate() - 0.2).abs() < 1e-12,
+            "1e9 errors over 5e9 calls reads 0.2, not a saturated {}",
+            stats.error_rate()
+        );
+    }
+
+    #[test]
+    fn out_of_order_wire_bounds_keep_their_counts_aligned() {
+        let swapped: LatencyHistogram =
+            serde_json::from_str(r#"{"buckets":[10,5],"counts":[1,0,0]}"#).unwrap();
+        assert_eq!(swapped.buckets(), &[5, 10]);
+        assert_eq!(
+            swapped.counts(),
+            &[0, 1, 0],
+            "each written count rides its own bound through the sort — the \
+             sample stays in the ≤10 bucket it was written for"
+        );
+        let duplicated: LatencyHistogram =
+            serde_json::from_str(r#"{"buckets":[5,10,5],"counts":[1,2,3]}"#).unwrap();
+        assert_eq!(duplicated.buckets(), &[5, 10]);
+        assert_eq!(
+            duplicated.counts(),
+            &[4, 2, 0],
+            "duplicate bounds merge their counts instead of dropping one"
+        );
+        let overflowing: LatencyHistogram =
+            serde_json::from_str(r#"{"buckets":[5],"counts":[1,7]}"#).unwrap();
+        assert_eq!(
+            overflowing.counts(),
+            &[1, 7],
+            "the count one past the last written bound stays the overflow slot"
+        );
+    }
+
+    #[test]
+    fn overflow_readings_flag_their_slot() {
+        let mut exceeded = LatencyHistogram::new();
+        exceeded.record(120_000);
+        let p99 = exceeded.percentile(99).expect("one sample");
+        assert_eq!(p99.value_ms, 60_000);
+        assert!(
+            p99.overflow,
+            "a sample above the last bound reads the last bound, flagged as such"
+        );
+        let mut bounded = LatencyHistogram::new();
+        bounded.record(120);
+        assert!(!bounded.percentile(99).expect("sample").overflow);
+        let legacy: LatencyPercentiles = serde_json::from_str(
+            r#"{"p50":{"rank":50,"value_ms":100},"p90":{"rank":90,"value_ms":100},"p99":{"rank":99,"value_ms":100}}"#,
+        )
+        .expect("a pre-overflow-field blob deserializes");
+        assert!(!legacy.p99.overflow, "the field defaults in as unflagged");
     }
 
     #[test]

@@ -38,8 +38,10 @@ use serde_json::Value;
 /// Captured ingestion events, exactly as the mock collector saw them.
 static EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
-fn spawn_mock(port: u16) {
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind mock collector");
+fn spawn_mock() -> u16 {
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("bind mock collector on an ephemeral port");
+    let port = listener.local_addr().expect("assigned port").port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
@@ -48,6 +50,7 @@ fn spawn_mock(port: u16) {
             }
         }
     });
+    port
 }
 
 fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
@@ -84,8 +87,7 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn install_simple_exports_a_trace_for_a_real_run() {
-    let port = 47_899;
-    spawn_mock(port);
+    let port = spawn_mock();
 
     let guard = install_simple(LangfuseConfig {
         host: format!("http://127.0.0.1:{port}"),

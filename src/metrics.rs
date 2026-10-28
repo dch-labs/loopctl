@@ -136,3 +136,20 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// Converts a wide unsigned integer to `f64` the way a rendered digit
+/// string parses — exact below 2^53, correctly rounded beyond.
+///
+/// Composing the value from its two 32-bit limbs (`mul_add`'s single
+/// fused rounding) keeps every ratio built from these figures
+/// magnitude-honest: totals past `u32::MAX` stay distinct instead of
+/// flattening onto one saturating ceiling, without a lossy-cast lint
+/// to suppress.
+pub(crate) fn wide_to_f64(value: u64) -> f64 {
+    let hi = value.div_euclid(4_294_967_296);
+    let lo = value.rem_euclid(4_294_967_296);
+    f64::from(u32::try_from(hi).unwrap_or(u32::MAX)).mul_add(
+        4_294_967_296.0,
+        f64::from(u32::try_from(lo).unwrap_or(u32::MAX)),
+    )
+}

@@ -491,6 +491,17 @@ pub struct BareLoop<C: ApiClient> {
     /// resumed phase cannot inherit a stale start.
     turn_wall_start: Option<Instant>,
 
+    /// The turn span held open across a tool-bearing turn's dispatch
+    /// phase.
+    ///
+    /// `drive_steps` stashes the span when the committed turn carries
+    /// tool calls, and the turn-end notification settles it with the
+    /// final outcome — a settlement recorded before the tool phase ran
+    /// would claim an `ok` the phase could still falsify. Held under a
+    /// short mutex because the notification path is `&self`; dropped
+    /// (closing the span) whenever a new turn begins or the run ends.
+    open_turn_span: std::sync::Mutex<Option<(usize, tracing::Span)>>,
+
     /// Sticky detection bypass, set once detection state is found
     /// poisoned — detection is advisory, so the session continues with
     /// it skipped rather than failing. Atomic so the `&self` tool-path
@@ -969,13 +980,14 @@ impl<C: ApiClient> BareLoop<C> {
                         turn,
                         query: String::new(),
                     };
-                    if let Err(e) = self
-                        .handle_call_llm(turn)
-                        .instrument(crate::tracing_spans::turn_span(&turn_ctx))
-                        .await
-                    {
+                    self.clear_turn_span_hold();
+                    let span = crate::tracing_spans::turn_span(&turn_ctx);
+                    if let Err(e) = self.handle_call_llm(turn).instrument(span.clone()).await {
                         self.set_error_state(&e);
                         return Err(e);
+                    }
+                    if self.last_turn_carried_tool_calls() {
+                        self.hold_turn_span(turn, span);
                     }
                 }
                 MachineStep::CallTools { turn, calls } => {
@@ -1009,6 +1021,43 @@ impl<C: ApiClient> BareLoop<C> {
                 },
             }
         }
+    }
+
+    /// Whether the run's most recently committed turn requested tools.
+    ///
+    /// The driver's hold signal for the turn span: a tool-carrying
+    /// turn's span stays open until the tool phase settles it, so the
+    /// driver needs exactly this after the model phase commits.
+    fn last_turn_carried_tool_calls(&self) -> bool {
+        self.session
+            .current_run()
+            .and_then(|run| run.turns.last())
+            .is_some_and(|turn| !turn.tool_calls.is_empty())
+    }
+
+    /// Hold a tool-bearing turn's span open for its dispatch phase.
+    ///
+    /// The span stays alive (unentered) until the turn-end
+    /// notification settles it from the tool phase — recording on a
+    /// held handle works while the span has not closed, and the drop
+    /// after settlement closes it with every record aboard.
+    fn hold_turn_span(&self, turn: usize, span: tracing::Span) {
+        *self
+            .open_turn_span
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((turn, span));
+    }
+
+    /// Drop any held turn span, closing it.
+    ///
+    /// A span dropped without settlement closes as a span the engine
+    /// never learned an outcome for — the documented reading of a
+    /// turn-span without its outcome fields.
+    fn clear_turn_span_hold(&self) {
+        *self
+            .open_turn_span
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Ask the registered hooks for one follow-up turn.
@@ -1163,6 +1212,7 @@ impl<C: ApiClient> BareLoop<C> {
             truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
+            open_turn_span: std::sync::Mutex::new(None),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1723,6 +1773,7 @@ impl<C: ApiClient> BareLoop<C> {
             truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
+            open_turn_span: std::sync::Mutex::new(None),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1850,6 +1901,7 @@ impl<C: ApiClient> BareLoop<C> {
             truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
+            open_turn_span: std::sync::Mutex::new(None),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -2621,15 +2673,6 @@ impl<C: ApiClient> BareLoop<C> {
         let turn = record.index;
         let stop_reason = record.stop_reason;
         let duration = self.managers.clock().elapsed_since(turn_start);
-        crate::tracing_spans::record_turn_end(
-            true,
-            Self::millis_u64(duration),
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cached_input_tokens,
-            usage.cache_write_tokens,
-            usage.reasoning_tokens,
-        );
         if let Some(run) = self.session.current_run_mut() {
             run.turns.push(record);
         }
@@ -3115,8 +3158,16 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     self.session.session_start = Some(self.managers.clock().monotonic());
                 }
 
-                if run_config.reset_managers {
-                    self.managers.reset_all()?;
+                let run_opened = self.managers.clock().monotonic();
+                if run_config.reset_managers
+                    && let Err(reset_error) = self.managers.reset_all()
+                {
+                    crate::tracing_spans::record_run_end(
+                        false,
+                        Self::millis_u64(self.managers.clock().elapsed_since(run_opened)),
+                        Some(&reset_error),
+                    );
+                    return Err(reset_error);
                 }
 
                 self.session
@@ -3204,6 +3255,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
         &'a mut self,
         error: Option<&'a LoopError>,
     ) -> Pin<Box<dyn Future<Output = RunResult> + Send + 'a>> {
+        self.clear_turn_span_hold();
         Box::pin(async move {
             if let Some(run) = self.session.current_run_mut() {
                 run.end = Some(self.managers.clock().monotonic());
@@ -3235,21 +3287,11 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             let duration = run.duration();
 
             self.notify_run_end(&run, duration, error);
-            let span = tracing::Span::current();
-            span.record(
-                crate::tracing_spans::fields::OUTCOME,
-                if error.is_none() { "ok" } else { "error" },
-            );
-            span.record(
-                crate::tracing_spans::fields::DURATION_MS,
+            crate::tracing_spans::record_run_end(
+                error.is_none(),
                 u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                error,
             );
-            if let Some(e) = error {
-                span.record(
-                    crate::tracing_spans::fields::ERROR_TYPE,
-                    crate::tracing_spans::error_type(e),
-                );
-            }
             self.cancelled.reset();
             self.steering.close_run();
 

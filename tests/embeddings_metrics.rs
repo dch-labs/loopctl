@@ -149,7 +149,11 @@ async fn every_batch_settles_one_event_and_a_mismatch_warns() {
     let delta = capture.events()[before..].to_vec();
     let settled: Vec<&String> = delta
         .iter()
-        .filter(|event| event.contains("metric=loopctl.embed.batch.duration_ms"))
+        .filter(|event| {
+            event
+                .split_whitespace()
+                .any(|field| field == "metric=loopctl.embed.batch.duration_ms")
+        })
         .collect();
     assert_eq!(
         settled.len(),
@@ -157,10 +161,12 @@ async fn every_batch_settles_one_event_and_a_mismatch_warns() {
         "one batch, one settle event — the failure path settles exactly one: {delta:?}"
     );
     assert!(
-        settled[0].contains("metric=loopctl.embed.batch.duration_ms")
+        settled[0]
+            .split_whitespace()
+            .any(|field| field == "metric=loopctl.embed.batch.duration_ms")
             && settled[0].contains("provider=ollama")
             && settled[0].contains("outcome=error"),
-        "the failed batch's event names its provider and outcome: {delta:?}"
+        "the failed batch's event names its metric, provider, and outcome: {delta:?}"
     );
     // The failed wire request additionally narrates itself — one
     // wire-failure event classifying the 500. The batch metric and this

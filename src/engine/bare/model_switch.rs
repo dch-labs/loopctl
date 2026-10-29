@@ -109,7 +109,6 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
                  (set_model returned false); nothing was changed"
             )));
         }
-
         loop_.anchor = None;
         if let Some(cw) = context_window {
             loop_.session.config.context_window = cw;
@@ -126,10 +125,11 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
             .managers
             .observers()
             .on_model_switched(&ModelSwitchedContext {
-                from,
+                from: from.clone(),
                 to: trimmed.to_string(),
             });
         loop_.last_routed_model = Some(trimmed.to_string());
+        crate::tracing_spans::event_model_switch(&from, trimmed);
 
         Ok(())
     }

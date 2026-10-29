@@ -561,6 +561,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// this.
     #[cfg(feature = "streaming")]
     pub(super) fn notify_transport_fallback(&self, turn: usize, stop_reason: StreamStopReason) {
+        crate::tracing_spans::event_transport_fallback(turn);
         self.managers.observers().on_transport_fallback(
             &crate::observer::TransportFallbackContext { turn, stop_reason },
         );

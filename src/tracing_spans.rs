@@ -40,13 +40,48 @@
 //!
 //! | Target | Emissions | Levels |
 //! |---|---|---|
-//! | `loopctl::engine` | these three spans + lifecycle events | spans DEBUG; lifecycle progression INFO; problems WARN (bounded per contract — once per condition) |
+//! | `loopctl::engine` | the span tree + signal events | spans/events DEBUG; lifecycle progression INFO; problems WARN (bounded per contract — once per condition) |
 //! | `loopctl::metrics` | metric events | DEBUG only; never spans. The [`MetricsLayer`](crate::metrics::MetricsLayer) host filter needs `loopctl::metrics=debug` |
 //! | `loopctl::compact`, `::structured`, `::trajectory`, `::memory`, `::pricing`, `::provider::forensics` | existing events plus `structured.extract` / `trajectory.run` spans | DEBUG; forensics WARN bounded |
 //! | spans in general | all loopctl spans | DEBUG — always on; an `INFO` filter keeps an events-only log |
 //!
 //! Presets: `loopctl=warn` production · `loopctl=info` lifecycle events ·
-//! `loopctl=debug` full trace trees plus metric events.
+//! `loopctl=debug` full trace trees, signal events, plus metric events.
+//!
+//! # Signal events (the engine's transparency layer)
+//!
+//! Beyond the span tree, the engine narrates its decisions as named
+//! DEBUG events on target `loopctl::engine` — one per decision point,
+//! each with a fixed field set. Under an `OTLP` exporter they attach as
+//! events on the span in whose scope they fire (a compaction under its
+//! run, a steering drain under the turn it steers), so one trace reads
+//! as the whole story. The vocabulary is closed — every name below is
+//! pinned: the names ride [`SIGNAL_EVENT_NAMES`], which the vocabulary
+//! pin and the telemetry reference both iterate, and a new signal is
+//! added to this table first:
+//!
+//! | Event | Fires at | Fields |
+//! |---|---|---|
+//! | `loopctl.compaction` | a compaction pass settles | `reason` (`prune`/`threshold`/`emergency`/`manual`), `tokens_before`, `tokens_after`, `outcome` (`applied`/`noop`/`deferred`/`failed`) |
+//! | `loopctl.steering_drain` | accepted guidance joins the next turn | `count` |
+//! | `loopctl.model_switch` | the active model changes | `from`, `to` |
+//! | `loopctl.transport_fallback` | a failed stream is recovered on the non-streaming transport | `turn` |
+//! | `loopctl.salvage` | a salvage retry is armed toward shrinking | `kind` (`overflow`/`length_cut`), `turn`, `target_tokens` |
+//! | `loopctl.cancelled` | the run ends by cancellation | `turn` |
+//! | `loopctl.hook_followup` | a hook extends a clean run by one turn | `origin` (hook-declared id, never prompt content) |
+//!
+//! None of them carry message content — names, counts, token figures,
+//! and model ids only — so turning this layer on is not turning content
+//! capture on. The `query` field below remains the only content-bearing
+//! field in the crate, at the same DEBUG opt-in. Figures are honest
+//! counts on one scale — the engine's provider-token figure, never the
+//! compaction manager's raw counts: a pass where no compaction ran
+//! reports the conversation unchanged (`after == before`), a failed
+//! pass that measured reports its figures (the conversation's measured
+//! size, and — when the pass produced a result the window refused —
+//! that result's own size), zeros only when nothing was ever measured,
+//! and a salvage reports the target the retry aims at — the compaction
+//! may still decline, which the run's settlement narrates.
 //!
 //! The `query` field rides the turn span, which is DEBUG — a host filtering
 //! at DEBUG opts into user-content capture, mirroring `OTel`'s content-capture
@@ -79,11 +114,15 @@ pub mod fields {
     /// collector can group runs across processes.
     pub const CONVERSATION_ID: &str = "gen_ai.conversation.id";
 
-    /// Model requested for this operation.
+    /// Model requested for this operation, on both spans that carry it.
     ///
-    /// The client's model at run start; routing fallbacks are their own
-    /// events, so this stays the *requested* name a host configures, not
-    /// whatever answered last.
+    /// On the run span this is the run's starting model — the client's
+    /// configured name at `run()` entry; routing fallbacks are their
+    /// own events, so the run-level field stays the *requested* name a
+    /// host configures. On the turn span it is the model serving that
+    /// turn (see [`record_turn_model`](super::record_turn_model)),
+    /// which a fallback chain or a mid-run switch can change after the
+    /// run opens.
     pub const REQUEST_MODEL: &str = "gen_ai.request.model";
 
     /// Turn index within the run (loopctl-neutral extra).
@@ -198,6 +237,115 @@ pub const TOOL_SPAN: &str = "agent.tool";
 /// any subsystem's own emissions.
 pub const TARGET: &str = "loopctl::engine";
 
+/// Every signal-event name the engine emits, in dictionary order.
+///
+/// The single list the pinning suite and the telemetry reference
+/// iterate: the vocabulary test fires each helper and asserts its
+/// event carries one of these names, and the reference test asserts
+/// the document's signal-event table names exactly this set. The
+/// helpers spell the names in their own emissions, so a helper that
+/// drifts from this list fails the vocabulary pin, and a signal added
+/// without a row — or a row without a signal — fails the reference.
+pub const SIGNAL_EVENT_NAMES: [&str; 7] = [
+    "loopctl.compaction",
+    "loopctl.steering_drain",
+    "loopctl.model_switch",
+    "loopctl.transport_fallback",
+    "loopctl.salvage",
+    "loopctl.cancelled",
+    "loopctl.hook_followup",
+];
+
+/// The settled outcome of one compaction pass, as the
+/// `loopctl.compaction` event narrates it.
+///
+/// A closed vocabulary: the engine constructs these at its call
+/// sites, so a misspelled outcome cannot reach the wire the way a
+/// free-form string literal could. The spellings are the wire
+/// contract an `OTLP` consumer groups on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionPassOutcome {
+    /// Compacted history was adopted; the conversation shrank.
+    ///
+    /// The pass rewrote the history and the machine took the result;
+    /// `tokens_after` is the adopted conversation's measured size.
+    Applied,
+
+    /// The pass changed nothing and the conversation stands.
+    ///
+    /// No compactor ran, a hook vetoed the pass, or the manager
+    /// reported no action; both figures are measurements of the same
+    /// unchanged conversation.
+    Noop,
+
+    /// A threshold pass could not shrink below the line; the turn
+    /// serves uncompacted.
+    ///
+    /// The compactor errored while the payload still fit the window,
+    /// or the pass could not shrink below the threshold; the next turn
+    /// retries the same compactor.
+    Deferred,
+
+    /// The pass errored into the run.
+    ///
+    /// Either the compactor failed or its result still did not fit;
+    /// the run ends. A pass that measured reports its figures — the
+    /// conversation's measured size, and the rejected result's own
+    /// when one was produced.
+    Failed,
+}
+
+impl CompactionPassOutcome {
+    /// The wire spelling the `loopctl.compaction` event carries.
+    ///
+    /// One word per outcome, stable across releases — a consumer's
+    /// dashboard groups on it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Noop => "noop",
+            Self::Deferred => "deferred",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Which rejection a salvage retry answers, as the `loopctl.salvage`
+/// event narrates it.
+///
+/// A closed vocabulary mirroring the engine's two salvage arms; the
+/// engine constructs these at its call sites, so a misspelled kind
+/// cannot reach the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SalvageKind {
+    /// The provider reported the window: an oversized-prompt rejection.
+    ///
+    /// The provider's own error named the limit; the retry compacts
+    /// toward a target strictly under the refused payload.
+    Overflow,
+
+    /// The response ended at the output limit with no visible text.
+    ///
+    /// The wire cannot report this case; the engine reads the shape
+    /// and remedies it as an over-full context.
+    LengthCut,
+}
+
+impl SalvageKind {
+    /// The wire spelling the `loopctl.salvage` event carries.
+    ///
+    /// One word per arm, stable across releases — a consumer's
+    /// dashboard groups on it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overflow => "overflow",
+            Self::LengthCut => "length_cut",
+        }
+    }
+}
+
 /// Creates the `agent.run` span for one engine run.
 ///
 /// Built at the driver before its future starts polling, so the run's
@@ -235,8 +383,10 @@ pub fn agent_run_span(session_id: uuid::Uuid, model: &str) -> tracing::Span {
 ///
 /// Carries the turn index and — because the span is DEBUG, an explicit
 /// host opt-in for content capture — the input text. The engine records
-/// [`fields::OUTCOME`], duration, and the usage fields at its turn-end
-/// boundary before the handle closes.
+/// [`fields::OUTCOME`], duration, the usage fields, and — once the
+/// request is assembled — the serving model (a fallback chain can
+/// change it mid-run, so the run span's model is only the starting
+/// one) at the turn's boundaries before the handle closes.
 #[must_use = "the Span must be entered or recorded to take effect"]
 pub fn turn_span(ctx: &TurnStartContext) -> tracing::Span {
     tracing::span!(
@@ -245,6 +395,7 @@ pub fn turn_span(ctx: &TurnStartContext) -> tracing::Span {
         TURN_SPAN,
         "turn" = ctx.turn,
         "query" = ctx.query.as_str(),
+        "gen_ai.request.model" = tracing::field::Empty,
         "outcome" = tracing::field::Empty,
         "duration_ms" = tracing::field::Empty,
         "gen_ai.usage.input_tokens" = tracing::field::Empty,
@@ -291,6 +442,131 @@ pub fn record_turn_query(query: &str) {
         return;
     }
     span.record(fields::QUERY, query);
+}
+
+/// Record the model serving this turn onto its span.
+///
+/// The run span already names the run's starting model; a fallback
+/// chain or a mid-run [`switch_model`](crate::engine::BareLoop::switch_model)
+/// can change it, and the turn span is where a per-request reader
+/// looks. Called from the turn's request assembly — inside the turn
+/// span's scope — so [`Span::current`](tracing::Span::current) is that
+/// span; the name guard makes a stray call a no-op rather than a field
+/// on the wrong span.
+pub fn record_turn_model(model: &str) {
+    let span = tracing::Span::current();
+    if span.metadata().is_none_or(|meta| meta.name() != TURN_SPAN) {
+        return;
+    }
+    span.record(fields::REQUEST_MODEL, model);
+}
+
+/// Narrate one compaction pass settling.
+///
+/// Fired once per pass with the before/after context figures and the
+/// outcome the machine adopted — [`Applied`](CompactionPassOutcome::Applied)
+/// when compacted history was taken, [`Noop`](CompactionPassOutcome::Noop)
+/// when the pass kept the conversation as it stood,
+/// [`Deferred`](CompactionPassOutcome::Deferred) when a threshold pass
+/// could not shrink below the line and the turn is served uncompacted,
+/// [`Failed`](CompactionPassOutcome::Failed) when the pass errored into
+/// the run. Token figures are context counts on the engine's
+/// provider-token scale, not usage and not the compaction manager's
+/// raw counts: a pass where no compaction ran reports the conversation
+/// unchanged (`after == before`), a failed pass that measured reports
+/// its figures — the conversation's measured size and, when the pass
+/// produced a result the window refused, that result's own — and zeros
+/// only when nothing was ever measured.
+pub fn event_compaction(
+    reason: crate::compact::types::CompactReason,
+    tokens_before: u64,
+    tokens_after: u64,
+    outcome: CompactionPassOutcome,
+) {
+    let reason = match reason {
+        crate::compact::types::CompactReason::Prune => "prune",
+        crate::compact::types::CompactReason::ThresholdExceeded => "threshold",
+        crate::compact::types::CompactReason::Emergency => "emergency",
+        crate::compact::types::CompactReason::Manual => "manual",
+    };
+    let outcome = outcome.as_str();
+    tracing::debug!(
+        target: TARGET,
+        reason,
+        tokens_before,
+        tokens_after,
+        outcome,
+        "loopctl.compaction"
+    );
+}
+
+/// Narrate accepted guidance joining the next turn.
+///
+/// Fires at the turn boundary where the steering slot drains: every
+/// message accepted since the last boundary enters the pending set
+/// ahead of this turn's assembly. The count is messages, not sources —
+/// three pushes from one host are three.
+pub fn event_steering_drain(count: usize) {
+    tracing::debug!(target: TARGET, count, "loopctl.steering_drain");
+}
+
+/// Narrate the active model changing.
+///
+/// Fires after the client accepted the switch — `from` is the model the
+/// run was serving, `to` the one it serves now. Model ids only; request
+/// content never rides this event.
+pub fn event_model_switch(from: &str, to: &str) {
+    tracing::debug!(target: TARGET, from, to, "loopctl.model_switch");
+}
+
+/// Narrate a failed stream recovered on the non-streaming transport.
+///
+/// Fires when the turn is served by the `create_message` recovery after
+/// streaming exhausted its retry ceiling — the same condition the
+/// run's `transport_fallbacks` counter records, at the turn and span
+/// a reader is already looking at.
+pub fn event_transport_fallback(turn: usize) {
+    tracing::debug!(target: TARGET, turn, "loopctl.transport_fallback");
+}
+
+/// Narrate an over-window turn's salvage retry being armed.
+///
+/// Fires when the engine decides to retry a turn the provider refused
+/// (or ended at the output cap) by compacting toward `target_tokens`
+/// and reissuing — [`Overflow`](SalvageKind::Overflow) for the
+/// provider-reported window and [`LengthCut`](SalvageKind::LengthCut)
+/// for the silent output-cap shape. Armed, not completed: the
+/// compaction may still decline or fail, which the run's own
+/// settlement narrates; this event is the decision to retry.
+pub fn event_salvage(kind: SalvageKind, turn: usize, target_tokens: u64) {
+    let kind = kind.as_str();
+    tracing::debug!(
+        target: TARGET,
+        kind,
+        turn,
+        target_tokens,
+        "loopctl.salvage"
+    );
+}
+
+/// Narrate the run ending by cancellation.
+///
+/// Fired once from the run's finalize funnel — whichever arm the cancel
+/// won (before the first turn, mid-stream, mid-tool), `turn` is the
+/// run's settled turn count at that moment, so a cancel before any turn
+/// is `0`. The run span's `outcome` settlement remains the authoritative
+/// end state; this event is the timing of the interrupt itself.
+pub fn event_cancelled(turn: usize) {
+    tracing::debug!(target: TARGET, turn, "loopctl.cancelled");
+}
+
+/// Narrate a hook extending a clean run by one turn.
+///
+/// Fires when a follow-up is accepted — `origin` is the hook-declared
+/// id (the `"hook:<name>"` convention), never the injected prompt,
+/// which is user content and stays out of telemetry entirely.
+pub fn event_hook_followup(origin: &str) {
+    tracing::debug!(target: TARGET, origin, "loopctl.hook_followup");
 }
 
 /// The settled figures one turn-span settlement records.

@@ -233,6 +233,16 @@ pub enum OtelInstallError {
     /// this process — the meter handle is set-once, first install wins.
     #[error("no OTLP metrics pipeline is installed (set OtelConfig::metrics)")]
     NoMetricsPipeline,
+
+    /// [`export_metrics`] was called after the pipeline was shut down.
+    ///
+    /// A shut-down meter provider still accepts measurements and
+    /// exports none of them, and installation is once-per-process, so
+    /// the handle a later call finds is the dead one — an `Ok` there
+    /// would look like delivery while nothing left the process.
+    /// Rebuilding the install means a new process.
+    #[error("the metrics pipeline was shut down; exports no longer deliver")]
+    PipelineShutDown,
 }
 
 /// Flushes pending spans (and metrics) on drop.
@@ -295,6 +305,7 @@ impl Drop for ShutdownGuard {
         {
             eprintln!("loopctl-otel: meter shutdown failed: {err}");
         }
+        metrics::note_meter_shutdown();
     }
 }
 
@@ -372,17 +383,26 @@ pub fn otel_layer(config: &OtelConfig) -> Result<OtelTracingLayer, OtelInstallEr
 /// deltas since the previous call, gauges as last value, histograms
 /// reconstructed from the registry's bucket arrays. Returns
 /// [`OtelInstallError::NoMetricsPipeline`] when
-/// [`OtelConfig::metrics`] was `None`.
+/// [`OtelConfig::metrics`] was `None`, and
+/// [`OtelInstallError::PipelineShutDown`] once the pipeline's providers
+/// have been shut down — installation is once-per-process, so the
+/// handle a later call finds is the dead one, and an `Ok` here would
+/// look like delivery while nothing left the process.
 ///
 /// # Errors
 ///
-/// [`OtelInstallError::NoMetricsPipeline`] when nothing is installed.
+/// [`OtelInstallError::NoMetricsPipeline`] when nothing is installed;
+/// [`OtelInstallError::PipelineShutDown`] when the installed pipeline
+/// was shut down.
 pub fn export_metrics(
     agent: Option<&AgentMetrics>,
     registry: &MetricsRegistry,
 ) -> Result<(), OtelInstallError> {
     let meter = metrics::active_meter().ok_or(OtelInstallError::NoMetricsPipeline)?;
-    let registry_id = std::ptr::from_ref(registry).cast::<()>() as usize;
+    if meter.is_shut_down() {
+        return Err(OtelInstallError::PipelineShutDown);
+    }
+    let registry_id = registry.generation();
     metrics::record_registry(&meter, registry_id, &registry.snapshot());
     if let Some(agent) = agent {
         for attr in metrics::run_attributes(agent) {

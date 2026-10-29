@@ -44,6 +44,32 @@ use tracing_subscriber::registry::LookupSpan;
 /// A tool that echoes a fixed successful output.
 struct EchoTool;
 
+/// Counts the run-start and run-end notifications one loop fires.
+///
+/// Exists to pin the pairing: every run a loop starts must also end,
+/// including one that fails before its first turn — an unmatched start
+/// is what an event-ledger observer reads as a run left open.
+#[derive(Default)]
+struct RunLifecycleCounts {
+    starts: std::sync::atomic::AtomicUsize,
+    ends: std::sync::atomic::AtomicUsize,
+}
+
+impl loopctl::observer::LoopObserver for RunLifecycleCounts {
+    fn name(&self) -> &'static str {
+        "run-lifecycle-counts"
+    }
+
+    fn on_run_start(&self, _ctx: &loopctl::observer::RunStartContext) {
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn on_run_end(&self, _ctx: &loopctl::observer::RunEndContext) {
+        self.ends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A tool whose dispatch outlives the run: it sleeps far past the
 /// cancel signal, so the dispatcher's own cancellation select is what
 /// ends it — the hard-failure path a tool phase can take.
@@ -678,7 +704,10 @@ async fn the_engine_emits_the_documented_span_tree() {
         panic!("poison the convergence detector");
     }));
     assert!(poisoned.is_err(), "the poisoning panic is what poisons");
-    let managers = loopctl::managers::LoopManagers::new().with_detection(detection);
+    let lifecycle = std::sync::Arc::new(RunLifecycleCounts::default());
+    let managers = loopctl::managers::LoopManagers::new()
+        .with_detection(detection)
+        .with_observer(lifecycle.clone());
     let reset_client =
         Arc::new(
             MockApiClient::new("test-model").with_responses(vec![MockResponse {
@@ -730,6 +759,16 @@ async fn the_engine_emits_the_documented_span_tree() {
             .iter()
             .all(|s| s.name != loopctl::tracing_spans::TURN_SPAN),
         "the reset fails the run before any turn opens"
+    );
+    assert_eq!(
+        (
+            lifecycle.starts.load(std::sync::atomic::Ordering::SeqCst),
+            lifecycle.ends.load(std::sync::atomic::Ordering::SeqCst)
+        ),
+        (1, 1),
+        "a reset-refused run announces a matched start and end — the end \
+         carries the reset failure, so no observer is left holding a \
+         start with no run to close"
     );
 }
 

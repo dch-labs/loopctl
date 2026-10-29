@@ -13,6 +13,7 @@
 //!   (delta since last call), gauges as gauges, histograms reconstructed by
 //!   recording each bucket's midpoint once per sample it holds.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use loopctl::metrics::{AgentMetrics, RegistrySnapshot, SeriesValue, session::LatencyPercentiles};
@@ -67,6 +68,17 @@ pub(crate) struct MeterHandle {
     /// and its previous total together, so a concurrent export cannot
     /// interleave an instrument build with a delta read.
     state: Mutex<InstrumentState>,
+
+    /// Whether the pipeline this handle fronts has been shut down.
+    ///
+    /// A shut-down meter provider still accepts measurements and
+    /// exports none of them, so a caller that kept exporting would get
+    /// `Ok` answers that deliver nothing.
+    /// [`export_metrics`](crate::export_metrics) checks this and fails
+    /// loudly instead; the shutdown paths set it through
+    /// [`note_meter_shutdown`], whichever guard or layer owns the
+    /// providers.
+    shut_down: AtomicBool,
 }
 
 /// The reusable half of a pipeline installation: instruments and deltas.
@@ -103,7 +115,7 @@ struct InstrumentState {
     /// exported counts and sums on each pass.
     histogram_counts: Vec<(String, Vec<u64>)>,
 
-    /// Which registry the two ledgers were built from, by address.
+    /// Which registry the two ledgers were built from, by generation.
     ///
     /// A ledger only means "growth since the last export" against the
     /// registry that accumulated it. A replacement registry restarts
@@ -111,13 +123,33 @@ struct InstrumentState {
     /// saturates every delta to zero until the newcomer outgrew its
     /// predecessor, dropping the samples it did record — so a changed
     /// identity clears both ledgers and the newcomer's first export
-    /// replays its own counts whole. The residual the delta math cannot
-    /// see is address reuse: a newcomer allocated exactly where a freed
-    /// predecessor stood reads as the same registry.
-    tracked_registry: Option<usize>,
+    /// replays its own counts whole. The identity is the registry's
+    /// own
+    /// [`generation`](loopctl::metrics::MetricsRegistry::generation),
+    /// never its address: the allocator can hand a replacement the exact
+    /// address a freed predecessor held, and a generation never repeats.
+    tracked_registry: Option<u64>,
 }
 
 impl MeterHandle {
+    /// Mark this pipeline shut down.
+    ///
+    /// Idempotent and sticky: installation is once-per-process, so no
+    /// later handle replaces a marked one.
+    pub(crate) fn mark_shut_down(&self) {
+        self.shut_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this pipeline was marked shut down.
+    ///
+    /// Read by [`export_metrics`](crate::export_metrics) before it
+    /// records anything: a `true` there is the difference between an
+    /// export that fails loudly and one that answers `Ok` for
+    /// measurements a shut-down provider will never deliver.
+    pub(crate) fn is_shut_down(&self) -> bool {
+        self.shut_down.load(Ordering::SeqCst)
+    }
+
     /// Lock the instrument state, recovering from poison.
     ///
     /// The guarded data is cached instruments and a delta ledger —
@@ -184,6 +216,7 @@ pub fn install_meter(meter: Meter) {
     let handle = Arc::new(MeterHandle {
         meter,
         state: Mutex::new(InstrumentState::default()),
+        shut_down: AtomicBool::new(false),
     });
     ACTIVE_METER.set(handle).ok();
 }
@@ -195,6 +228,21 @@ pub fn install_meter(meter: Meter) {
 /// reads this to answer its `NoMetricsPipeline` error.
 pub(crate) fn active_meter() -> Option<Arc<MeterHandle>> {
     ACTIVE_METER.get().cloned()
+}
+
+/// Mark the installed pipeline, if any, as shut down.
+///
+/// Called by the shutdown paths — the guard's drop and
+/// [`OtelTracingLayer::shutdown`](crate::OtelTracingLayer::shutdown) —
+/// so a later [`export_metrics`](crate::export_metrics) fails loudly
+/// instead of recording into a provider that exports nothing. The
+/// tracer-only paths call it too: a pipeline whose tracer half was torn
+/// down is no longer a live export target, whether or not a meter was
+/// ever built.
+pub(crate) fn note_meter_shutdown() {
+    if let Some(handle) = ACTIVE_METER.get() {
+        handle.mark_shut_down();
+    }
 }
 
 /// Upper bound on the samples one bucket contributes to a replay.
@@ -268,7 +316,9 @@ fn series_key(series: &loopctl::metrics::SeriesSnapshot) -> String {
 /// Replay a registry snapshot into the installed `OTLP` pipeline.
 ///
 /// `registry_id` identifies which registry `snapshot` came from (the
-/// caller passes its address). The delta ledgers belong to that one
+/// caller passes its
+/// [`generation`](loopctl::metrics::MetricsRegistry::generation)). The
+/// delta ledgers belong to that one
 /// registry, so a changing identity clears them: a replacement's lower
 /// counts replay whole rather than saturating against a predecessor
 /// they have no relation to — see
@@ -280,11 +330,7 @@ fn series_key(series: &loopctl::metrics::SeriesSnapshot) -> String {
 /// value; histograms are reconstructed bucket by bucket; the registry's
 /// diagnostics counters export as `loopctl.telemetry.*` gauges so store
 /// drift is visible on dashboards.
-pub(crate) fn record_registry(
-    meter: &MeterHandle,
-    registry_id: usize,
-    snapshot: &RegistrySnapshot,
-) {
+pub(crate) fn record_registry(meter: &MeterHandle, registry_id: u64, snapshot: &RegistrySnapshot) {
     let mut guard = meter.lock();
     let state: &mut InstrumentState = &mut guard;
     if state.tracked_registry != Some(registry_id) {
@@ -616,8 +662,35 @@ mod tests {
 
     use super::*;
 
-    const REGISTRY: usize = 0xA1;
-    const REPLACEMENT: usize = 0xB2;
+    const REGISTRY: u64 = 0xA1;
+    const REPLACEMENT: u64 = 0xB2;
+
+    #[test]
+    fn exports_after_shutdown_report_it() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        install_meter(provider.meter("shutdown-probe"));
+        let registry = loopctl::metrics::MetricsRegistry::default();
+        assert!(
+            crate::export_metrics(None, &registry).is_ok(),
+            "a live pipeline accepts the export"
+        );
+        note_meter_shutdown();
+        assert!(
+            matches!(
+                crate::export_metrics(None, &registry),
+                Err(crate::OtelInstallError::PipelineShutDown)
+            ),
+            "an export after shutdown reports the dead pipeline instead \
+             of returning Ok for measurements that cannot deliver"
+        );
+    }
 
     fn find<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a opentelemetry::Value> {
         attrs
@@ -709,6 +782,7 @@ mod tests {
         let handle = MeterHandle {
             meter: provider.meter("collision-probe"),
             state: Mutex::new(InstrumentState::default()),
+            shut_down: AtomicBool::new(false),
         };
 
         let rich = |tool: &str, outcome: &str, total: u64| loopctl::metrics::SeriesSnapshot {
@@ -805,6 +879,7 @@ mod tests {
         let handle = MeterHandle {
             meter: provider.meter("replay-probe"),
             state: Mutex::new(InstrumentState::default()),
+            shut_down: AtomicBool::new(false),
         };
 
         let histogram_series = |first: u64, second: u64| {
@@ -887,6 +962,7 @@ mod tests {
         let handle = MeterHandle {
             meter: provider.meter("replacement-probe"),
             state: Mutex::new(InstrumentState::default()),
+            shut_down: AtomicBool::new(false),
         };
 
         let snapshot = |samples: u64, total: u64| {
@@ -1021,6 +1097,7 @@ mod tests {
         let handle = MeterHandle {
             meter: provider.meter("delta-probe"),
             state: Mutex::new(InstrumentState::default()),
+            shut_down: AtomicBool::new(false),
         };
 
         let counter_series = |tool: &str, total: u64| loopctl::metrics::SeriesSnapshot {

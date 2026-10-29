@@ -299,14 +299,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// Notify all observers and hooks that a run has started.
     ///
     /// Observers always fire; the hook half is feature-gated and
-    /// skipped when no executor is configured. Every run announces its
-    /// start here before its run span settles — including a run the
-    /// manager reset refuses before its first turn — which is the
-    /// ordering an observer relies on to read one run's figures as that
-    /// run's own rather than its predecessor's. The reset-refused run is
-    /// the one run that never reaches [`notify_run_end`]: the path fails
-    /// before a run record exists to report, so counting starts against
-    /// ends leaves that single start unmatched.
+    /// skipped when no executor is configured. A run announces its
+    /// start here before its first turn — the ordering an observer
+    /// relies on to read one run's figures as that run's own rather
+    /// than its predecessor's. A run the manager reset refuses before
+    /// its first turn announces start **and** end: no run record is
+    /// pushed to the session, but observers and hooks see a matched
+    /// pair carrying the reset failure, so none is left holding an
+    /// unmatched start — the shape event-ledger and trajectory
+    /// observers read as a run that never closed — and the metrics
+    /// observer's start-reset lands before the run span's stamp reads
+    /// it, so the failed run stamps its own empty rollup instead of its
+    /// predecessor's totals.
     pub(super) fn notify_run_start(&self) {
         self.managers.observers().on_run_start(&RunStartContext {
             session_id: self.session.id,

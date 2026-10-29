@@ -11,9 +11,25 @@
 //! | [`AgentMetrics`] rollup | **scores** on the trace |
 //!
 //! Transport is Langfuse's batched-ingest REST API (`POST
-//! /api/public/ingestion`, Basic auth) with background batching, idempotent
-//! event ids, retry-with-backoff, and a bounded flush on guard drop. Cloud
-//! and self-hosted differ only by `host`.
+//! /api/public/ingestion`, Basic auth) with background batching, stable
+//! event ids, retry-with-backoff, and a bounded flush on guard drop.
+//! Cloud and self-hosted differ only by `host`.
+//!
+//! ## Which servers this speaks
+//!
+//! The ingestion endpoint above is the **legacy** one: Langfuse v3, and
+//! v4 deployments running a `legacy` or `dual` write mode, accept trace,
+//! span, and score events on it. A v4 deployment in its default
+//! `events_only` mode accepts only `score-create` — every trace and
+//! span envelope is answered with a client error, retried per the
+//! transport contract, and finally dropped with a warning, so a
+//! default-mode server ends up storing this exporter's scores and
+//! nothing else (Langfuse Cloud sunsets the legacy endpoint on
+//! 2026-11-16 and moves to that shape). The client cannot detect a
+//! server's write mode, so the compatibility contract lives here in the
+//! docs: hosts that need traces on a v4-default server should point
+//! [`loopctl-otel`](https://docs.rs/loopctl-otel) at the server's `OTLP`
+//! endpoint instead.
 //!
 //! ## Privacy
 //!

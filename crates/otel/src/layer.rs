@@ -125,13 +125,19 @@ fn bounded_run_attributes(agent: &AgentMetrics) -> Vec<KeyValue> {
     bounded
 }
 
-/// The group an attribute belongs to: its key without the final segment.
+/// The group an attribute belongs to: its key without a trailing
+/// overflow marker and without the final segment.
 ///
 /// Tool rollup keys are `loopctl.tool.<tool>.<figure>`, so the head
 /// identifies the tool; stripping only the last segment keeps a dotted
-/// tool name inside one group.
+/// tool name inside one group. An overflowed percentile emits a boolean
+/// `<figure>.overflow` marker beside the reading it qualifies, and that
+/// marker must not peel off into a group of its own — `p99_ms.overflow`
+/// drops the marker first, then the figure, so the honesty signal rides
+/// or drops with the tool it belongs to.
 fn tool_group_key(key: &str) -> &str {
-    key.rsplit_once('.').map_or(key, |head| head.0)
+    let stem = key.strip_suffix(".overflow").unwrap_or(key);
+    stem.rsplit_once('.').map_or(stem, |head| head.0)
 }
 
 /// Sources the bridge polls when a run span closes.
@@ -440,6 +446,7 @@ impl OtelTracingLayer {
                 first = meter_result;
             }
         }
+        crate::metrics::note_meter_shutdown();
         first
     }
 
@@ -696,5 +703,71 @@ mod tests {
             "with 40 tools the budget must bite, not silently exceed: {} groups rode",
             groups.len()
         );
+    }
+
+    #[test]
+    fn a_tool_s_overflow_marker_stays_in_its_tool_s_group() {
+        assert_eq!(
+            tool_group_key("loopctl.tool.bash.p99_ms.overflow"),
+            "loopctl.tool.bash",
+            "the marker strips with its figure before the group split"
+        );
+        assert_eq!(
+            tool_group_key("loopctl.tool.bash.calls"),
+            "loopctl.tool.bash"
+        );
+        assert_eq!(
+            tool_group_key("bare"),
+            "bare",
+            "a key with no dot is its own group"
+        );
+
+        // A tool whose every latency sample sat above the histogram's
+        // last bound: its percentiles export as markers only, no values.
+        let overflowing_tool = |name: &str| {
+            let mut stats = loopctl::metrics::ToolStats::new(name);
+            stats.record(4_000_000, false);
+            stats
+        };
+        let mut lone = AgentMetrics {
+            total_turns: 1,
+            ..Default::default()
+        };
+        lone.tools
+            .insert("bash".to_string(), overflowing_tool("bash"));
+        let attrs = bounded_run_attributes(&lone);
+        let has = |key: &str| attrs.iter().any(|kv| kv.key.as_str() == key);
+        assert!(
+            has("loopctl.tool.bash.p50_ms.overflow")
+                && has("loopctl.tool.bash.p99_ms.overflow")
+                && has("loopctl.tool.bash.calls"),
+            "a lone overflowing tool rides whole: the markers are the honest \
+             reading, and they group with the tool's own counters"
+        );
+
+        // Under budget pressure the invariant that matters: no marker
+        // rides without the rest of its tool's group.
+        let mut crowded = AgentMetrics {
+            total_turns: 3,
+            ..Default::default()
+        };
+        for index in 0..40_u8 {
+            let name = format!("tool{index:02}");
+            let stats = overflowing_tool(&name);
+            crowded.tools.insert(name, stats);
+        }
+        let attrs = bounded_run_attributes(&crowded);
+        for kv in &attrs {
+            let key = kv.key.as_str();
+            if !key.ends_with(".overflow") {
+                continue;
+            }
+            let calls = format!("{}.calls", tool_group_key(key));
+            assert!(
+                attrs.iter().any(|other| other.key.as_str() == calls),
+                "the marker for {key} rode without its tool's counters — a \
+                 group split before the marker was stripped"
+            );
+        }
     }
 }

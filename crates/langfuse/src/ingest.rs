@@ -3,12 +3,15 @@
 //! A bounded shared buffer fronts a background task on the consumer's
 //! `tokio` runtime: envelopes batch to `batch_size` (or a 250 ms tick),
 //! ship as one `{"batch":[…]}` body with Basic auth, and failures retry
-//! up to three times, backing off 250 → 500 → 1000 ms (event ids are
-//! idempotent, so a retry can never double-count). A 207 whose body
-//! names failed entries retries them; a 429 honors `Retry-After` for
-//! the same batch; other 4xx responses are dropped loudly — the
-//! payload is wrong, not the transport. Buffer overflow evicts the
-//! **oldest** event and counts the loss (the guard's `dropped_count`).
+//! up to three times, backing off 250 → 500 → 1000 ms (stable event
+//! ids, so a re-sent envelope the server never stored is the same
+//! event, never a second one). A 207 whose body names failed entries
+//! resends exactly those envelopes — Langfuse does not deduplicate
+//! re-ingested events, so the accepted half of a partial batch is
+//! never re-sent; a 429 honors `Retry-After` for the same batch; other
+//! 4xx responses are dropped loudly — the payload is wrong, not the
+//! transport. Buffer overflow evicts the **oldest** event and counts
+//! the loss (the guard's `dropped_count`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -109,6 +112,24 @@ struct Buffer {
     woken: Notify,
 }
 
+/// Test seam for the exit check: when set, the next
+/// [`Buffer::closed_and_empty`] records whether the queue lock was
+/// still held between its two reads.
+///
+/// The window cannot be probed by interleaving a push — the window
+/// holds the lock, which is the property under test — so the observable
+/// is lock-held-ness itself, read with `try_lock` so it never blocks:
+/// the fixed single-lock read records `true`, a read split into two
+/// lock acquisitions would record `false`.
+#[cfg(test)]
+static EXIT_WINDOW_PROBE: AtomicBool = AtomicBool::new(false);
+
+/// The `try_lock` outcome the last probed exit window recorded.
+///
+/// `true` means the lock was held across both facts.
+#[cfg(test)]
+static EXIT_WINDOW_LOCK_HELD: AtomicBool = AtomicBool::new(true);
+
 impl Buffer {
     /// Lock the queue, recovering from poison.
     ///
@@ -153,7 +174,12 @@ impl Buffer {
     /// or the close lands first and the push refuses.
     fn closed_and_empty(&self) -> bool {
         let queue = self.lock();
-        self.closed.load(Ordering::SeqCst) && queue.is_empty()
+        let empty = queue.is_empty();
+        #[cfg(test)]
+        if EXIT_WINDOW_PROBE.swap(false, Ordering::SeqCst) {
+            EXIT_WINDOW_LOCK_HELD.store(self.queue.try_lock().is_err(), Ordering::SeqCst);
+        }
+        self.closed.load(Ordering::SeqCst) && empty
     }
 }
 
@@ -376,22 +402,29 @@ where
 /// POST one ingestion batch, applying the transport's retry contract.
 ///
 /// A 2xx settles the batch; Langfuse's 207 multi-status settles only
-/// when its body is a well-formed answer naming no failed entries — a
-/// body naming failed entries retries the same ids (idempotent
-/// server-side), and so does an answer that cannot be read as a
-/// multi-status body at all: settling on an unreadable 207 would
-/// settle failed entries on the word of a response never parsed. A 429
+/// when its body is a well-formed answer naming no failed entries. A
+/// readable body naming failed entries resends **only the envelopes
+/// whose ids it lists**: Langfuse does not deduplicate re-ingested
+/// events, so an envelope the server already accepted must not be sent
+/// again — a failure id matching no envelope in the batch is foreign
+/// (named in a warning, never dropped in silence), and a 207 naming
+/// only foreign ids has nothing of ours left to resend, so it settles.
+/// An answer that cannot be read as a multi-status body at all retries
+/// the whole batch: settling there would drop the rejected entries on
+/// the word of a response never parsed, which loses data outright,
+/// where a re-send of stored events only risks a duplicate. A 429
 /// honors the response's `Retry-After` (delta-seconds or HTTP-date,
-/// capped at 5 s) and retries the same batch; other 4xx responses are
-/// dropped with a warning (the payload is wrong, not the transport);
-/// 5xx answers and transport failures retry up to three times on a
-/// 250 → 500 → 1000 ms ladder. A batch that exhausts the ladder is
-/// dropped with a warning and counted nowhere else.
-async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>) {
+/// capped at 5 s) and retries the same batch — nothing was stored on a
+/// 429, so the same ids are safe to send again; other 4xx responses
+/// are dropped with a warning (the payload is wrong, not the
+/// transport); 5xx answers and transport failures retry up to three
+/// times on a 250 → 500 → 1000 ms ladder. A batch that exhausts the
+/// ladder is dropped with a warning and counted nowhere else.
+async fn post(client: &reqwest::Client, url: &str, auth: &str, mut batch: Vec<Value>) {
     if batch.is_empty() {
         return;
     }
-    let body = json!({ "batch": batch });
+    let mut body = json!({ "batch": batch });
     let mut delay = Duration::from_millis(250);
     for attempt in 0..4_u32 {
         let request = client
@@ -416,12 +449,43 @@ async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>
         if status.as_u16() == 207 {
             match multi_status_failures(response).await {
                 Ack::Settled => return,
-                Ack::Failed { failed } => tracing::debug!(
-                    target: "loopctl::langfuse",
-                    failed,
-                    attempt,
-                    "langfuse 207 carried failed entries, will retry them"
-                ),
+                Ack::Failed { failed } => {
+                    let rejected: std::collections::HashSet<&str> =
+                        failed.iter().map(String::as_str).collect();
+                    batch.retain(|envelope| {
+                        envelope
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| rejected.contains(id))
+                    });
+                    let foreign = rejected.len().saturating_sub(batch.len());
+                    if foreign > 0 {
+                        tracing::warn!(
+                            target: "loopctl::langfuse",
+                            foreign,
+                            attempt,
+                            "langfuse 207 named failures for envelopes this \
+                             client never sent"
+                        );
+                    }
+                    if batch.is_empty() {
+                        tracing::warn!(
+                            target: "loopctl::langfuse",
+                            attempt,
+                            "langfuse 207 named no envelope of ours; nothing \
+                             retryable remains, batch settled"
+                        );
+                        return;
+                    }
+                    body = json!({ "batch": batch });
+                    tracing::debug!(
+                        target: "loopctl::langfuse",
+                        failed = batch.len(),
+                        attempt,
+                        "langfuse 207 carried failed entries, will resend \
+                         only those envelopes"
+                    );
+                }
                 Ack::Unreadable => tracing::debug!(
                     target: "loopctl::langfuse",
                     attempt,
@@ -473,12 +537,15 @@ async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>
 /// What a 207 multi-status answer says about the batch it accepted.
 ///
 /// Langfuse answers a partially-processed batch with a JSON body naming
-/// both the accepted and the rejected entries, so the answer has to be
-/// read before the batch can settle. The three verdicts separate "the
-/// server says every entry landed" from "the server says some did not"
-/// from "the server said something unreadable" — only the first ends the
-/// batch's life, because envelope ids are idempotent and retrying an
-/// unreadable answer costs a round-trip, never a duplicate.
+/// the accepted and the rejected entries, so the answer has to be read
+/// before the batch can settle. The three verdicts separate "the
+/// server says every entry landed" from "the server says these ids did
+/// not" from "the server said something unreadable". Only the first
+/// ends the batch's life outright; the second ends it by naming what
+/// to resend, and the third is the one verdict that risks a duplicate,
+/// because an unreadable answer leaves no way to tell accepted from
+/// rejected and dropping it would lose the rejected entries for good.
+#[derive(Debug)]
 enum Ack {
     /// Settle the batch: a well-formed answer naming no failed entries.
     ///
@@ -487,19 +554,23 @@ enum Ack {
     /// flusher moves on to the next one.
     Settled,
 
-    /// Retry the batch: the answer names entries the server rejected.
+    /// Resend the rejected envelopes: the answer names their ids.
     ///
-    /// The partial-success shape: some entries landed, these did not.
-    /// Re-sending the whole batch is safe because the server
-    /// deduplicates what it already took, and it is the only way the
-    /// rejected entries ever arrive.
+    /// The partial-success shape: some entries landed, these did not,
+    /// and Langfuse does not deduplicate re-ingested events — an
+    /// accepted envelope sent again becomes a second record, inflating
+    /// counts and dashboards. The retry therefore carries only the
+    /// envelopes whose ids are listed here, unchanged, so the accepted
+    /// half of the batch is never re-sent.
     Failed {
-        /// How many entries the body lists under `errors`.
+        /// The ids of the entries the body lists under `errors`.
         ///
-        /// Counted for the log line only; the retry re-sends the whole
-        /// batch rather than the named subset, since the ids make the
-        /// overlap harmless.
-        failed: usize,
+        /// Matched against the batch's own envelope ids to select what
+        /// to resend; an id matching no envelope is foreign to this
+        /// client — named in a warning rather than dropped in silence,
+        /// because the mismatch says the server and this client
+        /// disagree about what was sent.
+        failed: Vec<String>,
     },
 
     /// Retry the batch: the answer is not a multi-status body the client
@@ -517,29 +588,48 @@ enum Ack {
 
 /// Read a 207 multi-status body into its [`Ack`] verdict.
 ///
-/// Langfuse answers a partially-accepted batch with
-/// `{"successes": […], "errors": […]}`; a well-formed object whose
-/// `errors` is absent or empty settles, while anything unreadable
-/// retries — the envelope ids make a re-send idempotent, so retrying a
-/// body the client could not parse costs a round-trip, never a
-/// double-count.
+/// The body is decoded off the response here and judged by
+/// [`parse_multi_status`], which owns the verdict rules; an answer that
+/// does not decode as JSON at all is [`Ack::Unreadable`] on the spot.
 async fn multi_status_failures(response: reqwest::Response) -> Ack {
-    let Ok(body) = response.json::<Value>().await else {
-        return Ack::Unreadable;
-    };
+    match response.json::<Value>().await {
+        Ok(body) => parse_multi_status(&body),
+        Err(_) => Ack::Unreadable,
+    }
+}
+
+/// Judge a decoded 207 body: settle, name the rejected ids, or refuse
+/// to read it.
+///
+/// A well-formed object whose `errors` is absent or empty settles; a
+/// present `errors` array names the rejected envelopes **by id**, and
+/// one entry without a readable string id makes the whole answer
+/// [`Ack::Unreadable`] — a failure this client cannot attribute to an
+/// envelope cannot be retried selectively, so it takes the whole-batch
+/// trade an unparsable body gets. `errors` present but not an array,
+/// and a root that is not an object, are unreadable for the same
+/// reason.
+fn parse_multi_status(body: &Value) -> Ack {
     if !body.is_object() {
         return Ack::Unreadable;
     }
-    match body.get("errors") {
-        None => Ack::Settled,
-        Some(errors) => match errors.as_array() {
-            None => Ack::Unreadable,
-            Some(errors) if errors.is_empty() => Ack::Settled,
-            Some(errors) => Ack::Failed {
-                failed: errors.len(),
-            },
-        },
+    let Some(errors) = body.get("errors") else {
+        return Ack::Settled;
+    };
+    let Some(entries) = errors.as_array() else {
+        return Ack::Unreadable;
+    };
+    if entries.is_empty() {
+        return Ack::Settled;
     }
+    let mut failed = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            return Ack::Unreadable;
+        };
+        failed.push(id.to_string());
+    }
+    Ack::Failed { failed }
 }
 
 /// Parse a `Retry-After` value: delta-seconds or an HTTP-date.
@@ -644,7 +734,13 @@ fn civil_from_days(days: u64) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::missing_panics_doc, clippy::unwrap_used, clippy::expect_used)]
+    #![allow(
+        clippy::missing_panics_doc,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -671,14 +767,17 @@ mod tests {
         assert_eq!(basic_auth("pk", "sk"), "Basic cGs6c2s=");
     }
 
-    /// Serve scripted one-shot responses, counting requests.
+    /// Serve scripted one-shot responses, counting requests and
+    /// capturing each request body.
     ///
     /// Each accepted connection is read to its body (Content-Length),
-    /// counted, and answered with the round's status line, an optional
-    /// header, and body — the minimal collector the wire tests need.
+    /// counted, captured, and answered with the round's status line, an
+    /// optional header, and body — the minimal collector the wire tests
+    /// need, with the bytes each round actually received.
     fn serve_rounds(
         listener: &TcpListener,
         hits: &Arc<AtomicUsize>,
+        bodies: &Arc<std::sync::Mutex<Vec<String>>>,
         rounds: Vec<(String, Option<String>, String)>,
     ) {
         for (status, header, body) in rounds {
@@ -706,6 +805,10 @@ mod tests {
             if length > 0 {
                 stream.read_exact(&mut request_body).unwrap_or(());
             }
+            bodies
+                .lock()
+                .expect("capture lock")
+                .push(String::from_utf8_lossy(&request_body).into_owned());
             hits.fetch_add(1, Ordering::SeqCst);
             let extra = header.map_or(String::new(), |value| format!("{value}\r\n"));
             let response = format!(
@@ -720,22 +823,49 @@ mod tests {
 
     fn one_shot_endpoint(
         rounds: Vec<(String, Option<String>, String)>,
-    ) -> (String, Arc<AtomicUsize>) {
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
+        let bodies: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let addr = listener.local_addr().unwrap();
         let counted = Arc::clone(&hits);
-        std::thread::spawn(move || serve_rounds(&listener, &counted, rounds));
-        (format!("http://{addr}/api/public/ingestion"), hits)
+        let captured = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            serve_rounds(&listener, &counted, &captured, rounds);
+        });
+        (format!("http://{addr}/api/public/ingestion"), hits, bodies)
+    }
+
+    /// The envelope ids one request body carried, in order.
+    ///
+    /// Parses a captured `{"batch": […]}` body down to its envelopes'
+    /// `id` fields, so a test can assert exactly which envelopes a
+    /// retry re-sent.
+    fn sent_envelope_ids(raw: &str) -> Vec<String> {
+        serde_json::from_str::<Value>(raw)
+            .expect("captured body parses")
+            .get("batch")
+            .and_then(Value::as_array)
+            .expect("a request carries a batch array")
+            .iter()
+            .map(|envelope| {
+                envelope
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .expect("test envelopes carry ids")
+                    .to_string()
+            })
+            .collect()
     }
 
     #[tokio::test]
-    async fn a_207_with_failed_entries_retries_the_batch() {
-        let (url, hits) = one_shot_endpoint(vec![
+    async fn a_207_resends_only_the_envelopes_the_server_rejected() {
+        let (url, hits, bodies) = one_shot_endpoint(vec![
             (
                 "207 Multi-Status".to_string(),
                 None,
-                r#"{"successes":[],"errors":[{"id":"e1","status":500,"message":"boom"}]}"#
+                r#"{"successes":[{"id":"e2","status":201}],"errors":[{"id":"e1","status":500,"message":"boom"}]}"#
                     .to_string(),
             ),
             (
@@ -749,18 +879,109 @@ mod tests {
             &client,
             &url,
             &basic_auth("pk", "sk"),
-            vec![json!({ "n": 1 })],
+            vec![
+                json!({ "id": "e1", "type": "trace-create", "body": {} }),
+                json!({ "id": "e2", "type": "span-create", "body": {} }),
+            ],
         )
         .await;
-        assert!(
-            hits.load(Ordering::SeqCst) >= 2,
-            "the errored 207 must re-send the batch, not settle over failed entries"
+        let captured = bodies.lock().expect("capture lock").clone();
+        let first_request = captured.first().expect("first request captured");
+        let retry_request = captured.get(1).expect("the retry request captured");
+        assert_eq!(captured.len(), 2, "the errored 207 retries, then settles");
+        assert_eq!(
+            sent_envelope_ids(first_request),
+            ["e1".to_string(), "e2".to_string()],
+            "the first request carries the whole batch"
+        );
+        assert_eq!(
+            sent_envelope_ids(retry_request),
+            ["e1".to_string()],
+            "the retry re-sends exactly the envelope the server named — \
+             re-sending e2 would store a second copy of an event Langfuse \
+             already accepted and does not deduplicate"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the rejected envelope settles on its second answer"
         );
     }
 
     #[tokio::test]
+    async fn a_207_naming_only_foreign_ids_settles_with_a_warning() {
+        let (url, hits, bodies) = one_shot_endpoint(vec![(
+            "207 Multi-Status".to_string(),
+            None,
+            r#"{"successes":[],"errors":[{"id":"not-ours","status":500}]}"#.to_string(),
+        )]);
+        let client = reqwest::Client::new();
+        post(
+            &client,
+            &url,
+            &basic_auth("pk", "sk"),
+            vec![json!({ "id": "e1", "type": "trace-create", "body": {} })],
+        )
+        .await;
+        let captured = bodies.lock().expect("capture lock").clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "a 207 whose failures name no envelope of ours has nothing \
+             retryable — it settles instead of re-sending envelopes the \
+             server says it accepted"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn parse_multi_status_judges_each_body_shape() {
+        assert!(
+            matches!(
+                parse_multi_status(&json!({ "successes": [] })),
+                Ack::Settled
+            ),
+            "an answer without an errors list is a complete success"
+        );
+        assert!(
+            matches!(parse_multi_status(&json!({ "errors": [] })), Ack::Settled),
+            "an empty errors list settles"
+        );
+        assert!(
+            matches!(
+                parse_multi_status(&json!({ "errors": "boom" })),
+                Ack::Unreadable
+            ),
+            "errors that is not an array cannot be attributed"
+        );
+        assert!(
+            matches!(
+                parse_multi_status(&json!(["not", "an", "object"])),
+                Ack::Unreadable
+            ),
+            "a non-object root is not a multi-status body"
+        );
+        assert!(
+            matches!(
+                parse_multi_status(&json!({ "errors": [{ "status": 500 }] })),
+                Ack::Unreadable
+            ),
+            "a failure entry without an id cannot be retried selectively"
+        );
+        match parse_multi_status(&json!({
+            "errors": [
+                { "id": "e1", "status": 500 },
+                { "id": "e2", "status": 429 },
+            ]
+        })) {
+            Ack::Failed { failed } => assert_eq!(failed, ["e1".to_string(), "e2".to_string()]),
+            other => panic!("named ids read as Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn a_429_honors_retry_after_and_retries_the_same_batch() {
-        let (url, hits) = one_shot_endpoint(vec![
+        let (url, hits, _bodies) = one_shot_endpoint(vec![
             (
                 "429 Too Many Requests".to_string(),
                 Some("retry-after: 0".to_string()),
@@ -957,7 +1178,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreadable_207_answer_retries_the_batch() {
-        let (url, hits) = one_shot_endpoint(vec![
+        let (url, hits, _bodies) = one_shot_endpoint(vec![
             (
                 "207 Multi-Status".to_string(),
                 None,
@@ -986,7 +1207,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_207_naming_no_errors_settles_on_the_first_try() {
-        let (url, hits) = one_shot_endpoint(vec![(
+        let (url, hits, _bodies) = one_shot_endpoint(vec![(
             "207 Multi-Status".to_string(),
             None,
             r#"{"successes":[{"id":"e1","status":201}]}"#.to_string(),
@@ -1004,6 +1225,30 @@ mod tests {
             1,
             "a well-formed 207 without an errors list is a complete success — \
              retrying it would treat a valid answer as an unreadable one"
+        );
+    }
+
+    #[test]
+    fn the_exit_check_holds_the_queue_lock_across_both_reads() {
+        let buffer = Buffer {
+            queue: std::sync::Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            work_in_flight: AtomicBool::new(false),
+            woken: Notify::new(),
+        };
+        EXIT_WINDOW_LOCK_HELD.store(false, Ordering::SeqCst);
+        EXIT_WINDOW_PROBE.store(true, Ordering::SeqCst);
+        let _ = buffer.closed_and_empty();
+        assert!(
+            EXIT_WINDOW_LOCK_HELD.load(Ordering::SeqCst),
+            "the queue lock is still held between the emptiness read and \
+             the closed read — a read split into two acquisitions would \
+             let a push land in exactly that window"
+        );
+        assert!(
+            !EXIT_WINDOW_PROBE.load(Ordering::SeqCst),
+            "the probe arms one call"
         );
     }
 

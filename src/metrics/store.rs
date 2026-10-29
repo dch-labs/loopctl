@@ -266,8 +266,14 @@ pub struct RegistrySnapshot {
 /// short holds; poison is recovered (the guarded data is plain numbers,
 /// safe to read after any panic), never propagated — a metrics store
 /// must not take a process down with it.
-#[derive(Default)]
 pub struct MetricsRegistry {
+    /// This registry's process-unique identity.
+    ///
+    /// Drawn from [`REGISTRY_GENERATION`] at construction and never
+    /// repeated, so a replacement registry is distinguishable from the
+    /// one it replaced even where both lived at the same address.
+    generation: u64,
+
     /// Series map, keyed canonically; sorted for stable snapshots.
     ///
     /// One [`Mutex`] hold covers every read and write, so a scrape
@@ -307,6 +313,59 @@ pub struct MetricsRegistry {
     /// These events are dropped rather than guessed at; the count is
     /// the evidence that the emission site needs a unit-suffixed field.
     ambiguous_scalar: AtomicU64,
+}
+
+/// The stamp every [`MetricsRegistry`] constructor draws from.
+///
+/// A process-wide monotonic counter, so each registry holds a number
+/// no other registry in this process ever held — the identity exporters
+/// key per-registry bookkeeping on (see
+/// [`MetricsRegistry::generation`]).
+static REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+impl Default for MetricsRegistry {
+    /// A fresh registry with its own generation.
+    ///
+    /// Every construction path stamps the same identity discipline, so
+    /// two defaults are as distinct as any two registries — nothing
+    /// about `Default` implies a shared or zeroed identity.
+    fn default() -> Self {
+        Self::fresh()
+    }
+}
+
+impl MetricsRegistry {
+    /// Build an empty registry stamped with the next generation.
+    ///
+    /// The single construction path behind [`MetricsRegistry::default`]
+    /// and every constructor this type grows; stamping in one place is
+    /// what keeps the never-repeats guarantee true by construction.
+    fn fresh() -> Self {
+        Self {
+            generation: REGISTRY_GENERATION
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1),
+            series: Mutex::new(BTreeMap::new()),
+            unknown_metric: AtomicU64::new(0),
+            unknown_labels: AtomicU64::new(0),
+            missing_labels: AtomicU64::new(0),
+            numeric_on_counter: AtomicU64::new(0),
+            ambiguous_scalar: AtomicU64::new(0),
+        }
+    }
+
+    /// This registry's process-unique generation stamp.
+    ///
+    /// Exporters that keep per-registry bookkeeping — delta ledgers,
+    /// last-exported totals — key it on this value rather than on the
+    /// registry's address: an address can be reused after a drop, a
+    /// generation never repeats, so a replacement registry is always
+    /// recognized as new. Two registries built back to back hold
+    /// consecutive values.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 /// Adds one to an atomic counter without wrap arithmetic.
@@ -950,6 +1009,24 @@ mod tests {
             panic!("counter shape");
         };
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn every_registry_gets_its_own_generation() {
+        let first = MetricsRegistry::default();
+        let second = MetricsRegistry::default();
+        let third = MetricsRegistry::default();
+        assert!(
+            first.generation() > 0,
+            "generations start past zero — the derive's zeroed default is \
+             exactly the shared identity a generation exists to avoid"
+        );
+        assert!(
+            first.generation() < second.generation() && second.generation() < third.generation(),
+            "each construction stamps the next generation: an identity \
+             derived from an address could repeat when the allocator \
+             hands a replacement the spot a freed predecessor held"
+        );
     }
 
     #[test]

@@ -125,6 +125,7 @@ pub use steering::Steering;
 
 use emission::{TurnEnd, TurnUsage};
 pub use model_switch::ModelSwitch;
+use tracing::Instrument as _;
 
 /// The framework's default agent loop implementation.
 ///
@@ -489,6 +490,17 @@ pub struct BareLoop<C: ApiClient> {
     /// falls back to its own entry instant. Cleared at run start so a
     /// resumed phase cannot inherit a stale start.
     turn_wall_start: Option<Instant>,
+
+    /// The turn span held open across a tool-bearing turn's dispatch
+    /// phase.
+    ///
+    /// `drive_steps` stashes the span when the committed turn carries
+    /// tool calls, and the turn-end notification settles it with the
+    /// final outcome — a settlement recorded before the tool phase ran
+    /// would claim an `ok` the phase could still falsify. Held under a
+    /// short mutex because the notification path is `&self`; dropped
+    /// (closing the span) whenever a new turn begins or the run ends.
+    open_turn_span: std::sync::Mutex<Option<(usize, tracing::Span)>>,
 
     /// Sticky detection bypass, set once detection state is found
     /// poisoned — detection is advisory, so the session continues with
@@ -886,6 +898,7 @@ impl EstimateCalibration {
         tracing::debug!(
             target: "loopctl::metrics",
             metric = "loopctl.estimate.calibration",
+            value = sample,
             ratio_bp = self.ratio_bp,
             sample_bp = sample,
             "usage-fed estimate calibration updated"
@@ -963,9 +976,18 @@ impl<C: ApiClient> BareLoop<C> {
             let policy = self.machine_policy();
             match self.machine.next_step(policy) {
                 MachineStep::CallLLM { turn } => {
-                    if let Err(e) = self.handle_call_llm(turn).await {
+                    let turn_ctx = crate::observer::TurnStartContext {
+                        turn,
+                        query: String::new(),
+                    };
+                    self.clear_turn_span_hold();
+                    let span = crate::tracing_spans::turn_span(&turn_ctx);
+                    if let Err(e) = self.handle_call_llm(turn).instrument(span.clone()).await {
                         self.set_error_state(&e);
                         return Err(e);
+                    }
+                    if self.last_turn_carried_tool_calls() {
+                        self.hold_turn_span(turn, span);
                     }
                 }
                 MachineStep::CallTools { turn, calls } => {
@@ -1001,6 +1023,43 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// Whether the run's most recently committed turn requested tools.
+    ///
+    /// The driver's hold signal for the turn span: a tool-carrying
+    /// turn's span stays open until the tool phase settles it, so the
+    /// driver needs exactly this after the model phase commits.
+    fn last_turn_carried_tool_calls(&self) -> bool {
+        self.session
+            .current_run()
+            .and_then(|run| run.turns.last())
+            .is_some_and(|turn| !turn.tool_calls.is_empty())
+    }
+
+    /// Hold a tool-bearing turn's span open for its dispatch phase.
+    ///
+    /// The span stays alive (unentered) until the turn-end
+    /// notification settles it from the tool phase — recording on a
+    /// held handle works while the span has not closed, and the drop
+    /// after settlement closes it with every record aboard.
+    fn hold_turn_span(&self, turn: usize, span: tracing::Span) {
+        *self
+            .open_turn_span
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((turn, span));
+    }
+
+    /// Drop any held turn span, closing it.
+    ///
+    /// A span dropped without settlement closes as a span the engine
+    /// never learned an outcome for — the documented reading of a
+    /// turn-span without its outcome fields.
+    fn clear_turn_span_hold(&self) {
+        *self
+            .open_turn_span
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     /// Ask the registered hooks for one follow-up turn.
     ///
     /// The consult half of the hook follow-up: builds the run-end
@@ -1023,6 +1082,7 @@ impl<C: ApiClient> BareLoop<C> {
         };
         executor.run_followup(&ctx)
     }
+
     /// The hard ceiling on tool-recovery retry attempts.
     ///
     /// This single value is the retry budget, enforced at **two** points that
@@ -1152,6 +1212,7 @@ impl<C: ApiClient> BareLoop<C> {
             truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
+            open_turn_span: std::sync::Mutex::new(None),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1712,6 +1773,7 @@ impl<C: ApiClient> BareLoop<C> {
             truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
+            open_turn_span: std::sync::Mutex::new(None),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1839,6 +1901,7 @@ impl<C: ApiClient> BareLoop<C> {
             truncation_retry: None,
             salvage_target: None,
             turn_wall_start: None,
+            open_turn_span: std::sync::Mutex::new(None),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -2455,17 +2518,8 @@ impl<C: ApiClient> BareLoop<C> {
         let turn_start = self.managers.clock().monotonic();
         self.turn_wall_start = Some(turn_start);
         let turn_input = self.turn_input(turn);
-
+        crate::tracing_spans::record_turn_query(&turn_input);
         let (messages, tools) = self.take_prepared_turn(turn).await;
-
-        // The transients ride this turn's request but not the history:
-        // feed their size (plus the per-request overhead) before the
-        // request goes out, and re-check the machine — if the payload
-        // now crosses the line, the step becomes `Compact` and this
-        // turn defers to the outer loop's compaction arm (turn events
-        // and model-switch bookkeeping have not fired yet;
-        // `next_step` is idempotent, so the re-check is a pure
-        // re-decision).
         let mut raw_payload = self
             .count_context(&self.machine.full_history())
             .saturating_add(self.advertised_overhead_tokens(tools.as_deref()))
@@ -2618,6 +2672,7 @@ impl<C: ApiClient> BareLoop<C> {
         };
         let turn = record.index;
         let stop_reason = record.stop_reason;
+        let duration = self.managers.clock().elapsed_since(turn_start);
         if let Some(run) = self.session.current_run_mut() {
             run.turns.push(record);
         }
@@ -2626,7 +2681,7 @@ impl<C: ApiClient> BareLoop<C> {
                 turn,
                 success: true,
                 error: None,
-                duration: self.managers.clock().elapsed_since(turn_start),
+                duration,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
@@ -3075,19 +3130,15 @@ impl<C: ApiClient> BareLoop<C> {
 
 impl<C: ApiClient> Drop for BareLoop<C> {
     fn drop(&mut self) {
-        if let Some(dir) = self.session_temp_dir.take() {
-            // Best-effort: a missing dir (host pre-cleaned, or lazy
-            // materialisation never ran) is silent; anything else logs
-            // once and is left for the OS — Drop cannot return errors.
-            if let Err(e) = std::fs::remove_dir_all(&dir)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(
-                    path = %dir.display(),
-                    error = %e,
-                    "failed to clean up session temp dir"
-                );
-            }
+        if let Some(dir) = self.session_temp_dir.take()
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "failed to clean up session temp dir"
+            );
         }
     }
 }
@@ -3098,68 +3149,84 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
         input: &'a str,
         run_config: &'a RunConfig,
     ) -> Pin<Box<dyn Future<Output = RunResult> + Send + 'a>> {
-        Box::pin(async move {
-            let session_is_new = self.session.session_start.is_none();
+        let run_span = crate::tracing_spans::agent_run_span(self.session.id, &self.client.model());
+        Box::pin(
+            async move {
+                let session_is_new = self.session.session_start.is_none();
 
-            if session_is_new {
-                self.session.session_start = Some(self.managers.clock().monotonic());
-            }
-
-            if run_config.reset_managers {
-                self.managers.reset_all()?;
-            }
-
-            self.session
-                .runs
-                .push(Self::new_run(input, run_config, &self.managers));
-            self.notify_run_start();
-            if let Some(gate) = &self.budget_gate {
-                gate.begin();
-                self.budget_run_started = Some(self.managers.clock().monotonic());
-            }
-            self.steering.open_run();
-            let _slot_guard = steering::SteeringCloseGuard::new(Arc::clone(&self.steering));
-            self.machine.accept_input(input);
-            self.deferred_transient_tokens = 0;
-            self.overflow_retry = None;
-            self.truncation_retry = None;
-            self.salvage_target = None;
-            self.turn_wall_start = None;
-            let cancelled = Arc::clone(&self.cancelled);
-            let resolution = tokio::select! {
-                biased;
-                () = cancelled.notified() => Err(LoopError::Cancelled),
-                () = self.resolve_context_window() => Ok(()),
-            };
-            if let Err(e) = resolution {
-                self.set_error_state(&e);
-                self.finalize(Some(&e)).await?;
-                return Err(e);
-            }
-            self.arm_first_turn().await;
-            if let Err(e) = self.drive_steps(run_config).await {
-                self.finalize(Some(&e)).await?;
-                return Err(e);
-            }
-            #[cfg(feature = "hooks")]
-            if self.machine.turns_taken() < run_config.max_turns
-                && let Some(action) = self.collect_followup()
-            {
-                let crate::hooks::PostRunAction::FollowUp { prompt, origin } = action;
-                if let Some(run) = self.session.current_run_mut() {
-                    run.followup_origin = Some(origin);
-                    run.output = None;
+                if session_is_new {
+                    self.session.session_start = Some(self.managers.clock().monotonic());
                 }
-                self.machine.accept_followup(&prompt);
-                self.arm_followup_turn().await;
+
+                let run_opened = self.managers.clock().monotonic();
+                if run_config.reset_managers
+                    && let Err(reset_error) = self.managers.reset_all()
+                {
+                    self.notify_run_start();
+                    let failed_run = Self::new_run(input, run_config, &self.managers);
+                    let failed_after = self.managers.clock().elapsed_since(run_opened);
+                    self.notify_run_end(&failed_run, failed_after, Some(&reset_error));
+                    crate::tracing_spans::record_run_end(
+                        false,
+                        Self::millis_u64(failed_after),
+                        Some(&reset_error),
+                    );
+                    return Err(reset_error);
+                }
+
+                self.session
+                    .runs
+                    .push(Self::new_run(input, run_config, &self.managers));
+                self.notify_run_start();
+                if let Some(gate) = &self.budget_gate {
+                    gate.begin();
+                    self.budget_run_started = Some(self.managers.clock().monotonic());
+                }
+                self.steering.open_run();
+                let _slot_guard = steering::SteeringCloseGuard::new(Arc::clone(&self.steering));
+                self.machine.accept_input(input);
+                self.deferred_transient_tokens = 0;
+                self.overflow_retry = None;
+                self.truncation_retry = None;
+                self.salvage_target = None;
+                self.turn_wall_start = None;
+                let cancelled = Arc::clone(&self.cancelled);
+                let resolution = tokio::select! {
+                    biased;
+                    () = cancelled.notified() => Err(LoopError::Cancelled),
+                    () = self.resolve_context_window() => Ok(()),
+                };
+                if let Err(e) = resolution {
+                    self.set_error_state(&e);
+                    self.finalize(Some(&e)).await?;
+                    return Err(e);
+                }
+                self.arm_first_turn().await;
                 if let Err(e) = self.drive_steps(run_config).await {
                     self.finalize(Some(&e)).await?;
                     return Err(e);
                 }
-            }
+                #[cfg(feature = "hooks")]
+                if self.machine.turns_taken() < run_config.max_turns
+                    && let Some(action) = self.collect_followup()
+                {
+                    let crate::hooks::PostRunAction::FollowUp { prompt, origin } = action;
+                    if let Some(run) = self.session.current_run_mut() {
+                        run.followup_origin = Some(origin);
+                        run.output = None;
+                    }
+                    self.machine.accept_followup(&prompt);
+                    self.arm_followup_turn().await;
+                    if let Err(e) = self.drive_steps(run_config).await {
+                        self.finalize(Some(&e)).await?;
+                        return Err(e);
+                    }
+                }
 
-            self.finalize(None).await
-        })
+                self.finalize(None).await
+            }
+            .instrument(run_span),
+        )
     }
 
     fn should_continue(&self) -> bool {
@@ -3192,6 +3259,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
         &'a mut self,
         error: Option<&'a LoopError>,
     ) -> Pin<Box<dyn Future<Output = RunResult> + Send + 'a>> {
+        self.clear_turn_span_hold();
         Box::pin(async move {
             if let Some(run) = self.session.current_run_mut() {
                 run.end = Some(self.managers.clock().monotonic());
@@ -3223,6 +3291,11 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             let duration = run.duration();
 
             self.notify_run_end(&run, duration, error);
+            crate::tracing_spans::record_run_end(
+                error.is_none(),
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                error,
+            );
             self.cancelled.reset();
             self.steering.close_run();
 

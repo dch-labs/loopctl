@@ -24,6 +24,7 @@
 //! - **[`compact`]** — Context management and compaction (threshold detection, pluggable strategies).
 //! - **[`stream`]** — Streaming event types for LLM API responses.
 //! - **[`middleware`]** — Tool dispatch middleware pipeline (timeouts, permissions, output limits).
+//! - **[`metrics`]** — Per-run metrics value types ([`AgentMetrics`](metrics::AgentMetrics), latency percentiles, tool stats) and the metric registry catalog. *Requires `metrics` feature.*
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
 //! - **`tool::health`** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
 //! - **[`mcp`]** — MCP client + server adapters ([`McpToolProvider`](mcp::McpToolProvider) adapts foreign MCP servers; [`McpServerAdapter`](mcp::McpServerAdapter) serves a `ToolRegistry` over MCP). *Requires `mcp` feature.*
@@ -96,6 +97,7 @@
 //!   [`ExtractionObserver`](memory::extractor::ExtractionObserver) for automated best-effort at run end).
 //! - **hooks** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
 //! - **testing** — Test utilities and fixtures. *Requires `testing` feature.*
+//! - **[`tracing_spans`]** — Engine span hierarchy (`agent.run`/`agent.turn`/`agent.tool`) with OTel-GenAI-shaped fields at emission, plus the level/target contract for `RUST_LOG`.
 
 // Relax strict lints in test code. The crate enforces a strict no-panic /
 // no-unwrap policy in production code, but test code legitimately uses
@@ -158,6 +160,8 @@ pub mod manifest;
 pub mod mcp;
 pub mod memory;
 pub mod message;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod middleware;
 pub(crate) mod numeric;
 pub mod observer;
@@ -171,3 +175,4 @@ pub mod structured;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool;
+pub mod tracing_spans;

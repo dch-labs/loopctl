@@ -59,6 +59,7 @@ use uuid::Uuid;
 /// consumer may render or persist; the engine's one wall read stamps the
 /// timestamp on permission-gate decision records, so a pinned clock
 /// pins those too.
+///
 /// Implementations must be cheap to call and free of panics; the default
 /// [`SystemClock`] performs the live reads, and a pinned implementation
 /// (see [`FixedClock`]) freezes both halves.

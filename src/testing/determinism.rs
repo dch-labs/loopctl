@@ -166,8 +166,13 @@ pub enum CapturedEvent {
 
         /// The run's duration in whole milliseconds.
         ///
-        /// Measured through the clock seam from run start to run end, so
-        /// a pinned clock makes it exactly zero or an exact step multiple.
+        /// Measured through the clock seam from run start to run end and
+        /// truncated to whole milliseconds. A frozen clock makes it exactly
+        /// zero; a stepping clock makes it an exact multiple of the step
+        /// whenever the step is a whole number of milliseconds — a
+        /// fractional step's sub-millisecond remainder is truncated away,
+        /// deterministically, so the figure still compares equal across
+        /// same-seed engines.
         duration_ms: u64,
 
         /// The source of the run's final context-size figure.
@@ -273,8 +278,12 @@ pub enum CapturedEvent {
         /// The turn's duration in whole milliseconds.
         ///
         /// Measured through the clock seam from the turn's start read to
-        /// its end read, so a pinned clock makes it exactly zero or an
-        /// exact step multiple.
+        /// its end read and truncated to whole milliseconds. A frozen
+        /// clock makes it exactly zero; a stepping clock makes it an exact
+        /// multiple of the step whenever the step is a whole number of
+        /// milliseconds — a fractional step's sub-millisecond remainder is
+        /// truncated away, deterministically, so the figure still compares
+        /// equal across same-seed engines.
         duration_ms: u64,
 
         /// Input tokens the turn consumed.

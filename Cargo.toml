@@ -14,7 +14,7 @@ readme = "README.md"
 rust-version = "1.98"
 
 [workspace]
-members = ["crates/derive", "crates/sqlite", "crates/hnsw", "crates/client"]
+members = ["crates/derive", "crates/sqlite", "crates/hnsw", "crates/client", "crates/otel", "crates/langfuse"]
 exclude = ["crates/vector"]
 
 [lib]
@@ -36,6 +36,7 @@ tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["registry", "std"] }
 
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"], optional = true }
 bytes = { version = "1", optional = true }
@@ -58,6 +59,7 @@ proptest = "1"
 httpmock = { version = "0.8.3", default-features = false, features = ["record"] }
 serde_yaml = "0.9"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry"] }
 
 [features]
 default = []
@@ -70,6 +72,7 @@ vector_memory = ["vector_index"]
 derive = ["dep:loopctl-derive"]
 hooks = []
 testing = []
+metrics = ["dep:tracing-subscriber"]
 file_memory = []
 file_grants = []
 tool_health = []
@@ -139,6 +142,26 @@ required-features = ["mcp"]
 [[example]]
 name = "mcp_server"
 required-features = ["mcp"]
+
+[[test]]
+name = "metrics"
+required-features = ["metrics"]
+
+[[test]]
+name = "metrics_observer"
+required-features = ["metrics", "testing"]
+
+[[test]]
+name = "emission_catalog_contract"
+required-features = ["metrics", "testing"]
+
+[[test]]
+name = "metrics_layer_e2e"
+required-features = ["metrics", "testing"]
+
+[[test]]
+name = "tracing_spans"
+required-features = ["testing"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

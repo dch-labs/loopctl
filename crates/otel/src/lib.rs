@@ -240,7 +240,10 @@ pub enum OtelInstallError {
     /// exports none of them, and installation is once-per-process, so
     /// the handle a later call finds is the dead one — an `Ok` there
     /// would look like delivery while nothing left the process.
-    /// Rebuilding the install means a new process.
+    /// Rebuilding the install means a new process. Only the pipeline
+    /// that **owns** the installed handle marks it, so a trace-only
+    /// layer or a pipeline whose meter lost the set-once race cannot
+    /// end another pipeline's exports.
     #[error("the metrics pipeline was shut down; exports no longer deliver")]
     PipelineShutDown,
 }
@@ -251,7 +254,6 @@ pub enum OtelInstallError {
 /// (failures print to stderr, since `Drop` cannot propagate them).
 /// [`ShutdownGuard::force_flush`] is the checked flush for hosts that
 /// want errors before the last batch leaves the process.
-#[derive(Debug)]
 pub struct ShutdownGuard {
     /// The tracer provider this guard owns; `None` only for guards
     /// built without a trace pipeline.
@@ -269,6 +271,23 @@ pub struct ShutdownGuard {
     /// `SpanAttributes` install builds no reader, and a guard without one
     /// has nothing to shut down beyond the tracer.
     meter_provider: Option<SdkMeterProvider>,
+
+    /// The pipeline handle this guard's install created, when it built
+    /// a meter.
+    ///
+    /// The handle a pipeline keeps is its own — the winner's is the
+    /// process-wide slot, a loser's is an orphan — so marking it on
+    /// drop can never end another pipeline's exports. A traces-only
+    /// install holds `None` and marks nothing: it never owned a meter.
+    meter: Option<std::sync::Arc<metrics::MeterHandle>>,
+}
+
+impl std::fmt::Debug for ShutdownGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShutdownGuard")
+            .field("meter", &self.meter.as_ref().map(|_| "MeterHandle"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ShutdownGuard {
@@ -295,6 +314,9 @@ impl ShutdownGuard {
 
 impl Drop for ShutdownGuard {
     fn drop(&mut self) {
+        if let Some(handle) = &self.meter {
+            handle.mark_shut_down();
+        }
         if let Some(provider) = &self.tracer_provider
             && let Err(err) = provider.shutdown()
         {
@@ -305,7 +327,6 @@ impl Drop for ShutdownGuard {
         {
             eprintln!("loopctl-otel: meter shutdown failed: {err}");
         }
-        metrics::note_meter_shutdown();
     }
 }
 
@@ -338,13 +359,14 @@ pub fn install(config: &OtelConfig) -> Result<ShutdownGuard, OtelInstallError> {
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|_| OtelInstallError::AlreadyInstalled)?;
     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
-    if let Some(meter) = &meter_provider {
+    let installed_meter = meter_provider.as_ref().map(|meter| {
         opentelemetry::global::set_meter_provider(meter.clone());
-        metrics::install_meter(meter.meter("loopctl"));
-    }
+        metrics::install_meter_handle(meter.meter("loopctl"))
+    });
     Ok(ShutdownGuard {
         tracer_provider: Some(tracer_provider),
         meter_provider,
+        meter: installed_meter,
     })
 }
 
@@ -362,14 +384,15 @@ pub fn install(config: &OtelConfig) -> Result<ShutdownGuard, OtelInstallError> {
 pub fn otel_layer(config: &OtelConfig) -> Result<OtelTracingLayer, OtelInstallError> {
     let stamper = stamper_for(config);
     let (tracer_provider, meter_provider) = build_providers(config)?;
-    if let Some(meter) = &meter_provider {
-        metrics::install_meter(meter.meter("loopctl"));
-    }
+    let installed_meter = meter_provider
+        .as_ref()
+        .map(|meter| metrics::install_meter_handle(meter.meter("loopctl")));
     let composed = OtelTracingLayer::new(
         compose_layer_inner(&tracer_provider),
         tracer_provider,
         meter_provider,
-    );
+    )
+    .owning_meter(installed_meter);
     Ok(match stamper {
         Some(stamper) => composed.with_stamper(stamper),
         None => composed,
@@ -387,7 +410,10 @@ pub fn otel_layer(config: &OtelConfig) -> Result<OtelTracingLayer, OtelInstallEr
 /// [`OtelInstallError::PipelineShutDown`] once the pipeline's providers
 /// have been shut down — installation is once-per-process, so the
 /// handle a later call finds is the dead one, and an `Ok` here would
-/// look like delivery while nothing left the process.
+/// look like delivery while nothing left the process. The liveness
+/// check and the recording share one lock with the teardown mark, and
+/// the owning pipeline marks **before** its providers stop, so an
+/// export cannot slip between a check and a teardown.
 ///
 /// # Errors
 ///
@@ -399,11 +425,8 @@ pub fn export_metrics(
     registry: &MetricsRegistry,
 ) -> Result<(), OtelInstallError> {
     let meter = metrics::active_meter().ok_or(OtelInstallError::NoMetricsPipeline)?;
-    if meter.is_shut_down() {
-        return Err(OtelInstallError::PipelineShutDown);
-    }
     let registry_id = registry.generation();
-    metrics::record_registry(&meter, registry_id, &registry.snapshot());
+    let mut recorded = metrics::record_registry(&meter, registry_id, &registry.snapshot());
     if let Some(agent) = agent {
         for attr in metrics::run_attributes(agent) {
             let name = attr.key.as_str().to_string();
@@ -413,8 +436,11 @@ pub fn export_metrics(
                 opentelemetry::Value::Bool(b) => f64::from(b),
                 _ => continue,
             };
-            meter.with_gauge(&name, value);
+            recorded &= meter.with_gauge(&name, value);
         }
+    }
+    if !recorded {
+        return Err(OtelInstallError::PipelineShutDown);
     }
     Ok(())
 }

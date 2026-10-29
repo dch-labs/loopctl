@@ -12,8 +12,11 @@
 //!
 //! Transport is Langfuse's batched-ingest REST API (`POST
 //! /api/public/ingestion`, Basic auth) with background batching, stable
-//! event ids, retry-with-backoff, and a bounded flush on guard drop.
-//! Cloud and self-hosted differ only by `host`.
+//! event ids, retry-with-backoff, and a bounded flush on guard drop —
+//! except on a current-thread runtime, where dropping the guard closes
+//! the queue without waiting and hosts await
+//! [`flush`](LangfuseGuard::flush) before the runtime stops. Cloud and
+//! self-hosted differ only by `host`.
 //!
 //! ## Which servers this speaks
 //!

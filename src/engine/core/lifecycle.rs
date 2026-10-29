@@ -794,6 +794,10 @@ pub struct Session {
     /// One [`Run`] per `run()` call. The session's derived totals
     /// (turns, tokens, duration) sum over this list. The last entry is the
     /// in-flight run (or the most recently completed one).
+    ///
+    /// Exception: a run the manager reset refuses before its first turn
+    /// announces observer start and end events but is not pushed here —
+    /// it failed before a run record existed to keep.
     pub runs: Vec<Run>,
 }
 

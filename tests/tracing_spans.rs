@@ -44,15 +44,20 @@ use tracing_subscriber::registry::LookupSpan;
 /// A tool that echoes a fixed successful output.
 struct EchoTool;
 
-/// Counts the run-start and run-end notifications one loop fires.
+/// Counts the run-start and run-end notifications one loop fires, and
+/// captures what each callback carried.
 ///
-/// Exists to pin the pairing: every run a loop starts must also end,
-/// including one that fails before its first turn — an unmatched start
-/// is what an event-ledger observer reads as a run left open.
+/// Exists to pin the pairing and its contents: every run a loop starts
+/// must also end, the start must carry the loop's own session
+/// identity, and the end of a failed run must report the failure —
+/// counts alone would pass a start with the wrong session or an end
+/// claiming success.
 #[derive(Default)]
 struct RunLifecycleCounts {
     starts: std::sync::atomic::AtomicUsize,
     ends: std::sync::atomic::AtomicUsize,
+    start_sessions: std::sync::Mutex<Vec<String>>,
+    end_states: std::sync::Mutex<Vec<(bool, Option<String>, usize)>>,
 }
 
 impl loopctl::observer::LoopObserver for RunLifecycleCounts {
@@ -60,13 +65,22 @@ impl loopctl::observer::LoopObserver for RunLifecycleCounts {
         "run-lifecycle-counts"
     }
 
-    fn on_run_start(&self, _ctx: &loopctl::observer::RunStartContext) {
+    fn on_run_start(&self, ctx: &loopctl::observer::RunStartContext) {
         self.starts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.start_sessions
+            .lock()
+            .expect("start sessions lock")
+            .push(ctx.session_id.to_string());
     }
 
-    fn on_run_end(&self, _ctx: &loopctl::observer::RunEndContext) {
+    fn on_run_end(&self, ctx: &loopctl::observer::RunEndContext) {
         self.ends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.end_states.lock().expect("end states lock").push((
+            ctx.success,
+            ctx.error.clone(),
+            ctx.total_turns,
+        ));
     }
 }
 
@@ -769,6 +783,36 @@ async fn the_engine_emits_the_documented_span_tree() {
         "a reset-refused run announces a matched start and end — the end \
          carries the reset failure, so no observer is left holding a \
          start with no run to close"
+    );
+    let session_id = reset_agent.session().id.to_string();
+    assert_eq!(
+        *lifecycle
+            .start_sessions
+            .lock()
+            .expect("start sessions lock"),
+        [session_id],
+        "the start carries the loop's own session identity"
+    );
+    let end_states = lifecycle
+        .end_states
+        .lock()
+        .expect("end states lock")
+        .clone();
+    assert_eq!(end_states.len(), 1, "exactly one run end fired");
+    let (success, error, turns) = end_states.first().expect("the single end state exists");
+    assert!(
+        !success,
+        "the refused run's end reports failure, not success"
+    );
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|text| text.to_ascii_lowercase().contains("poison")),
+        "the end carries the reset failure's own error class, got {error:?}"
+    );
+    assert_eq!(
+        *turns, 0,
+        "the refused run ran no turns, and its end says so"
     );
 }
 

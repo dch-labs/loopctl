@@ -38,9 +38,13 @@ pub(crate) const BUFFER_CAP: usize = 4096;
 /// One ingestion event envelope.
 ///
 /// Wraps a typed body with the fields every Langfuse ingest event
-/// needs: a fresh idempotency id (uuid v4), the event type, and the
-/// emission timestamp. A retried batch resends the same ids, so the
-/// server deduplicates instead of double-counting.
+/// needs: a fresh event id (uuid v4), the event type, and the
+/// emission timestamp. A retried batch resends the same ids. Langfuse
+/// does not deduplicate re-ingested events, so a transport-level retry
+/// that follows a timeout can create duplicate records — the price of
+/// not losing a batch the server may never have seen — while a 207's
+/// selective retry re-sends only what the server named, so an
+/// accepted envelope is never re-sent.
 #[must_use]
 pub(crate) fn envelope(event_type: &str, body: &Value) -> Value {
     json!({
@@ -747,6 +751,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use tracing_subscriber::prelude::*;
+
     use super::*;
 
     #[test]
@@ -859,6 +865,37 @@ mod tests {
             .collect()
     }
 
+    /// A `MakeWriter` collecting formatted WARN lines in memory.
+    ///
+    /// The wire tests assert on the warnings `post` emits — a test that
+    /// only counts requests cannot tell a warned settle from a silent
+    /// one — so the foreign-id test installs a scoped subscriber whose
+    /// output lands here.
+    #[derive(Clone, Default)]
+    struct WarnSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WarnSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("warn sink lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for WarnSink {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     #[tokio::test]
     async fn a_207_resends_only_the_envelopes_the_server_rejected() {
         let (url, hits, bodies) = one_shot_endpoint(vec![
@@ -910,6 +947,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_207_naming_only_foreign_ids_settles_with_a_warning() {
+        let warnings = WarnSink::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(warnings.clone()))
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("loopctl::langfuse", tracing::Level::WARN),
+            );
+        let _captured = tracing::subscriber::set_default(subscriber);
         let (url, hits, bodies) = one_shot_endpoint(vec![(
             "207 Multi-Status".to_string(),
             None,
@@ -932,6 +977,16 @@ mod tests {
              server says it accepted"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let text = String::from_utf8_lossy(&warnings.0.lock().expect("warn sink lock")).to_string();
+        assert!(
+            text.contains("named failures for envelopes this client never sent"),
+            "the foreign ids are named in a warning, never dropped in \
+             silence: {text}"
+        );
+        assert!(
+            text.contains("nothing retryable remains"),
+            "the settle says why it settled: {text}"
+        );
     }
 
     #[test]
@@ -1178,7 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreadable_207_answer_retries_the_batch() {
-        let (url, hits, _bodies) = one_shot_endpoint(vec![
+        let (url, hits, bodies) = one_shot_endpoint(vec![
             (
                 "207 Multi-Status".to_string(),
                 None,
@@ -1195,13 +1250,22 @@ mod tests {
             &client,
             &url,
             &basic_auth("pk", "sk"),
-            vec![json!({ "n": 1 })],
+            vec![json!({ "id": "e1", "type": "trace-create", "body": {} })],
         )
         .await;
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
             "a 207 the client cannot parse must re-send the batch, not settle"
+        );
+        let captured = bodies.lock().expect("capture lock").clone();
+        let first = captured.first().expect("the first request is captured");
+        let retry = captured.get(1).expect("the retry request is captured");
+        assert_eq!(
+            retry, first,
+            "the unreadable retry re-sends the same batch byte-for-byte — the \
+             answer said nothing about which entries landed, so the whole \
+             batch is the only honest unit to send"
         );
     }
 

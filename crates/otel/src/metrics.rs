@@ -13,7 +13,6 @@
 //!   (delta since last call), gauges as gauges, histograms reconstructed by
 //!   recording each bucket's midpoint once per sample it holds.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use loopctl::metrics::{AgentMetrics, RegistrySnapshot, SeriesValue, session::LatencyPercentiles};
@@ -64,21 +63,12 @@ pub(crate) struct MeterHandle {
 
     /// The instrument cache and the per-series delta ledger.
     ///
-    /// One lock covers both: an export resolves a series' instrument
-    /// and its previous total together, so a concurrent export cannot
-    /// interleave an instrument build with a delta read.
+    /// One lock covers the cache, the ledgers, and the pipeline's
+    /// shutdown flag: an export resolves a series' instrument, its
+    /// previous total, and whether the pipeline is still live together,
+    /// so a concurrent shutdown cannot land between the check and the
+    /// record.
     state: Mutex<InstrumentState>,
-
-    /// Whether the pipeline this handle fronts has been shut down.
-    ///
-    /// A shut-down meter provider still accepts measurements and
-    /// exports none of them, so a caller that kept exporting would get
-    /// `Ok` answers that deliver nothing.
-    /// [`export_metrics`](crate::export_metrics) checks this and fails
-    /// loudly instead; the shutdown paths set it through
-    /// [`note_meter_shutdown`], whichever guard or layer owns the
-    /// providers.
-    shut_down: AtomicBool,
 }
 
 /// The reusable half of a pipeline installation: instruments and deltas.
@@ -94,15 +84,39 @@ struct InstrumentState {
     /// per name serves every label series of that name.
     instruments: Vec<(String, Instruments)>,
 
+    /// Whether this pipeline was shut down.
+    ///
+    /// Set by the owning pipeline's teardown, under the lock an export
+    /// records under, before its providers stop — so an export either
+    /// completes ahead of the mark or refuses after it, and never
+    /// records into a pipeline mid-teardown.
+    shut_down: bool,
+
+    /// Per-generation delta ledgers, most recently exported last.
+    ///
+    /// A returning registry resumes **its own** deltas: clearing on
+    /// identity change would replay a returning registry's totals into
+    /// the `OTLP` counters a second time, so each generation keeps its
+    /// ledger until [`MAX_TRACKED_REGISTRIES`] evicts the least
+    /// recently exported one — an evicted generation replays whole on
+    /// return, the same trade a first export makes.
+    ledgers: Vec<(u64, RegistryLedgers)>,
+}
+
+/// The delta ledgers of one registry generation.
+///
+/// Two maps because the two instrument kinds diff differently:
+/// counters export the growth of a cumulative total, histograms the
+/// growth of each bucket's count.
+#[derive(Default)]
+struct RegistryLedgers {
     /// Last exported total per canonical **series** identity.
     ///
     /// The key is [`series_key`] — name plus sorted `label=value` pairs —
     /// and never the name alone: two label series under one name must
     /// track their growth separately, or one series' increase silently
     /// swallows the other's delta. Registry snapshots are cumulative, so
-    /// what an export records is this ledger's difference, and
-    /// [`tracked_registry`](Self::tracked_registry) names the registry
-    /// those differences belong to.
+    /// what an export records is this ledger's difference.
     counter_totals: Vec<(String, u64)>,
 
     /// Last replayed per-bucket counts per canonical series identity.
@@ -114,40 +128,44 @@ struct InstrumentState {
     /// cumulative temporality the re-records would inflate the
     /// exported counts and sums on each pass.
     histogram_counts: Vec<(String, Vec<u64>)>,
-
-    /// Which registry the two ledgers were built from, by generation.
-    ///
-    /// A ledger only means "growth since the last export" against the
-    /// registry that accumulated it. A replacement registry restarts
-    /// counting; differencing its counts against the old ledger
-    /// saturates every delta to zero until the newcomer outgrew its
-    /// predecessor, dropping the samples it did record — so a changed
-    /// identity clears both ledgers and the newcomer's first export
-    /// replays its own counts whole. The identity is the registry's
-    /// own
-    /// [`generation`](loopctl::metrics::MetricsRegistry::generation),
-    /// never its address: the allocator can hand a replacement the exact
-    /// address a freed predecessor held, and a generation never repeats.
-    tracked_registry: Option<u64>,
 }
 
+/// How many registry generations keep a delta ledger.
+///
+/// The window bounds the state a long-lived host accumulates: a host
+/// rebuilding its registry per run would otherwise grow a ledger per
+/// run without end. Past the bound the least-recently-exported
+/// generation's ledger is dropped, and that registry replays whole on
+/// return — exactly as a first export does.
+const MAX_TRACKED_REGISTRIES: usize = 4;
+
 impl MeterHandle {
-    /// Mark this pipeline shut down.
+    /// Build a handle fronting `meter`, not installed anywhere.
     ///
-    /// Idempotent and sticky: installation is once-per-process, so no
-    /// later handle replaces a marked one.
-    pub(crate) fn mark_shut_down(&self) {
-        self.shut_down.store(true, Ordering::SeqCst);
+    /// The pipeline constructors install through
+    /// [`install_meter_handle`]; this is the shared building block, and
+    /// the way a test holds a private pipeline without touching the
+    /// process-wide slot.
+    pub(crate) fn new(meter: Meter) -> Self {
+        Self {
+            meter,
+            state: Mutex::new(InstrumentState::default()),
+        }
     }
 
-    /// Whether this pipeline was marked shut down.
+    /// Mark this handle's pipeline shut down.
     ///
-    /// Read by [`export_metrics`](crate::export_metrics) before it
-    /// records anything: a `true` there is the difference between an
-    /// export that fails loudly and one that answers `Ok` for
-    /// measurements a shut-down provider will never deliver.
-    pub(crate) fn is_shut_down(&self) -> bool {
-        self.shut_down.load(Ordering::SeqCst)
+    /// Idempotent and sticky: installation is once-per-process, so no
+    /// later handle replaces a marked one. The caller marks **its own**
+    /// handle — the one its install created, winner or orphan — so a
+    /// pipeline that never owned the process-wide slot cannot mark
+    /// another pipeline's exports dead. The flag flips under the same
+    /// lock an export records under, and teardown sets it **before**
+    /// stopping the providers, so an export either completes ahead of
+    /// the mark or refuses after it — never records into a pipeline
+    /// mid-teardown and answers `Ok`.
+    pub(crate) fn mark_shut_down(&self) {
+        self.lock().shut_down = true;
     }
 
     /// Lock the instrument state, recovering from poison.
@@ -164,14 +182,19 @@ impl MeterHandle {
     /// The first use of a name builds its instrument via `make` under
     /// the handle's lock; later uses reuse the cached one. `record`
     /// receives the instrument and the label set to attach to the
-    /// reading.
+    /// reading. Answers `false` — recording nothing — when the pipeline
+    /// was shut down, so a caller surfacing the shutdown as an error
+    /// can tell a refused record from a delivered one.
     fn with_instrument(
         &self,
         name: &str,
         make: impl FnOnce(&Meter, String) -> Instruments,
         record: impl FnOnce(&mut Instruments, Vec<KeyValue>),
-    ) {
+    ) -> bool {
         let mut state = self.lock();
+        if state.shut_down {
+            return false;
+        }
         if !state.instruments.iter().any(|(key, _)| key == name) {
             state
                 .instruments
@@ -180,14 +203,16 @@ impl MeterHandle {
         if let Some(entry) = state.instruments.iter_mut().find(|(key, _)| key == name) {
             record(&mut entry.1, Vec::new());
         }
+        true
     }
 
     /// Record one value on a cached f64 gauge named `name`.
     ///
     /// The run-rollup export path: every derived `loopctl.run.*`
     /// attribute becomes its own gauge reading through this call, so a
-    /// host's dashboard sees the rollup as first-class series.
-    pub(crate) fn with_gauge(&self, name: &str, value: f64) {
+    /// host's dashboard sees the rollup as first-class series. Answers
+    /// `false` when the pipeline was shut down.
+    pub(crate) fn with_gauge(&self, name: &str, value: f64) -> bool {
         self.with_instrument(
             name,
             |meter, key| Instruments::Gauge(meter.f64_gauge(key).build()),
@@ -196,7 +221,7 @@ impl MeterHandle {
                     gauge.record(value, &labels);
                 }
             },
-        );
+        )
     }
 }
 
@@ -213,12 +238,22 @@ static ACTIVE_METER: OnceLock<Arc<MeterHandle>> = OnceLock::new();
 /// hosts running their own `SdkMeterProvider` can hand a `Meter` over
 /// directly. First installation wins; later ones are ignored.
 pub fn install_meter(meter: Meter) {
-    let handle = Arc::new(MeterHandle {
-        meter,
-        state: Mutex::new(InstrumentState::default()),
-        shut_down: AtomicBool::new(false),
-    });
-    ACTIVE_METER.set(handle).ok();
+    let _handle = install_meter_handle(meter);
+}
+
+/// Install the pipeline handle and return **this call's** handle.
+///
+/// The returned handle is the one the caller's own pipeline built,
+/// whether or not it won the process-wide slot: a winner's shutdown
+/// mark ends exports for everyone (it *is* the installed handle), a
+/// loser's mark lands on its own orphaned handle and changes nothing
+/// for the pipeline that won — which is exactly the ownership rule the
+/// shutdown paths need. A caller that will tear its providers down
+/// keeps this handle and marks it, instead of reaching for the global.
+pub(crate) fn install_meter_handle(meter: Meter) -> Arc<MeterHandle> {
+    let handle = Arc::new(MeterHandle::new(meter));
+    ACTIVE_METER.set(Arc::clone(&handle)).ok();
+    handle
 }
 
 /// The installed pipeline handle, if this process has one.
@@ -228,21 +263,6 @@ pub fn install_meter(meter: Meter) {
 /// reads this to answer its `NoMetricsPipeline` error.
 pub(crate) fn active_meter() -> Option<Arc<MeterHandle>> {
     ACTIVE_METER.get().cloned()
-}
-
-/// Mark the installed pipeline, if any, as shut down.
-///
-/// Called by the shutdown paths — the guard's drop and
-/// [`OtelTracingLayer::shutdown`](crate::OtelTracingLayer::shutdown) —
-/// so a later [`export_metrics`](crate::export_metrics) fails loudly
-/// instead of recording into a provider that exports nothing. The
-/// tracer-only paths call it too: a pipeline whose tracer half was torn
-/// down is no longer a live export target, whether or not a meter was
-/// ever built.
-pub(crate) fn note_meter_shutdown() {
-    if let Some(handle) = ACTIVE_METER.get() {
-        handle.mark_shut_down();
-    }
 }
 
 /// Upper bound on the samples one bucket contributes to a replay.
@@ -317,27 +337,54 @@ fn series_key(series: &loopctl::metrics::SeriesSnapshot) -> String {
 ///
 /// `registry_id` identifies which registry `snapshot` came from (the
 /// caller passes its
-/// [`generation`](loopctl::metrics::MetricsRegistry::generation)). The
-/// delta ledgers belong to that one
-/// registry, so a changing identity clears them: a replacement's lower
-/// counts replay whole rather than saturating against a predecessor
-/// they have no relation to — see
-/// [`InstrumentState::tracked_registry`]. A caller exporting one
-/// registry repeatedly passes the same id and sees pure deltas.
+/// [`generation`](loopctl::metrics::MetricsRegistry::generation)). Each
+/// generation keeps **its own** delta ledger, so a caller exporting one
+/// registry repeatedly sees pure deltas and a caller that returns to an
+/// earlier registry sees only that registry's growth since **its** last
+/// export — a returning registry's totals are never replayed a second
+/// time. The ledger window holds [`MAX_TRACKED_REGISTRIES`] generations;
+/// a registry returning after eviction replays whole, the same trade a
+/// first export makes.
 ///
 /// Counters export the delta since the previous call (registry totals are
 /// cumulative, `OTLP` counters take increments); gauges export their current
 /// value; histograms are reconstructed bucket by bucket; the registry's
 /// diagnostics counters export as `loopctl.telemetry.*` gauges so store
 /// drift is visible on dashboards.
-pub(crate) fn record_registry(meter: &MeterHandle, registry_id: u64, snapshot: &RegistrySnapshot) {
+///
+/// Returns `false` when the pipeline was already shut down, recording
+/// nothing — the caller surfaces that as its shutdown error.
+pub(crate) fn record_registry(
+    meter: &MeterHandle,
+    registry_id: u64,
+    snapshot: &RegistrySnapshot,
+) -> bool {
     let mut guard = meter.lock();
     let state: &mut InstrumentState = &mut guard;
-    if state.tracked_registry != Some(registry_id) {
-        state.counter_totals.clear();
-        state.histogram_counts.clear();
-        state.tracked_registry = Some(registry_id);
+    if state.shut_down {
+        return false;
     }
+    // Take this generation's ledger out — a returning registry resumes
+    // its own deltas — or start a fresh one, then park the slot at the
+    // back (most recently exported) so eviction always drops the
+    // stalest generation past the window.
+    let mut ledger = state
+        .ledgers
+        .iter()
+        .position(|(id, _)| *id == registry_id)
+        .map_or_else(RegistryLedgers::default, |found| {
+            state.ledgers.remove(found).1
+        });
+    state
+        .ledgers
+        .push((registry_id, RegistryLedgers::default()));
+    if state.ledgers.len() > MAX_TRACKED_REGISTRIES {
+        state.ledgers.remove(0);
+    }
+    let RegistryLedgers {
+        counter_totals,
+        histogram_counts,
+    } = &mut ledger;
     let mut totals_updates: Vec<(String, u64)> = Vec::new();
     let mut histogram_updates: Vec<(String, Vec<u64>)> = Vec::new();
     for series in &snapshot.series {
@@ -367,8 +414,7 @@ pub(crate) fn record_registry(meter: &MeterHandle, registry_id: u64, snapshot: &
         match (&mut entry.1, &series.value) {
             (Instruments::Counter(counter), SeriesValue::Counter { total }) => {
                 let key = series_key(series);
-                let previous = state
-                    .counter_totals
+                let previous = counter_totals
                     .iter()
                     .find(|(seen, _)| *seen == key)
                     .map_or(0, |(_, seen)| *seen);
@@ -383,8 +429,7 @@ pub(crate) fn record_registry(meter: &MeterHandle, registry_id: u64, snapshot: &
             }
             (Instruments::Histogram(histogram), SeriesValue::Histogram { summary }) => {
                 let key = series_key(series);
-                let previous = state
-                    .histogram_counts
+                let previous = histogram_counts
                     .iter()
                     .find(|(seen, _)| *seen == key)
                     .map_or_else(Vec::new, |(_, seen)| seen.clone());
@@ -403,27 +448,23 @@ pub(crate) fn record_registry(meter: &MeterHandle, registry_id: u64, snapshot: &
         }
     }
     for (key, total) in totals_updates {
-        match state
-            .counter_totals
-            .iter_mut()
-            .find(|(seen, _)| *seen == key)
-        {
+        match counter_totals.iter_mut().find(|(seen, _)| *seen == key) {
             Some(seen) => seen.1 = total,
-            None => state.counter_totals.push((key, total)),
+            None => counter_totals.push((key, total)),
         }
     }
     for (key, counts) in histogram_updates {
-        match state
-            .histogram_counts
-            .iter_mut()
-            .find(|(seen, _)| *seen == key)
-        {
+        match histogram_counts.iter_mut().find(|(seen, _)| *seen == key) {
             Some(seen) => seen.1 = counts,
-            None => state.histogram_counts.push((key, counts)),
+            None => histogram_counts.push((key, counts)),
         }
+    }
+    if let Some(entry) = state.ledgers.last_mut() {
+        entry.1 = ledger;
     }
     drop(guard);
     record_diagnostics(meter, snapshot);
+    true
 }
 
 /// Reconstruct a distribution's growth from explicit bucket counts by
@@ -675,13 +716,13 @@ mod tests {
         let exporter = InMemoryMetricExporter::default();
         let reader = PeriodicReader::builder(exporter).build();
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
-        install_meter(provider.meter("shutdown-probe"));
+        let handle = install_meter_handle(provider.meter("shutdown-probe"));
         let registry = loopctl::metrics::MetricsRegistry::default();
         assert!(
             crate::export_metrics(None, &registry).is_ok(),
             "a live pipeline accepts the export"
         );
-        note_meter_shutdown();
+        handle.mark_shut_down();
         assert!(
             matches!(
                 crate::export_metrics(None, &registry),
@@ -689,6 +730,193 @@ mod tests {
             ),
             "an export after shutdown reports the dead pipeline instead \
              of returning Ok for measurements that cannot deliver"
+        );
+    }
+
+    #[test]
+    fn a_stranger_s_shutdown_cannot_end_another_pipeline_s_exports() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        // Two private pipelines, neither touching the process-wide slot:
+        // the handles are per-pipeline, exactly what the shutdown paths
+        // hold.
+        let build = |probe: &'static str| {
+            let exporter = InMemoryMetricExporter::default();
+            let reader = PeriodicReader::builder(exporter).build();
+            let provider = SdkMeterProvider::builder().with_reader(reader).build();
+            MeterHandle::new(provider.meter(probe))
+        };
+        let snapshot = RegistrySnapshot::default();
+        let owner = build("owner");
+        let stranger = build("stranger");
+        assert!(
+            record_registry(&owner, 0xA1, &snapshot),
+            "a live pipeline records"
+        );
+        stranger.mark_shut_down();
+        assert!(
+            record_registry(&owner, 0xA2, &snapshot),
+            "a shutdown mark is per-handle: a pipeline that never owned \
+             the process-wide slot cannot end another pipeline's exports"
+        );
+        owner.mark_shut_down();
+        assert!(
+            !record_registry(&owner, 0xA3, &snapshot),
+            "the owning pipeline's own shutdown ends its exports"
+        );
+    }
+
+    #[test]
+    fn a_returning_registry_exports_only_its_new_counts() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let handle = MeterHandle::new(provider.meter("returning-probe"));
+        let counter_snapshot = |total: u64| RegistrySnapshot {
+            series: vec![loopctl::metrics::SeriesSnapshot {
+                name: "loopctl.tools.calls",
+                kind: loopctl::metrics::MetricKind::Counter,
+                labels: std::collections::BTreeMap::from([("tool", "bash".to_string())]),
+                value: SeriesValue::Counter { total },
+            }],
+            ..RegistrySnapshot::default()
+        };
+        let counted = |probe: &InMemoryMetricExporter| -> u64 {
+            // Cumulative temporality: every flush re-sends the series'
+            // running total, so the newest batch's value is the sum of
+            // every increment recorded so far — what a delta actually
+            // delivered.
+            let mut sum = 0_u64;
+            let Some(resource) = probe
+                .get_finished_metrics()
+                .unwrap_or_default()
+                .into_iter()
+                .next_back()
+            else {
+                return 0;
+            };
+            {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics() {
+                        if metric.name() == "loopctl.tools.calls"
+                            && let AggregatedMetrics::U64(MetricData::Sum(sum_data)) = metric.data()
+                        {
+                            for point in sum_data.data_points() {
+                                sum = sum.saturating_add(point.value());
+                            }
+                        }
+                    }
+                }
+            }
+            sum
+        };
+
+        record_registry(&handle, 1, &counter_snapshot(6));
+        assert!(provider.force_flush().is_ok());
+        assert_eq!(
+            counted(&exporter),
+            6,
+            "a first export replays the registry's counts whole"
+        );
+        record_registry(&handle, 2, &counter_snapshot(9));
+        assert!(provider.force_flush().is_ok());
+        assert_eq!(
+            counted(&exporter),
+            15,
+            "a replacement replays its own whole: 6 from the first \
+             registry plus its 9, accumulated by the exporter"
+        );
+        record_registry(&handle, 1, &counter_snapshot(8));
+        assert!(provider.force_flush().is_ok());
+        assert_eq!(
+            counted(&exporter),
+            17,
+            "a returning registry resumes its own ledger — only the 2 \
+             calls it gained since its last export ride, never its \
+             whole 8 a second time"
+        );
+    }
+
+    #[test]
+    fn an_evicted_registry_replays_whole_on_return() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let handle = MeterHandle::new(provider.meter("eviction-probe"));
+        let counter_snapshot = |total: u64| RegistrySnapshot {
+            series: vec![loopctl::metrics::SeriesSnapshot {
+                name: "loopctl.tools.calls",
+                kind: loopctl::metrics::MetricKind::Counter,
+                labels: std::collections::BTreeMap::from([("tool", "bash".to_string())]),
+                value: SeriesValue::Counter { total },
+            }],
+            ..RegistrySnapshot::default()
+        };
+        let counted = |probe: &InMemoryMetricExporter| -> u64 {
+            // Cumulative temporality: every flush re-sends the series'
+            // running total, so the newest batch's value is the sum of
+            // every increment recorded so far — what a delta actually
+            // delivered.
+            let mut sum = 0_u64;
+            let Some(resource) = probe
+                .get_finished_metrics()
+                .unwrap_or_default()
+                .into_iter()
+                .next_back()
+            else {
+                return 0;
+            };
+            {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics() {
+                        if metric.name() == "loopctl.tools.calls"
+                            && let AggregatedMetrics::U64(MetricData::Sum(sum_data)) = metric.data()
+                        {
+                            for point in sum_data.data_points() {
+                                sum = sum.saturating_add(point.value());
+                            }
+                        }
+                    }
+                }
+            }
+            sum
+        };
+
+        // Fill the ledger window with more generations than it holds:
+        // the first generation's ledger is evicted by the fifth's.
+        let mut cumulative = 0_u64;
+        for generation in 1_u64..=5 {
+            record_registry(&handle, generation, &counter_snapshot(generation));
+            assert!(provider.force_flush().is_ok());
+            cumulative += generation;
+            assert_eq!(
+                counted(&exporter),
+                cumulative,
+                "generation {generation} replays whole on its first export"
+            );
+        }
+        record_registry(&handle, 1, &counter_snapshot(7));
+        assert!(provider.force_flush().is_ok());
+        assert_eq!(
+            counted(&exporter),
+            cumulative + 7,
+            "a registry returning past the ledger window replays whole — \
+             the documented bound, the same trade a first export makes"
         );
     }
 
@@ -779,11 +1007,7 @@ mod tests {
         let exporter = InMemoryMetricExporter::default();
         let reader = PeriodicReader::builder(exporter.clone()).build();
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
-        let handle = MeterHandle {
-            meter: provider.meter("collision-probe"),
-            state: Mutex::new(InstrumentState::default()),
-            shut_down: AtomicBool::new(false),
-        };
+        let handle = MeterHandle::new(provider.meter("collision-probe"));
 
         let rich = |tool: &str, outcome: &str, total: u64| loopctl::metrics::SeriesSnapshot {
             name: "loopctl.tools.calls",
@@ -876,11 +1100,7 @@ mod tests {
         let exporter = InMemoryMetricExporter::default();
         let reader = PeriodicReader::builder(exporter.clone()).build();
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
-        let handle = MeterHandle {
-            meter: provider.meter("replay-probe"),
-            state: Mutex::new(InstrumentState::default()),
-            shut_down: AtomicBool::new(false),
-        };
+        let handle = MeterHandle::new(provider.meter("replay-probe"));
 
         let histogram_series = |first: u64, second: u64| {
             let mut histogram = loopctl::metrics::LatencyHistogram::with_buckets(vec![10, 100]);
@@ -959,11 +1179,7 @@ mod tests {
         let exporter = InMemoryMetricExporter::default();
         let reader = PeriodicReader::builder(exporter.clone()).build();
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
-        let handle = MeterHandle {
-            meter: provider.meter("replacement-probe"),
-            state: Mutex::new(InstrumentState::default()),
-            shut_down: AtomicBool::new(false),
-        };
+        let handle = MeterHandle::new(provider.meter("replacement-probe"));
 
         let snapshot = |samples: u64, total: u64| {
             let mut histogram = loopctl::metrics::LatencyHistogram::with_buckets(vec![10, 100]);
@@ -1094,11 +1310,7 @@ mod tests {
         let exporter = InMemoryMetricExporter::default();
         let reader = PeriodicReader::builder(exporter.clone()).build();
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
-        let handle = MeterHandle {
-            meter: provider.meter("delta-probe"),
-            state: Mutex::new(InstrumentState::default()),
-            shut_down: AtomicBool::new(false),
-        };
+        let handle = MeterHandle::new(provider.meter("delta-probe"));
 
         let counter_series = |tool: &str, total: u64| loopctl::metrics::SeriesSnapshot {
             name: "loopctl.tools.calls",

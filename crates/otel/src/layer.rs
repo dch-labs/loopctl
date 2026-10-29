@@ -358,6 +358,15 @@ pub struct OtelTracingLayer {
     /// host cannot be left with traces flushed and a metric reader still
     /// running.
     meter_provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
+
+    /// The pipeline handle this layer's build created, when it built a
+    /// meter.
+    ///
+    /// Shutdown marks **this** handle — the one its own install built,
+    /// whether or not it won the process-wide slot — so a trace-only
+    /// layer (which holds `None`) or a pipeline whose meter lost the
+    /// set-once race cannot mark another pipeline's exports dead.
+    installed_meter: Option<Arc<crate::metrics::MeterHandle>>,
 }
 
 use tracing_subscriber::Registry;
@@ -395,7 +404,21 @@ impl OtelTracingLayer {
             stamper: None,
             tracer_provider,
             meter_provider,
+            installed_meter: None,
         }
+    }
+
+    /// Record the pipeline handle this layer's build created.
+    ///
+    /// Called by the crate's constructors right after they install the
+    /// meter: [`shutdown`](Self::shutdown) marks that handle — and only
+    /// that handle — so the export pipeline ends exactly when the
+    /// pipeline that owns it ends. A layer built without a meter keeps
+    /// `None` and shuts no exports down.
+    #[must_use]
+    pub(crate) fn owning_meter(mut self, handle: Option<Arc<crate::metrics::MeterHandle>>) -> Self {
+        self.installed_meter = handle;
+        self
     }
 
     /// Stamp the run rollup onto every run span, from `stamper`'s sources.
@@ -430,6 +453,9 @@ impl OtelTracingLayer {
     /// either way.
     pub fn shutdown(self) -> Result<(), crate::OtelInstallError> {
         let mut first = Ok(());
+        if let Some(handle) = &self.installed_meter {
+            handle.mark_shut_down();
+        }
         if let Err(err) = self
             .tracer_provider
             .force_flush()
@@ -446,7 +472,6 @@ impl OtelTracingLayer {
                 first = meter_result;
             }
         }
-        crate::metrics::note_meter_shutdown();
         first
     }
 
@@ -587,7 +612,7 @@ impl Layer<Registry> for OtelTracingLayer {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::missing_panics_doc)]
+    #![allow(clippy::missing_panics_doc, clippy::expect_used)]
 
     use super::*;
 
@@ -769,5 +794,56 @@ mod tests {
                  group split before the marker was stripped"
             );
         }
+    }
+
+    #[test]
+    fn shutdown_marks_only_the_pipeline_that_owns_the_meter() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        // Private pipelines, none touching the process-wide slot: the
+        // handles are what the crate's own constructors hand their
+        // layers and guards.
+        let build_handle = |probe: &'static str| {
+            let exporter = InMemoryMetricExporter::default();
+            let reader = PeriodicReader::builder(exporter).build();
+            let provider = SdkMeterProvider::builder().with_reader(reader).build();
+            std::sync::Arc::new(crate::metrics::MeterHandle::new(provider.meter(probe)))
+        };
+        let build_layer = |handle: Option<std::sync::Arc<crate::metrics::MeterHandle>>| {
+            let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+            OtelTracingLayer::new(crate::compose_layer_inner(&tracer), tracer, None)
+                .owning_meter(handle)
+        };
+        let snapshot = loopctl::metrics::RegistrySnapshot::default();
+        let owner = build_handle("owner");
+        let stranger = build_handle("stranger");
+
+        let trace_only = build_layer(None);
+        trace_only
+            .shutdown()
+            .expect("a trace-only layer shuts its own tracer down");
+        assert!(
+            crate::metrics::record_registry(&owner, 0xA1, &snapshot),
+            "a trace-only layer never owned a meter and ends no exports"
+        );
+
+        let loser = build_layer(Some(stranger));
+        loser.shutdown().expect("a losing pipeline shuts down");
+        assert!(
+            crate::metrics::record_registry(&owner, 0xA2, &snapshot),
+            "a pipeline whose meter lost the set-once race marks only its \
+             own orphaned handle"
+        );
+
+        let winner = build_layer(Some(std::sync::Arc::clone(&owner)));
+        winner.shutdown().expect("the owning pipeline shuts down");
+        assert!(
+            !crate::metrics::record_registry(&owner, 0xA3, &snapshot),
+            "the owning pipeline's shutdown ends the exports its handle \
+             fronts"
+        );
     }
 }

@@ -1030,6 +1030,21 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_registry_gets_a_new_generation() {
+        let first = MetricsRegistry::default();
+        let retired = first.generation();
+        drop(first);
+        let replacement = MetricsRegistry::default();
+        assert_ne!(
+            replacement.generation(),
+            retired,
+            "a replacement built after its predecessor was dropped still \
+             stamps its own generation — the identity never rides the \
+             address the allocator happens to reuse"
+        );
+    }
+
+    #[test]
     fn bump_by_saturates_at_the_u64_ceiling() {
         let counter = AtomicU64::new(u64::MAX - 1);
         bump_by(&counter, 5);

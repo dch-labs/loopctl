@@ -3162,6 +3162,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 if run_config.reset_managers
                     && let Err(reset_error) = self.managers.reset_all()
                 {
+                    self.notify_run_start();
                     crate::tracing_spans::record_run_end(
                         false,
                         Self::millis_u64(self.managers.clock().elapsed_since(run_opened)),

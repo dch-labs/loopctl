@@ -67,8 +67,12 @@ pub(crate) fn set(body: &mut Value, key: &str, value: Value) {
 /// worker early instead of waiting out its 250 ms tick.
 #[derive(Debug)]
 struct Buffer {
-    /// The pending envelopes, oldest at the front; the mutex is held
-    /// only for push/drain — never across an HTTP call.
+    /// The pending envelopes, oldest at the front.
+    ///
+    /// The mutex is held only for a push or a drain — never across an
+    /// HTTP call — so a slow collector cannot block a layer callback
+    /// trying to enqueue. Capacity is [`BUFFER_CAP`]: a push past it
+    /// evicts the oldest envelope rather than refusing or growing.
     queue: std::sync::Mutex<VecDeque<Value>>,
 
     /// Events evicted past [`BUFFER_CAP`], oldest first.
@@ -78,8 +82,14 @@ struct Buffer {
     /// counter growth.
     dropped: AtomicU64,
 
-    /// Set once by [`IngestSink::shutdown_blocking`]: pushes refuse
-    /// afterwards and the flusher exits after its final drain.
+    /// Set once when the pipeline shuts down: pushes refuse afterwards.
+    ///
+    /// [`IngestSink::close`] is the writer, called directly or through
+    /// [`IngestSink::shutdown_blocking`], and nothing clears it — a sink
+    /// closes once and stays closed. The flusher reads the same flag as
+    /// its permission to exit, and reads it together with emptiness
+    /// under the queue lock ([`Buffer::closed_and_empty`]) so an
+    /// accepted push can never find the worker already gone.
     closed: AtomicBool,
 
     /// A batch has been drained and its POST has not finished.
@@ -89,8 +99,13 @@ struct Buffer {
     /// the shutdown poller, and cleared once the POST settles.
     work_in_flight: AtomicBool,
 
-    /// Wakes the flusher the moment an event arrives, instead of
-    /// letting it idle out its 250 ms tick.
+    /// Wakes the flusher the moment an event arrives.
+    ///
+    /// Without it the worker would sit out its 250 ms tick before
+    /// noticing a push, making latency to first export the tick
+    /// interval rather than the round trip. Every enqueue path notifies
+    /// it, and so do both close paths — a worker parked on the tick has
+    /// to wake to observe a shutdown too.
     woken: Notify,
 }
 
@@ -125,6 +140,21 @@ impl Buffer {
     fn is_empty(&self) -> bool {
         self.lock().is_empty()
     }
+
+    /// Whether the queue is closed and holds no pending envelopes,
+    /// decided under one lock.
+    ///
+    /// The flusher's exit condition. Reading emptiness and then
+    /// `closed` in two steps lets a push slip between the reads: the
+    /// push sees an open queue and reports success, the flusher then
+    /// sees `closed` and exits — stranding an event nobody will ever
+    /// drain. Under one lock the two facts cannot disagree: either the
+    /// push lands before the exit check and keeps the worker running,
+    /// or the close lands first and the push refuses.
+    fn closed_and_empty(&self) -> bool {
+        let queue = self.lock();
+        self.closed.load(Ordering::SeqCst) && queue.is_empty()
+    }
 }
 
 /// Handle the layer and guard use to enqueue events and shut down.
@@ -134,14 +164,25 @@ impl Buffer {
 /// owns the shutdown path.
 #[derive(Clone, Debug)]
 pub(crate) struct IngestSink {
-    /// The shared queue every clone enqueues through and that exactly
-    /// one guard shuts down.
+    /// The shared queue every clone enqueues through.
+    ///
+    /// Cloning a sink hands the new handle the same buffer, so spans
+    /// recorded through any layer composition land in one queue and one
+    /// worker ships them. Exactly one guard owns the shutdown path that
+    /// closes that queue, which is what keeps a clone from ending the
+    /// pipeline out from under the handles still writing to it.
     buffer: std::sync::Arc<Buffer>,
 }
 
 impl IngestSink {
-    /// Queue one envelope; when the buffer is at capacity, the oldest
-    /// buffered event is evicted (and counted) to make room.
+    /// Queue one envelope, discarding whether the pipeline took it.
+    ///
+    /// For callers with nowhere to put a refusal: a layer closing a
+    /// span on a shutting-down runtime cannot retry, store, or surface
+    /// an event it cannot queue. Past [`BUFFER_CAP`] the oldest buffered
+    /// event is evicted to make room and counted in
+    /// [`IngestSink::dropped_count`]. A caller that can act on the
+    /// answer uses [`IngestSink::try_push`].
     pub(crate) fn push(&self, event: Value) {
         self.try_push(event);
     }
@@ -192,9 +233,16 @@ impl IngestSink {
         self.buffer.woken.notify_waiters();
     }
 
-    /// Close the queue, let the worker flush what remains, and wait
-    /// (bounded) for it to finish. For `Drop` and shutdown paths on
-    /// ordinary threads — never call from a thread the runtime drives.
+    /// Close the queue and wait, bounded, for the worker to finish.
+    ///
+    /// For `Drop` and shutdown paths on ordinary threads: the wait
+    /// covers whatever is still queued plus a batch already in flight,
+    /// and returns at `timeout` whether or not the drain completed — a
+    /// wedged collector costs a late process exit, never a hung one.
+    /// Never call it from a thread the runtime drives, where parking
+    /// the only worker starves the flusher this drain is waiting on;
+    /// that path closes with [`IngestSink::close`] and awaits
+    /// [`IngestSink::wait_drained`] instead.
     pub(crate) fn shutdown_blocking(&self, timeout: Duration) {
         self.close();
         let deadline = std::time::Instant::now()
@@ -264,8 +312,14 @@ pub(crate) fn spawn_flusher(
     IngestSink { buffer }
 }
 
-/// Worker: wait for events or the 250 ms tick, ship batches; once closed
-/// and drained, post the remainder and exit.
+/// Worker: wait for events or the 250 ms tick, ship batches, exit when
+/// closed and drained.
+///
+/// Spawned by [`spawn_flusher`] with the sink's own buffer. It exists
+/// only to bind the transport — client, URL, and Basic auth header — to
+/// [`drain_loop`], which owns the batching and the exit rule; keeping
+/// the two apart is what lets the drain run against a stub ship
+/// function with no HTTP in the picture.
 async fn run_flusher(
     client: reqwest::Client,
     url: String,
@@ -284,6 +338,12 @@ async fn run_flusher(
 
 /// The flusher's body, transport-agnostic: ship every non-empty drain
 /// through `ship` until the queue is closed and empty.
+///
+/// The exit check reads both facts under one lock
+/// ([`Buffer::closed_and_empty`]): a push accepted moments before the
+/// close must not find the worker already gone, and the `while` loop's
+/// separate emptiness read only ever runs again when the exit check
+/// declined — so no accepted event can be left behind.
 ///
 /// The in-flight marker is set **before** the drain, never after: a
 /// shutdown poller reading `queue-empty && !work_in_flight` between a
@@ -307,7 +367,7 @@ where
             ship(batch).await;
             buffer.work_in_flight.store(false, Ordering::SeqCst);
         }
-        if buffer.closed.load(Ordering::SeqCst) {
+        if buffer.closed_and_empty() {
             return;
         }
     }
@@ -316,15 +376,17 @@ where
 /// POST one ingestion batch, applying the transport's retry contract.
 ///
 /// A 2xx settles the batch; Langfuse's 207 multi-status settles only
-/// when its body names no failed entries — a body carrying `errors`
-/// retries the same ids (idempotent server-side), and a body that
-/// cannot be parsed settles rather than guessing. A 429 honors the
-/// response's `Retry-After` (delta-seconds, capped at 5 s) and retries
-/// the same batch; other 4xx responses are dropped with a warning
-/// (the payload is wrong, not the transport); 5xx answers and
-/// transport failures retry up to three times on a 250 → 500 →
-/// 1000 ms ladder. A batch that exhausts the ladder is dropped with a
-/// warning and counted nowhere else.
+/// when its body is a well-formed answer naming no failed entries — a
+/// body naming failed entries retries the same ids (idempotent
+/// server-side), and so does an answer that cannot be read as a
+/// multi-status body at all: settling on an unreadable 207 would
+/// settle failed entries on the word of a response never parsed. A 429
+/// honors the response's `Retry-After` (delta-seconds or HTTP-date,
+/// capped at 5 s) and retries the same batch; other 4xx responses are
+/// dropped with a warning (the payload is wrong, not the transport);
+/// 5xx answers and transport failures retry up to three times on a
+/// 250 → 500 → 1000 ms ladder. A batch that exhausts the ladder is
+/// dropped with a warning and counted nowhere else.
 async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>) {
     if batch.is_empty() {
         return;
@@ -352,16 +414,20 @@ async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>
         };
         let status = response.status();
         if status.as_u16() == 207 {
-            let failed = multi_status_failures(response).await;
-            if failed == 0 {
-                return;
+            match multi_status_failures(response).await {
+                Ack::Settled => return,
+                Ack::Failed { failed } => tracing::debug!(
+                    target: "loopctl::langfuse",
+                    failed,
+                    attempt,
+                    "langfuse 207 carried failed entries, will retry them"
+                ),
+                Ack::Unreadable => tracing::debug!(
+                    target: "loopctl::langfuse",
+                    attempt,
+                    "langfuse answered a 207 this client cannot read, will retry the batch"
+                ),
             }
-            tracing::debug!(
-                target: "loopctl::langfuse",
-                failed,
-                attempt,
-                "langfuse 207 carried failed entries, will retry them"
-            );
         } else if status.is_success() {
             return;
         } else if status.as_u16() == 429 {
@@ -404,29 +470,95 @@ async fn post(client: &reqwest::Client, url: &str, auth: &str, batch: Vec<Value>
     );
 }
 
-/// Count the failed entries a 207 multi-status body names.
+/// What a 207 multi-status answer says about the batch it accepted.
 ///
-/// Langfuse answers a partially-accepted batch with
-/// `{"successes": […], "errors": […]}`; a body whose `errors` array
-/// is absent or empty settles the batch, and a body that cannot be
-/// parsed settles too — the client cannot distinguish failures it
-/// never read, and the envelope ids make any re-send idempotent, so
-/// settling a foreign shape never double-counts a well-formed retry
-/// path.
-async fn multi_status_failures(response: reqwest::Response) -> usize {
-    let parsed = response.json::<Value>().await.ok();
-    parsed
-        .and_then(|body| body.get("errors").and_then(Value::as_array).cloned())
-        .map_or(0, |errors| errors.len())
+/// Langfuse answers a partially-processed batch with a JSON body naming
+/// both the accepted and the rejected entries, so the answer has to be
+/// read before the batch can settle. The three verdicts separate "the
+/// server says every entry landed" from "the server says some did not"
+/// from "the server said something unreadable" — only the first ends the
+/// batch's life, because envelope ids are idempotent and retrying an
+/// unreadable answer costs a round-trip, never a duplicate.
+enum Ack {
+    /// Settle the batch: a well-formed answer naming no failed entries.
+    ///
+    /// A complete success on the server's own account — an object whose
+    /// `errors` list is absent or empty — so the batch is done and the
+    /// flusher moves on to the next one.
+    Settled,
+
+    /// Retry the batch: the answer names entries the server rejected.
+    ///
+    /// The partial-success shape: some entries landed, these did not.
+    /// Re-sending the whole batch is safe because the server
+    /// deduplicates what it already took, and it is the only way the
+    /// rejected entries ever arrive.
+    Failed {
+        /// How many entries the body lists under `errors`.
+        ///
+        /// Counted for the log line only; the retry re-sends the whole
+        /// batch rather than the named subset, since the ids make the
+        /// overlap harmless.
+        failed: usize,
+    },
+
+    /// Retry the batch: the answer is not a multi-status body the client
+    /// can read.
+    ///
+    /// Unparsable JSON, a non-object root, and an `errors` field that is
+    /// not an array all mean the same thing: whatever the 207 claimed,
+    /// the claim is unverified, so the batch has not been shown to land.
+    /// Retrying costs one round-trip and buys nothing when the server
+    /// really did take everything — idempotent event ids make that cost
+    /// the whole of the downside — which is the trade preferred to
+    /// dropping entries on the strength of a body nobody read.
+    Unreadable,
 }
 
-/// Parse a `Retry-After` value as delta-seconds.
+/// Read a 207 multi-status body into its [`Ack`] verdict.
 ///
-/// Langfuse's rate-limit answers advise seconds — the documented
-/// shape. An `Option`-shaped `None` (HTTP-date, junk) falls back to
-/// the caller's ladder; the caller caps whatever parses.
+/// Langfuse answers a partially-accepted batch with
+/// `{"successes": […], "errors": […]}`; a well-formed object whose
+/// `errors` is absent or empty settles, while anything unreadable
+/// retries — the envelope ids make a re-send idempotent, so retrying a
+/// body the client could not parse costs a round-trip, never a
+/// double-count.
+async fn multi_status_failures(response: reqwest::Response) -> Ack {
+    let Ok(body) = response.json::<Value>().await else {
+        return Ack::Unreadable;
+    };
+    if !body.is_object() {
+        return Ack::Unreadable;
+    }
+    match body.get("errors") {
+        None => Ack::Settled,
+        Some(errors) => match errors.as_array() {
+            None => Ack::Unreadable,
+            Some(errors) if errors.is_empty() => Ack::Settled,
+            Some(errors) => Ack::Failed {
+                failed: errors.len(),
+            },
+        },
+    }
+}
+
+/// Parse a `Retry-After` value: delta-seconds or an HTTP-date.
+///
+/// Langfuse's rate-limit answers advise seconds; intermediaries and
+/// self-hosted collectors answer with an HTTP-date instead. A future
+/// date becomes the delay it advertises, a date already past becomes
+/// an immediate retry, and junk is `None` — the caller's ladder covers
+/// what cannot be read, and the caller caps whatever does parse.
 fn retry_after_delay(value: &str) -> Option<Duration> {
-    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds.min(u64::from(u32::MAX))));
+    }
+    let when = httpdate::parse_http_date(value).ok()?;
+    Some(match when.duration_since(SystemTime::now()) {
+        Ok(ahead) => ahead,
+        Err(_) => Duration::ZERO,
+    })
 }
 
 /// Encode the ingestion credentials as a Basic `Authorization` header.
@@ -758,5 +890,145 @@ mod tests {
         buffer.woken.notify_waiters();
         let finished = tokio::time::timeout(Duration::from_secs(1), worker).await;
         assert!(matches!(finished, Ok(Ok(()))), "the closed flusher exits");
+    }
+
+    #[test]
+    fn closed_and_empty_reads_both_facts_under_one_lock() {
+        let buffer = Arc::new(Buffer {
+            queue: std::sync::Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            work_in_flight: AtomicBool::new(false),
+            woken: Notify::new(),
+        });
+        assert!(
+            !buffer.closed_and_empty(),
+            "an open queue is never the exit state, drained or not"
+        );
+        buffer.closed.store(true, Ordering::SeqCst);
+        assert!(
+            buffer.closed_and_empty(),
+            "closed and drained is the exit state"
+        );
+        buffer.lock().push_back(json!({ "n": 1 }));
+        assert!(
+            !buffer.closed_and_empty(),
+            "a closed queue still holding work is not drained"
+        );
+    }
+
+    #[test]
+    fn a_push_accepted_before_close_keeps_the_flusher_from_exiting() {
+        let buffer = Arc::new(Buffer {
+            queue: std::sync::Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            work_in_flight: AtomicBool::new(false),
+            woken: Notify::new(),
+        });
+        let sink = IngestSink {
+            buffer: Arc::clone(&buffer),
+        };
+        assert!(
+            buffer.is_empty(),
+            "the flusher's work check sees the queue empty"
+        );
+        assert!(
+            sink.try_push(json!({ "n": 1 })),
+            "the push lands while the queue is still open, and is accepted"
+        );
+        buffer.closed.store(true, Ordering::SeqCst);
+        assert!(
+            !buffer.closed_and_empty(),
+            "the exit check must not fire while an accepted event still waits \
+             — a two-step read would have exited over exactly this event"
+        );
+        let drained = buffer.drain(8);
+        assert_eq!(
+            drained.len(),
+            1,
+            "the accepted event reaches the flusher's final drain"
+        );
+        assert!(
+            buffer.closed_and_empty(),
+            "only once drained may the flusher exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_207_answer_retries_the_batch() {
+        let (url, hits) = one_shot_endpoint(vec![
+            (
+                "207 Multi-Status".to_string(),
+                None,
+                "upstream returned a non-JSON body".to_string(),
+            ),
+            (
+                "207 Multi-Status".to_string(),
+                None,
+                r#"{"successes":[],"errors":[]}"#.to_string(),
+            ),
+        ]);
+        let client = reqwest::Client::new();
+        post(
+            &client,
+            &url,
+            &basic_auth("pk", "sk"),
+            vec![json!({ "n": 1 })],
+        )
+        .await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a 207 the client cannot parse must re-send the batch, not settle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_207_naming_no_errors_settles_on_the_first_try() {
+        let (url, hits) = one_shot_endpoint(vec![(
+            "207 Multi-Status".to_string(),
+            None,
+            r#"{"successes":[{"id":"e1","status":201}]}"#.to_string(),
+        )]);
+        let client = reqwest::Client::new();
+        post(
+            &client,
+            &url,
+            &basic_auth("pk", "sk"),
+            vec![json!({ "n": 1 })],
+        )
+        .await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a well-formed 207 without an errors list is a complete success — \
+             retrying it would treat a valid answer as an unreadable one"
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_dates() {
+        assert_eq!(retry_after_delay("3"), Some(Duration::from_secs(3)));
+        assert_eq!(
+            retry_after_delay("not a delay"),
+            None,
+            "junk falls back to the caller's ladder"
+        );
+
+        let ahead = SystemTime::now() + Duration::from_secs(30);
+        let advised = retry_after_delay(&httpdate::fmt_http_date(ahead))
+            .expect("an HTTP-date in the future advises a delay");
+        assert!(
+            advised <= Duration::from_secs(30) && advised > Duration::from_secs(25),
+            "an HTTP-date Retry-After waits the advertised time, got {advised:?}"
+        );
+
+        let past = SystemTime::now() - Duration::from_secs(30);
+        assert_eq!(
+            retry_after_delay(&httpdate::fmt_http_date(past)),
+            Some(Duration::ZERO),
+            "an already-elapsed HTTP-date means retry now"
+        );
     }
 }

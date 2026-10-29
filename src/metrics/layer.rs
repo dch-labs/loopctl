@@ -79,9 +79,10 @@ pub const METRIC_EXEMPT_FIELDS: &[&str] = &["model", "session_id", "request_id"]
 struct Collected {
     /// The `metric` field's value, the catalog name under test.
     ///
-    /// `None` when the emission carried no `metric` field at all —
-    /// that is not a metric, and it is counted as drift before any
-    /// lookup is attempted.
+    /// `None` marks the event as not a metric event rather than as an
+    /// unknown one: the engine's own non-metric warnings ride the same
+    /// target, so the layer lets such an event go before any catalog
+    /// check — it stores nothing and counts nothing.
     metric: Option<String>,
 
     /// String fields other than `metric` — label candidates.

@@ -78,9 +78,13 @@ pub enum OtelMetricsMode {
     /// threads.
     SpanAttributes,
 
-    /// Additionally run an `OTLP` metrics pipeline: [`export_metrics`]
-    /// exports registry counters/gauges/histograms on demand (a ticker or
-    /// at run end). The run rollup stays attributes-only.
+    /// Additionally run an `OTLP` metrics pipeline beside the stamping.
+    ///
+    /// [`export_metrics`] replays the registry's counters, gauges, and
+    /// histograms to the collector on demand — from a ticker or at run
+    /// end, since the exporter is invoked rather than backgrounded. The
+    /// per-run rollup stays a span attribute either way: what the
+    /// pipeline moves is the subsystem store. This is the default mode.
     #[default]
     Pipeline,
 }
@@ -94,8 +98,14 @@ pub enum OtelMetricsMode {
 /// [`loopctl::metrics::MetricsRegistry`].
 #[derive(Clone)]
 pub struct OtelConfig {
-    /// `OTLP` endpoint. Default `http://localhost:4318` (`OTLP`/HTTP, the
-    /// Jaeger/Tempo/Honeycomb collector default).
+    /// The `OTLP` endpoint traces and metrics are both sent to. Default
+    /// `http://localhost:4318`.
+    ///
+    /// One endpoint configures both exporters, so a pipeline pointed at a
+    /// collector cannot end up shipping spans there and metrics somewhere
+    /// else — the shape the metric exporter used to reach on its own. It
+    /// is honored on either transport; the default is the `OTLP`/HTTP
+    /// collector port the common collectors listen on by default.
     pub endpoint: String,
 
     /// gRPC transport; requires the crate's `grpc` feature. Default false.
@@ -111,8 +121,13 @@ pub struct OtelConfig {
     /// distinct agent services override it per install.
     pub service_name: String,
 
-    /// Root-span sampler ratio, `0.0..=1.0` (child spans follow their
-    /// parent). Default `1.0`.
+    /// Root-span sampler ratio, `0.0..=1.0`. Default `1.0`.
+    ///
+    /// The ratio decides whether a *root* span is recorded and child
+    /// spans follow their parent, so a run that is sampled out takes its
+    /// turns and tool calls with it instead of exporting orphaned
+    /// children. Below `1.0` an absent trace is not evidence the run
+    /// never happened, which is the trade to make knowingly.
     pub sample_ratio: f64,
 
     /// Metrics handling; `None` exports traces only.
@@ -122,12 +137,23 @@ pub struct OtelConfig {
     /// [`export_metrics`] replays registry snapshots through.
     pub metrics: Option<OtelMetricsMode>,
 
-    /// Session rollup source for run-span stamping. Provide the session
-    /// [`MetricsObserver`] to enable it; `None` stamps nothing.
+    /// Session rollup source for run-span stamping.
+    ///
+    /// Hand over the session's [`MetricsObserver`] and each closing run
+    /// span is stamped with that run's own figures; `None` stamps nothing
+    /// and the layer stays a pure span bridge. The observer is read at
+    /// the run's end record rather than at export time, so one observer
+    /// sustained across runs can leak neither direction: not a later
+    /// run's numbers onto an earlier span, and not the last completed
+    /// run's onto a span for a run that failed before its first turn.
     pub observer: Option<Arc<MetricsObserver>>,
 
-    /// Subsystem store for `SpanAttributes`-mode stamping and
-    /// [`export_metrics`]; the same `Arc` handed to the metrics layer.
+    /// Subsystem store the exporters read.
+    ///
+    /// Pass the very `Arc` the metrics layer writes to: a registry of
+    /// your own, or a copy made for the exporter, shows a busy process as
+    /// an empty one. It is the source for `SpanAttributes`-mode stamping
+    /// as well as for [`export_metrics`].
     pub registry: Option<Arc<MetricsRegistry>>,
 }
 
@@ -172,13 +198,23 @@ impl std::fmt::Debug for OtelConfig {
 /// [`install`] or [`otel_layer`], never mid-run.
 #[derive(Debug, thiserror::Error)]
 pub enum OtelInstallError {
-    /// A global tracer provider / default subscriber is already installed;
-    /// `OTel` globals are once-per-process.
+    /// A global tracer provider or default subscriber is already installed.
+    ///
+    /// `OTel` globals are set-once and this install claims the global
+    /// subscriber along with the provider, so a second [`install`] is
+    /// refused rather than replacing what the process already runs — the
+    /// first installation keeps recording untouched, which
+    /// `a_refused_second_install_leaves_the_first_running` pins. A host
+    /// that owns its subscriber composes [`otel_layer`] into it instead.
     #[error("an OTel provider or global subscriber is already installed")]
     AlreadyInstalled,
 
-    /// The `OTLP` exporter could not be constructed (bad endpoint, missing
-    /// transport feature, …).
+    /// The `OTLP` exporter could not be constructed.
+    ///
+    /// A malformed endpoint, or gRPC requested without the crate's
+    /// `grpc` feature — refused rather than quietly downgraded to HTTP,
+    /// because a fallback would send metrics somewhere the host never
+    /// configured. The payload carries the SDK's own reason.
     #[error("OTLP exporter construction failed: {0}")]
     Exporter(String),
 
@@ -216,8 +252,12 @@ pub struct ShutdownGuard {
     tracer_provider: Option<SdkTracerProvider>,
 
     /// The meter provider, present only in
-    /// [`OtelMetricsMode::Pipeline`]; shut down after the tracer so a
-    /// final metric flush lands before the process moves on.
+    /// [`OtelMetricsMode::Pipeline`].
+    ///
+    /// Drop stops it after the tracer so a final metric flush lands
+    /// before the process moves on. `None` in every other mode: a
+    /// `SpanAttributes` install builds no reader, and a guard without one
+    /// has nothing to shut down beyond the tracer.
     meter_provider: Option<SdkMeterProvider>,
 }
 
@@ -342,7 +382,8 @@ pub fn export_metrics(
     registry: &MetricsRegistry,
 ) -> Result<(), OtelInstallError> {
     let meter = metrics::active_meter().ok_or(OtelInstallError::NoMetricsPipeline)?;
-    metrics::record_registry(&meter, &registry.snapshot());
+    let registry_id = std::ptr::from_ref(registry).cast::<()>() as usize;
+    metrics::record_registry(&meter, registry_id, &registry.snapshot());
     if let Some(agent) = agent {
         for attr in metrics::run_attributes(agent) {
             let name = attr.key.as_str().to_string();
@@ -498,8 +539,13 @@ fn stamper_for(config: &OtelConfig) -> Option<layer::Stamper> {
     })
 }
 
-/// The stock bridge layer: the `tracing-opentelemetry` layer bound to
-/// `provider`'s tracer.
+/// The stock bridge layer, bound to `provider`'s tracer.
+///
+/// The bridge is the whole span path: it opens an `OTel` span per
+/// `tracing` span and records span fields as attributes. Everything
+/// loopctl adds — the `GenAI` rename, the status mapping, the run
+/// rollup — happens downstream of it, which is why this helper stays one
+/// call deep.
 fn compose_layer_inner(
     provider: &SdkTracerProvider,
 ) -> impl tracing_subscriber::Layer<Registry> + Send + Sync {
@@ -548,9 +594,12 @@ mod tests {
         assert!(bare.is_none(), "nothing to stamp, no stamper");
     }
 
-    /// The metric pipeline honors the configured endpoint: an endpoint
-    /// no HTTP client can route must fail the pipeline build, exactly
-    /// as it fails the span exporter build.
+    /// The metric exporter honors the configured endpoint: an endpoint
+    /// no HTTP client can route must fail its build, exactly as it
+    /// fails the span exporter's. Asserted on the metric exporter
+    /// directly — the provider build reaches it only through the span
+    /// exporter, which would fail first and mask a metric exporter that
+    /// ignored the endpoint.
     #[test]
     fn a_pipeline_with_an_unroutable_endpoint_fails_to_build() {
         let config = OtelConfig {
@@ -559,7 +608,7 @@ mod tests {
             ..OtelConfig::default()
         };
         assert!(
-            build_providers(&config).is_err(),
+            build_metric_exporter(&config).is_err(),
             "the metric exporter must reject an unroutable endpoint instead of \
              silently building against its own default"
         );

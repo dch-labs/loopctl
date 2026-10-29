@@ -46,9 +46,14 @@ enum Instruments {
     Histogram(Histogram<f64>),
 }
 
-/// Handle installed process-wide when the metrics pipeline is active;
-/// [`export_metrics`](crate::export_metrics) reads it through
-/// [`active_meter`].
+/// Handle installed process-wide while the metrics pipeline is active.
+///
+/// [`export_metrics`](crate::export_metrics) reaches the pipeline through
+/// [`active_meter`] rather than through a handle it was handed, because a
+/// metric export has none of its own: the host calls it from a ticker or
+/// at run end and expects whatever pipeline is installed to serve. The
+/// slot is set-once, so a second install in the same process exports
+/// through the first one's meter.
 pub(crate) struct MeterHandle {
     /// The SDK meter every cached instrument is built from.
     ///
@@ -77,10 +82,15 @@ struct InstrumentState {
     /// per name serves every label series of that name.
     instruments: Vec<(String, Instruments)>,
 
-    /// Last exported total per canonical **series** identity (name plus
-    /// sorted `label=value` pairs, [`series_key`]) — never per name
-    /// alone: a name with two label series must track each delta
-    /// separately, or one series' growth silently swallows another's.
+    /// Last exported total per canonical **series** identity.
+    ///
+    /// The key is [`series_key`] — name plus sorted `label=value` pairs —
+    /// and never the name alone: two label series under one name must
+    /// track their growth separately, or one series' increase silently
+    /// swallows the other's delta. Registry snapshots are cumulative, so
+    /// what an export records is this ledger's difference, and
+    /// [`tracked_registry`](Self::tracked_registry) names the registry
+    /// those differences belong to.
     counter_totals: Vec<(String, u64)>,
 
     /// Last replayed per-bucket counts per canonical series identity.
@@ -92,6 +102,19 @@ struct InstrumentState {
     /// cumulative temporality the re-records would inflate the
     /// exported counts and sums on each pass.
     histogram_counts: Vec<(String, Vec<u64>)>,
+
+    /// Which registry the two ledgers were built from, by address.
+    ///
+    /// A ledger only means "growth since the last export" against the
+    /// registry that accumulated it. A replacement registry restarts
+    /// counting; differencing its counts against the old ledger
+    /// saturates every delta to zero until the newcomer outgrew its
+    /// predecessor, dropping the samples it did record — so a changed
+    /// identity clears both ledgers and the newcomer's first export
+    /// replays its own counts whole. The residual the delta math cannot
+    /// see is address reuse: a newcomer allocated exactly where a freed
+    /// predecessor stood reads as the same registry.
+    tracked_registry: Option<usize>,
 }
 
 impl MeterHandle {
@@ -174,8 +197,14 @@ pub(crate) fn active_meter() -> Option<Arc<MeterHandle>> {
     ACTIVE_METER.get().cloned()
 }
 
-/// Upper bound on per-bucket replay samples, so a pathological histogram
-/// count cannot stall an export.
+/// Upper bound on the samples one bucket contributes to a replay.
+///
+/// Bucket counts arrive as cumulative totals, and replaying them means
+/// recording that many individual observations. A pathological count — a
+/// long-lived series, or an overflow bucket that accumulated most of the
+/// distribution — would otherwise spend the export's whole budget
+/// re-recording one bucket, so the excess is dropped: the export reports
+/// less growth than happened, never more.
 const BUCKET_REPLAY_CAP: u64 = 10_000;
 
 /// Converts a wide unsigned integer to `f64` — exact below 2^53,
@@ -238,14 +267,31 @@ fn series_key(series: &loopctl::metrics::SeriesSnapshot) -> String {
 
 /// Replay a registry snapshot into the installed `OTLP` pipeline.
 ///
+/// `registry_id` identifies which registry `snapshot` came from (the
+/// caller passes its address). The delta ledgers belong to that one
+/// registry, so a changing identity clears them: a replacement's lower
+/// counts replay whole rather than saturating against a predecessor
+/// they have no relation to — see
+/// [`InstrumentState::tracked_registry`]. A caller exporting one
+/// registry repeatedly passes the same id and sees pure deltas.
+///
 /// Counters export the delta since the previous call (registry totals are
 /// cumulative, `OTLP` counters take increments); gauges export their current
 /// value; histograms are reconstructed bucket by bucket; the registry's
 /// diagnostics counters export as `loopctl.telemetry.*` gauges so store
 /// drift is visible on dashboards.
-pub(crate) fn record_registry(meter: &MeterHandle, snapshot: &RegistrySnapshot) {
+pub(crate) fn record_registry(
+    meter: &MeterHandle,
+    registry_id: usize,
+    snapshot: &RegistrySnapshot,
+) {
     let mut guard = meter.lock();
     let state: &mut InstrumentState = &mut guard;
+    if state.tracked_registry != Some(registry_id) {
+        state.counter_totals.clear();
+        state.histogram_counts.clear();
+        state.tracked_registry = Some(registry_id);
+    }
     let mut totals_updates: Vec<(String, u64)> = Vec::new();
     let mut histogram_updates: Vec<(String, Vec<u64>)> = Vec::new();
     for series in &snapshot.series {
@@ -570,6 +616,9 @@ mod tests {
 
     use super::*;
 
+    const REGISTRY: usize = 0xA1;
+    const REPLACEMENT: usize = 0xB2;
+
     fn find<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a opentelemetry::Value> {
         attrs
             .iter()
@@ -712,11 +761,13 @@ mod tests {
 
         record_registry(
             &handle,
+            REGISTRY,
             &snapshot(vec![rich("read", "ok", 3), sneaky("read.outcome=ok", 5)]),
         );
         assert!(provider.force_flush().is_ok(), "flush 1 lands");
         record_registry(
             &handle,
+            REGISTRY,
             &snapshot(vec![rich("read", "ok", 4), sneaky("read.outcome=ok", 5)]),
         );
         assert!(provider.force_flush().is_ok(), "flush 2 lands");
@@ -803,11 +854,11 @@ mod tests {
             counts
         };
 
-        record_registry(&handle, &snapshot(histogram_series(1, 1)));
+        record_registry(&handle, REGISTRY, &snapshot(histogram_series(1, 1)));
         assert!(provider.force_flush().is_ok(), "flush 1 lands");
-        record_registry(&handle, &snapshot(histogram_series(1, 1)));
+        record_registry(&handle, REGISTRY, &snapshot(histogram_series(1, 1)));
         assert!(provider.force_flush().is_ok(), "flush 2 lands");
-        record_registry(&handle, &snapshot(histogram_series(2, 3)));
+        record_registry(&handle, REGISTRY, &snapshot(histogram_series(2, 3)));
         assert!(provider.force_flush().is_ok(), "flush 3 lands");
         let counts = exported_counts(&exporter);
         assert!(
@@ -819,6 +870,110 @@ mod tests {
             counts.last() == Some(&5) || counts.iter().sum::<u64>() == 5,
             "the exported aggregate ends at the true sample count (delta sums to \
              it, cumulative ends at it): {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_registry_replays_its_own_counts() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let handle = MeterHandle {
+            meter: provider.meter("replacement-probe"),
+            state: Mutex::new(InstrumentState::default()),
+        };
+
+        let snapshot = |samples: u64, total: u64| {
+            let mut histogram = loopctl::metrics::LatencyHistogram::with_buckets(vec![10, 100]);
+            for _ in 0..samples {
+                histogram.record(5);
+            }
+            let counts = histogram.counts().to_vec();
+            RegistrySnapshot {
+                series: vec![
+                    loopctl::metrics::SeriesSnapshot {
+                        name: "loopctl.vector.embed",
+                        kind: loopctl::metrics::MetricKind::Histogram,
+                        labels: std::collections::BTreeMap::new(),
+                        value: SeriesValue::Histogram {
+                            summary: loopctl::metrics::HistogramSummary {
+                                bounds: vec![10, 100],
+                                counts,
+                                percentiles: histogram
+                                    .percentiles()
+                                    .map(|readings| [readings.p50, readings.p90, readings.p99]),
+                            },
+                        },
+                    },
+                    loopctl::metrics::SeriesSnapshot {
+                        name: "loopctl.tools.calls",
+                        kind: loopctl::metrics::MetricKind::Counter,
+                        labels: std::collections::BTreeMap::from([("tool", "bash".to_string())]),
+                        value: SeriesValue::Counter { total },
+                    },
+                ],
+                ..RegistrySnapshot::default()
+            }
+        };
+        let batches = |probe: &InMemoryMetricExporter| -> Vec<(u64, u64)> {
+            let mut batches = Vec::new();
+            for resource in probe.get_finished_metrics().unwrap_or_default() {
+                let mut replayed = 0_u64;
+                let mut counted = 0_u64;
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics() {
+                        match metric.name() {
+                            "loopctl.vector.embed" => {
+                                if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) =
+                                    metric.data()
+                                {
+                                    replayed = replayed.saturating_add(
+                                        histogram.data_points().fold(0_u64, |acc, point| {
+                                            acc.saturating_add(point.count())
+                                        }),
+                                    );
+                                }
+                            }
+                            "loopctl.tools.calls" => {
+                                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data()
+                                {
+                                    counted = counted.saturating_add(
+                                        sum.data_points().fold(0_u64, |acc, point| {
+                                            acc.saturating_add(point.value())
+                                        }),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                batches.push((replayed, counted));
+            }
+            batches
+        };
+
+        record_registry(&handle, REGISTRY, &snapshot(6, 9));
+        assert!(provider.force_flush().is_ok(), "the first export lands");
+        record_registry(&handle, REPLACEMENT, &snapshot(2, 4));
+        assert!(
+            provider.force_flush().is_ok(),
+            "the replacement's export lands"
+        );
+
+        let emitted = batches(&exporter);
+        let last = emitted.last().copied().unwrap_or_default();
+        assert!(
+            (last.0 >= 8 || last.0 == 2) && (last.1 >= 13 || last.1 == 4),
+            "both ledgers reset when the registry does: the replacement's own \
+             2 samples and 4 calls must reach the export (delta temporality shows \
+             them as the increment, cumulative as the new total), got {emitted:?}"
         );
     }
 
@@ -852,13 +1007,6 @@ mod tests {
         );
     }
 
-    /// The delta bookkeeping is keyed by canonical series identity, so
-    /// a name with two label series exports each one's own growth.
-    /// Pinned temporality-agnostically: under delta aggregation batch 2
-    /// carries the read series' increment, under cumulative it carries
-    /// its new total — either way the point must exist (a name-keyed
-    /// `previous` would silently swallow it) and the exported figures
-    /// must end at the true growth.
     #[test]
     fn counter_deltas_track_each_label_series_apart() {
         use opentelemetry::metrics::MeterProvider as _;
@@ -911,6 +1059,7 @@ mod tests {
 
         record_registry(
             &handle,
+            REGISTRY,
             &snapshot(vec![counter_series("read", 3), counter_series("exec", 5)]),
         );
         let flushed_one = provider.force_flush().is_ok();
@@ -924,6 +1073,7 @@ mod tests {
 
         record_registry(
             &handle,
+            REGISTRY,
             &snapshot(vec![counter_series("read", 4), counter_series("exec", 5)]),
         );
         let flushed_two = provider.force_flush().is_ok();
@@ -938,6 +1088,7 @@ mod tests {
 
         record_registry(
             &handle,
+            REGISTRY,
             &snapshot(vec![counter_series("read", 10), counter_series("exec", 5)]),
         );
         let flushed_three = provider.force_flush().is_ok();

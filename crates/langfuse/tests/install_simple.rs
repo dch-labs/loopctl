@@ -78,9 +78,12 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
     {
         EVENTS.lock().unwrap().extend(batch.iter().cloned());
     }
-    let response = "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\n\
-                    connection: close\r\ncontent-length: 24\r\n\r\n\
-                    {\"successes\":[],\"errors\":[]}";
+    let ack = "{\"successes\":[],\"errors\":[]}";
+    let response = format!(
+        "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\n\
+         connection: close\r\ncontent-length: {}\r\n\r\n{ack}",
+        ack.len()
+    );
     stream.write_all(response.as_bytes())?;
     stream.flush()
 }

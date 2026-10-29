@@ -17,9 +17,21 @@
 //!
 //! ## Privacy
 //!
-//! Traces are metadata-only: the engine deliberately never emits message
-//! content into spans (PII), and neither does this crate. Hosts wanting
-//! `input`/`output` on the trace can add them via their own ingest.
+//! Traces are metadata-only: this crate never exports message content.
+//! The engine records prompt text in exactly one place — the `query`
+//! field of the turn span, which is `DEBUG`-level and therefore an
+//! explicit host opt-in, and carries the assembled prompt including
+//! steering injections. [`mapping::first_class`] suppresses the field
+//! across the scope it is declared for — the turn span — so a run's
+//! prompt reaches neither an observation's metadata nor any part of
+//! the ingestion body; a `query` recorded on any other span is
+//! ordinary free-form metadata. Hosts wanting `input`/`output` on the
+//! trace can add them via their own ingest.
+//!
+//! The filter belongs to this crate alone: pointing
+//! [`loopctl-otel`](https://docs.rs/loopctl-otel) at a collector exports
+//! span attributes verbatim, so a host that enables `DEBUG` ships the
+//! assembled prompt to its own OTLP endpoint.
 //!
 //! ## OTLP alternative
 //!
@@ -187,14 +199,17 @@ pub enum LangfuseInstallError {
 /// [`LangfuseGuard::dropped_events`] reports queue losses.
 ///
 /// **Runtime hazard:** `Drop` polls the drain by parking its dropping
-/// thread — fine on an ordinary thread, wrong on one the tokio runtime
-/// drives. On a current-thread runtime `Drop` detects the flavor and
+/// thread — fine on an ordinary thread, wrong on the runtime's only
+/// worker. A current-thread runtime has exactly that one worker, and a
+/// multi-thread runtime built with a single worker is the same trap
+/// wearing different clothes; on either, `Drop` detects the shape and
 /// **closes without waiting** (a warn names the loss and the `flush`
 /// remedy — parking the only worker guarantees the pending events are
 /// lost, because the flusher cannot run). Hosts inside a runtime call
 /// [`LangfuseGuard::flush`] (an `await`, so the flusher runs) before
-/// dropping; hosts on multi-thread runtimes may drop from any thread,
-/// parking one worker briefly while the rest keep the flusher alive.
+/// dropping; hosts on multi-thread runtimes with workers to spare, or
+/// on ordinary threads, may drop from anywhere — parking one thread
+/// briefly while the rest keep the flusher alive.
 #[derive(Debug)]
 pub struct LangfuseGuard {
     /// The shared enqueue/shutdown handle the layer also holds.
@@ -253,18 +268,35 @@ impl LangfuseGuard {
     pub async fn flush(&self, timeout: std::time::Duration) -> bool {
         self.sink.wait_drained(timeout).await
     }
+
+    /// Whether parking the dropping thread would starve the flusher.
+    ///
+    /// `Drop` waits by parking its thread, and that only makes progress
+    /// if the flusher has a worker left to run on. A current-thread
+    /// runtime has exactly the one worker the drop happens on; a
+    /// multi-thread runtime configured with a single worker is the same
+    /// starvation wearing different clothes — the parked thread IS the
+    /// flusher's only executor. Anywhere else (an ordinary thread, or a
+    /// multi-thread runtime with workers to spare) the park costs a
+    /// thread and the drain completes.
+    fn drop_would_starve_the_flusher() -> bool {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::CurrentThread => true,
+            _ => handle.metrics().num_workers() <= 1,
+        }
+    }
 }
 
 impl Drop for LangfuseGuard {
     fn drop(&mut self) {
-        let current_thread_runtime = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
-            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
-        });
-        if current_thread_runtime {
+        if Self::drop_would_starve_the_flusher() {
             tracing::warn!(
                 target: "loopctl::langfuse",
-                "guard dropped on a current-thread runtime: pending events cannot drain \
-                 while Drop parks the only worker — call flush().await before dropping"
+                "guard dropped on a runtime whose only worker this drop would park: \
+                 pending events cannot drain — call flush().await before dropping"
             );
             self.sink.close();
             return;

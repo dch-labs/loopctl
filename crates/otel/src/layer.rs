@@ -21,7 +21,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use loopctl::metrics::{MetricsObserver, MetricsRegistry};
+use loopctl::metrics::{AgentMetrics, MetricsObserver, MetricsRegistry};
 use opentelemetry::trace::{Status, TraceContextExt as _};
 use opentelemetry::{KeyValue, Value};
 use opentelemetry_sdk::error::OTelSdkResult;
@@ -53,6 +53,21 @@ const METRICS_TARGET: &str = "loopctl::metrics";
 /// identically.
 const MAX_STAMPED_SERIES_ATTRIBUTES: usize = 64;
 
+/// Run-rollup attributes a single run span will carry.
+///
+/// The same 128-attribute SDK cap that bounds the registry share bounds
+/// the rollup: per-tool figures grow with the tool count (up to four
+/// attributes each), and an unbounded rollup would push the run span's
+/// own fields and the always-appended `loopctl.telemetry.*` diagnostics
+/// past what the SDK keeps — the SDK drops later additions silently.
+/// The budget leaves room for the whole registry share
+/// ([`MAX_STAMPED_SERIES_ATTRIBUTES`] plus its five diagnostics) and the
+/// handful of fields an `agent.run` span carries, so no tool count can
+/// cost the diagnostics their seats. Only the run-span copy is trimmed:
+/// [`export_metrics`](crate::export_metrics) still ships every tool's
+/// full detail on the metrics path.
+const MAX_STAMPED_ROLLUP_ATTRIBUTES: usize = 48;
+
 /// The registry share of a run-span stamp, bounded.
 ///
 /// Series attributes ride in the snapshot's deterministic order up to
@@ -74,6 +89,49 @@ fn bounded_registry_attributes(snapshot: &RegistrySnapshot) -> Vec<KeyValue> {
     }
     bounded.extend(diagnostics);
     bounded
+}
+
+/// The run-rollup share of a run-span stamp, bounded by whole tool groups.
+///
+/// The base run figures — headline counters and derived rates — always
+/// ride; tool groups ride in the rollup's own order until
+/// [`MAX_STAMPED_ROLLUP_ATTRIBUTES`] is spent, and a group that would
+/// not fit whole is skipped whole, because a half-stamped tool reads as
+/// a tool that never errored. The cut is deterministic: the same rollup
+/// always stamps the same attributes.
+fn bounded_run_attributes(agent: &AgentMetrics) -> Vec<KeyValue> {
+    let emitted = run_attributes(agent);
+    let base_end = emitted
+        .iter()
+        .position(|kv| kv.key.as_str().starts_with("loopctl.tool."))
+        .unwrap_or(emitted.len());
+    let (base, tools) = emitted.split_at(base_end);
+    let mut bounded: Vec<KeyValue> = base.to_vec();
+    let mut rest = tools;
+    while let Some(first) = rest.first() {
+        let group_key = tool_group_key(first.key.as_str());
+        let group_end = rest
+            .iter()
+            .skip(1)
+            .position(|kv| tool_group_key(kv.key.as_str()) != group_key)
+            .map_or(rest.len(), |found| found.saturating_add(1));
+        let (group, tail) = rest.split_at(group_end);
+        if bounded.len().saturating_add(group.len()) > MAX_STAMPED_ROLLUP_ATTRIBUTES {
+            break;
+        }
+        bounded.extend_from_slice(group);
+        rest = tail;
+    }
+    bounded
+}
+
+/// The group an attribute belongs to: its key without the final segment.
+///
+/// Tool rollup keys are `loopctl.tool.<tool>.<figure>`, so the head
+/// identifies the tool; stripping only the last segment keeps a dotted
+/// tool name inside one group.
+fn tool_group_key(key: &str) -> &str {
+    key.rsplit_once('.').map_or(key, |head| head.0)
 }
 
 /// Sources the bridge polls when a run span closes.
@@ -131,8 +189,13 @@ impl std::fmt::Debug for Stamper {
 /// span at the run-end record by [`OtelTracingLayer`] carrying a
 /// [`Stamper`].
 pub struct SpecExporter<E> {
-    /// The transport this exporter transforms for — the batch worker
-    /// every transformed `SpanData` is handed to unchanged.
+    /// The transport this exporter transforms for.
+    ///
+    /// Every transformed [`SpanData`] is handed to it unchanged, which is
+    /// what lets one transform ride an in-memory recorder in tests and an
+    /// `OTLP` exporter in production without either learning that the
+    /// loopctl vocabulary exists. Flush and shutdown are forwarded rather
+    /// than reimplemented, so batching stays the inner exporter's.
     inner: E,
 }
 
@@ -236,8 +299,13 @@ fn string_attr(attrs: &[KeyValue], key: &str) -> Option<String> {
         })
 }
 
-/// Event-target filter: `loopctl::metrics` events are the metrics path's signals and
-/// must not be mirrored as `OTel` span events; everything else delegates.
+/// Whether an event belongs to the metrics path rather than to tracing.
+///
+/// Events on `loopctl::metrics` are the signals the metric pipeline
+/// consumes; mirroring them through the bridge would publish each one
+/// twice — once as a metric, once as a span event on whatever span
+/// happened to be current — so they are dropped here and everything else
+/// delegates to the stock bridge.
 fn metrics_event(event: &tracing::Event<'_>) -> bool {
     event.metadata().target() == METRICS_TARGET
 }
@@ -251,8 +319,12 @@ fn metrics_event(event: &tracing::Event<'_>) -> bool {
 /// span's `OTel` span at the run-end record (see
 /// [`with_stamper`](Self::with_stamper)).
 pub struct OtelTracingLayer {
-    /// The stock `tracing-opentelemetry` bridge, pinned to `Registry`
-    /// and boxed so the layer itself stays object-safe and `Send`.
+    /// The stock `tracing-opentelemetry` bridge, boxed.
+    ///
+    /// Boxing keeps this layer's own type free of the bridge's generic
+    /// parameters, so composing it onto a subscriber stays `Send + Sync`
+    /// without a cascade of type arguments at every call site; the bridge
+    /// is reached through the box.
     inner: Box<dyn Layer<Registry> + Send + Sync>,
 
     /// Run-end stamp sources for the run-span rollup.
@@ -263,14 +335,22 @@ pub struct OtelTracingLayer {
     /// run-end record.
     stamper: Option<Arc<Stamper>>,
 
-    /// The provider whose tracer the bridge records through; owned so
-    /// [`shutdown`](Self::shutdown) can flush and stop it with the
-    /// layer.
+    /// The provider whose tracer the bridge records through.
+    ///
+    /// Owned rather than borrowed so [`shutdown`](Self::shutdown) can
+    /// flush and stop the exact provider this layer installed, with no
+    /// second handle for the host to keep alive alongside it and no
+    /// teardown ordering it could get wrong.
     tracer_provider: opentelemetry_sdk::trace::SdkTracerProvider,
 
     /// The pipeline's meter provider, present in
-    /// [`Pipeline`](crate::OtelMetricsMode) mode; shut down beside the
-    /// tracer.
+    /// [`Pipeline`](crate::OtelMetricsMode) mode.
+    ///
+    /// No span is recorded through it — metrics reach it through
+    /// [`crate::export_metrics`] — but it is held beside the tracer so one
+    /// [`shutdown`](Self::shutdown) stops both halves of a pipeline, and a
+    /// host cannot be left with traces flushed and a metric reader still
+    /// running.
     meter_provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
 }
 
@@ -288,10 +368,16 @@ impl std::fmt::Debug for OtelTracingLayer {
 }
 
 impl OtelTracingLayer {
-    /// Compose an already-built span layer (typically
-    /// `tracing_opentelemetry::layer().with_tracer(..)`) into the loopctl
-    /// shape bound to `tracer_provider`, optionally carrying a meter
-    /// provider for [`crate::export_metrics`].
+    /// Compose an already-built span layer into the loopctl shape.
+    ///
+    /// The inner layer is typically
+    /// `tracing_opentelemetry::layer().with_tracer(..)`; it is boxed so
+    /// the composed type stays `Send + Sync` without exposing the
+    /// bridge's generics. `tracer_provider` names what
+    /// [`shutdown`](Self::shutdown) will flush and stop, and
+    /// `meter_provider` is retained only for
+    /// [`crate::export_metrics`] — pass `None` wherever no metrics
+    /// pipeline was built.
     #[must_use]
     pub fn new(
         inner: impl Layer<Registry> + Send + Sync + 'static,
@@ -362,9 +448,14 @@ impl OtelTracingLayer {
     /// The engine records `outcome` on the `agent.run` span exactly
     /// once, at the run-end boundary — inside the span's scope, after
     /// that run's observer callbacks — so the trigger is both precise
-    /// and on time. The stamp rides straight onto the span's `OTel`
-    /// span through the bridge's activated context; nothing is stored
-    /// for the exporter to guess later.
+    /// and on time. The same boundary guarantees the read: the engine
+    /// announces every run to its observers before it settles that run's
+    /// span, so what the snapshot holds at this record is the run being
+    /// stamped — and a run that fails before its first turn stamps its
+    /// own empty rollup rather than the last completed run's. The stamp
+    /// rides straight onto the span's `OTel` span through the bridge's
+    /// activated context; nothing is stored for the exporter to guess
+    /// later.
     fn stamp_run_end(
         &self,
         id: &tracing::span::Id,
@@ -391,7 +482,7 @@ impl OtelTracingLayer {
             };
             let otel_span = otel_cx.span();
             if let Some(observer) = &stamper.observer {
-                for kv in run_attributes(&observer.snapshot()) {
+                for kv in bounded_run_attributes(&observer.snapshot()) {
                     otel_span.set_attribute(kv);
                 }
             }
@@ -493,6 +584,15 @@ mod tests {
 
     use super::*;
 
+    /// The stamp's attributes as `(key, debug-value)` pairs, for comparing
+    /// what a bounded stamp retained against what it dropped.
+    fn stamped(attrs: &[KeyValue]) -> Vec<(&str, String)> {
+        attrs
+            .iter()
+            .map(|kv| (kv.key.as_str(), format!("{:?}", kv.value)))
+            .collect()
+    }
+
     /// A snapshot past the stamp bound keeps its diagnostics and loses
     /// only series attributes — the SDK's 128-attribute span budget is
     /// shared with the run rollup and the engine's own fields, which an
@@ -537,9 +637,64 @@ mod tests {
         }
         let bounded_again = bounded_registry_attributes(&snapshot);
         assert_eq!(
-            attrs.len(),
-            bounded_again.len(),
-            "the cut is deterministic in the snapshot's own order"
+            stamped(&attrs),
+            stamped(&bounded_again),
+            "the cut is deterministic in the snapshot's own order: the same \
+             attributes ride, in order, with the same values — equal lengths \
+             alone would let a different equal-size cut pass"
+        );
+    }
+
+    #[test]
+    fn a_rolled_up_run_stays_inside_its_attribute_budget() {
+        let mut agent = AgentMetrics {
+            total_turns: 3,
+            ..Default::default()
+        };
+        for index in 0..40_u8 {
+            let name = format!("tool{index:02}");
+            let mut stats = loopctl::metrics::ToolStats::new(&name);
+            stats.record(12, false);
+            stats.record(30, true);
+            agent.tools.insert(name, stats);
+        }
+
+        let attrs = bounded_run_attributes(&agent);
+        assert!(
+            attrs.len() <= MAX_STAMPED_ROLLUP_ATTRIBUTES,
+            "the rollup share never exceeds its budget, whatever the tool count: {}",
+            attrs.len()
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|kv| kv.key.as_str() == "loopctl.run.turns"),
+            "the base run figures always ride, whatever was cut"
+        );
+        let mut groups: Vec<&str> = Vec::new();
+        for kv in &attrs {
+            let key = kv.key.as_str();
+            if !key.starts_with("loopctl.tool.") {
+                continue;
+            }
+            let group = tool_group_key(key);
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+            if key.strip_suffix(".calls").is_some() {
+                continue;
+            }
+            let calls = format!("{group}.calls");
+            assert!(
+                attrs.iter().any(|other| other.key.as_str() == calls),
+                "a stamped tool carries its whole group — a tool stamped with \
+                 errors but no calls reads as one that was never called: {calls}"
+            );
+        }
+        assert!(
+            groups.len() < 40,
+            "with 40 tools the budget must bite, not silently exceed: {} groups rode",
+            groups.len()
         );
     }
 }

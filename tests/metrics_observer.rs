@@ -171,7 +171,7 @@ async fn an_observer_shared_across_sessions_reports_each_run_alone() {
         session_id: uuid::Uuid::new_v4(),
     });
 
-    let mut first = scripted_loop(Arc::clone(&observer), terminal_only());
+    let mut first = scripted_loop(Arc::clone(&observer), tool_turn_then_terminal());
     first.run("one", &RunConfig::default()).await.expect("one");
 
     // No reset and no `reset_managers` between runs: the observer still
@@ -194,7 +194,8 @@ async fn an_observer_shared_across_sessions_reports_each_run_alone() {
     assert_eq!(
         m.tools.get("echo").map(|s| s.calls),
         Some(1),
-        "the first run's tools stay out of the second run's record"
+        "the first run called echo too — a snapshot retaining tool stats across \
+        the run boundary would read two calls here, not the second run's one"
     );
     assert!(m.run_success, "the last run's outcome is the boundary read");
 }

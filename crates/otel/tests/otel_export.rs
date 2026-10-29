@@ -424,12 +424,17 @@ async fn the_collector_sees_genai_shaped_spans() {
     provider.force_flush().unwrap();
     let bare_spans = EXPORTED.lock().unwrap().clone();
     let bare_run = find_span(&bare_spans, "invoke_agent").expect("the registry-only run span");
-    assert!(
-        bare_run
-            .attributes
-            .iter()
-            .any(|kv| kv.key.as_str().starts_with("loopctl.tools.calls")),
-        "the registry's series ride the run span without an observer"
+    let stamped_calls = bare_run
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str().starts_with("loopctl.tools.calls"))
+        .expect("the registry's series ride the run span without an observer");
+    assert_eq!(
+        stamped_calls.value,
+        opentelemetry::Value::I64(1),
+        "the fixture's single echo call stamps as one call — presence alone \
+         would pass on a zero or a doubled count: {:?}",
+        stamped_calls.value
     );
     assert!(
         attr(bare_run, "loopctl.run.turns").is_none(),

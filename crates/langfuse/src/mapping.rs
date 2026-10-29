@@ -108,12 +108,15 @@ pub enum LangfuseField {
     /// it means either vocabulary can flag a failed span.
     Outcome,
 
-    /// Never exported — the turn span's assembled-prompt field.
+    /// Never exported from the turn span — the assembled-prompt field.
     ///
     /// The engine records `query` on DEBUG turn spans for hosts that
     /// opt into content capture; the exporter never uploads that text
     /// (or the PII inside it), so the field maps here instead of
-    /// falling through to free-form metadata.
+    /// falling through to free-form metadata. The suppression is
+    /// scoped to the turn span: a `query` recorded on any other span
+    /// is that span's own vocabulary (a search tool's argument, say)
+    /// and rides the metadata path like any other field.
     Suppressed,
 }
 
@@ -124,7 +127,8 @@ pub enum LangfuseField {
 /// for (tool names, call ids, durations) and every loopctl extra. The
 /// one exception is the turn span's `query`, which maps to
 /// [`LangfuseField::Suppressed`] so the assembled prompt never reaches
-/// that pass-through path.
+/// that pass-through path — the field collector honors that verdict on
+/// the turn span only, leaving a `query` on any other span free-form.
 #[must_use]
 pub fn first_class(field: &str) -> Option<LangfuseField> {
     match field {

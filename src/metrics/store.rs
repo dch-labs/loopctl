@@ -104,8 +104,13 @@ pub struct HistogramSummary {
     /// Exactly [`LatencyHistogram::buckets`] at snapshot time.
     pub bounds: Vec<u64>,
 
-    /// Per-slot counts; one more entry than [`bounds`](Self::bounds),
-    /// the last for overflow samples.
+    /// Per-slot counts, one more entry than [`bounds`](Self::bounds).
+    ///
+    /// Entry `i` counts the samples at or below `bounds[i]` and above the
+    /// bound before it; the final entry has no bound of its own and holds
+    /// everything past the last one. Bounds and counts stay paired
+    /// through serialization on purpose — a read that sorted the bounds
+    /// without their counts would move samples between ranges.
     pub counts: Vec<u64>,
 
     /// p50/p90/p99 readings, present only when samples exist.
@@ -386,6 +391,43 @@ fn counter_sum(
     found.then_some(total)
 }
 
+/// The label name the store reserves for its own overflow routing.
+///
+/// Excess label sets fold onto the synthetic pair `series=overflow`, so
+/// this key belongs to the store: a write carrying its own `series`
+/// label is renamed to [`CALLER_SERIES_LABEL`] instead of being allowed
+/// to land on the reserved row, where two unrelated populations would
+/// merge into one snapshot line.
+const RESERVED_SERIES_LABEL: &str = "series";
+
+/// Where a caller-written `series` label rides instead.
+///
+/// The caller's dimension stays visible under a name the overflow
+/// routing never produces. A write carrying both `series` and
+/// `caller.series` keeps its own `caller.series` and loses the renamed
+/// value to it — carrying both spellings in one write is a caller bug,
+/// and dropping one is the honest resolution.
+const CALLER_SERIES_LABEL: &str = "caller.series";
+
+/// Move a caller-written reserved label out of the routing key's way.
+///
+/// `series` is the store's own label: it is what the overflow row is
+/// keyed by. A write carrying a `series` pair of its own is renamed to
+/// [`CALLER_SERIES_LABEL`] before routing, so the caller keeps a row for
+/// its dimension and the store's overflow row stays exclusively the
+/// store's. A set that already carries [`CALLER_SERIES_LABEL`] keeps its
+/// own pair and the renamed value yields the seat — writing both
+/// spellings in one set is a caller error, and dropping one of two
+/// colliding pairs is the honest reading of it.
+fn unreserved_labels(mut labels: BTreeMap<&'static str, String>) -> BTreeMap<&'static str, String> {
+    if let Some(value) = labels.remove(RESERVED_SERIES_LABEL)
+        && !labels.contains_key(CALLER_SERIES_LABEL)
+    {
+        labels.insert(CALLER_SERIES_LABEL, value);
+    }
+    labels
+}
+
 /// The key a write lands on after the cardinality bound.
 ///
 /// A label-set the store already holds, or a name still under
@@ -395,21 +437,33 @@ fn counter_sum(
 /// churn (a host registering unbounded tool names) folds into one
 /// visible row instead of growing the store, and every snapshot of
 /// it, without end. Existing series are never re-routed.
+///
+/// Two guards ride here, shared by every write path: caller-written
+/// `series` labels are renamed first ([`unreserved_labels`]), so the
+/// reserved row is only ever the store's own; and the distinct-series
+/// scan stops at the bound ([`Iterator::take`]) instead of counting
+/// every stored series, because a name at the cap is proven the
+/// moment the walk reaches it.
 fn routed_key(
     store: &BTreeMap<SeriesKey, MetricValue>,
     name: &'static str,
     labels: BTreeMap<&'static str, String>,
 ) -> SeriesKey {
-    let key = (name, labels);
+    let key = (name, unreserved_labels(labels));
     if store.contains_key(&key) {
         return key;
     }
-    let distinct = store.keys().filter(|(seen, _)| *seen == name).count();
-    if distinct < MAX_SERIES_PER_METRIC {
+    let capped = store
+        .keys()
+        .filter(|(seen, _)| *seen == name)
+        .take(MAX_SERIES_PER_METRIC)
+        .count()
+        >= MAX_SERIES_PER_METRIC;
+    if !capped {
         return key;
     }
     let mut overflow = BTreeMap::new();
-    overflow.insert("series", "overflow".to_string());
+    overflow.insert(RESERVED_SERIES_LABEL, "overflow".to_string());
     (name, overflow)
 }
 
@@ -983,6 +1037,92 @@ mod tests {
             panic!("counter series");
         };
         assert_eq!(total, 1, "existing series are never re-routed");
+
+        let gauge = lookup("loopctl.memory.entries").unwrap();
+        for index in 0..300_u32 {
+            let backend = format!("dynamic-{index}");
+            store.gauge_set(
+                gauge,
+                labels(&[("store", backend.as_str())]),
+                f64::from(index),
+            );
+        }
+        let gauge_snap = store.snapshot();
+        let gauge_rows = gauge_snap
+            .series
+            .iter()
+            .filter(|series| series.name == "loopctl.memory.entries")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gauge_rows.len(),
+            MAX_SERIES_PER_METRIC.saturating_add(1),
+            "the gauge path shares the bound: the cap plus one shared overflow row"
+        );
+        let gauge_overflow = gauge_rows
+            .into_iter()
+            .find(|series| series.labels.contains_key(RESERVED_SERIES_LABEL))
+            .expect("the gauge excess folds too");
+        let SeriesValue::Gauge { value } = gauge_overflow.value else {
+            panic!("gauge series");
+        };
+        assert!(
+            (value - f64::from(299)).abs() < f64::EPSILON,
+            "the overflow gauge keeps the last-written value — the documented \
+             last-write-wins over the fold, got {value}"
+        );
+    }
+
+    #[test]
+    fn a_caller_written_series_label_cannot_merge_with_the_overflow_row() {
+        let store = MetricsRegistry::default();
+        let descriptor = lookup("loopctl.tools.calls").unwrap();
+        store.counter_add(descriptor, labels(&[("series", "overflow")]), 5);
+        for index in 0..300_u32 {
+            let tool = format!("dynamic-{index}");
+            store.counter_add(descriptor, labels(&[("tool", &tool), ("outcome", "ok")]), 1);
+        }
+
+        let snap = store.snapshot();
+        let calls = snap
+            .series
+            .iter()
+            .filter(|series| series.name == "loopctl.tools.calls");
+        let reserved: u64 = calls
+            .clone()
+            .filter(|series| {
+                series.labels.len() == 1 && series.labels.contains_key(RESERVED_SERIES_LABEL)
+            })
+            .map(|series| match series.value {
+                SeriesValue::Counter { total } => total,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(
+            reserved,
+            u64::from(
+                300_u32.saturating_sub(
+                    u32::try_from(MAX_SERIES_PER_METRIC)
+                        .unwrap_or(u32::MAX)
+                        .saturating_sub(1)
+                )
+            ),
+            "the store's overflow row holds only its own excess (the caller's \
+             renamed row occupies one seat below the cap) — a caller that wrote \
+             `series=overflow` first must not become its host"
+        );
+        let renamed = calls
+            .into_iter()
+            .find(|series| {
+                series.labels.get(CALLER_SERIES_LABEL).map(String::as_str) == Some("overflow")
+            })
+            .expect("the caller's dimension survives under the reserved-name escape");
+        let SeriesValue::Counter { total } = renamed.value else {
+            panic!(
+                "counter series: {:?}",
+                renamed.labels.get(CALLER_SERIES_LABEL)
+            )
+        };
+        assert_eq!(total, 5, "the write itself is not lost, only renamed");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! The guard's drop-time drain against the runtime it finds itself on.
 //!
 //! `Drop` cannot `await`, so the bounded blocking drain is right on an
-//! ordinary thread and wrong on the one worker a current-thread
-//! runtime drives — parking it starves the flusher for the whole wait.
-//! This binary pins the guard's answer to that hazard.
+//! ordinary thread and wrong on a runtime's only worker — a
+//! current-thread runtime has one by definition, and a multi-thread
+//! runtime with `worker_threads = 1` has one by configuration. Parking
+//! that worker starves the flusher for the whole wait. This binary
+//! pins the guard's answer to that hazard.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -68,5 +70,34 @@ async fn guard_drop_on_a_current_thread_runtime_does_not_park() {
         "a guard dropped on a current-thread runtime closes without parking \
          the only worker — five seconds of parking guarantees the pending \
          events are lost, because the flusher cannot run: {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn guard_drop_on_a_single_worker_multi_thread_runtime_does_not_park() {
+    let port = holding_collector();
+    let (layer, guard) = install(LangfuseConfig {
+        host: format!("http://127.0.0.1:{port}"),
+        public_key: "pk-test".to_string(),
+        secret_key: "sk-test".to_string(),
+        batch_size: 100,
+    })
+    .expect("install");
+    drop(layer);
+    assert!(
+        guard
+            .export_scores("trace-pending", &AgentMetrics::default())
+            .is_ok(),
+        "score events queue behind the held-open collector"
+    );
+
+    let started = Instant::now();
+    drop(guard);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a one-worker multi-thread runtime starves like a current-thread one: \
+         parking its single worker for the drain's whole five seconds leaves \
+         the flusher nowhere to run: {elapsed:?}"
     );
 }

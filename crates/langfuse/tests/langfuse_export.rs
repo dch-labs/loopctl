@@ -91,9 +91,12 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
             "missing basic auth",
         ));
     }
-    let response = "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\n\
-                    connection: close\r\ncontent-length: 24\r\n\r\n\
-                    {\"successes\":[],\"errors\":[]}";
+    let ack = "{\"successes\":[],\"errors\":[]}";
+    let response = format!(
+        "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\n\
+         connection: close\r\ncontent-length: {}\r\n\r\n{ack}",
+        ack.len()
+    );
     stream.write_all(response.as_bytes())?;
     stream.flush()
 }
@@ -287,6 +290,11 @@ async fn the_cloud_would_receive_traces_observations_and_scores() {
     assert!(
         tool_obs["body"]["parentObservationId"].is_null(),
         "tool executions attach to the trace root (engine span tree)"
+    );
+    assert_eq!(
+        tool_obs["body"]["metadata"]["gen_ai.tool.name"], "echo",
+        "a permitted field rides the exported metadata — the query suppression \
+         above must not become a metadata-wide embargo"
     );
 
     // The turn observation's metadata never carries the assembled

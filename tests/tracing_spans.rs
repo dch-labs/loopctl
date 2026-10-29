@@ -659,6 +659,78 @@ async fn the_engine_emits_the_documented_span_tree() {
             .any(|s| s.name == loopctl::tracing_spans::AGENT_RUN_SPAN),
         "a fresh DEBUG-accepting subscriber sees spans again"
     );
+
+    // A manager reset that finds a poisoned lock fails the run before any
+    // turn opens, and that failure still settles the run span: outcome
+    // `error`, the error class the run returned on, and a duration. An
+    // early return that skipped the settlement would leave the span
+    // hanging with no outcome at all.
+    let reset_captures = Arc::new(Captures::default());
+    let reset_subscriber =
+        tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&reset_captures)));
+    let reset_guard = tracing::subscriber::set_default(reset_subscriber);
+    let detection = loopctl::detection::DetectionManager::default();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = detection
+            .convergence_detector()
+            .lock()
+            .expect("lock before poison");
+        panic!("poison the convergence detector");
+    }));
+    assert!(poisoned.is_err(), "the poisoning panic is what poisons");
+    let managers = loopctl::managers::LoopManagers::new().with_detection(detection);
+    let reset_client =
+        Arc::new(
+            MockApiClient::new("test-model").with_responses(vec![MockResponse {
+                text: "never reached".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            }]),
+        );
+    let mut reset_agent = BareLoop::new_with_managers(
+        reset_client,
+        ToolRegistry::new(),
+        SessionConfig::default(),
+        managers,
+    );
+    let mut reset_config = RunConfig::default();
+    reset_config.reset_managers = true;
+    let reset_outcome = reset_agent
+        .run("the reset poisons first", &reset_config)
+        .await;
+    drop(reset_guard);
+    assert!(
+        matches!(
+            reset_outcome,
+            Err(loopctl::error::LoopError::LockPoisoned { .. })
+        ),
+        "a poisoned manager reset fails the run with its own error: {reset_outcome:?}"
+    );
+    let reset_spans = reset_captures.spans.lock().expect("spans lock").clone();
+    let failed_run = reset_spans
+        .iter()
+        .find(|s| s.name == loopctl::tracing_spans::AGENT_RUN_SPAN)
+        .expect("the run span opened before the reset was attempted");
+    assert_eq!(
+        failed_run.field(fields::OUTCOME),
+        Some("error"),
+        "the reset failure settles the run span as failed"
+    );
+    assert_eq!(
+        failed_run.field(fields::ERROR_TYPE),
+        Some("lock_poisoned"),
+        "the settlement names the class of error the run returned on"
+    );
+    assert!(
+        failed_run.field(fields::DURATION_MS).is_some(),
+        "the settlement carries a duration even though no turn ever ran"
+    );
+    assert!(
+        reset_spans
+            .iter()
+            .all(|s| s.name != loopctl::tracing_spans::TURN_SPAN),
+        "the reset fails the run before any turn opens"
+    );
 }
 
 /// The field-name constants are the exporter contract; pin every one.

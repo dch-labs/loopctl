@@ -243,7 +243,17 @@ mod tests {
     fn an_out_of_order_touch_never_supersedes_a_newer_observation() {
         let mut baselines = FileBaselines::default();
         let path = Path::new("a.rs");
+        // `observed` is a process-wide stamp starting at zero, so the first
+        // observation of a process has no representable older stamp — its
+        // `saturating_sub(1)` is a tie, which newest-observation-wins settles
+        // for the newcomer. Take a warm-up observation so the out-of-order
+        // landing below is genuinely older, whichever order the suite runs in.
+        record(&mut baselines, Path::new("warm.rs"), observe_bytes(b"warm"));
         let newer = observe_bytes(b"newer");
+        assert!(
+            newer.observed > 0,
+            "the pin needs a stamp with a representable predecessor"
+        );
         let older = FileBaseline {
             observed: newer.observed.saturating_sub(1),
             hash: content_hash(b"older"),
@@ -289,7 +299,15 @@ mod tests {
     fn identity_entries_hold_the_newest_observation() {
         let mut identities = FileIdentities::default();
         let key = (1, 2);
+        // Same stamp floor as the path-side pin above: an identity-side warm-up
+        // (a different key, so this pin's own entry stays untouched) puts the
+        // stamp past zero, where "one older" is a real order and not a tie.
+        record_identity(&mut identities, (9, 9), observe_bytes(b"warm"));
         let newer = observe_bytes(b"newer");
+        assert!(
+            newer.observed > 0,
+            "the pin needs a stamp with a representable predecessor"
+        );
         let older = FileBaseline {
             observed: newer.observed.saturating_sub(1),
             hash: content_hash(b"older"),

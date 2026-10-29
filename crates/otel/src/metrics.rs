@@ -463,8 +463,7 @@ pub(crate) fn record_registry(
         entry.1 = ledger;
     }
     drop(guard);
-    record_diagnostics(meter, snapshot);
-    true
+    record_diagnostics(meter, snapshot)
 }
 
 /// Reconstruct a distribution's growth from explicit bucket counts by
@@ -510,8 +509,11 @@ fn replay_buckets(
 /// Store drift — rejected names, undeclared or missing labels, counted
 /// numerics, ambiguous scalars — becomes a dashboard-visible signal, so
 /// the telemetry pipeline reports on its own health the same way it
-/// reports on the agent's.
-fn record_diagnostics(meter: &MeterHandle, snapshot: &RegistrySnapshot) {
+/// reports on the agent's. Answers `false` when a reading was refused
+/// — the pipeline was shut down mid-export — so the caller can surface
+/// the same shutdown error it would for a refused series.
+fn record_diagnostics(meter: &MeterHandle, snapshot: &RegistrySnapshot) -> bool {
+    let mut delivered = true;
     for (name, value) in [
         ("loopctl.telemetry.unknown_metric", snapshot.unknown_metric),
         ("loopctl.telemetry.unknown_labels", snapshot.unknown_labels),
@@ -526,7 +528,7 @@ fn record_diagnostics(meter: &MeterHandle, snapshot: &RegistrySnapshot) {
         ),
     ] {
         let value = wide_to_f64(value);
-        meter.with_instrument(
+        delivered &= meter.with_instrument(
             name,
             |m, key| Instruments::Gauge(m.f64_gauge(key).build()),
             |instrument, labels| {
@@ -536,6 +538,7 @@ fn record_diagnostics(meter: &MeterHandle, snapshot: &RegistrySnapshot) {
             },
         );
     }
+    delivered
 }
 
 /// Run rollup flattened to span attributes.
@@ -730,6 +733,34 @@ mod tests {
             ),
             "an export after shutdown reports the dead pipeline instead \
              of returning Ok for measurements that cannot deliver"
+        );
+    }
+
+    #[test]
+    fn diagnostics_refuse_after_shutdown_too() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let handle = MeterHandle::new(provider.meter("diagnostics-probe"));
+        let snapshot = RegistrySnapshot {
+            unknown_metric: 3,
+            ..RegistrySnapshot::default()
+        };
+        assert!(
+            record_diagnostics(&handle, &snapshot),
+            "a live pipeline delivers the diagnostic readings"
+        );
+        handle.mark_shut_down();
+        assert!(
+            !record_diagnostics(&handle, &snapshot),
+            "a shut-down pipeline refuses the diagnostic readings too — the \
+             export must surface the shutdown, not answer Ok over readings \
+             it never delivered"
         );
     }
 

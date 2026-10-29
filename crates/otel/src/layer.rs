@@ -456,20 +456,20 @@ impl OtelTracingLayer {
         if let Some(handle) = &self.installed_meter {
             handle.mark_shut_down();
         }
-        if let Err(err) = self
-            .tracer_provider
-            .force_flush()
-            .and_then(|()| self.tracer_provider.shutdown())
-        {
+        let flushed = self.tracer_provider.force_flush();
+        let stopped = self.tracer_provider.shutdown();
+        if let Err(err) = flushed.and(stopped) {
             first = Err(crate::OtelInstallError::Flush(err.to_string()));
         }
         if let Some(meter) = &self.meter_provider {
-            meter.force_flush().ok();
+            let flush_result = meter
+                .force_flush()
+                .map_err(|err| crate::OtelInstallError::Flush(err.to_string()));
             let meter_result = meter
                 .shutdown()
                 .map_err(|err| crate::OtelInstallError::Flush(err.to_string()));
             if first.is_ok() {
-                first = meter_result;
+                first = flush_result.and(meter_result);
             }
         }
         first
@@ -844,6 +844,128 @@ mod tests {
             !crate::metrics::record_registry(&owner, 0xA3, &snapshot),
             "the owning pipeline's shutdown ends the exports its handle \
              fronts"
+        );
+    }
+
+    /// A span exporter whose export always fails, recording that its
+    /// shutdown ran.
+    ///
+    /// The shutdown pin needs a flush that fails while the provider is
+    /// still required to stop: the flag is the observable for "shutdown
+    /// ran anyway", which is the behavior a failed flush used to skip.
+    #[derive(Debug)]
+    struct FailingSpanExporter {
+        stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl opentelemetry_sdk::trace::SpanExporter for FailingSpanExporter {
+        fn export(
+            &self,
+            _batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            std::future::ready(Err(
+                opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                    "planted flush failure".to_string(),
+                ),
+            ))
+        }
+
+        fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A metric exporter in the same shape: export fails, shutdown is
+    /// observable.
+    struct FailingMetricExporter {
+        stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl opentelemetry_sdk::metrics::exporter::PushMetricExporter for FailingMetricExporter {
+        fn export(
+            &self,
+            _metrics: &opentelemetry_sdk::metrics::data::ResourceMetrics,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            std::future::ready(Err(
+                opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                    "planted flush failure".to_string(),
+                ),
+            ))
+        }
+
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(
+            &self,
+            _timeout: std::time::Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn temporality(&self) -> opentelemetry_sdk::metrics::Temporality {
+            opentelemetry_sdk::metrics::Temporality::Cumulative
+        }
+    }
+
+    #[test]
+    fn a_failed_flush_still_stops_the_providers_and_reports_it() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry::trace::Tracer as _;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+
+        let span_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let meter_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_batch_exporter(FailingSpanExporter {
+                stopped: std::sync::Arc::clone(&span_stopped),
+            })
+            .build();
+        let meter_provider = {
+            let reader = PeriodicReader::builder(FailingMetricExporter {
+                stopped: std::sync::Arc::clone(&meter_stopped),
+            })
+            .build();
+            SdkMeterProvider::builder().with_reader(reader).build()
+        };
+
+        // One span and one counter, so each flush has work to carry and
+        // meets the planted failure.
+        let tracer = tracer_provider.tracer("probe");
+        tracer.in_span("flush-me", |_cx| {});
+        meter_provider
+            .meter("probe")
+            .u64_counter("probe.calls")
+            .build()
+            .add(1, &[]);
+
+        let layer = OtelTracingLayer::new(
+            crate::compose_layer_inner(&tracer_provider),
+            tracer_provider,
+            Some(meter_provider),
+        );
+        let outcome = layer.shutdown();
+        assert!(
+            matches!(&outcome, Err(crate::OtelInstallError::Flush(message)) if message.contains("planted")),
+            "the flush failure is what the caller hears, got {outcome:?}"
+        );
+        assert!(
+            span_stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "the tracer provider stops even when its flush failed"
+        );
+        assert!(
+            meter_stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "the meter provider stops even when its flush failed"
         );
     }
 }

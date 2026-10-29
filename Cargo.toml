@@ -56,7 +56,7 @@ lru = { version = "0.18.2", optional = true }
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util", "test-util"] }
 proptest = "1"
-httpmock = { version = "0.8.3", default-features = false, features = ["record"] }
+httpmock = { version = "0.9.0", default-features = false, features = ["record"] }
 serde_yaml = "0.9"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry"] }

@@ -2508,6 +2508,7 @@ impl<C: ApiClient> BareLoop<C> {
         // (injections included) and re-feeds the machine.
         let steered = self.steering.drain_waiting();
         if !steered.is_empty() {
+            crate::tracing_spans::event_steering_drain(steered.len());
             for message in steered {
                 self.machine.inject(message);
             }
@@ -3085,25 +3086,61 @@ impl<C: ApiClient> BareLoop<C> {
             () = cancelled.notified() => return Err(LoopError::Cancelled),
             attempt = self.run_compaction(turn, reason) => match attempt {
                 Ok(outcome) => outcome,
-                Err(LoopError::CompactionFailed { used, limit, .. })
-                    if reason == crate::compact::types::CompactReason::ThresholdExceeded
-                        && used < limit =>
-                {
-                    self.defer_failed_threshold_pass(used);
-                    return Ok(());
+                Err(failure) => {
+                    let deferrable = matches!(
+                        &failure.error,
+                        LoopError::CompactionFailed { used, limit, .. }
+                            if reason == crate::compact::types::CompactReason::ThresholdExceeded
+                                && used < limit
+                    );
+                    crate::tracing_spans::event_compaction(
+                        reason,
+                        failure.tokens_before,
+                        failure.tokens_after,
+                        if deferrable {
+                            crate::tracing_spans::CompactionPassOutcome::Deferred
+                        } else {
+                            crate::tracing_spans::CompactionPassOutcome::Failed
+                        },
+                    );
+                    if deferrable {
+                        if let LoopError::CompactionFailed { used, .. } = &failure.error {
+                            self.defer_failed_threshold_pass(*used);
+                        }
+                        return Ok(());
+                    }
+                    return Err(failure.error);
                 }
-                Err(err) => return Err(err),
             },
         };
         if let Some(compacted) = outcome.compacted {
-            self.machine
-                .compaction_result(compacted, outcome.tokens_before, outcome.tokens_after);
+            let adopted = self.machine.compaction_result(
+                compacted,
+                outcome.tokens_before,
+                outcome.tokens_after,
+            );
+            crate::tracing_spans::event_compaction(
+                reason,
+                outcome.tokens_before,
+                outcome.tokens_after,
+                if adopted {
+                    crate::tracing_spans::CompactionPassOutcome::Applied
+                } else {
+                    crate::tracing_spans::CompactionPassOutcome::Failed
+                },
+            );
         } else {
             let window = self.effective_context_window();
             let threshold_stall = reason == crate::compact::types::CompactReason::ThresholdExceeded
                 && outcome.tokens_after < window
                 && outcome.tokens_after >= outcome.tokens_before;
             if threshold_stall {
+                crate::tracing_spans::event_compaction(
+                    reason,
+                    outcome.tokens_before,
+                    outcome.tokens_after,
+                    crate::tracing_spans::CompactionPassOutcome::Deferred,
+                );
                 self.machine.compaction_deferred(outcome.tokens_after);
                 self.managers.observers().on_compaction_failed(
                     &crate::observer::CompactionFailedContext {
@@ -3120,8 +3157,19 @@ impl<C: ApiClient> BareLoop<C> {
                     },
                 );
             } else {
-                self.machine
+                let fed = self
+                    .machine
                     .compaction_noop(outcome.tokens_before, outcome.tokens_after);
+                crate::tracing_spans::event_compaction(
+                    reason,
+                    outcome.tokens_before,
+                    outcome.tokens_after,
+                    if fed {
+                        crate::tracing_spans::CompactionPassOutcome::Noop
+                    } else {
+                        crate::tracing_spans::CompactionPassOutcome::Failed
+                    },
+                );
             }
         }
         Ok(())
@@ -3211,6 +3259,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     && let Some(action) = self.collect_followup()
                 {
                     let crate::hooks::PostRunAction::FollowUp { prompt, origin } = action;
+                    crate::tracing_spans::event_hook_followup(&origin);
                     if let Some(run) = self.session.current_run_mut() {
                         run.followup_origin = Some(origin);
                         run.output = None;
@@ -3261,6 +3310,9 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
     ) -> Pin<Box<dyn Future<Output = RunResult> + Send + 'a>> {
         self.clear_turn_span_hold();
         Box::pin(async move {
+            if matches!(error, Some(LoopError::Cancelled)) {
+                crate::tracing_spans::event_cancelled(self.machine.turns_taken());
+            }
             if let Some(run) = self.session.current_run_mut() {
                 run.end = Some(self.managers.clock().monotonic());
                 run.stop_reason = error.cloned();
@@ -3428,6 +3480,11 @@ impl<C: ApiClient> BareLoop<C> {
                 None => half,
             };
             self.salvage_target = Some(target);
+            crate::tracing_spans::event_salvage(
+                crate::tracing_spans::SalvageKind::LengthCut,
+                turn,
+                target,
+            );
             self.machine
                 .set_context_tokens(self.effective_context_window().saturating_add(1));
         }
@@ -3543,6 +3600,11 @@ impl<C: ApiClient> BareLoop<C> {
                 None => half,
             };
             self.salvage_target = Some(target);
+            crate::tracing_spans::event_salvage(
+                crate::tracing_spans::SalvageKind::Overflow,
+                turn,
+                target,
+            );
             self.machine
                 .set_context_tokens(self.effective_context_window().saturating_add(1));
         }

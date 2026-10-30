@@ -54,6 +54,39 @@ pub(super) struct CompactStepOutcome {
     pub(super) compacted: Option<Vec<Message>>,
 }
 
+/// A failed compaction pass: the propagating error plus the driver's
+/// measured figures for the signal event.
+///
+/// `tokens_before` is the same driver-measured, provider-token-scale
+/// figure the pass's observer context carried, so the event and the
+/// observer can never disagree. `tokens_after` is the measured size
+/// the failure narrates — the conversation unchanged when the
+/// compactor produced nothing, or the rejected result's own measured
+/// size when the pass succeeded but did not fit.
+pub(super) struct CompactStepFailure {
+    /// The error to propagate, exactly as the pass produced it.
+    ///
+    /// Its own `used`/`limit` pair stays manager-scale, like with
+    /// like — the deferral guard compares them raw, and the machine
+    /// feed routes the figure through the driver's conversion
+    /// separately.
+    pub(super) error: LoopError,
+
+    /// Driver-measured conversation size ahead of the pass.
+    ///
+    /// Taken with the same counter and the same provider-token
+    /// conversion as every successful pass's `tokens_before`, so all
+    /// outcomes of the event family report one scale.
+    pub(super) tokens_before: u64,
+
+    /// The measured size the failure narrates for the pass.
+    ///
+    /// Equal to `tokens_before` when the compactor errored (nothing
+    /// was produced); the `context_figure`-scaled size of the rejected
+    /// result when the pass succeeded but did not fit.
+    pub(super) tokens_after: u64,
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// Compact the conversation context owned by the driving machine.
     ///
@@ -79,6 +112,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// real measurements and terminates with a typed error when compaction
     /// cannot reduce instead of silently looping.
     ///
+    /// A failed pass returns [`CompactStepFailure`]: the propagating
+    /// error beside the driver-measured, provider-token-scale figure
+    /// pair the signal event emits — a compactor error leaves the
+    /// conversation unchanged (`after == before`), while a pass whose
+    /// result still does not fit reports that result's own measured
+    /// size as `after`.
+    ///
     /// # Errors
     ///
     /// Returns [`LoopError::CompactionFailed`] when the configured
@@ -89,7 +129,7 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         reason: crate::compact::types::CompactReason,
-    ) -> Result<CompactStepOutcome, LoopError> {
+    ) -> Result<CompactStepOutcome, CompactStepFailure> {
         let history = self.machine.full_history();
         let tokens_before = self.context_figure(
             self.count_context(&history)
@@ -219,14 +259,22 @@ impl<C: ApiClient> BareLoop<C> {
                         error: overflow.compactor_error.clone(),
                     });
                 match overflow.compactor_error {
-                    Some(cause) => Err(LoopError::CompactionFailed {
-                        used: overflow.tokens_used,
-                        limit: overflow.context_window,
-                        cause,
+                    Some(cause) => Err(CompactStepFailure {
+                        error: LoopError::CompactionFailed {
+                            used: overflow.tokens_used,
+                            limit: overflow.context_window,
+                            cause,
+                        },
+                        tokens_before,
+                        tokens_after: tokens_before,
                     }),
-                    None => Err(LoopError::ContextExceeded {
-                        used: overflow.tokens_used,
-                        limit: overflow.context_window,
+                    None => Err(CompactStepFailure {
+                        error: LoopError::ContextExceeded {
+                            used: overflow.tokens_used,
+                            limit: overflow.context_window,
+                        },
+                        tokens_before,
+                        tokens_after: self.context_figure(overflow.tokens_used),
                     }),
                 }
             }

@@ -790,23 +790,31 @@ impl LoopMachine {
     /// `tokens_after` as the current context size so it does not
     /// immediately request another compaction. The next
     /// [`Self::next_step`] then requests the deferred
-    /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
+    /// [`MachineStep::CallLLM`].
+    ///
+    /// Returns whether the compacted history was adopted: `false`
+    /// when the machine was already terminal, or when the no-progress
+    /// guard — `tokens_after` at or above `tokens_before` — failed the
+    /// run with [`LoopError::CompactionStalled`] instead of adopting.
+    /// A caller narrating the pass settles on this return value, never
+    /// on the compactor's own success.
     pub fn compaction_result(
         &mut self,
         compacted: Vec<Message>,
         tokens_before: u64,
         tokens_after: u64,
-    ) {
+    ) -> bool {
         if self.is_terminal() {
-            return;
+            return false;
         }
         if self.terminate_on_no_progress(tokens_before, tokens_after) {
-            return;
+            return false;
         }
         self.history = crate::message::coalesce_adjacent_assistants(compacted);
         self.pending.clear();
         self.context_tokens = tokens_after;
         self.state = MachineState::Start;
+        true
     }
 
     /// Feed an unchanged compaction result back into the machine.
@@ -829,15 +837,23 @@ impl LoopMachine {
     /// [`LoopError::CompactionStalled`] — compaction cannot shrink this
     /// conversation below the size that triggered the pass.
     /// Has no effect once the machine is terminal.
-    pub fn compaction_noop(&mut self, tokens_before: u64, tokens_after: u64) {
+    ///
+    /// Returns whether the unchanged feed was accepted: `false` when
+    /// the machine was already terminal, or when the no-progress guard
+    /// — `tokens_after` at or above `tokens_before` — failed the run
+    /// with [`LoopError::CompactionStalled`] instead of advancing. A
+    /// caller narrating the pass settles on this return value, never
+    /// on the pass's own shape.
+    pub fn compaction_noop(&mut self, tokens_before: u64, tokens_after: u64) -> bool {
         if self.is_terminal() {
-            return;
+            return false;
         }
         if self.terminate_on_no_progress(tokens_before, tokens_after) {
-            return;
+            return false;
         }
         self.context_tokens = tokens_after;
         self.state = MachineState::Start;
+        true
     }
 
     /// Absorb a stalled pass by serving the next request anyway.
@@ -2276,6 +2292,37 @@ mod tests {
             }
             other => panic!("expected emergency Compact at the line, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compaction_noop_reports_whether_the_unchanged_feed_was_accepted() {
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(400))]);
+        machine.pending.push(Message::user(long_text(50)));
+        assert!(
+            machine.compaction_noop(900, 600),
+            "a shrinking feed advances the machine"
+        );
+        assert!(matches!(machine.state(), MachineState::Start));
+        assert_eq!(
+            machine.history().len(),
+            1,
+            "an accepted no-op must not commit pending messages"
+        );
+        assert_eq!(
+            machine.pending.len(),
+            1,
+            "an accepted no-op must not clear pending messages"
+        );
+        assert!(
+            !machine.compaction_noop(600, 600),
+            "an unchanged feed trips the no-progress guard"
+        );
+        assert!(matches!(
+            machine.state(),
+            MachineState::Terminal(MachineOutcome::Failed {
+                error: LoopError::CompactionStalled { .. }
+            })
+        ));
     }
 
     #[test]

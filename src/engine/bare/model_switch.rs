@@ -102,14 +102,13 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
         }
 
         loop_.managers.fallback().state()?;
-        let from = loop_.client.model();
+        let from = loop_.routed_or_client_model()?;
         if !loop_.client.set_model(trimmed) {
             return Err(LoopError::Config(format!(
                 "client rejected the model switch to {trimmed:?} \
                  (set_model returned false); nothing was changed"
             )));
         }
-
         loop_.anchor = None;
         if let Some(cw) = context_window {
             loop_.session.config.context_window = cw;
@@ -126,10 +125,11 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
             .managers
             .observers()
             .on_model_switched(&ModelSwitchedContext {
-                from,
+                from: from.clone(),
                 to: trimmed.to_string(),
             });
         loop_.last_routed_model = Some(trimmed.to_string());
+        crate::tracing_spans::event_model_switch(&from, trimmed);
 
         Ok(())
     }

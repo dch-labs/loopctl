@@ -2297,11 +2297,22 @@ mod tests {
     #[test]
     fn compaction_noop_reports_whether_the_unchanged_feed_was_accepted() {
         let mut machine = LoopMachine::from_history(vec![Message::user(long_text(400))]);
+        machine.pending.push(Message::user(long_text(50)));
         assert!(
             machine.compaction_noop(900, 600),
             "a shrinking feed advances the machine"
         );
         assert!(matches!(machine.state(), MachineState::Start));
+        assert_eq!(
+            machine.history().len(),
+            1,
+            "an accepted no-op must not commit pending messages"
+        );
+        assert_eq!(
+            machine.pending.len(),
+            1,
+            "an accepted no-op must not clear pending messages"
+        );
         assert!(
             !machine.compaction_noop(600, 600),
             "an unchanged feed trips the no-progress guard"

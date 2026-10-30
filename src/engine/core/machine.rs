@@ -790,23 +790,31 @@ impl LoopMachine {
     /// `tokens_after` as the current context size so it does not
     /// immediately request another compaction. The next
     /// [`Self::next_step`] then requests the deferred
-    /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
+    /// [`MachineStep::CallLLM`].
+    ///
+    /// Returns whether the compacted history was adopted: `false`
+    /// when the machine was already terminal, or when the no-progress
+    /// guard — `tokens_after` at or above `tokens_before` — failed the
+    /// run with [`LoopError::CompactionStalled`] instead of adopting.
+    /// A caller narrating the pass settles on this return value, never
+    /// on the compactor's own success.
     pub fn compaction_result(
         &mut self,
         compacted: Vec<Message>,
         tokens_before: u64,
         tokens_after: u64,
-    ) {
+    ) -> bool {
         if self.is_terminal() {
-            return;
+            return false;
         }
         if self.terminate_on_no_progress(tokens_before, tokens_after) {
-            return;
+            return false;
         }
         self.history = crate::message::coalesce_adjacent_assistants(compacted);
         self.pending.clear();
         self.context_tokens = tokens_after;
         self.state = MachineState::Start;
+        true
     }
 
     /// Feed an unchanged compaction result back into the machine.

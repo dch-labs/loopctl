@@ -985,6 +985,11 @@ fn signal_events_carry_their_documented_names_fields_and_levels() {
             .unwrap_or_else(|| panic!("no {name} event fired, got {events:#?}"))
     };
     for event in &events {
+        assert!(
+            signals::SIGNAL_EVENT_NAMES.contains(&event.name.as_str()),
+            "the vocabulary emits an undeclared event `{}`: {event:?}",
+            event.name
+        );
         assert_eq!(
             event.level,
             tracing::Level::DEBUG,
@@ -1370,6 +1375,100 @@ async fn a_fallback_served_turn_span_names_the_routing_model() {
     );
 }
 
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_model_switch_while_serving_fallback_names_the_served_model_as_from() {
+    use loopctl::api::error::ApiError;
+    use loopctl::api::{ApiClient, NonStreamingResponse, StreamRequest};
+    use loopctl::fallback::FallbackManager;
+    use loopctl::managers::LoopManagers;
+    use loopctl::stream::StreamEvent;
+
+    struct FailingStreamClient {
+        model: Mutex<String>,
+    }
+
+    impl ApiClient for FailingStreamClient {
+        fn model(&self) -> String {
+            self.model.lock().expect("model lock").clone()
+        }
+
+        fn set_model(&self, model: &str) -> bool {
+            *self.model.lock().expect("model lock") = model.to_string();
+            true
+        }
+
+        fn stream_messages(
+            &self,
+            _request: &StreamRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            Box::pin(futures::stream::once(async {
+                Err(ApiError::auth_invalid_key("scripted permanent failure"))
+            }))
+        }
+
+        fn create_message(
+            &self,
+            _request: &StreamRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>>
+        {
+            Box::pin(async { Err(ApiError::api("this test never recovers")) })
+        }
+    }
+
+    let manager = FallbackManager::new(1, 1);
+    manager
+        .set_original_model("primary-model".to_string())
+        .expect("original model set");
+    manager
+        .set_fallback_model("fallback-model")
+        .expect("fallback model set");
+
+    let captures = Arc::new(Captures::default());
+    let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captures)));
+    let guard = tracing::subscriber::set_default(subscriber);
+    let client = Arc::new(FailingStreamClient {
+        model: Mutex::new("primary-model".to_string()),
+    });
+    let managers = LoopManagers::new().with_fallback(manager);
+    let mut agent = BareLoop::new_with_managers(
+        client,
+        ToolRegistry::new(),
+        SessionConfig::default(),
+        managers,
+    );
+    let first = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        first.is_err(),
+        "the scripted permanent failure trips the breaker: {first:?}"
+    );
+    agent
+        .switch_model("switched-model")
+        .apply()
+        .expect("the mock accepts the model switch");
+    drop(guard);
+    let event = captures
+        .events
+        .lock()
+        .expect("events lock")
+        .iter()
+        .find(|event| event.name == "loopctl.model_switch")
+        .expect("the switch narrates itself")
+        .clone();
+    assert_eq!(
+        event.field("from"),
+        Some("fallback-model"),
+        "`from` is the model the run was serving when the switch landed — \
+         the fallback route, never the client's configured primary"
+    );
+    assert_eq!(
+        event.field("to"),
+        Some("switched-model"),
+        "`to` is the model the switch adopted"
+    );
+}
+
 /// A compactor that fails every pass with a fixed cause.
 struct FailingCompactor;
 
@@ -1394,7 +1493,11 @@ impl loopctl::compact::ContextCompactor for FailingCompactor {
 
 /// A compactor that reports success with a result larger than its
 /// input — the pass measured, but the window refuses what it produced.
-struct OversizedCompactor;
+/// Records its own raw before/after counts so the test can hold the
+/// emitted figures against the conversion's monotone shape.
+struct OversizedCompactor {
+    raw: Mutex<(u64, u64)>,
+}
 
 impl loopctl::compact::ContextCompactor for OversizedCompactor {
     fn compact(
@@ -1407,6 +1510,32 @@ impl loopctl::compact::ContextCompactor for OversizedCompactor {
         Box::pin(async move {
             let tokens_before = loopctl::compact::HeuristicTokenCounter.count(&messages);
             messages.push(Message::user("p".repeat(3_000)));
+            let tokens_after = loopctl::compact::HeuristicTokenCounter.count(&messages);
+            *self.raw.lock().expect("raw lock") = (tokens_before, tokens_after);
+            loopctl::compact::CompactionOutcome::compacted(messages, tokens_before, tokens_after)
+        })
+    }
+}
+
+/// A compactor that returns a restructured result — one extra message,
+/// more tokens than it started with — a compacted history that shrank
+/// nothing. The changed message count keeps the manager's no-action
+/// guard from absorbing it, and the small growth keeps the manager's
+/// fit check happy, so the machine's no-progress guard is what refuses
+/// the adoption.
+struct NonShrinkingCompactor;
+
+impl loopctl::compact::ContextCompactor for NonShrinkingCompactor {
+    fn compact(
+        &self,
+        mut messages: Vec<Message>,
+        _target_tokens: u64,
+        _context: loopctl::compact::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = loopctl::compact::CompactionOutcome> + Send + '_>> {
+        use loopctl::compact::TokenCounter;
+        Box::pin(async move {
+            let tokens_before = loopctl::compact::HeuristicTokenCounter.count(&messages);
+            messages.push(Message::user("x"));
             let tokens_after = loopctl::compact::HeuristicTokenCounter.count(&messages);
             loopctl::compact::CompactionOutcome::compacted(messages, tokens_before, tokens_after)
         })
@@ -1574,8 +1703,11 @@ async fn a_failed_compactor_pass_narrates_its_measured_figures() {
 
 #[tokio::test]
 async fn a_pass_that_still_does_not_fit_narrates_its_measured_result() {
+    let compactor = Arc::new(OversizedCompactor {
+        raw: Mutex::new((0, 0)),
+    });
     let (events, befores, outcome) = compaction_run(
-        Arc::new(OversizedCompactor),
+        compactor.clone(),
         1_000,
         Some(loopctl::stream::Usage::new(900, 1)),
     )
@@ -1614,6 +1746,61 @@ async fn a_pass_that_still_does_not_fit_narrates_its_measured_result() {
         after > observer_before,
         "the after-figure is the rejected result's measured size, not the \
          conversation's unchanged size: after {after}, before {observer_before}"
+    );
+    let (raw_before, raw_after) = *compactor.raw.lock().expect("raw lock");
+    assert!(
+        raw_after > raw_before,
+        "the fixture produced a genuinely larger rejected result: \
+         raw after {raw_after}, raw before {raw_before}"
+    );
+    assert!(
+        after > before,
+        "the conversion is monotone in the raw count — the rejected result's \
+         converted size exceeds the conversation's, as its raw size does"
+    );
+    assert_ne!(
+        after, raw_after,
+        "the after-figure rides the engine's provider-token scale, never the \
+         compactor's raw count"
+    );
+}
+
+#[tokio::test]
+async fn a_compacted_result_the_machine_refuses_narrates_itself_as_failed() {
+    let (events, _befores, outcome) = compaction_run(
+        Arc::new(NonShrinkingCompactor),
+        1_150,
+        Some(loopctl::stream::Usage::new(900, 1)),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(loopctl::error::LoopError::CompactionStalled { .. })
+        ),
+        "the no-progress guard fails the run on a shrank-nothing result: {outcome:?}"
+    );
+    let refused = events
+        .iter()
+        .find(|event| event.name == "loopctl.compaction")
+        .expect("the refused pass narrates itself");
+    assert_eq!(
+        refused.field("outcome"),
+        Some("failed"),
+        "a compacted history the machine refused to adopt is never narrated as applied"
+    );
+    let refused_before = refused
+        .field("tokens_before")
+        .and_then(|figure| figure.parse::<u64>().ok())
+        .expect("numeric before-figure");
+    let refused_after = refused
+        .field("tokens_after")
+        .and_then(|figure| figure.parse::<u64>().ok())
+        .expect("numeric after-figure");
+    assert!(
+        refused_after > refused_before,
+        "the refused result did not shrink the conversation — its own \
+         measured size exceeds the pass's starting size"
     );
 }
 

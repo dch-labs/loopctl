@@ -2520,7 +2520,6 @@ impl<C: ApiClient> BareLoop<C> {
         self.turn_wall_start = Some(turn_start);
         let turn_input = self.turn_input(turn);
         crate::tracing_spans::record_turn_query(&turn_input);
-        crate::tracing_spans::record_turn_model(&self.routed_or_client_model()?);
         let (messages, tools) = self.take_prepared_turn(turn).await;
         let mut raw_payload = self
             .count_context(&self.machine.full_history())
@@ -3115,14 +3114,21 @@ impl<C: ApiClient> BareLoop<C> {
             },
         };
         if let Some(compacted) = outcome.compacted {
+            let adopted = self.machine.compaction_result(
+                compacted,
+                outcome.tokens_before,
+                outcome.tokens_after,
+            );
             crate::tracing_spans::event_compaction(
                 reason,
                 outcome.tokens_before,
                 outcome.tokens_after,
-                crate::tracing_spans::CompactionPassOutcome::Applied,
+                if adopted {
+                    crate::tracing_spans::CompactionPassOutcome::Applied
+                } else {
+                    crate::tracing_spans::CompactionPassOutcome::Failed
+                },
             );
-            self.machine
-                .compaction_result(compacted, outcome.tokens_before, outcome.tokens_after);
         } else {
             let window = self.effective_context_window();
             let threshold_stall = reason == crate::compact::types::CompactReason::ThresholdExceeded

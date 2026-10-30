@@ -102,7 +102,7 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
         }
 
         loop_.managers.fallback().state()?;
-        let from = loop_.client.model();
+        let from = loop_.routed_or_client_model()?;
         if !loop_.client.set_model(trimmed) {
             return Err(LoopError::Config(format!(
                 "client rejected the model switch to {trimmed:?} \

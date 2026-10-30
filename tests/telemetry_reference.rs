@@ -30,32 +30,43 @@ fn reference() -> String {
 
 /// The metric rows of the document: a (name, kind, labels) triple from
 /// every metric table row.
+///
+/// Reads only the metrics section, where every `| `loopctl.`-prefixed
+/// table row is a metric row by construction: a row whose kind cell is
+/// not one of the three the catalog knows is a broken row that fails
+/// here, never a silently skipped one — a misspelled kind must not
+/// drop out of both reciprocal checks.
 fn metric_rows(document: &str) -> Vec<(String, &'static str, Vec<String>)> {
+    let section = document
+        .split("## 3.")
+        .nth(1)
+        .and_then(|rest| rest.split("## 4.").next())
+        .expect("the document carries its metrics section");
     let mut rows = Vec::new();
-    for line in document.lines() {
-        let Some(rest) = line.strip_prefix("| `loopctl.") else {
-            continue;
-        };
-        // Only metric table rows carry the kind column; diagnostics and
-        // rollup prose lines start the same way, so require the row to
-        // parse into name / kind / labels cells.
-        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-        if cells.len() < 4 {
+    for line in section.lines() {
+        if !line.starts_with("| `loopctl.") {
             continue;
         }
-        let Some(name) = cells[1]
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        assert!(
+            cells.len() >= 4,
+            "the metric row `{line}` is malformed — a metrics-section row \
+             parses into name / kind / labels cells"
+        );
+        let name = cells[1]
             .trim_matches('`')
             .strip_prefix("loopctl.")
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let _ = rest;
+            .expect("a metrics-section row starting `| `loopctl.` names a loopctl metric")
+            .to_string();
         let Some(kind) = ["counter", "gauge", "histogram"]
             .iter()
             .find(|kind| cells[2] == **kind)
         else {
-            continue;
+            panic!(
+                "the metric row for `{name}` carries unrecognized kind `{}` — \
+                 counter, gauge, or histogram",
+                cells[2]
+            );
         };
         let labels = cells[3]
             .split(',')
@@ -192,6 +203,26 @@ fn the_error_type_row_lists_classes_the_classifier_emits() {
         "the row names its classes in backticks — an unparseable row is a \
          broken pin"
     );
+    for emitted in [
+        "cancelled",
+        "api",
+        "tool_not_found",
+        "tool_execution",
+        "invalid_input",
+        "max_turns_exceeded",
+        "context_exceeded",
+        "budget_exhausted",
+        "loop_detected",
+        "lock_poisoned",
+        "stream_error",
+        "config",
+        "memory",
+    ] {
+        assert!(
+            classes.contains(&emitted),
+            "the run-span error.type row omits the emitted class `{emitted}`"
+        );
+    }
     for class in classes {
         let err = match class {
             "cancelled" => LoopError::Cancelled,

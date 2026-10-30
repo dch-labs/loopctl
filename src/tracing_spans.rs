@@ -80,8 +80,11 @@
 //! pass that measured reports its figures (the conversation's measured
 //! size, and — when the pass produced a result the window refused —
 //! that result's own size), zeros only when nothing was ever measured,
-//! and a salvage reports the target the retry aims at — the compaction
-//! may still decline, which the run's settlement narrates.
+//! and `applied` means the machine adopted the compacted history — a
+//! result that shrank nothing is refused by the no-progress guard and
+//! narrates as `failed`. A salvage reports the target the retry aims
+//! at — the compaction may still decline, which the run's settlement
+//! narrates.
 //!
 //! The `query` field rides the turn span, which is DEBUG — a host filtering
 //! at DEBUG opts into user-content capture, mirroring `OTel`'s content-capture
@@ -247,13 +250,13 @@ pub const TARGET: &str = "loopctl::engine";
 /// drifts from this list fails the vocabulary pin, and a signal added
 /// without a row — or a row without a signal — fails the reference.
 pub const SIGNAL_EVENT_NAMES: [&str; 7] = [
-    "loopctl.compaction",
-    "loopctl.steering_drain",
-    "loopctl.model_switch",
-    "loopctl.transport_fallback",
-    "loopctl.salvage",
     "loopctl.cancelled",
+    "loopctl.compaction",
     "loopctl.hook_followup",
+    "loopctl.model_switch",
+    "loopctl.salvage",
+    "loopctl.steering_drain",
+    "loopctl.transport_fallback",
 ];
 
 /// The settled outcome of one compaction pass, as the
@@ -269,6 +272,9 @@ pub enum CompactionPassOutcome {
     ///
     /// The pass rewrote the history and the machine took the result;
     /// `tokens_after` is the adopted conversation's measured size.
+    /// Emitted only after the machine accepted the result — a
+    /// shrank-nothing compacted history the no-progress guard refuses
+    /// narrates as [`Failed`](Self::Failed).
     Applied,
 
     /// The pass changed nothing and the conversation stands.
@@ -288,10 +294,11 @@ pub enum CompactionPassOutcome {
 
     /// The pass errored into the run.
     ///
-    /// Either the compactor failed or its result still did not fit;
-    /// the run ends. A pass that measured reports its figures — the
-    /// conversation's measured size, and the rejected result's own
-    /// when one was produced.
+    /// Either the compactor failed, its result still did not fit, or
+    /// the machine's no-progress guard refused a compacted history
+    /// that shrank nothing; the run ends. A pass that measured reports
+    /// its figures — the conversation's measured size, and the
+    /// rejected result's own when one was produced.
     Failed,
 }
 
@@ -449,13 +456,17 @@ pub fn record_turn_query(query: &str) {
 /// The run span already names the run's starting model; a fallback
 /// chain or a mid-run [`switch_model`](crate::engine::BareLoop::switch_model)
 /// can change it, and the turn span is where a per-request reader
-/// looks. Called from the turn's request assembly — inside the turn
-/// span's scope — so [`Span::current`](tracing::Span::current) is that
-/// span; the name guard makes a stray call a no-op rather than a field
-/// on the wrong span.
+/// looks. Called from the turn's request-options assembly — inside
+/// the turn span's scope — so [`Span::current`](tracing::Span::current)
+/// is that span; the name-and-target guard makes a stray call a
+/// no-op rather than a field on the wrong span — a host's own
+/// `agent.turn`-named span on another target is never written.
 pub fn record_turn_model(model: &str) {
     let span = tracing::Span::current();
-    if span.metadata().is_none_or(|meta| meta.name() != TURN_SPAN) {
+    if span
+        .metadata()
+        .is_none_or(|meta| meta.name() != TURN_SPAN || meta.target() != TARGET)
+    {
         return;
     }
     span.record(fields::REQUEST_MODEL, model);
@@ -465,7 +476,8 @@ pub fn record_turn_model(model: &str) {
 ///
 /// Fired once per pass with the before/after context figures and the
 /// outcome the machine adopted — [`Applied`](CompactionPassOutcome::Applied)
-/// when compacted history was taken, [`Noop`](CompactionPassOutcome::Noop)
+/// when compacted history was taken (the machine's adoption, not the
+/// compactor's success, decides this), [`Noop`](CompactionPassOutcome::Noop)
 /// when the pass kept the conversation as it stood,
 /// [`Deferred`](CompactionPassOutcome::Deferred) when a threshold pass
 /// could not shrink below the line and the turn is served uncompacted,

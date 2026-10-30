@@ -182,7 +182,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Applies [`routed_model`](Self::routed_model) as the per-request
     /// model override; anything the host set on `request_options` passes
-    /// through untouched when no manager is configured.
+    /// through untouched when no manager is configured. The model the
+    /// assembled request carries is recorded onto the turn span here —
+    /// the one place the request's own value exists — so the span and
+    /// the request can never disagree.
     /// # Errors
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
@@ -191,6 +194,8 @@ impl<C: ApiClient> BareLoop<C> {
         if let Some(model) = self.routed_model()? {
             options.model = Some(model);
         }
+        let serving = options.model.clone().unwrap_or_else(|| self.client.model());
+        crate::tracing_spans::record_turn_model(&serving);
         Ok(options)
     }
 

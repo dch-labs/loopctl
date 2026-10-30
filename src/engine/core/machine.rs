@@ -2326,6 +2326,40 @@ mod tests {
     }
 
     #[test]
+    fn compaction_noop_from_awaiting_compaction_advances_and_keeps_pending() {
+        // The driver feeds the no-op after a `MachineStep::Compact`, when
+        // the machine sits in AwaitingCompaction — so that is the state
+        // whose acceptance the transition must be pinned in, not only
+        // the Start-state path the sibling test walks.
+        let mut machine = small_machine();
+        machine.pending.push(Message::user(long_text(50)));
+        machine.set_context_tokens(160_001);
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::Compact { .. }
+        ));
+        assert!(matches!(
+            machine.state(),
+            MachineState::AwaitingCompaction { .. }
+        ));
+        assert!(
+            machine.compaction_noop(900, 600),
+            "a shrinking no-op is accepted from AwaitingCompaction"
+        );
+        assert!(matches!(machine.state(), MachineState::Start));
+        assert_eq!(
+            machine.pending.len(),
+            1,
+            "an accepted no-op must not clear the pending queue"
+        );
+        assert_eq!(
+            machine.history().len(),
+            1,
+            "an accepted no-op must not commit the pending queue"
+        );
+    }
+
+    #[test]
     fn emergency_compaction_fires_at_95_percent() {
         let policy = MachinePolicy {
             max_turns: 5,

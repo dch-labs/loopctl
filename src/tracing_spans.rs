@@ -57,8 +57,7 @@
 //! run, a steering drain under the turn it steers), so one trace reads
 //! as the whole story. The vocabulary is closed — every name below is
 //! pinned: the names ride [`SIGNAL_EVENT_NAMES`], which the vocabulary
-//! pin and the telemetry reference both iterate, and a new signal is
-//! added to this table first:
+//! pin iterates, and a new signal is added to this table first:
 //!
 //! | Event | Fires at | Fields |
 //! |---|---|---|
@@ -80,11 +79,12 @@
 //! pass that measured reports its figures (the conversation's measured
 //! size, and — when the pass produced a result the window refused —
 //! that result's own size), zeros only when nothing was ever measured,
-//! and `applied` means the machine adopted the compacted history — a
-//! result that shrank nothing is refused by the no-progress guard and
-//! narrates as `failed`. A salvage reports the target the retry aims
-//! at — the compaction may still decline, which the run's settlement
-//! narrates.
+//! and an outcome is settled by the machine's own decision — `applied`
+//! only when it adopts the compacted history, `noop` only when it
+//! accepts the unchanged feed; a result that shrank nothing is refused
+//! by the no-progress guard and narrates as `failed`. A salvage reports
+//! the target the retry aims at — the compaction may still decline,
+//! which the run's settlement narrates.
 //!
 //! The `query` field rides the turn span, which is DEBUG — a host filtering
 //! at DEBUG opts into user-content capture, mirroring `OTel`'s content-capture
@@ -242,13 +242,11 @@ pub const TARGET: &str = "loopctl::engine";
 
 /// Every signal-event name the engine emits, in dictionary order.
 ///
-/// The single list the pinning suite and the telemetry reference
-/// iterate: the vocabulary test fires each helper and asserts its
-/// event carries one of these names, and the reference test asserts
-/// the document's signal-event table names exactly this set. The
-/// helpers spell the names in their own emissions, so a helper that
-/// drifts from this list fails the vocabulary pin, and a signal added
-/// without a row — or a row without a signal — fails the reference.
+/// The single list the vocabulary pin iterates: the test fires each
+/// helper and asserts its event carries one of these names, and
+/// rejects an emission the list does not declare. The helpers spell
+/// the names in their own emissions, so a helper that drifts from
+/// this list fails the vocabulary pin.
 pub const SIGNAL_EVENT_NAMES: [&str; 7] = [
     "loopctl.cancelled",
     "loopctl.compaction",
@@ -281,7 +279,9 @@ pub enum CompactionPassOutcome {
     ///
     /// No compactor ran, a hook vetoed the pass, or the manager
     /// reported no action; both figures are measurements of the same
-    /// unchanged conversation.
+    /// unchanged conversation. Emitted only when the machine accepted
+    /// the unchanged feed — a no-progress stall the guard refuses
+    /// narrates as [`Failed`](Self::Failed).
     Noop,
 
     /// A threshold pass could not shrink below the line; the turn
@@ -295,10 +295,10 @@ pub enum CompactionPassOutcome {
     /// The pass errored into the run.
     ///
     /// Either the compactor failed, its result still did not fit, or
-    /// the machine's no-progress guard refused a compacted history
-    /// that shrank nothing; the run ends. A pass that measured reports
-    /// its figures — the conversation's measured size, and the
-    /// rejected result's own when one was produced.
+    /// the machine's no-progress guard refused a pass that shrank
+    /// nothing — compacted or unchanged alike; the run ends. A pass
+    /// that measured reports its figures — the conversation's measured
+    /// size, and the rejected result's own when one was produced.
     Failed,
 }
 

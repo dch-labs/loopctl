@@ -3157,14 +3157,19 @@ impl<C: ApiClient> BareLoop<C> {
                     },
                 );
             } else {
+                let fed = self
+                    .machine
+                    .compaction_noop(outcome.tokens_before, outcome.tokens_after);
                 crate::tracing_spans::event_compaction(
                     reason,
                     outcome.tokens_before,
                     outcome.tokens_after,
-                    crate::tracing_spans::CompactionPassOutcome::Noop,
+                    if fed {
+                        crate::tracing_spans::CompactionPassOutcome::Noop
+                    } else {
+                        crate::tracing_spans::CompactionPassOutcome::Failed
+                    },
                 );
-                self.machine
-                    .compaction_noop(outcome.tokens_before, outcome.tokens_after);
             }
         }
         Ok(())

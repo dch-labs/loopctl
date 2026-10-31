@@ -179,9 +179,10 @@ const DEMOTION_SINK_LABEL: &str = "memory";
 /// the passes whose rendered entry landed, `loopctl.demotion.errors` the
 /// passes whose entry was refused — together they count attempts.
 /// The family's third event, `loopctl.compaction.evicted.messages`, is
-/// booked by the evicting pass in the engine rather than here: it counts
-/// the messages that left the feed whatever the store then did with them,
-/// and a loop on the default sink evicts while storing nothing.
+/// booked by the engine's compaction driver rather than here, and only once
+/// the machine adopts the compacted history: it counts the messages that left
+/// the feed whatever the store then did with them, and a loop on the default
+/// sink evicts while storing nothing.
 #[derive(Clone)]
 pub struct MemoryDemotionSink {
     /// The store receiving rendered trajectories.

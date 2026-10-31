@@ -52,6 +52,16 @@ pub(super) struct CompactStepOutcome {
     /// `None` when compaction changed nothing — no compactor ran, a
     /// pre-compact hook vetoed the pass, or the manager reported no action.
     pub(super) compacted: Option<Vec<Message>>,
+
+    /// How many messages the pass evicted from the feed.
+    ///
+    /// Carried out rather than counted inside the pass, because a pass that
+    /// produced a history is not yet a conversation that lost messages: the
+    /// driver books `loopctl.compaction.evicted.messages` only once the
+    /// machine adopts the compacted history. A pass dropped on the way there
+    /// — cancelled while a demotion sink was awaited, or refused by the
+    /// machine — leaves the original feed in place and must book nothing.
+    pub(super) evicted_messages: usize,
 }
 
 /// A failed compaction pass: the propagating error plus the driver's
@@ -196,6 +206,7 @@ impl<C: ApiClient> BareLoop<C> {
                 tokens_before,
                 tokens_after: tokens_before,
                 compacted: None,
+                evicted_messages: 0,
             });
         };
 
@@ -210,6 +221,7 @@ impl<C: ApiClient> BareLoop<C> {
                 tokens_before,
                 tokens_after: tokens_before,
                 compacted: None,
+                evicted_messages: 0,
             });
         }
         #[cfg(not(feature = "hooks"))]
@@ -242,6 +254,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
+                let evicted_messages = outcome.evicted.len();
                 self.demote_evicted(&outcome.evicted, reason, turn).await;
                 let tokens_after = self
                     .context_figure(outcome.tokens_after.saturating_add(self.overhead_tokens()));
@@ -277,6 +290,7 @@ impl<C: ApiClient> BareLoop<C> {
                     tokens_before,
                     tokens_after,
                     compacted: Some(outcome.messages),
+                    evicted_messages,
                 })
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
@@ -293,6 +307,7 @@ impl<C: ApiClient> BareLoop<C> {
                     tokens_before,
                     tokens_after,
                     compacted: None,
+                    evicted_messages: 0,
                 })
             }
             Err(overflow) => {
@@ -341,12 +356,14 @@ impl<C: ApiClient> BareLoop<C> {
     /// and a sink that rejects the batch is warned about, never failed
     /// — compaction's own success must not hinge on the memory layer.
     ///
-    /// `loopctl.compaction.evicted.messages` is booked here, before the
-    /// handover, because the row counts messages that left the feed —
-    /// true of every eviction whatever the sink does with them, including
-    /// the default [`NoopDemotionSink`](crate::compact::demote::NoopDemotionSink),
-    /// which keeps nothing. A sink that stores is already counted by its
-    /// own `loopctl.demotion.delivered`.
+    /// This seam books nothing on the metric target. The eviction count rides
+    /// out with [`CompactStepOutcome::evicted_messages`](super::compact::CompactStepOutcome)
+    /// and is booked by the driver once the machine has adopted the compacted
+    /// history — until then the conversation still holds those messages, and a
+    /// pass cancelled here (a storing sink that never returns is enough) drops
+    /// the whole attempt with the history intact. Whether the sink stored,
+    /// refused, or is the default that keeps nothing is its own story, told by
+    /// `loopctl.demotion.delivered` and `loopctl.demotion.errors`.
     pub(super) async fn demote_evicted(
         &self,
         evicted: &[Message],
@@ -356,12 +373,6 @@ impl<C: ApiClient> BareLoop<C> {
         if evicted.is_empty() {
             return;
         }
-        tracing::debug!(
-            target: "loopctl::metrics",
-            metric = "loopctl.compaction.evicted.messages",
-            messages = evicted.len(),
-            "messages left the feed as a compaction pass evicted them"
-        );
         let meta = crate::compact::demote::DemotionContext {
             reason,
             turn,

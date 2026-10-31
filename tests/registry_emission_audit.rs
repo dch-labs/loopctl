@@ -215,20 +215,107 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every `.rs` file under `src/` and `crates/`, code-only.
-fn emission_haystack() -> String {
+/// The code-only text of every `.rs` file under `src/` and `crates/`.
+///
+/// Kept one entry per file rather than one joined blob: an emission site is
+/// decided by the call it sits in, and a scan that runs across a file
+/// boundary could let an opener in one file enclose a name in another.
+fn emission_sources() -> Vec<String> {
     let files = {
         let mut files = Vec::new();
         collect_rs(Path::new("src"), &mut files);
         collect_rs(Path::new("crates"), &mut files);
         files
     };
-    let mut haystack = String::new();
-    for file in &files {
-        haystack.push_str(&code_only(&read(file)));
-        haystack.push('\n');
+    files.iter().map(|file| code_only(&read(file))).collect()
+}
+
+/// Whether `name` has an emission site in `sources`.
+///
+/// A site is `metric = "name"` inside the argument list of a macro call, which
+/// is the only shape an emission takes (`tracing::debug!`). A string that
+/// merely contains the text — a raw string quoting an example, a doc fixture, a
+/// guide shipped as a literal — is prose *about* a row, and prose has never
+/// written a sample.
+fn has_emission_site(sources: &[String], name: &str) -> bool {
+    let mut needle = String::from("metric = ");
+    needle.push('"');
+    needle.push_str(name);
+    needle.push('"');
+    sources.iter().any(|src| {
+        let mut from = 0usize;
+        while let Some(window) = src.get(from..) {
+            let Some(offset) = window.find(&needle) else {
+                return false;
+            };
+            let at = from.saturating_add(offset);
+            if in_macro_call(src, at) {
+                return true;
+            }
+            from = at.saturating_add(needle.len());
+        }
+        false
+    })
+}
+
+fn in_macro_call(src: &str, at: usize) -> bool {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    for (seen, byte) in bytes.iter().take(at).rev().enumerate() {
+        match *byte {
+            b')' | b']' | b'}' => depth = depth.saturating_add(1),
+            b'(' | b'[' | b'{' => {
+                if depth == 0 {
+                    let mut before = at.saturating_sub(1).saturating_sub(seen);
+                    while before > 0 {
+                        match bytes.get(before.saturating_sub(1)) {
+                            Some(b) if b.is_ascii_whitespace() => {
+                                before = before.saturating_sub(1);
+                            }
+                            Some(b) => return *b == b'!',
+                            None => return false,
+                        }
+                    }
+                    return false;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
     }
-    haystack
+    false
+}
+
+#[test]
+fn a_quoted_metric_name_is_not_an_emission_site() {
+    // The gate asks whether a row is *spoken*, not whether its name is spelled.
+    // A real call site counts; the same text inside a string literal, or handed
+    // to a function that never reaches a subscriber, is prose about a row.
+    const Q: &str = "loopctl.dead.row";
+    let call =
+        r#"tracing::debug!(target: "loopctl::metrics", metric = "loopctl.dead.row", "spoken");"#;
+    assert!(
+        has_emission_site(&[call.to_string()], Q),
+        "a `tracing::debug!` site must count, or the gate fails the crate's own emitters"
+    );
+    let quoted = r#"const GUIDE: &str = "spell it as metric = "loopctl.dead.row" in the docs";"#;
+    assert!(
+        !has_emission_site(&[quoted.to_string()], Q),
+        "a string literal quoting the shape is prose, not an emission site"
+    );
+    let plain_call = r#"record("metric = "loopctl.dead.row".to_string());"#;
+    assert!(
+        !has_emission_site(&[plain_call.to_string()], Q),
+        "a function call reaches no subscriber, so it books nothing"
+    );
+    let across = [
+        r#"tracing::debug!("unclosed".to_string(), "#.to_string(),
+        r#"metric = "loopctl.dead.row";"#.to_string(),
+    ];
+    assert!(
+        !has_emission_site(&across, Q),
+        "an unterminated opener in an earlier file cannot make a later name an emission"
+    );
 }
 
 #[test]
@@ -279,7 +366,7 @@ fn the_scan_skips_test_and_example_sources() {
 
 #[test]
 fn every_declared_metric_row_has_an_emission_site() {
-    let haystack = emission_haystack();
+    let sources = emission_sources();
     let declared = declared_names(&read(Path::new("src/metrics/registry.rs")));
     assert!(
         declared.len() > 30,
@@ -289,7 +376,7 @@ fn every_declared_metric_row_has_an_emission_site() {
 
     let unemitted: Vec<&String> = declared
         .iter()
-        .filter(|name| !haystack.contains(&format!("metric = \"{name}\"")))
+        .filter(|name| !has_emission_site(&sources, name))
         .collect();
 
     assert!(

@@ -3216,6 +3216,14 @@ impl<C: ApiClient> BareLoop<C> {
                     crate::tracing_spans::CompactionPassOutcome::Failed
                 },
             );
+            if adopted && outcome.evicted_messages > 0 {
+                tracing::debug!(
+                    target: "loopctl::metrics",
+                    metric = "loopctl.compaction.evicted.messages",
+                    messages = outcome.evicted_messages,
+                    "messages left the feed as the machine adopted a compacted history"
+                );
+            }
         } else {
             let window = self.effective_context_window();
             let threshold_stall = reason == crate::compact::types::CompactReason::ThresholdExceeded

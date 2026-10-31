@@ -25,6 +25,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use loopctl::attachment::{AttachmentStore, FileAttachment};
 use loopctl::compact::CompactReason;
 use loopctl::compact::ContextManager;
 use loopctl::compact::TruncatingCompactor;
@@ -32,7 +33,7 @@ use loopctl::compact::demote::{DemotionContext, DemotionSink, MemoryDemotionSink
 use loopctl::config::SessionConfig;
 use loopctl::engine::{BareLoop, RunConfig, core::Loop};
 use loopctl::manifest::{EnvMap, ManifestDocument};
-use loopctl::memory::{InMemoryStore, LoopMemory};
+use loopctl::memory::{FileMemoryStore, InMemoryStore, LoopMemory};
 use loopctl::message::Message;
 use loopctl::metrics::{MetricsLayer, MetricsObserver, MetricsRegistry, SeriesValue};
 use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
@@ -214,6 +215,101 @@ async fn the_demotion_sink_settles_exactly_its_declared_shape() {
         "a demotion counter carrying a numeric the row does not name is drift: {:?}",
         snap.series.iter().map(|s| &s.name).collect::<Vec<_>>()
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_file_store_gauges_move_with_a_store_not_only_a_flush() {
+    let dir = tempfile::tempdir().expect("a temp dir for the backing file");
+    let memory = FileMemoryStore::open(dir.path().join("memory.jsonl"))
+        .expect("a file store creates its backing file");
+
+    let store = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&store)));
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    memory
+        .store(loopctl::memory::MemoryEntry::new(
+            loopctl::memory::MemoryCategory::Fact,
+            "the launch code is ARC-7",
+        ))
+        .await
+        .expect("the append settles");
+    drop(guard);
+
+    let snap = store.snapshot();
+    let held = snap
+        .series
+        .iter()
+        .find(|s| {
+            s.name == "loopctl.memory.entries"
+                && s.labels.get("store").map(String::as_str) == Some("file")
+        })
+        .expect("an append books the entries gauge with no flush in sight");
+    match &held.value {
+        SeriesValue::Gauge { value } => assert!(
+            (*value - 1.0).abs() < f64::EPSILON,
+            "one entry was appended, so the gauge reads one: {value}"
+        ),
+        other => panic!("memory.entries is a gauge series, got {other:?}"),
+    }
+
+    let bytes = snap
+        .series
+        .iter()
+        .find(|s| {
+            s.name == "loopctl.memory.persist.file_bytes"
+                && s.labels.get("backend").map(String::as_str) == Some("file")
+        })
+        .expect("the same append books the on-disk size");
+    match &bytes.value {
+        SeriesValue::Gauge { value } => assert!(
+            *value > 0.0,
+            "the appended line is on disk, so the file is not empty: {value}"
+        ),
+        other => panic!("persist.file_bytes is a gauge series, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_emptied_attachment_kind_reads_zero_not_its_old_height() {
+    let store = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&store)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut pinned = AttachmentStore::new();
+    pinned.insert(Arc::new(FileAttachment::path_only("notes.md")));
+    assert!(
+        pinned.consolidated_message().is_some(),
+        "one pin renders a consolidated message"
+    );
+
+    let id = pinned
+        .attachments()
+        .first()
+        .expect("one attachment is pinned")
+        .id();
+    assert!(pinned.remove(&id), "a pin is removable by its own id");
+    assert!(
+        pinned.consolidated_message().is_none(),
+        "with nothing pinned there is nothing to consolidate"
+    );
+
+    let snap = store.snapshot();
+    let count = snap
+        .series
+        .iter()
+        .find(|s| {
+            s.name == "loopctl.attachments.count"
+                && s.labels.get("kind").map(String::as_str) == Some("file")
+        })
+        .expect("the pinned set is recorded under its kind");
+    match &count.value {
+        SeriesValue::Gauge { value } => assert!(
+            *value <= f64::EPSILON,
+            "the last file attachment is gone, so the gauge reads zero rather than {value}"
+        ),
+        other => panic!("attachments.count is a gauge series, got {other:?}"),
+    }
 }
 
 #[test]

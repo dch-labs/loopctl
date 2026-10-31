@@ -1417,6 +1417,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_failed_llm_pass_still_measures_its_duration() {
+        // `extract.attempts` counts a failed Llm pass; the duration histogram
+        // must cover that same pass, or it answers only how long the provider
+        // takes when it answers and hides what a pass that never got an answer
+        // cost.
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let store = std::sync::Arc::new(crate::metrics::MetricsRegistry::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::metrics::MetricsLayer::new(std::sync::Arc::clone(&store)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let config = ExtractionConfig {
+            strategy: ExtractionStrategy::Llm,
+            min_turns: 1,
+            include_failures: true,
+            ..ExtractionConfig::default()
+        };
+        let rec = record(TrajectoryOutcome::Failure, vec![turn(0, "ship it", vec![])]);
+        let error = extract_from_record(&rec, &config, None)
+            .await
+            .expect_err("an Llm strategy with no client cannot run");
+        assert!(
+            error.to_string().contains("ApiClient"),
+            "the failure names the missing client: {error}"
+        );
+
+        let snapshot = store.snapshot();
+        let duration = snapshot
+            .series
+            .iter()
+            .find(|s| s.name == "loopctl.memory.extract.duration_ms")
+            .expect("a failed pass is measured, not only counted");
+        assert!(
+            matches!(&duration.value, crate::metrics::SeriesValue::Histogram { .. }),
+            "duration_ms is a histogram series, got {:?}",
+            duration.value
+        );
+    }
+
     fn write_record(record: &TrajectoryRecord) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "loopctl-extractor-test-{}.json",

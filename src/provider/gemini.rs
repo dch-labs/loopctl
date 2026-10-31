@@ -1074,7 +1074,9 @@ fn convert_message(m: &Message) -> Value {
 
 /// Convert a single [`MessagePart`] into a Gemini part JSON object.
 ///
-/// Returns `None` for image parts (not yet supported for Gemini).
+/// Returns `None` for image parts (not yet supported for Gemini) and for
+/// `Thinking` parts, which Gemini has no channel to replay — each dropped
+/// block is booked as `skipped` on the reasoning rows, not left unsaid.
 fn convert_part(p: &MessagePart) -> Option<Value> {
     match p {
         MessagePart::Text { text } => Some(serde_json::json!({"text": text})),

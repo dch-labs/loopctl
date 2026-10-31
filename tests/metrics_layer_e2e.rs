@@ -30,7 +30,6 @@ use loopctl::compact::CompactReason;
 use loopctl::compact::ContextManager;
 use loopctl::compact::TruncatingCompactor;
 use loopctl::compact::demote::{DemotionContext, DemotionSink, MemoryDemotionSink};
-use loopctl::compact::{CompactionContext, CompactionOutcome, ContextCompactor};
 use loopctl::config::SessionConfig;
 use loopctl::engine::{BareLoop, RunConfig, core::Loop};
 use loopctl::manifest::{EnvMap, ManifestDocument};

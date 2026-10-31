@@ -43,6 +43,7 @@
 )]
 
 use std::fs;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -232,8 +233,9 @@ fn emission_sources() -> Vec<String> {
 
 /// Whether `name` has an emission site in `sources`.
 ///
-/// A site is `metric = "name"` appearing as a *field* of a macro call, which is
-/// the only shape an emission takes (`tracing::debug!`). Two shapes are refused:
+/// A site is `metric = "name"` appearing as a *field* of a tracing event aimed
+/// at the metrics target, which is the only shape an emission takes
+/// (`tracing::debug!` with `target: "loopctl::metrics"`). Two shapes are refused:
 /// text inside a string literal — prose *about* a row, and prose has never
 /// written a sample — and a field of anything that is not a macro call.
 ///
@@ -254,7 +256,15 @@ fn emission_site_in(src: &str, name: &str) -> bool {
             return false;
         };
         let at = from.saturating_add(offset);
-        if is_macro_argument(src, at) {
+        if is_macro_argument(src, at)
+            && is_tracing_event(src, at)
+            && aimed_at_metrics(
+                enclosing_macro(src, at)
+                    .and_then(|(_, args)| src.get(args).map(str::to_owned))
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+        {
             return true;
         }
         from = at.saturating_add(1);
@@ -312,10 +322,15 @@ fn is_macro_argument(src: &str, at: usize) -> bool {
     if !matches!(bytes.get(before.saturating_sub(1)), Some(b'(' | b',')) {
         return false;
     }
-    in_macro_call(src, at)
+    enclosing_macro(src, at).is_some()
 }
 
-fn in_macro_call(src: &str, at: usize) -> bool {
+/// The macro call enclosing `at`: the name before its `!`, and its arguments.
+///
+/// Bracket matching treats every bracket as one nesting class, the way the
+/// backwards walk always has — the question is which call a field belongs to,
+/// not how the file parses.
+fn enclosing_macro(src: &str, at: usize) -> Option<(&str, Range<usize>)> {
     let bytes = src.as_bytes();
     let mut depth = 0usize;
     for (seen, byte) in bytes.iter().take(at).rev().enumerate() {
@@ -323,24 +338,89 @@ fn in_macro_call(src: &str, at: usize) -> bool {
             b')' | b']' | b'}' => depth = depth.saturating_add(1),
             b'(' | b'[' | b'{' => {
                 if depth == 0 {
-                    let mut before = at.saturating_sub(1).saturating_sub(seen);
-                    while before > 0 {
-                        match bytes.get(before.saturating_sub(1)) {
-                            Some(b) if b.is_ascii_whitespace() => {
-                                before = before.saturating_sub(1);
-                            }
-                            Some(b) => return *b == b'!',
-                            None => return false,
-                        }
+                    let open = at.saturating_sub(1).saturating_sub(seen);
+                    let mut before = open;
+                    while matches!(
+                        bytes.get(before.saturating_sub(1)),
+                        Some(b' ' | b'\t' | b'\n' | b'\r')
+                    ) {
+                        before = before.saturating_sub(1);
                     }
-                    return false;
+                    if bytes.get(before.saturating_sub(1)) != Some(&b'!') {
+                        return None;
+                    }
+                    let name_end = before.saturating_sub(1);
+                    let mut name_start = name_end;
+                    while name_start > 0
+                        && matches!(
+                            bytes.get(name_start.saturating_sub(1)),
+                            Some(b) if b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'.')
+                        )
+                    {
+                        name_start = name_start.saturating_sub(1);
+                    }
+                    let close = matching_close(src, open)?;
+                    return Some((
+                        src.get(name_start..name_end).unwrap_or_default(),
+                        open.saturating_add(1)..close,
+                    ));
                 }
                 depth = depth.saturating_sub(1);
             }
             _ => {}
         }
     }
-    false
+    None
+}
+
+/// The index of the bracket closing the one at `open`.
+fn matching_close(src: &str, open: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    for (index, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the field at `at` belongs to a tracing event macro.
+///
+/// A `metric` field handed to any other macro reaches no subscriber at all,
+/// whatever its fields say.
+fn is_tracing_event(src: &str, at: usize) -> bool {
+    let Some((name, _)) = enclosing_macro(src, at) else {
+        return false;
+    };
+    matches!(
+        name.rsplit(':').next().unwrap_or_default(),
+        "trace" | "debug" | "info" | "warn" | "error" | "event"
+    )
+}
+
+/// Whether an argument list names the target the metrics layer keeps.
+///
+/// Both spellings count: the literal every shipped emitter writes, and
+/// `MetricsLayer::TARGET`, which the crate's own test emitters use. The layer
+/// drops an event whose target differs from its own, so a field aimed anywhere
+/// else never reaches a row however faithfully it names one.
+fn aimed_at_metrics(args: &str) -> bool {
+    let Some(relative) = args.find("target:") else {
+        return false;
+    };
+    let value = args
+        .get(relative.saturating_add("target:".len())..)
+        .unwrap_or_default()
+        .trim_start();
+    value.starts_with("\"loopctl::metrics\"") || value.starts_with("MetricsLayer::TARGET")
 }
 
 #[test]
@@ -410,6 +490,52 @@ fn a_compactly_spaced_field_counts_and_a_strings_quoted_one_does_not() {
     assert!(
         !emission_site_in(r#"Row { metric = "loopctl.dead.row" }"#, "loopctl.dead.row"),
         "a struct field named `metric` books nothing"
+    );
+}
+
+/// The gate must read the macro and its target, not just its field.
+///
+/// A row is fed only by an event the metrics layer accepts: the layer drops
+/// every event whose target is not its own, so a `metric` field spoken from
+/// another target, or from a macro that is not a tracing event at all, is a
+/// declared row with no emitter wearing the costume of one. Both spellings of
+/// the target count, because the crate's own test emitters write the constant.
+#[test]
+fn a_site_is_a_tracing_event_aimed_at_the_metrics_target() {
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!(target: "loopctl::metrics", metric = "loopctl.dead.row", "spoken");"#,
+            "loopctl.dead.row"
+        ),
+        "the spelling every shipped emitter uses must count"
+    );
+    assert!(
+        emission_site_in(
+            "tracing::debug!(target: MetricsLayer::TARGET, metric = \"loopctl.dead.row\");",
+            "loopctl.dead.row"
+        ),
+        "the constant is the same target, and the crate's test emitters use it"
+    );
+    assert!(
+        !emission_site_in(
+            r#"tracing::debug!(target: "loopctl::engine", metric = "loopctl.dead.row", "spoken");"#,
+            "loopctl.dead.row"
+        ),
+        "an event on another target is dropped by the layer, so it books nothing"
+    );
+    assert!(
+        !emission_site_in(
+            r#"tracing::debug!(metric = "loopctl.dead.row", "spoken");"#,
+            "loopctl.dead.row"
+        ),
+        "an event with no target lands on the module path and is dropped too"
+    );
+    assert!(
+        !emission_site_in(
+            r#"println!("counted {}", metric = "loopctl.dead.row");"#,
+            "loopctl.dead.row"
+        ),
+        "a macro that is not a tracing event reaches no subscriber"
     );
 }
 

@@ -12,6 +12,15 @@
 //! so the mismatch is counted and surfaced rather than papered over
 //! with an invented name.
 //!
+//! The other direction holds too, and is enforced rather than asserted:
+//! every row here has at least one emission site in the crate, so a
+//! declared name is a promise the crate keeps, not a wish.
+//! The repository's own gate, `tests/registry_emission_audit.rs`, reads
+//! this table and fails the build on a row no `metric = "…"` site
+//! names — which is what makes it safe for a consumer to build a
+//! dashboard on a name declared here and see nothing: silence then means
+//! the signal never fired, never that nobody wired it.
+//!
 //! # Examples
 //!
 //! ```

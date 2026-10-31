@@ -389,11 +389,16 @@ pub fn agent_run_span(session_id: uuid::Uuid, model: &str) -> tracing::Span {
 /// Creates the `agent.turn` span for one model-call turn.
 ///
 /// Carries the turn index and — because the span is DEBUG, an explicit
-/// host opt-in for content capture — the input text. The engine records
-/// [`fields::OUTCOME`], duration, the usage fields, and — once the
-/// request is assembled — the serving model (a fallback chain can
-/// change it mid-run, so the run span's model is only the starting
-/// one) at the turn's boundaries before the handle closes.
+/// host opt-in for content capture — the input text, which opens unset
+/// and arrives through [`record_turn_query`] once the turn is assembled.
+/// It opens unset rather than empty for the same reason every other
+/// late-filled field here does: a recorded `tracing` field is *added* to
+/// the `OTel` attribute list, not swapped in, so an opening value ships
+/// alongside the recorded one and the backend receives the key twice.
+/// The engine records [`fields::OUTCOME`], duration, the usage fields,
+/// and — once the request is assembled — the serving model (a fallback
+/// chain can change it mid-run, so the run span's model is only the
+/// starting one) at the turn's boundaries before the handle closes.
 #[must_use = "the Span must be entered or recorded to take effect"]
 pub fn turn_span(ctx: &TurnStartContext) -> tracing::Span {
     tracing::span!(
@@ -401,7 +406,7 @@ pub fn turn_span(ctx: &TurnStartContext) -> tracing::Span {
         Level::DEBUG,
         TURN_SPAN,
         "turn" = ctx.turn,
-        "query" = ctx.query.as_str(),
+        "query" = tracing::field::Empty,
         "gen_ai.request.model" = tracing::field::Empty,
         "outcome" = tracing::field::Empty,
         "duration_ms" = tracing::field::Empty,
@@ -435,11 +440,18 @@ pub fn tool_span(ctx: &ToolPreContext) -> tracing::Span {
 
 /// Records the turn's assembled input onto the current turn span.
 ///
-/// The span opens with an empty `query` because the real text is only
+/// The span opens with `query` unset because the real text is only
 /// known once the turn is assembled — steering injections included —
 /// and the engine computes that string exactly once, for the turn-start
 /// observers; this records it onto the span from the same value, so the
 /// two consumers can never disagree about what the turn's input was.
+/// Unset is the opening shape, not an empty string: a `tracing` record
+/// adds an attribute to an `OTel` span instead of replacing one, so a
+/// span that opened with `""` would export both the empty opener and the
+/// recorded text under the same key, and a backend that keeps the first
+/// occurrence it sees would show an empty input for every turn. A turn
+/// that ends before this point exports no `query` at all, which says
+/// *never assembled* rather than *assembled as nothing*.
 /// The same name check as [`record_turn_end`] keeps stray callers from
 /// writing turn text onto someone else's span, and on a host that
 /// filters the span away the record is a no-op.

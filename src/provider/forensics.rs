@@ -133,6 +133,12 @@ pub(super) fn log_wire_failure(status: u16, meta: &ProviderMeta) {
     let class = wire_failure_class(status);
     let empty = RateLimitSnapshot::default();
     let quota = meta.rate_limit.as_ref().unwrap_or(&empty);
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.provider.wire_failures",
+        class,
+        "one provider wire failure classified"
+    );
     match class {
         "auth" | "other" => {
             tracing::warn!(
@@ -168,6 +174,12 @@ pub(super) fn log_wire_failure(status: u16, meta: &ProviderMeta) {
 /// connect failure is usually transient and the retry narrates it at the
 /// caller's level.
 pub(super) fn log_transport_failure(error: &str) {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.provider.wire_failures",
+        class = "network",
+        "one provider transport failure"
+    );
     tracing::debug!(
         target: "loopctl::provider::forensics",
         class = "network",

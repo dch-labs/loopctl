@@ -297,10 +297,27 @@ impl ToolMiddleware for VerifyMiddleware {
             let verify = verifier
                 .verify_call(&ctx.tool_context, resolved, &input_at_call)
                 .await;
+            record_verdict(verify.passed);
             append_verify_result(&mut result.output, &verify);
             result
         })
     }
+}
+
+/// Count one write-tool verification verdict, whichever way it fell.
+///
+/// Backs `loopctl.verify.passes`. Both verdicts share the counter and are
+/// told apart by the `outcome` label, because a pass rate is a ratio and a
+/// denominator that counts only passes measures nothing. It is recorded
+/// where the verdict is turned into the block the model reads, so what is
+/// counted is exactly what was reported.
+fn record_verdict(passed: bool) {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.verify.passes",
+        outcome = if passed { "pass" } else { "fail" },
+        "a write-tool verification reached its verdict"
+    );
 }
 
 /// Append a `[verify]` block to a [`ToolContent`].

@@ -1,12 +1,19 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama conformance check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check doc-census
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama conformance check-default check-no-default package-check redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check doc-census
 
-ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check client-check
+ci: fmt package-check check check-default check-no-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check client-check
 
 check:
 	cargo check --all-features
 
 check-default:
 	cargo clippy --all-targets -- -D warnings
+
+# The stripped build is its own contract. A helper that exists to serve a
+# feature-gated call site compiles clean under --all-features and is dead code
+# under none, and no other leg here builds the main crate without default
+# features (crates/vector has its own stripped legs below).
+check-no-default:
+	cargo clippy --all-targets --no-default-features -- -D warnings
 
 test:
 	cargo test
@@ -20,6 +27,7 @@ test:
 
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets -p loopctl-derive -- -D warnings
 	cargo clippy --all-targets -p loopctl-sqlite -- -D warnings
 	cargo clippy --all-targets -p loopctl-hnsw -- -D warnings
 	cargo clippy --all-targets -p loopctl-otel -- -D warnings
@@ -203,3 +211,33 @@ client-check:
 	cargo check -p loopctl-client
 	RUSTDOCFLAGS="-D warnings" cargo doc -p loopctl-client --no-deps
 	cargo test -p loopctl-client
+
+# The published tarball is a shipped artifact, so the no-internal-metadata rule
+# applies to it. Cargo packs tracked files *plus* untracked-but-not-ignored
+# ones, so "it is not committed" keeps nothing out of a release — only a real
+# ignore rule or Cargo.toml `exclude` does. Fails on any crate-root document
+# that is not part of the crate, and on the listing itself failing: a gate that
+# printed its verdict on an empty listing would verify nothing and stay green.
+# The message claims the set is *exactly* three documents, so both directions
+# are checked — no stray root documents, and each expected one present.
+package-check:
+	@listing=$$(cargo package --list --allow-dirty --no-verify 2>/dev/null) || { \
+		printf 'package-check: cargo package --list failed, so the tarball was never listed\n' >&2; \
+		exit 1; \
+	}; \
+	stray=$$(printf '%s\n' "$$listing" | grep -E '^[^/]+\.md$$' | grep -vEx 'CHANGELOG.md|README.md|TESTING.md' || true); \
+	if [ -n "$$stray" ]; then \
+		printf 'package-check: the tarball carries crate-root documents that are not part of the crate:\n' >&2; \
+		printf '%s\n' "$$stray" | sed 's/^/  /' >&2; \
+		printf 'Move them out of the crate root, or add them to Cargo.toml `exclude` — untracked is not excluded.\n' >&2; \
+		exit 1; \
+	fi; \
+	missing=""; \
+	for doc in CHANGELOG.md README.md TESTING.md; do \
+		printf '%s\n' "$$listing" | grep -qxF "$$doc" || missing="$$missing $$doc"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		printf 'package-check: the tarball is missing crate-root documents it ships with:%s\n' "$$missing" >&2; \
+		exit 1; \
+	fi; \
+	printf 'package-check: tarball root documents are exactly CHANGELOG.md, README.md, TESTING.md\n'

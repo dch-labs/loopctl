@@ -2268,6 +2268,7 @@ pub(super) fn convert_message(
                 signature,
                 redacted,
             } if thinking_on && (signature.is_some() || redacted.is_some()) => {
+                super::record_reasoning_block("native");
                 thinking_blocks.push(native_thinking_block(
                     text,
                     signature.as_deref(),
@@ -2275,6 +2276,7 @@ pub(super) fn convert_message(
                 ));
             }
             MessagePart::Thinking { text, .. } if reasoning_as_text && !text.is_empty() => {
+                super::record_reasoning_block("as_text");
                 let tail = super::replay_reasoning_tail(text);
                 thinking_blocks.push(serde_json::json!({
                     "type": "text",
@@ -2307,7 +2309,11 @@ pub(super) fn convert_message(
                 }
                 tool_results.push(block);
             }
-            MessagePart::Thinking { .. } | MessagePart::Image { .. } => {}
+            MessagePart::Thinking { .. } => {
+                super::record_reasoning_block("skipped");
+                super::record_reasoning_skip();
+            }
+            MessagePart::Image { .. } => {}
         }
     }
 

@@ -51,6 +51,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets -p loopctl-derive -- -D warnings
 
   clippy-default:
     runs-on: ubuntu-latest

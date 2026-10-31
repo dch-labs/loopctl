@@ -172,9 +172,9 @@ async fn no_exported_body_carries_the_turn_prompt() {
 
     let events = EVENTS.lock().unwrap().clone();
     assert!(
-        events
-            .iter()
-            .any(|event| event["type"] == "span-create" && event["body"]["name"] == "agent.turn"),
+        events.iter().any(|event| {
+            event["type"] == "generation-create" && event["body"]["name"] == "agent.turn"
+        }),
         "the batch carries the turn observation whose span records the prompt, \
          so the sweep below is not scanning an empty payload"
     );

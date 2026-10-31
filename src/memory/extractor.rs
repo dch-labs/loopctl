@@ -223,6 +223,12 @@ pub async fn extract(
 /// `min_turns` and `include_failures` gates before dispatching to the
 /// configured strategy.
 ///
+/// The pass reports `loopctl.memory.extract.duration_ms` measured on the
+/// process's own monotonic clock. This is a free function with no
+/// [`LoopManagers`](crate::managers::LoopManagers) in reach, so the span is
+/// not routed through the determinism seam: a pinned clock freezes the
+/// engine's durations, not this one.
+///
 /// # Errors
 ///
 /// - [`LoopError::Api`] when the `Llm` strategy's provider
@@ -234,6 +240,7 @@ pub async fn extract_from_record(
     config: &ExtractionConfig,
     client: Option<&dyn ApiClient>,
 ) -> Result<Vec<ExtractedMemory>, LoopError> {
+    let pass_started = std::time::Instant::now();
     if record.turns.len() < config.min_turns {
         return Ok(Vec::new());
     }
@@ -292,6 +299,12 @@ pub async fn extract_from_record(
     memories.truncate(config.max_memories);
     let outcome = settle_outcome(fallback_outcome);
     emit_extraction_metrics(&memories, outcome);
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.memory.extract.duration_ms",
+        value = pass_started.elapsed().as_millis(),
+        "one extraction pass settled"
+    );
     Ok(memories)
 }
 
@@ -1239,19 +1252,14 @@ fn settle_outcome(fallback: Option<&'static str>) -> &'static str {
 
 /// The stable `snake_case` telemetry label for a memory category.
 ///
-/// The labels are the contract for the `loopctl.memory.extracted`
-/// counter, matching the trajectory module's outcome-label convention so
-/// downstream dashboards see one vocabulary. Debug-formatted variant
-/// names are deliberately not used — they are unstable presentation.
+/// One spelling with [`MemoryCategory::as_str`], the published vocabulary:
+/// the labels are the contract for the `loopctl.memory.extracted` counter,
+/// matching the trajectory module's outcome-label convention so downstream
+/// dashboards see one vocabulary. Debug-formatted variant names are
+/// deliberately not used — they are unstable presentation, and a second
+/// hand-written list of the same six words is a second thing to drift.
 fn category_label(category: MemoryCategory) -> &'static str {
-    match category {
-        MemoryCategory::Strategy => "strategy",
-        MemoryCategory::ErrorPattern => "error_pattern",
-        MemoryCategory::Insight => "insight",
-        MemoryCategory::Fact => "fact",
-        MemoryCategory::Working => "working",
-        MemoryCategory::Trajectory => "trajectory",
-    }
+    category.as_str()
 }
 
 #[cfg(test)]

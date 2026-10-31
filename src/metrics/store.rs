@@ -246,7 +246,14 @@ pub struct RegistrySnapshot {
     ///
     /// Counters count passes (`+1` per event); a numeric field on one
     /// means the emission site and the declaration disagree about what
-    /// the signal measures.
+    /// the signal measures. The crate's own stream carries one such
+    /// disagreement deliberately: `loopctl.tools.calls` rides a
+    /// `duration_ms` that a pass counter has no use for, so a run
+    /// dispatching N tool calls reads N here, and that figure is the
+    /// baseline rather than a fault to chase. Read the counter as a
+    /// change from the baseline a run establishes — a value above it
+    /// names an emission site that began disagreeing with its own
+    /// declaration.
     pub numeric_on_counter: u64,
 
     /// Count of gauge/histogram events with no resolvable scalar.

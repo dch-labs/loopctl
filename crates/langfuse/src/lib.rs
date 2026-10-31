@@ -6,7 +6,7 @@
 //! | loopctl | Langfuse |
 //! |---|---|
 //! | one `agent.run` span | one **trace**, `session_id` grouping runs |
-//! | `agent.turn` span | observation (kind `span`) under the trace |
+//! | `agent.turn` span | observation (kind `generation`) under the trace — the only observation kind that keeps model and usage |
 //! | `agent.tool` span | observation under the run, beside its turn (the engine dispatches tool spans from the run scope) |
 //! | [`AgentMetrics`] rollup | **scores** on the trace |
 //!

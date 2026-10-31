@@ -24,6 +24,7 @@ use std::sync::Arc;
 use loopctl::metrics::{AgentMetrics, MetricsObserver, MetricsRegistry};
 use opentelemetry::trace::{Status, TraceContextExt as _};
 use opentelemetry::{KeyValue, Value};
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::SpanData;
 use tracing::Subscriber;
@@ -200,8 +201,10 @@ pub struct SpecExporter<E> {
     /// Every transformed [`SpanData`] is handed to it unchanged, which is
     /// what lets one transform ride an in-memory recorder in tests and an
     /// `OTLP` exporter in production without either learning that the
-    /// loopctl vocabulary exists. Flush and shutdown are forwarded rather
-    /// than reimplemented, so batching stays the inner exporter's.
+    /// loopctl vocabulary exists. Flush, shutdown, and the `Resource` a
+    /// provider hands down at build time are forwarded rather than
+    /// reimplemented, so batching and the resource stay the inner
+    /// exporter's.
     inner: E,
 }
 
@@ -245,6 +248,10 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
 
     fn shutdown(&self) -> OTelSdkResult {
         self.inner.shutdown()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
     }
 }
 
@@ -844,6 +851,50 @@ mod tests {
             !crate::metrics::record_registry(&owner, 0xA3, &snapshot),
             "the owning pipeline's shutdown ends the exports its handle \
              fronts"
+        );
+    }
+
+    /// An exporter that remembers the `Resource` it was handed.
+    ///
+    /// A provider passes its resource to each exporter through
+    /// `set_resource`; this is the observable for whether one arrived at
+    /// the transport underneath a wrapper.
+    #[derive(Debug, Default)]
+    struct ResourceSpy {
+        seen: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl opentelemetry_sdk::trace::SpanExporter for ResourceSpy {
+        fn export(
+            &self,
+            _batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            std::future::ready(Ok(()))
+        }
+
+        fn set_resource(&mut self, resource: &Resource) {
+            let name = resource
+                .get(&opentelemetry::Key::from("service.name"))
+                .map(|value| value.as_str().to_string());
+            *self.seen.lock().expect("an uncontested spy") = name;
+        }
+    }
+
+    #[test]
+    fn a_wrapped_exporter_still_receives_the_providers_resource() {
+        use opentelemetry_sdk::trace::SpanExporter as _;
+
+        let spy = ResourceSpy::default();
+        let seen = std::sync::Arc::clone(&spy.seen);
+        let mut exporter = SpecExporter::new(spy);
+        exporter.set_resource(&Resource::builder().with_service_name("loopctl").build());
+        assert_eq!(
+            seen.lock().expect("an uncontested spy").as_deref(),
+            Some("loopctl"),
+            "a wrapper that leaves set_resource to the trait's no-op default \
+             exports to an unnamed service: the batch still arrives, and the \
+             backend files it under a placeholder no one looks in"
         );
     }
 

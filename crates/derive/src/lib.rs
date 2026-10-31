@@ -49,6 +49,24 @@
 //!
 //! [`Tool`]: https://docs.rs/loopctl/latest/loopctl/tool/trait.Tool.html
 
+// Relax strict lints in test code, as the main crate does at its root. The
+// crate enforces a strict no-panic / no-unwrap policy in production code — it
+// is a proc-macro crate, so a panic in `expand` is a broken build, not a
+// runtime error — but test code legitimately unwraps and asserts for
+// readability.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::missing_panics_doc,
+        clippy::indexing_slicing,
+        clippy::unnecessary_wraps,
+        clippy::wildcard_imports,
+    )
+)]
+
 mod attr;
 mod expand;
 

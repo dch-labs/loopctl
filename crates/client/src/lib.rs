@@ -23,7 +23,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! loopctl-client = "0.3"
+//! loopctl-client = "0.5"
 //! ```
 //!
 //! ```rust,no_run

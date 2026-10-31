@@ -188,6 +188,16 @@ impl ManifestDocument {
     /// reference, plus MCP server `env` maps wholesale — so resolved
     /// secrets never reach a recorded pin.
     ///
+    /// A manifest that resolves also reports the choice it made: a
+    /// `loopctl.profile.active` gauge labelled by the profile's own name,
+    /// since the resolved document carries no other record of it (resolution
+    /// drops the overlays). A document resolved with no overlay reports
+    /// `"base"`, the nameless profile, so a dashboard sees one shape for "the
+    /// manifest as authored" instead of a missing series. The gauge settles
+    /// only on success: a document that fails validation or interpolation
+    /// leaves no series behind, so a profile seen on a dashboard is always
+    /// one some process actually ran.
+    ///
     /// # Errors
     ///
     /// [`ManifestError::UnknownProfile`] when `profile` names nothing;
@@ -216,6 +226,13 @@ impl ManifestDocument {
         let canonical =
             serde_json::to_value(&pinned).map_err(|error| projection_failure(&error))?;
         let rendered = canonical.to_string();
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.profile.active",
+            profile = profile.unwrap_or("base"),
+            value = 1,
+            "a manifest resolved under this profile"
+        );
         Ok(ResolvedManifest {
             manifest: runtime,
             canonical_json: canonical,

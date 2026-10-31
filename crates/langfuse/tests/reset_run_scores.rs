@@ -256,7 +256,7 @@ async fn a_run_failing_at_manager_reset_scores_its_own_run() {
         .expect("the completed run's trace carries no level");
 
     assert_eq!(
-        score(&events, failed_id, "outcome")["body"]["stringValue"],
+        score(&events, failed_id, "outcome")["body"]["value"],
         "error",
         "the refused run's own outcome is what its trace scores"
     );
@@ -272,7 +272,7 @@ async fn a_run_failing_at_manager_reset_scores_its_own_run() {
     );
 
     assert_eq!(
-        score(&events, completed_id, "outcome")["body"]["stringValue"],
+        score(&events, completed_id, "outcome")["body"]["value"],
         "success",
         "the completed run still scores its own success"
     );

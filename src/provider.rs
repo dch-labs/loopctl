@@ -192,6 +192,45 @@ pub(super) fn replay_reasoning_tail(text: &str) -> String {
         .collect()
 }
 
+/// Record what happened to a reasoning block on its way to the wire.
+///
+/// `action` names the outcomes the converters can produce: `native` (the
+/// block rides back in the provider's own thinking shape), `as_text` (it
+/// rides back wrapped in a `<thinking>` block because the host enabled
+/// reasoning replay), and `skipped` (it rides back as nothing). Counted one
+/// event per block per request, so the ratio between the actions is the
+/// ratio of reasoning the model can see to reasoning it cannot. Shared
+/// because every dialect decides the same question over its own history —
+/// Gemini answers `skipped` always, having no reasoning channel to replay
+/// into.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+pub(super) fn record_reasoning_block(action: &'static str) {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.reasoning.blocks",
+        action,
+        "a reasoning block was classified for this request"
+    );
+}
+
+/// Record a reasoning block that reached the wire and was withheld.
+///
+/// The `skipped` outcome as its own series, because it is the one an
+/// operator acts on: a host that turned reasoning replay off, a run at an
+/// effort that budgets no thinking block, or a provider with no reasoning
+/// channel at all silently loses every prior turn's reasoning from the
+/// context the model sees. The counter makes that configuration visible
+/// without block-level tracing. One event per block, alongside the
+/// [`record_reasoning_block`] event that names the same block `skipped`.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+pub(super) fn record_reasoning_skip() {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.reasoning.redaction_skips",
+        "a reasoning block reached the wire and rode back as nothing"
+    );
+}
+
 /// Maximum accepted response body size (10 MB).
 ///
 /// Guards against unbounded memory growth from a misbehaving or hostile

@@ -13,7 +13,7 @@
 //! feeds the shield's internal history so multi-call combination rules
 //! (a `curl` followed by `| sh`) can fire across turns.
 //!
-//! Opt-in (P5): nothing changes for a loop that does not install it. A
+//! Opt-in: nothing changes for a loop that does not install it. A
 //! default-constructed loop does not.
 
 use std::future::Future;

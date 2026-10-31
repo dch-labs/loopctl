@@ -81,6 +81,16 @@ impl<C: ApiClient> BareLoop<C> {
     /// between what was counted and what was sent. An empty selection
     /// or empty registry advertises nothing (the request omits the
     /// tools field).
+    ///
+    /// The choice narrates itself where it is decided:
+    /// `loopctl.tools.selected` carries the selector's own name beside the
+    /// count `loopctl.tools.advertised_count` reports, so a reader can tell
+    /// "the selector chose narrowly" from "the registry is small".
+    /// `selector="none"` identifies an unconfigured loop — the crate's
+    /// built-ins name themselves and a host's own selector reports
+    /// `"custom"`. The `loopctl.tools.schema_tokens` this records carries
+    /// `direction="advertised"`, the outbound half of the schema-token pair;
+    /// the arriving half is `direction="received"` at the registry seam.
     pub(super) async fn turn_tool_schemas(
         &self,
         turn: usize,
@@ -90,13 +100,16 @@ impl<C: ApiClient> BareLoop<C> {
         if all.is_empty() {
             return None;
         }
+        let mut selector_name = "none";
         let advertised = match (&self.tool_selector, &self.async_tool_selector) {
             (None, None) => all,
             (Some(selector), _) => {
+                selector_name = selector.name();
                 let view = self.selection_view(turn, transients);
                 selector.select(&view.context(), &all)
             }
             (_, Some(selector)) => {
+                selector_name = selector.name();
                 let view = self.selection_view(turn, transients);
                 let cancelled = std::sync::Arc::clone(&self.cancelled);
                 let context = view.context();
@@ -108,6 +121,27 @@ impl<C: ApiClient> BareLoop<C> {
                 }
             }
         };
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.tools.selected",
+            selector = selector_name,
+            "this turn's advertised surface was chosen"
+        );
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.tools.advertised_count",
+            selector = selector_name,
+            value = i64::try_from(advertised.len()).unwrap_or(i64::MAX),
+            "schemas this turn's request advertises"
+        );
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.tools.schema_tokens",
+            direction = "advertised",
+            schema_tokens =
+                i64::try_from(crate::tool::ToolSchema::estimate_tokens(&advertised)).unwrap_or(i64::MAX),
+            "estimated schema tokens this turn advertises"
+        );
         (!advertised.is_empty()).then_some(advertised)
     }
 

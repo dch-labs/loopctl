@@ -25,13 +25,16 @@ pub fn score_events(trace_id: &str, metrics: &loopctl::metrics::AgentMetrics) ->
 
 /// One `score-create` envelope.
 ///
-/// Numeric scores carry `value` directly; categorical ones anchor
-/// `value` at zero and add `stringValue` plus
-/// `dataType: "CATEGORICAL"`, which is what the cloud API requires
-/// for categorical scores.
+/// Numeric scores carry `value` directly. A categorical score carries its
+/// **label** in `value` under `dataType: "CATEGORICAL"`: the server's schema
+/// discriminates on `dataType`, and a numeric `value` under that discriminator
+/// is refused with a per-entry 400 (`expected string` at `body.value`) rather
+/// than stored. The server derives `stringValue` from the label, so only
+/// `value` is sent.
 #[must_use]
 pub fn score_event(trace_id: &str, score: &LangfuseScore) -> Value {
     let mut body = json!({
+        "id": uuid::Uuid::new_v4().to_string(),
         "traceId": trace_id,
         "name": score.name,
         "source": "API",
@@ -40,8 +43,7 @@ pub fn score_event(trace_id: &str, score: &LangfuseScore) -> Value {
         ingest::set(&mut body, "value", json!(value));
     }
     if let Some(text) = &score.string_value {
-        ingest::set(&mut body, "value", json!(0.0));
-        ingest::set(&mut body, "stringValue", json!(text));
+        ingest::set(&mut body, "value", json!(text));
         ingest::set(&mut body, "dataType", json!("CATEGORICAL"));
     }
     ingest::envelope("score-create", &body)
@@ -72,13 +74,21 @@ mod tests {
             .find(|e| e["body"]["name"] == "input_tokens")
             .expect("input_tokens");
         assert_eq!(numeric["type"], "score-create");
+        assert!(
+            numeric["body"]["id"].is_string(),
+            "a score body without its own id is accepted by the server and never stored"
+        );
         assert_eq!(numeric["body"]["traceId"], "trace-1");
         assert_eq!(numeric["body"]["value"], 10.0);
         let categorical = events
             .iter()
             .find(|e| e["body"]["name"] == "outcome")
             .expect("outcome");
-        assert_eq!(categorical["body"]["stringValue"], "success");
+        assert_eq!(categorical["body"]["value"], "success");
         assert_eq!(categorical["body"]["dataType"], "CATEGORICAL");
+        assert!(
+            categorical["body"]["value"].is_string(),
+            "a numeric value under dataType CATEGORICAL is refused by the server"
+        );
     }
 }

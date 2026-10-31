@@ -25,7 +25,7 @@
 //! [`ContextExceeded`](crate::error::LoopError::ContextExceeded) death,
 //! the same death any oversized payload dies. `FileAttachment`'s
 //! 8 `KiB` ceiling is the default guard against pinning the whole
-//! window (P8: for a small-model host, pinning the todo list is the
+//! window (for a small-model host, pinning the todo list is the
 //! cheap alternative to re-reading history — reason about the budget
 //! with the render forms below).
 
@@ -464,12 +464,102 @@ impl AttachmentStore {
     /// with no attachments builds no message at all, so its requests
     /// stay byte-identical to a loop that has never heard of
     /// attachments.
+    ///
+    /// Records the pinned set as telemetry on its way out — see
+    /// [`record_pinned_telemetry`](Self::record_pinned_telemetry).
     #[must_use]
     pub fn consolidated_message(&self) -> Option<Message> {
         if self.attachments.is_empty() {
             return None;
         }
+        self.record_pinned_telemetry();
         Some(Message::new(Role::User, self.render_all()))
+    }
+
+    /// Record the pinned set, one reading per [`AttachmentKind`].
+    ///
+    /// `loopctl.attachments.count` is a gauge: how many attachments of
+    /// that kind are pinned *now*. `loopctl.attachments.tokens_estimate`
+    /// is a histogram of those same pinned attachments' rendered size in
+    /// estimated tokens — the shared heuristic, not a billed count. Both
+    /// are recorded where the set becomes a request (this store's own
+    /// consolidation seam) rather than at each pin, so a gauge read never
+    /// counts a pin that a later replacement made stale, and the histogram
+    /// samples the set that is actually being carried. A kind with nothing
+    /// pinned records nothing: absence is not zero pins on a dashboard, it
+    /// is no reading.
+    pub fn record_pinned_telemetry(&self) {
+        for (kind, kind_label) in [
+            (AttachmentKind::Memory, "memory"),
+            (AttachmentKind::File, "file"),
+            (AttachmentKind::Todo, "todo"),
+        ] {
+            let pinned: Vec<std::sync::Arc<dyn Attachment>> = self
+                .attachments
+                .iter()
+                .filter(|stored| stored.kind() == kind)
+                .cloned()
+                .collect();
+            if pinned.is_empty() {
+                continue;
+            }
+            let parts: Vec<MessagePart> = pinned.iter().map(|stored| stored.render()).collect();
+            let tokens = crate::compact::CompactionOutcome::estimate_tokens(&[Message::new(
+                Role::User,
+                parts,
+            )]);
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.attachments.count",
+                kind = kind_label,
+                value = i64::try_from(pinned.len()).unwrap_or(i64::MAX),
+                "attachments of this kind pinned to every request"
+            );
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.attachments.tokens_estimate",
+                kind = kind_label,
+                tokens_estimate = i64::try_from(tokens).unwrap_or(i64::MAX),
+                "estimated tokens this kind's pinned set carries"
+            );
+        }
+    }
+
+    /// Record what this turn carried past the compaction boundary.
+    ///
+    /// Attachments never enter history, so the consolidated message built
+    /// per turn *is* the seam where the pinned set crosses compaction —
+    /// after a pass has emptied the history, what remains of the context
+    /// is exactly this. `carried_count` counts the attachments that rode
+    /// the message; `carried_bytes` sums their rendered length in bytes,
+    /// the payload the pass could not take.
+    pub fn record_carried_telemetry(&self) {
+        if self.attachments.is_empty() {
+            return;
+        }
+        let bytes: u64 = self
+            .render_all()
+            .iter()
+            .map(|part| match part {
+                MessagePart::Text { text } | MessagePart::Thinking { text, .. } => {
+                    u64::try_from(text.len()).unwrap_or(u64::MAX)
+                }
+                other => serde_json::to_string(other)
+                    .map_or(0, |json| u64::try_from(json.len()).unwrap_or(u64::MAX)),
+            })
+            .sum();
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.compaction.attachments.carried_count",
+            carried_count = i64::try_from(self.attachments.len()).unwrap_or(i64::MAX),
+            "attachments carried past the compaction boundary this turn"
+        );
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.compaction.attachments.carried_bytes",
+            carried_bytes = i64::try_from(bytes).unwrap_or(i64::MAX),
+            "rendered bytes carried past the compaction boundary this turn"
+        );
     }
 }
 

@@ -153,6 +153,13 @@ impl DemotionSink for NoopDemotionSink {
     }
 }
 
+/// The `sink` label carried by demotion metrics from this sink.
+///
+/// Names the receiving store, not the rendering: a host installing its
+/// own [`DemotionSink`] emits its own spelling, so a dashboard splits
+/// demotion volume by where evicted history actually landed.
+const DEMOTION_SINK_LABEL: &str = "memory";
+
 /// Renders evicted turns to text and stores them as trajectory memories.
 ///
 /// The memory-backed sink: one [`MemoryEntry`] per compaction pass, its
@@ -165,6 +172,15 @@ impl DemotionSink for NoopDemotionSink {
 /// runs). Works over any [`LoopMemory`] implementation, from the
 /// in-memory reference store to a vector-backed store — the sink only
 /// calls `store`, so the backend decides what recall means.
+///
+/// Every call settles its own telemetry on the `loopctl::metrics` target,
+/// and the three events partition cleanly rather than overlapping:
+/// `loopctl.compaction.evicted.messages` counts the messages that left the
+/// feed whatever the store then did with them, `loopctl.demotion.delivered`
+/// counts the passes whose rendered entry landed, and
+/// `loopctl.demotion.errors` the passes whose entry was refused — so
+/// delivered and errors together count attempts, and no event carries a
+/// magnitude the eviction counter has not already reported.
 #[derive(Clone)]
 pub struct MemoryDemotionSink {
     /// The store receiving rendered trajectories.
@@ -234,7 +250,37 @@ impl DemotionSink for MemoryDemotionSink {
                 .with_tag("demoted")
                 .with_tag(format!("demoted-hash:{hash:016x}"))
                 .with_tag(format!("session:{}", meta.session_id));
-            self.memory.store(entry).await
+            let category = entry.category;
+            let stored = self.memory.store(entry).await;
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.compaction.evicted.messages",
+                messages = evicted.len(),
+                "messages left the feed for the demotion sink"
+            );
+            if let Err(error) = stored {
+                tracing::debug!(
+                    target: "loopctl::metrics",
+                    metric = "loopctl.demotion.errors",
+                    sink = DEMOTION_SINK_LABEL,
+                    "the demotion sink refused the entry"
+                );
+                return Err(error);
+            }
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.demotion.delivered",
+                sink = DEMOTION_SINK_LABEL,
+                "a rendered trajectory landed in the memory store"
+            );
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.memory.stored",
+                origin = "demoted",
+                category = category.as_str(),
+                "one entry joined the memory store"
+            );
+            Ok(())
         })
     }
 }

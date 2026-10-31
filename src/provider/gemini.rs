@@ -1104,7 +1104,12 @@ fn convert_part(p: &MessagePart) -> Option<Value> {
             );
             Some(serde_json::json!({"functionResponse": fr}))
         }
-        MessagePart::Thinking { .. } | MessagePart::Image { .. } => None,
+        MessagePart::Thinking { .. } => {
+            super::record_reasoning_block("skipped");
+            super::record_reasoning_skip();
+            None
+        }
+        MessagePart::Image { .. } => None,
     }
 }
 

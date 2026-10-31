@@ -1017,6 +1017,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.tool_not_found(tc)
         };
         Self::emit_tool_call_metric(&tc.tool, &result);
+        self.record_first_calls(&tc.tool, turn_idx);
         result
     }
 
@@ -1059,6 +1060,42 @@ impl<C: ApiClient> BareLoop<C> {
             duration_ms = %result.duration.as_millis(),
             "tool call settled"
         );
+    }
+
+    /// Count a settled call as new, where "new" has two meanings.
+    ///
+    /// `loopctl.tools.first_calls` fires once per tool name for the life of
+    /// the loop — how long until a surface is used, the signal a registry
+    /// carries more tools than it ever reaches for. `loopctl.think.first_in_turn`
+    /// fires once per turn for the `Think` tool specifically: a turn that
+    /// reasons before acting looks different from one that reasons only after
+    /// the first write, and only the first call of each kind can say which.
+    /// Both are counters incremented at the settle seam, so a call that
+    /// failed still counts as made — the question each answers is whether the
+    /// attempt happened, not whether it succeeded.
+    fn record_first_calls(&self, tool: &str, turn_idx: usize) {
+        let mut marks = crate::error::recover_guard(self.first_calls.lock());
+        if marks.turn != turn_idx {
+            marks.turn = turn_idx;
+            marks.in_turn.clear();
+        }
+        let first_ever = marks.seen.insert(tool.to_string());
+        let first_this_turn = tool == "Think" && marks.in_turn.insert(tool.to_string());
+        drop(marks);
+        if first_ever {
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.tools.first_calls",
+                "this tool name was called for the first time in the loop"
+            );
+        }
+        if first_this_turn {
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.think.first_in_turn",
+                "the turn's first scratchpad call settled"
+            );
+        }
     }
 
     /// Decide whether to retry a failed tool or return the error as a soft result.

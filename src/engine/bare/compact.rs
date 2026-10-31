@@ -88,6 +88,62 @@ pub(super) struct CompactStepFailure {
 }
 
 impl<C: ApiClient> BareLoop<C> {
+    /// Record what one compaction pass bought, in tokens and in time.
+    ///
+    /// `loopctl.compaction.tokens_saved` is the figure the pass reported on
+    /// the engine's own scale — the provider-token figure the machine
+    /// compares, not the compactor's raw count — so a pass that saved
+    /// nothing reads as zero rather than being skipped.
+    /// `loopctl.compaction.summarize.duration_ms` measures the pass from the
+    /// driver's side, which includes the summarizer call and everything the
+    /// pass owns; a pass that never reached this site (no action, a vetoed
+    /// hook, an errored compactor) records neither, because a failed pass has
+    /// no saving to report and its duration is a different question —
+    /// `loopctl.compaction.no_action` and the signal event carry those
+    /// readings.
+    fn record_pass_savings(&self, tokens_saved: u64, compact_start: std::time::Instant) {
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.compaction.tokens_saved",
+            value = tokens_saved,
+            "one compaction pass reported its saving"
+        );
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.compaction.summarize.duration_ms",
+            value = self.managers.clock().elapsed_since(compact_start).as_millis(),
+            "one compaction pass settled"
+        );
+    }
+
+    /// Tell the observers a compaction pass is starting, before anything
+    /// is reduced.
+    ///
+    /// Fires [`on_pre_compaction`](crate::observer::LoopObserver::on_pre_compaction)
+    /// with the pass's opening figures — the trigger, the turn, the measured
+    /// context against its window, and the message count the pass starts
+    /// from — on the session's own id. A named step rather than an inline
+    /// block so [`run_compaction`](Self::run_compaction) reads as the
+    /// sequence of decisions it makes: notify, reduce, record.
+    fn note_pre_compaction(
+        &self,
+        reason: crate::compact::types::CompactReason,
+        turn: usize,
+        tokens_before: u64,
+        message_count: usize,
+    ) {
+        self.managers
+            .observers()
+            .on_pre_compaction(&PreCompactionContext {
+                reason,
+                turn,
+                tokens_before,
+                context_window: self.effective_context_window(),
+                message_count,
+                session_id: self.session.id,
+            });
+    }
+
     /// Compact the conversation context owned by the driving machine.
     ///
     /// Run when the machine requests it via
@@ -144,16 +200,7 @@ impl<C: ApiClient> BareLoop<C> {
         };
 
         let message_count = history.len();
-        self.managers
-            .observers()
-            .on_pre_compaction(&PreCompactionContext {
-                reason,
-                turn,
-                tokens_before,
-                context_window: self.effective_context_window(),
-                message_count,
-                session_id: self.session.id,
-            });
+        self.note_pre_compaction(reason, turn, tokens_before, message_count);
 
         #[cfg(feature = "hooks")]
         let hook = self.pre_compact_hook(&history, reason);
@@ -199,6 +246,7 @@ impl<C: ApiClient> BareLoop<C> {
                 let tokens_after = self
                     .context_figure(outcome.tokens_after.saturating_add(self.overhead_tokens()));
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
+                self.record_pass_savings(tokens_saved, compact_start);
                 #[cfg(feature = "hooks")]
                 let messages_after = outcome.messages.len();
                 let telemetry = ctx_manager.build_telemetry_with_duration(
@@ -232,6 +280,11 @@ impl<C: ApiClient> BareLoop<C> {
                 })
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
+                tracing::debug!(
+                    target: "loopctl::metrics",
+                    metric = "loopctl.compaction.no_action",
+                    "a compaction pass found nothing to give back"
+                );
                 let tokens_after = self.context_figure(
                     self.count_context(&messages)
                         .saturating_add(self.overhead_tokens()),

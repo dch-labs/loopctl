@@ -916,12 +916,18 @@ impl FileMemoryStore {
     /// re-arms appends after an earlier append failure latched the
     /// store unusable.
     ///
+    /// A settled rewrite reports `loopctl.memory.persist.flush.duration_ms`
+    /// measured on the process's own monotonic clock; the file store holds no
+    /// clock handle, so this span stays outside the determinism seam that
+    /// freezes the engine's own durations.
+    ///
     /// # Errors
     ///
     /// [`LoopError::Memory`] on any I/O or serialization failure. On
     /// failure the original file is left untouched.
     pub fn flush(&self) -> Result<(), LoopError> {
         use std::sync::atomic::Ordering as AtomicOrdering;
+        let started = std::time::Instant::now();
         Self::converge_with_registry();
         let shared = recover_guard(self.inner.current.read());
         let mut entries = recover_guard(shared.entries.write());
@@ -931,9 +937,37 @@ impl FileMemoryStore {
         {
             *entries = adopted;
         }
-        match Self::rewrite(&backing_path, &entries) {
+        let rewrite = Self::rewrite(&backing_path, &entries);
+        match rewrite {
             Ok(()) => {
                 shared.append_unusable.store(false, AtomicOrdering::SeqCst);
+                tracing::debug!(
+                    target: "loopctl::metrics",
+                    metric = "loopctl.memory.persist.writes",
+                    backend = "file",
+                    "one durable rewrite completed"
+                );
+                tracing::debug!(
+                    target: "loopctl::metrics",
+                    metric = "loopctl.memory.persist.flush.duration_ms",
+                    backend = "file",
+                    value = started.elapsed().as_millis(),
+                    "durable rewrite settled"
+                );
+                tracing::debug!(
+                    target: "loopctl::metrics",
+                    metric = "loopctl.memory.persist.file_bytes",
+                    backend = "file",
+                    value = std::fs::metadata(&backing_path).map_or(0, |m| m.len()),
+                    "memory file size after rewrite"
+                );
+                tracing::debug!(
+                    target: "loopctl::metrics",
+                    metric = "loopctl.memory.entries",
+                    store = "file",
+                    value = entries.len(),
+                    "entries held by the file store"
+                );
                 Ok(())
             }
             Err(RewriteError::NotDurable(error)) => {

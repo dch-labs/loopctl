@@ -128,6 +128,19 @@ impl ToolRegistry {
     /// order; every landed registration bumps
     /// [`version`](Self::version).
     ///
+    /// A registration narrates itself twice.
+    /// `loopctl.tools.registry.mutations` with `op="register"` counts the
+    /// change that landed; a name already in the registry draws a `WARN`
+    /// first, because an overwrite silently changes what anything already
+    /// holding this registry will serve. `loopctl.tools.schema_tokens` with
+    /// `direction="received"` measures the schema that arrived — its
+    /// estimate is taken before the tool is moved into the registry, the
+    /// only moment the schema is still readable, and the figure below
+    /// describes exactly that schema. It is the other half of a pair:
+    /// `direction="advertised"` at the request seam counts the slice of this
+    /// surface one turn actually carries. Both follow the shared
+    /// token-estimation convention, so they are hints, not billed counts.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -137,6 +150,7 @@ impl ToolRegistry {
     /// ```
     pub fn register(&self, tool: impl Tool + 'static) {
         let name = tool.name().to_string();
+        let arrived = tool.schema();
         let mut state = crate::error::recover_guard(self.state.write());
         if state.tools.contains_key(&name) {
             tracing::warn!(
@@ -148,6 +162,26 @@ impl ToolRegistry {
         }
         state.tools.insert(name, Arc::new(tool));
         self.bump_version();
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.tools.registry.mutations",
+            op = "register",
+            "one tool joined the advertised surface"
+        );
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.tools.schema_tokens",
+            direction = "received",
+            schema_tokens =
+                i64::try_from(ToolSchema::estimate_tokens(&[arrived])).unwrap_or(i64::MAX),
+            "one tool schema joined the advertised surface"
+        );
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.tools.registered",
+            value = state.tools.len(),
+            "tools currently advertised"
+        );
     }
 
     /// Remove the tool registered under `name`.
@@ -167,6 +201,23 @@ impl ToolRegistry {
         if removed {
             state.order.retain(|stored| stored != name);
             self.bump_version();
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.tools.registry.mutations",
+                op = "deregister",
+                "one tool left the advertised surface"
+            );
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.tools.registry.inflight_drains",
+                "a removed tool's in-flight call now drains unadvertised"
+            );
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.tools.registered",
+                value = state.tools.len(),
+                "tools currently advertised"
+            );
         }
     }
 

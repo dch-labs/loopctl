@@ -1724,6 +1724,7 @@ fn convert_message(m: &Message, replay_reasoning: bool) -> Vec<Value> {
         match p {
             MessagePart::Text { text } => text_parts.push(text.as_str()),
             MessagePart::Thinking { text, .. } if replay_reasoning && !text.is_empty() => {
+                super::record_reasoning_block("as_text");
                 reasoning_parts.push(super::replay_reasoning_tail(text));
             }
             MessagePart::ToolCall { id, name, input } => {
@@ -1745,7 +1746,11 @@ fn convert_message(m: &Message, replay_reasoning: bool) -> Vec<Value> {
                     "content": output.to_string(),
                 }));
             }
-            MessagePart::Thinking { .. } | MessagePart::Image { .. } => {}
+            MessagePart::Thinking { .. } => {
+                super::record_reasoning_block("skipped");
+                super::record_reasoning_skip();
+            }
+            MessagePart::Image { .. } => {}
         }
     }
 

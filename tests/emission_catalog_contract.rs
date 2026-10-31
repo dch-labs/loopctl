@@ -7,7 +7,8 @@
 //! forever on every consumer, so the agreement is asserted here, on
 //! real emission sites, not on hand-written field lists. Scenarios drive
 //! the engine, both memory stores, the fallback chain, both summarizers,
-//! and the embedding client; every event the capture sees on the metrics
+//! the memoizing middleware, the memory-backed demotion sink, and the
+//! embedding client; every event the capture sees on the metrics
 //! target must pass `registry::validate`, and every signal the suite is
 //! expected to fire must appear at least once.
 //!
@@ -35,6 +36,7 @@ use loopctl::api::ApiClient;
 use loopctl::api::NonStreamingResponse;
 use loopctl::api::StreamRequest;
 use loopctl::api::error::ApiError;
+use loopctl::compact::demote::{DemotionContext, DemotionSink, MemoryDemotionSink};
 use loopctl::compact::qa_summarizer::{QaSummarizer, QaSummarizerConfig};
 use loopctl::compact::structured_summarizer::{StructuredSummarizer, StructuredSummaryConfig};
 use loopctl::compact::{
@@ -52,10 +54,12 @@ use loopctl::memory::{
 };
 use loopctl::message::Message;
 use loopctl::metrics::registry;
+use loopctl::middleware::{MemoizingMiddleware, NoopPathExtractor, ToolPipeline};
 use loopctl::stream::{StreamEvent, StreamStopReason, Usage};
 use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
 use loopctl::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema};
 use serde_json::json;
+use uuid::Uuid;
 
 /// One captured metric event: its catalog name and its label keys.
 #[derive(Debug, Clone)]
@@ -473,6 +477,62 @@ async fn embed_scenario() {
     assert_eq!(batch.len(), 2, "both embeddings came back");
 }
 
+/// Drive the memoizing middleware through a miss and the hit it enables.
+///
+/// Two turns call the same tool with the same input, so the second is
+/// served from the cache: the pair is what makes the hits/misses ratio the
+/// two declared rows exist to carry measurable in both directions.
+async fn memoize_scenario() {
+    let registry_tools = ToolRegistry::new();
+    registry_tools.register(PlainTool);
+    let mut engine = BareLoop::new(
+        Arc::new(MockApiClient::new("m").with_responses(vec![
+            turn("m1", "plain"),
+            turn("m2", "plain"),
+            terminal(),
+        ])),
+        registry_tools,
+        SessionConfig::default(),
+    );
+    engine
+        .set_pipeline(
+            ToolPipeline::builder().with_middleware(MemoizingMiddleware::new(
+                vec!["plain".to_string()],
+                Vec::new(),
+                Arc::new(NoopPathExtractor),
+                5,
+            )),
+        )
+        .expect("static pipeline composition is valid");
+    engine
+        .run(
+            "emission catalog contract: memoize legs",
+            &RunConfig::default(),
+        )
+        .await
+        .expect("the scripted run completes");
+}
+
+/// Hand an evicted slice to the memory-backed demotion sink.
+async fn demotion_scenario() {
+    let store = Arc::new(InMemoryStore::new());
+    let sink = MemoryDemotionSink::new(Arc::clone(&store) as Arc<dyn LoopMemory>);
+    let evicted = vec![
+        Message::user("the launch decision was Tuesday"),
+        Message::assistant("shipped on Wednesday instead"),
+    ];
+    sink.demote(
+        &evicted,
+        DemotionContext {
+            reason: CompactReason::ThresholdExceeded,
+            turn: 2,
+            session_id: Uuid::new_v4(),
+        },
+    )
+    .await
+    .expect("the sink accepts the rendered slice");
+}
+
 #[tokio::test]
 async fn every_live_emission_validates_against_the_catalog() {
     let capture = Arc::new(ContractCapture {
@@ -489,6 +549,8 @@ async fn every_live_emission_validates_against_the_catalog() {
     fallback_scenario().await;
     qa_scenario().await;
     structured_scenario().await;
+    memoize_scenario().await;
+    demotion_scenario().await;
     #[cfg(feature = "ollama")]
     embed_scenario().await;
 
@@ -511,6 +573,11 @@ async fn every_live_emission_validates_against_the_catalog() {
         "loopctl.compaction.degradations",
         "loopctl.compaction.summarizer.tokens",
         "loopctl.compaction.structured.sections",
+        "loopctl.memoize.hits",
+        "loopctl.memoize.misses",
+        "loopctl.demotion.delivered",
+        "loopctl.compaction.evicted.messages",
+        "loopctl.memory.stored",
     ];
     #[cfg(feature = "vector_memory")]
     expected.extend([

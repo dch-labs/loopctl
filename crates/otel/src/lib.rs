@@ -98,14 +98,26 @@ pub enum OtelMetricsMode {
 /// [`loopctl::metrics::MetricsRegistry`].
 #[derive(Clone)]
 pub struct OtelConfig {
-    /// The `OTLP` endpoint traces and metrics are both sent to. Default
-    /// `http://localhost:4318`.
+    /// The collector that traces and metrics are both sent to, as a **base**
+    /// URL. Default `http://localhost:4318`.
     ///
     /// One endpoint configures both exporters, so a pipeline pointed at a
     /// collector cannot end up shipping spans there and metrics somewhere
     /// else — the shape the metric exporter used to reach on its own. It
     /// is honored on either transport; the default is the `OTLP`/HTTP
     /// collector port the common collectors listen on by default.
+    ///
+    /// Over HTTP each signal kind is delivered at its own path, and the
+    /// `OTLP` SDK appends that path only for an endpoint it resolves from the
+    /// environment — a programmatically supplied one is used verbatim — so
+    /// this field names the collector while [`traces_endpoint`] and
+    /// [`metrics_endpoint`] append `/v1/traces` and `/v1/metrics`. A full
+    /// signal URL is accepted and re-pathed per signal, which is how a
+    /// collector mounted behind a proxy prefix (`https://col/otlp`) is named;
+    /// an empty value hands resolution back to the SDK, so
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` applies with the right path per signal.
+    /// gRPC takes this field verbatim: its service path belongs to the
+    /// protocol.
     pub endpoint: String,
 
     /// gRPC transport; requires the crate's `grpc` feature. Default false.
@@ -189,6 +201,76 @@ impl std::fmt::Debug for OtelConfig {
             )
             .finish()
     }
+}
+
+/// The OTLP/HTTP path a traces request is delivered at.
+const TRACES_PATH: &str = "/v1/traces";
+
+/// The OTLP/HTTP path a metrics request is delivered at.
+const METRICS_PATH: &str = "/v1/metrics";
+
+/// The URL traces are delivered to, for a collector base.
+///
+/// [`traces_endpoint`] and [`metrics_endpoint`] are public because a host that
+/// builds its own exporter needs the same rule the exporters here apply, and
+/// `opentelemetry_otlp` does not apply it for a supplied endpoint. That covers
+/// the hand-composed shape a host owning its subscriber uses, and
+/// `examples/jaeger.rs`.
+#[must_use]
+pub fn traces_endpoint(base: &str) -> String {
+    http_endpoint(base, TRACES_PATH)
+}
+
+/// The URL metrics are delivered to, for a collector base —
+/// [`traces_endpoint`]'s metric twin.
+#[must_use]
+pub fn metrics_endpoint(base: &str) -> String {
+    http_endpoint(base, METRICS_PATH)
+}
+
+/// Resolve the URL one signal kind is posted to from a collector base.
+///
+/// A collector base names a collector; each signal kind arrives at its own
+/// path. The `OTLP` SDK appends that path only when it resolves the endpoint
+/// from the environment or from its own built-in default — an endpoint supplied
+/// programmatically is used **verbatim** (`resolve_http_endpoint` in
+/// `opentelemetry_otlp`'s HTTP exporter) — so a base handed to `with_endpoint`
+/// as-is posts to `/`, which a collector answers with `404`. Nothing reports it
+/// at the call: spans leave through a batch processor, so the failure surfaces
+/// only when the run ends and its batch flushes, and a run that looked exported
+/// delivered nothing. Appending happens here, which is what lets one configured
+/// endpoint keep serving both signal kinds — and they are two kinds, with two
+/// paths, so no single full URL serves both.
+///
+/// Three shapes are honored:
+///
+/// * a **base** gains its signal path — `http://localhost:4318` becomes
+///   `http://localhost:4318/v1/traces`;
+/// * a **full signal URL** keeps its scheme, host, port, and any proxy-mounted
+///   prefix, and its tail is set to the signal being resolved — so
+///   `https://col/otlp/v1/traces` serves traces there and metrics at
+///   `https://col/otlp/v1/metrics`, and a host that already appended the path is
+///   never doubled;
+/// * an **empty** base stays empty, handing resolution back to the SDK:
+///   `OTEL_EXPORTER_OTLP_ENDPOINT`, or its built-in default, each with the right
+///   path per signal.
+///
+/// Trailing slashes on the base never double the path — a base built by
+/// concatenation can carry more than one, and a collector that matches the
+/// request target exactly answers `//v1/traces` with the same silent 404 this
+/// function exists to prevent. gRPC is not this function's business —
+/// [`OtelConfig::use_grpc`] carries its service path in the protocol, so both
+/// gRPC exporters take `OtelConfig::endpoint` verbatim.
+fn http_endpoint(base: &str, signal_path: &str) -> String {
+    if base.is_empty() {
+        return String::new();
+    }
+    let trimmed = base.trim_end_matches('/');
+    let root = trimmed
+        .strip_suffix(TRACES_PATH)
+        .or_else(|| trimmed.strip_suffix(METRICS_PATH))
+        .unwrap_or(trimmed);
+    format!("{root}{signal_path}")
 }
 
 /// Why installation failed.
@@ -500,12 +582,12 @@ fn build_span_exporter(
     config: &OtelConfig,
 ) -> Result<opentelemetry_otlp::SpanExporter, OtelInstallError> {
     use opentelemetry_otlp::WithExportConfig as _;
-    let endpoint = config.endpoint.clone();
     #[cfg(feature = "grpc")]
     if config.use_grpc {
         return opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
-            .with_endpoint(endpoint)
+            // gRPC carries its service path in the protocol: verbatim.
+            .with_endpoint(config.endpoint.clone())
             .build()
             .map_err(|err| OtelInstallError::Exporter(err.to_string()));
     }
@@ -516,7 +598,7 @@ fn build_span_exporter(
     }
     opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint(endpoint)
+        .with_endpoint(traces_endpoint(&config.endpoint))
         .with_timeout(Duration::from_secs(10))
         .build()
         .map_err(|err| OtelInstallError::Exporter(err.to_string()))
@@ -539,12 +621,11 @@ fn build_metric_exporter(
     config: &OtelConfig,
 ) -> Result<opentelemetry_otlp::MetricExporter, OtelInstallError> {
     use opentelemetry_otlp::WithExportConfig as _;
-    let endpoint = config.endpoint.clone();
     #[cfg(feature = "grpc")]
     if config.use_grpc {
         return opentelemetry_otlp::MetricExporter::builder()
             .with_tonic()
-            .with_endpoint(endpoint)
+            .with_endpoint(config.endpoint.clone())
             .with_timeout(Duration::from_secs(10))
             .build()
             .map_err(|err| OtelInstallError::Exporter(err.to_string()));
@@ -556,7 +637,7 @@ fn build_metric_exporter(
     }
     opentelemetry_otlp::MetricExporter::builder()
         .with_http()
-        .with_endpoint(endpoint)
+        .with_endpoint(metrics_endpoint(&config.endpoint))
         .with_timeout(Duration::from_secs(10))
         .build()
         .map_err(|err| OtelInstallError::Exporter(err.to_string()))
@@ -622,9 +703,6 @@ mod tests {
 
     use super::*;
 
-    /// A registry-only `SpanAttributes` config still gets its stamper:
-    /// stamping series onto run spans must not wait on an observer the
-    /// host never configured.
     #[test]
     fn a_registry_only_config_still_builds_a_stamper() {
         let config = OtelConfig {
@@ -640,12 +718,6 @@ mod tests {
         assert!(bare.is_none(), "nothing to stamp, no stamper");
     }
 
-    /// The metric exporter honors the configured endpoint: an endpoint
-    /// no HTTP client can route must fail its build, exactly as it
-    /// fails the span exporter's. Asserted on the metric exporter
-    /// directly — the provider build reaches it only through the span
-    /// exporter, which would fail first and mask a metric exporter that
-    /// ignored the endpoint.
     #[test]
     fn a_pipeline_with_an_unroutable_endpoint_fails_to_build() {
         let config = OtelConfig {
@@ -658,5 +730,55 @@ mod tests {
             "the metric exporter must reject an unroutable endpoint instead of \
              silently building against its own default"
         );
+    }
+
+    #[test]
+    fn a_collector_base_gains_each_signals_own_path() {
+        let base = OtelConfig::default().endpoint;
+        assert_eq!(traces_endpoint(&base), "http://localhost:4318/v1/traces");
+        assert_eq!(metrics_endpoint(&base), "http://localhost:4318/v1/metrics");
+        assert_ne!(
+            traces_endpoint(&base),
+            metrics_endpoint(&base),
+            "two signal kinds cannot share one delivery path"
+        );
+    }
+
+    #[test]
+    fn a_full_signal_url_keeps_its_prefix_and_repaths_per_signal() {
+        let mounted = "https://col.example.com/otlp/v1/traces";
+        assert_eq!(traces_endpoint(mounted), mounted, "never doubled");
+        assert_eq!(
+            metrics_endpoint(mounted),
+            "https://col.example.com/otlp/v1/metrics"
+        );
+        assert_eq!(
+            traces_endpoint("https://col.example.com/otlp/v1/metrics"),
+            "https://col.example.com/otlp/v1/traces"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_double_and_an_empty_base_defers_to_the_sdk() {
+        assert_eq!(
+            traces_endpoint("http://localhost:4318/"),
+            "http://localhost:4318/v1/traces"
+        );
+        assert_eq!(
+            traces_endpoint("http://localhost:4318//"),
+            "http://localhost:4318/v1/traces",
+            "a base built by concatenation can carry two slashes"
+        );
+        assert_eq!(
+            metrics_endpoint("http://localhost:4318/v1/metrics///"),
+            "http://localhost:4318/v1/metrics",
+            "slashes after an already-appended signal path go too"
+        );
+        assert_eq!(
+            traces_endpoint(""),
+            "",
+            "the SDK resolves it, path included"
+        );
+        assert_eq!(metrics_endpoint(""), "");
     }
 }

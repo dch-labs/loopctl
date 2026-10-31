@@ -345,8 +345,14 @@ impl ToolMiddleware for MemoizingMiddleware {
                 append_cached_marker(&mut result.output);
                 result.tool_call_id.clone_from(&ctx.call_id);
                 result.gate = None;
+                tracing::debug!(
+                    target: "loopctl::metrics",
+                    metric = "loopctl.memoize.hits",
+                    "a memoized tool answered from cache and skipped dispatch"
+                );
                 return result;
             }
+            record_cache_miss(is_memoized);
 
             let result = next.dispatch(ctx).await;
 
@@ -390,6 +396,25 @@ fn make_key(tool_name: &str, input: &Value) -> CacheKey {
     CacheKey {
         tool_name: tool_name.to_string(),
         input_hash: hasher.finish(),
+    }
+}
+
+/// Count a memoized tool's cache miss.
+///
+/// Backs `loopctl.memoize.misses`. Reaching the miss arm with the call
+/// memoized means the lookup found nothing — absent, or present but
+/// TTL-expired and evicted by the lookup itself. A tool this middleware
+/// does not track is not a miss: it was never a candidate, so counting it
+/// would make the hits/misses ratio measure the middleware's configuration
+/// rather than its usefulness. The counter therefore stays silent for an
+/// untracked tool, and the pair reads as the value of the tracked set.
+fn record_cache_miss(is_memoized: bool) {
+    if is_memoized {
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.memoize.misses",
+            "a memoized tool found nothing cached and dispatched for real"
+        );
     }
 }
 

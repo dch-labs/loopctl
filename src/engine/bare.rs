@@ -378,6 +378,17 @@ pub struct BareLoop<C: ApiClient> {
     /// is setup, not change.
     observed_registry: Option<(u64, Vec<(String, String)>)>,
 
+    /// The marks behind two counters that cannot be answered statelessly.
+    ///
+    /// `loopctl.tools.first_calls` fires the first time a name is called
+    /// anywhere in the loop's life; `loopctl.think.first_in_turn` the first
+    /// time `Think` is called within a turn. Records are made at dispatch,
+    /// where a call settles, which is a shared-reference seam — hence the
+    /// lock, the same idiom [`tool_overhead`](Self::tool_overhead) uses. A
+    /// name removed and re-registered keeps its mark: the counter counts
+    /// *calls* observed, not registry membership.
+    first_calls: std::sync::Mutex<FirstCallMarks>,
+
     /// Cached components of the per-request overhead.
     ///
     /// Holds the system-prompt and tool-schema costs separately — both
@@ -739,6 +750,45 @@ struct OverheadParts {
     /// estimate of a `response_format` turn, whose request suppresses
     /// tool advertisement.
     tools: u64,
+}
+
+/// Which tool names a loop has already seen called.
+///
+/// The state behind `loopctl.tools.first_calls` (first call in the loop's
+/// life) and `loopctl.think.first_in_turn` (first `Think` call in the
+/// current turn) — neither is answerable from a single dispatch, so the
+/// loop carries the marks. Lives behind the [`BareLoop`] field's lock
+/// because the seam that records them, tool dispatch, holds only a shared
+/// reference; a poisoned lock is recovered rather than propagated, the
+/// crate's rule for telemetry state — losing a mark is not worth failing a
+/// run over.
+#[derive(Debug, Default)]
+struct FirstCallMarks {
+    /// Names called at least once since the loop was built.
+    ///
+    /// Backs `loopctl.tools.first_calls`: a name absent from this set is
+    /// a tool the loop has never exercised, which is the only moment the
+    /// signal is worth emitting. Entries are never removed, so the set
+    /// grows with the distinct tool count of the run — bounded by the
+    /// registry, not by the turn count.
+    seen: std::collections::HashSet<String>,
+
+    /// Names called at least once in the turn [`turn`](Self::turn) names.
+    ///
+    /// Backs `loopctl.think.first_in_turn`: the first `Think` call of a
+    /// turn is worth marking, a repeat within the same turn is noise. The
+    /// set is cleared when the turn number moves, so its contents always
+    /// describe exactly one turn — never a stale carry-over.
+    in_turn: std::collections::HashSet<String>,
+
+    /// The turn number [`in_turn`](Self::in_turn) currently describes.
+    ///
+    /// The generation stamp that lets the per-turn set detect a turn
+    /// boundary without the loop having to remember to clear it: a dispatch
+    /// that arrives with a larger number clears `in_turn` first, then
+    /// adopts that number. Defaults to 0, the pre-first-turn state, where
+    /// every name is by definition first-in-turn.
+    turn: usize,
 }
 
 /// The identity calibration ratio, in thousandths of the raw estimate.
@@ -1202,6 +1252,7 @@ impl<C: ApiClient> BareLoop<C> {
             prepared_turn: None,
             last_advertised_surface: None,
             observed_registry: None,
+            first_calls: std::sync::Mutex::new(FirstCallMarks::default()),
             system_overhead: std::sync::OnceLock::new(),
             tool_overhead: std::sync::Mutex::new(None),
             deferred_transient_tokens: 0,
@@ -1763,6 +1814,7 @@ impl<C: ApiClient> BareLoop<C> {
             prepared_turn: None,
             last_advertised_surface: None,
             observed_registry: None,
+            first_calls: std::sync::Mutex::new(FirstCallMarks::default()),
             system_overhead: std::sync::OnceLock::new(),
             tool_overhead: std::sync::Mutex::new(None),
             deferred_transient_tokens: 0,
@@ -1891,6 +1943,7 @@ impl<C: ApiClient> BareLoop<C> {
             prepared_turn: None,
             last_advertised_surface: None,
             observed_registry: None,
+            first_calls: std::sync::Mutex::new(FirstCallMarks::default()),
             system_overhead: std::sync::OnceLock::new(),
             tool_overhead: std::sync::Mutex::new(None),
             deferred_transient_tokens: 0,
@@ -2279,6 +2332,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// never enter history, which is what makes them
     /// compaction-immune by construction.
     fn attachment_messages(&self) -> Vec<Message> {
+        self.attachments.record_carried_telemetry();
         match self.attachments.consolidated_message() {
             Some(message) => vec![message],
             None => Vec::new(),
@@ -2754,7 +2808,17 @@ impl<C: ApiClient> BareLoop<C> {
             return;
         }
         if let Some(memory) = self.managers.memory() {
-            match memory.retrieve(turn_input, memory_top_k).await {
+            let clock = Arc::clone(self.managers.clock());
+            let retrieve_started = clock.monotonic();
+            let retrieval = memory.retrieve(turn_input, memory_top_k).await;
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.memory.retrieve.duration_ms",
+                store = "memory",
+                value = clock.elapsed_since(retrieve_started).as_millis(),
+                "passive memory retrieve settled"
+            );
+            match retrieval {
                 Ok(entries) => {
                     tracing::debug!(
                         target: "loopctl::metrics",

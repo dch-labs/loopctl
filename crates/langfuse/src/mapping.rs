@@ -162,10 +162,9 @@ pub struct LangfuseScore {
 
     /// Numeric value; mutually exclusive with `string_value`.
     ///
-    /// Set for token totals, turns, latency, and rates. On the wire a
-    /// categorical score still ships a numeric `value` — a zero
-    /// anchor beside `stringValue` — but the struct keeps exactly one
-    /// field populated.
+    /// Set for token totals, turns, latency, and rates. A categorical score
+    /// leaves this `None`, and the wire builder then sends the label itself in
+    /// `value` — the struct keeps exactly one field populated.
     pub value: Option<f64>,
 
     /// Categorical value (e.g. `"success"`).
@@ -191,10 +190,9 @@ impl LangfuseScore {
 
     /// Build a categorical score — Langfuse's named-outcome form.
     ///
-    /// `value` stays `None` on the struct; the wire builder anchors
-    /// the numeric field at zero and carries the category in
-    /// `stringValue` under `dataType: "CATEGORICAL"`, the shape the
-    /// cloud API requires.
+    /// `value` stays `None` on the struct; the wire builder carries the
+    /// category itself in `value` under `dataType: "CATEGORICAL"`, which is
+    /// what the server's discriminated schema accepts.
     fn categorical(name: &str, value: &str) -> Self {
         Self {
             name: name.to_string(),

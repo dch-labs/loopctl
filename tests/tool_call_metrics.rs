@@ -29,7 +29,10 @@ use loopctl::engine::Loop;
 use loopctl::engine::{BareLoop, RunConfig};
 use loopctl::memory::SearchMemoriesTool;
 use loopctl::memory::{InMemoryStore, LoopMemory, MemoryCategory, MemoryEntry};
-use loopctl::middleware::{MemoizingMiddleware, PathExtractor, ToolPipeline};
+use loopctl::middleware::{
+    MemoizingMiddleware, PathExtractor, ToolDispatchContext, ToolDispatchResult, ToolMiddleware,
+    ToolPipeline,
+};
 use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
 use loopctl::tool::health::ToolHealthRegistry;
 use loopctl::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema};
@@ -480,6 +483,86 @@ impl Tool for ThinkNamedTool {
     }
 }
 
+/// A middleware that redirects a marked call to `Think`.
+///
+/// Mirrors what the engine's routing middleware does when it decides a call
+/// needs no execution: it rewrites `ctx.tool_name`, and the rewritten name is
+/// the one the registry looks up. Only a call whose input asks for it is
+/// redirected, so one scenario can compare a call that ran as asked with one
+/// that ran as something else.
+struct ThinkRedirect;
+
+impl ToolMiddleware for ThinkRedirect {
+    fn name(&self) -> &'static str {
+        "think-redirect-for-test"
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        ctx: &'a mut ToolDispatchContext,
+        next: &'a ToolPipeline,
+    ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
+        Box::pin(async move {
+            if ctx.input.get("redirect") == Some(&json!(true)) {
+                ctx.tool_name = "Think".to_string();
+            }
+            next.dispatch(ctx).await
+        })
+    }
+}
+
+/// A call rerouted to `Think` marks the tool that ran, not the one asked for.
+///
+/// Both first-call marks are counted by name, so the two runs of this
+/// scenario separate cleanly: `plain` runs once as asked, then a second call
+/// asks for `plain` and gets `Think`. Counting the requested name instead of
+/// the executed one leaves `Think`'s first call unmarked in both series — the
+/// scratchpad surface looks untouched while it was in fact used — and the
+/// per-turn scratchpad mark never fires at all.
+async fn a_rerouted_call_marks_the_tool_that_ran(capture: &MetricCapture) {
+    let before = capture.events().len();
+    let registry = ToolRegistry::new();
+    registry.register(PlainTool);
+    registry.register(ThinkNamedTool);
+    let mut loop_ = BareLoop::new(
+        Arc::new(MockApiClient::new("m").with_responses(vec![
+            turn("a1", "plain", json!({})),
+            turn("b1", "plain", json!({"redirect": true})),
+            terminal(),
+        ])),
+        registry,
+        SessionConfig::default(),
+    );
+    loop_
+        .set_pipeline(ToolPipeline::builder().with_middleware(ThinkRedirect))
+        .expect("static pipeline composition is valid");
+    loop_
+        .run(
+            "one call as asked, one rerouted to Think",
+            &RunConfig::default(),
+        )
+        .await
+        .expect("the run completes");
+
+    let delta: Vec<String> = capture.events()[before..].to_vec();
+    let ever = delta
+        .iter()
+        .filter(|event| event.contains("metric=loopctl.tools.first_calls"))
+        .count();
+    assert_eq!(
+        ever, 2,
+        "`plain` as asked and `Think` as rerouted are both first-ever calls: {delta:?}"
+    );
+    let in_turn = delta
+        .iter()
+        .filter(|event| event.contains("metric=loopctl.think.first_in_turn"))
+        .count();
+    assert_eq!(
+        in_turn, 1,
+        "the rerouted call is a scratchpad call, and the turn's first: {delta:?}"
+    );
+}
+
 /// A reused loop re-marks its first call at every run boundary.
 ///
 /// Turn numbers are per-run figures — `accept_input` restarts them at 0 — so
@@ -543,6 +626,7 @@ async fn every_call_and_retrieve_settles_one_labeled_event() {
     direct_path_scenario(&capture).await;
     pipeline_path_scenario(&capture).await;
     first_call_marks_rearm_at_a_run_boundary(&capture).await;
+    a_rerouted_call_marks_the_tool_that_ran(&capture).await;
     #[cfg(all(feature = "testing", feature = "vector_memory"))]
     store_internal_distinguishability_scenario(&capture);
     #[cfg(all(feature = "testing", feature = "builtin_tools"))]

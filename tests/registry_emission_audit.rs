@@ -232,30 +232,87 @@ fn emission_sources() -> Vec<String> {
 
 /// Whether `name` has an emission site in `sources`.
 ///
-/// A site is `metric = "name"` inside the argument list of a macro call, which
-/// is the only shape an emission takes (`tracing::debug!`). A string that
-/// merely contains the text — a raw string quoting an example, a doc fixture, a
-/// guide shipped as a literal — is prose *about* a row, and prose has never
-/// written a sample.
+/// A site is `metric = "name"` appearing as a *field* of a macro call, which is
+/// the only shape an emission takes (`tracing::debug!`). Two shapes are refused:
+/// text inside a string literal — prose *about* a row, and prose has never
+/// written a sample — and a field of anything that is not a macro call.
+///
+/// Spacing around `=` is not load-bearing. `cargo fmt` cannot normalise it
+/// inside a macro arm it cannot parse as expressions (`target:` is one), so an
+/// emitter written `metric="name"` survives formatting exactly as its author
+/// typed it, and a gate demanding the spaced spelling would report a working
+/// emitter as having no site.
 fn has_emission_site(sources: &[String], name: &str) -> bool {
-    let mut needle = String::from("metric = ");
-    needle.push('"');
-    needle.push_str(name);
-    needle.push('"');
-    sources.iter().any(|src| {
-        let mut from = 0usize;
-        while let Some(window) = src.get(from..) {
-            let Some(offset) = window.find(&needle) else {
-                return false;
-            };
-            let at = from.saturating_add(offset);
-            if in_macro_call(src, at) {
-                return true;
-            }
-            from = at.saturating_add(needle.len());
+    sources.iter().any(|src| emission_site_in(src, name))
+}
+
+/// One source, one row name.
+fn emission_site_in(src: &str, name: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(tail) = src.get(from..) {
+        let Some(offset) = find_metric_field(tail, name) else {
+            return false;
+        };
+        let at = from.saturating_add(offset);
+        if is_macro_argument(src, at) {
+            return true;
         }
-        false
-    })
+        from = at.saturating_add(1);
+    }
+    false
+}
+
+/// Locate `metric` `=` `"name"`, at any spacing around the `=`.
+fn find_metric_field(hay: &str, name: &str) -> Option<usize> {
+    let bytes = hay.as_bytes();
+    let mut quoted = String::from("\"");
+    quoted.push_str(name);
+    quoted.push('"');
+    let skip_spaces = |mut at: usize| {
+        while matches!(bytes.get(at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            at = at.saturating_add(1);
+        }
+        at
+    };
+    let mut from = 0usize;
+    while let Some(relative) = hay.get(from..).and_then(|tail| tail.find("metric")) {
+        let start = from.saturating_add(relative);
+        let after_word = start.saturating_add("metric".len());
+        let after_spaces = skip_spaces(after_word);
+        if bytes.get(after_spaces) == Some(&b'=') {
+            let at = skip_spaces(after_spaces.saturating_add(1));
+            if hay
+                .get(at..)
+                .is_some_and(|rest| rest.starts_with(quoted.as_str()))
+            {
+                return Some(start);
+            }
+        }
+        from = after_word;
+    }
+    None
+}
+
+/// Whether the `metric` token at `at` opens an argument of a macro call.
+///
+/// Two structural conditions. What introduces the token, past whitespace, is
+/// `(` or `,` — so the match begins an argument rather than sitting inside a
+/// string or in the middle of an expression. And the bracket it belongs to is
+/// opened by a `!`, so it is a macro and not a struct literal or a plain
+/// function call, neither of which reaches a subscriber.
+fn is_macro_argument(src: &str, at: usize) -> bool {
+    let bytes = src.as_bytes();
+    let mut before = at;
+    while matches!(
+        bytes.get(before.saturating_sub(1)),
+        Some(b' ' | b'\t' | b'\n' | b'\r')
+    ) {
+        before = before.saturating_sub(1);
+    }
+    if !matches!(bytes.get(before.saturating_sub(1)), Some(b'(' | b',')) {
+        return false;
+    }
+    in_macro_call(src, at)
 }
 
 fn in_macro_call(src: &str, at: usize) -> bool {
@@ -315,6 +372,44 @@ fn a_quoted_metric_name_is_not_an_emission_site() {
     assert!(
         !has_emission_site(&across, Q),
         "an unterminated opener in an earlier file cannot make a later name an emission"
+    );
+}
+
+#[test]
+fn a_compactly_spaced_field_counts_and_a_strings_quoted_one_does_not() {
+    // `cargo fmt` cannot rewrite `metric="name"` inside a macro arm it cannot
+    // parse as expressions — `target:` is one — so the compact spelling is a
+    // real emitter and this gate may not report it as having no site.
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!(target: "loopctl::metrics", metric="loopctl.dead.row", "spoken");"#,
+            "loopctl.dead.row"
+        ),
+        "a compactly spaced field is an emission: fmt leaves it exactly as written"
+    );
+    // The same text inside a macro's *string* is prose the macro prints. Built
+    // rather than written as one literal: the snippet contains a raw-string
+    // terminator, and nesting them costs hash counts.
+    let quoted_in_macro = format!(
+        "println!(r#\"{inner}\"#);",
+        inner = r#"metric = "loopctl.dead.row""#
+    );
+    assert!(
+        !emission_site_in(&quoted_in_macro, "loopctl.dead.row"),
+        "a raw string inside a macro call quotes the shape and writes no sample"
+    );
+    assert!(
+        !emission_site_in(
+            r#"println!("metric = \"loopctl.dead.row\"");"#,
+            "loopctl.dead.row"
+        ),
+        "an escaped copy of the shape inside a string writes no sample"
+    );
+    // And a field named `metric` on something that is not a macro reaches no
+    // subscriber either.
+    assert!(
+        !emission_site_in(r#"Row { metric = "loopctl.dead.row" }"#, "loopctl.dead.row"),
+        "a struct field named `metric` books nothing"
     );
 }
 

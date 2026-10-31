@@ -1417,6 +1417,9 @@ mod tests {
         }
     }
 
+    /// The `metrics` gate is load-bearing: the assertion reads the registry,
+    /// and `crate::metrics` is configured out of a build without that feature.
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn a_failed_llm_pass_still_measures_its_duration() {
         // `extract.attempts` counts a failed Llm pass; the duration histogram
@@ -1426,8 +1429,9 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let store = std::sync::Arc::new(crate::metrics::MetricsRegistry::default());
-        let subscriber = tracing_subscriber::registry()
-            .with(crate::metrics::MetricsLayer::new(std::sync::Arc::clone(&store)));
+        let subscriber = tracing_subscriber::registry().with(crate::metrics::MetricsLayer::new(
+            std::sync::Arc::clone(&store),
+        ));
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let config = ExtractionConfig {
@@ -1452,7 +1456,10 @@ mod tests {
             .find(|s| s.name == "loopctl.memory.extract.duration_ms")
             .expect("a failed pass is measured, not only counted");
         assert!(
-            matches!(&duration.value, crate::metrics::SeriesValue::Histogram { .. }),
+            matches!(
+                &duration.value,
+                crate::metrics::SeriesValue::Histogram { .. }
+            ),
             "duration_ms is a histogram series, got {:?}",
             duration.value
         );

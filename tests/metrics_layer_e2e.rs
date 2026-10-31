@@ -30,6 +30,7 @@ use loopctl::compact::CompactReason;
 use loopctl::compact::ContextManager;
 use loopctl::compact::TruncatingCompactor;
 use loopctl::compact::demote::{DemotionContext, DemotionSink, MemoryDemotionSink};
+use loopctl::compact::{CompactionContext, CompactionOutcome, ContextCompactor};
 use loopctl::config::SessionConfig;
 use loopctl::engine::{BareLoop, RunConfig, core::Loop};
 use loopctl::manifest::{EnvMap, ManifestDocument};
@@ -39,6 +40,41 @@ use loopctl::metrics::{MetricsLayer, MetricsObserver, MetricsRegistry, SeriesVal
 use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
 use loopctl::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema};
 use tracing_subscriber::layer::SubscriberExt as _;
+
+/// A tool whose result carries the bulk of a turn.
+///
+/// The growth knob for the compaction scenarios: the scripted preamble stays
+/// short so no single turn can outgrow the window on its own, and the repeated
+/// payload is what pushes the history past the threshold. A pass requested
+/// against one oversized turn fails the run instead of compacting it.
+struct GrowingTool;
+
+impl Tool for GrowingTool {
+    fn name(&self) -> &'static str {
+        "recall"
+    }
+    fn description(&self) -> &'static str {
+        "Returns a fact"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            self.name().to_string(),
+            self.description().to_string(),
+            serde_json::json!({"type": "object"}),
+        )
+    }
+    fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        Box::pin(async {
+            Ok(ToolOutput::text(
+                "the launch code is ARC-7 ".to_string() + &"supporting detail ".repeat(8),
+            ))
+        })
+    }
+}
 
 /// A tool that echoes a fixed successful output.
 struct EchoTool;
@@ -309,6 +345,91 @@ async fn an_emptied_attachment_kind_reads_zero_not_its_old_height() {
             "the last file attachment is gone, so the gauge reads zero rather than {value}"
         ),
         other => panic!("attachments.count is a gauge series, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_adopted_compaction_books_its_eviction_with_no_sink_installed() {
+    let registry = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&registry)));
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let tools = ToolRegistry::new();
+    tools.register(GrowingTool);
+    let mut responses = Vec::new();
+    for i in 0..10 {
+        responses.push(MockResponse {
+            // Long enough that the tiny window is exceeded by the third turn:
+            // a short scripted turn never crosses the threshold, and the pass
+            // this test is about never being requested is not the same as a
+            // pass that was requested and adopted.
+            text: "go".to_string(),
+            tool_call: Some(MockToolCall {
+                id: format!("c{i}"),
+                name: "recall".to_string(),
+                input: serde_json::json!({}),
+            }),
+            stop_reason: "tool_use".to_string(),
+        });
+    }
+    responses.push(MockResponse {
+        text: "done".to_string(),
+        tool_call: None,
+        stop_reason: "end_turn".to_string(),
+    });
+
+    let config = SessionConfig::default()
+        .with_context_window(900)
+        .with_compact_threshold(50);
+    let mut loop_ = BareLoop::new(
+        Arc::new(
+            MockApiClient::new("m")
+                .without_usage()
+                .with_responses(responses),
+        ),
+        tools,
+        config,
+    );
+    // The tiny window is what forces the pass. The compactor's knobs sit below
+    // the size that window compacts at, so a machine-requested pass removes
+    // messages instead of shaving nothing and tripping the no-progress guard.
+    loop_.set_context_manager(Arc::new(
+        ContextManager::new(Arc::new(
+            TruncatingCompactor::new()
+                .with_min_messages(2)
+                .with_preserve_recent(2),
+        ))
+        .with_context_window(900),
+    ));
+    loop_
+        .run("grow until compact", &RunConfig::default())
+        .await
+        .expect("the run completes");
+    drop(guard);
+
+    let snap = registry.snapshot();
+    let names: Vec<&str> = snap
+        .series
+        .iter()
+        .filter(|s| s.name.contains("compaction") || s.name.contains("context"))
+        .map(|s| s.name)
+        .collect();
+    let evicted = snap
+        .series
+        .iter()
+        .find(|s| s.name == "loopctl.compaction.evicted.messages")
+        .unwrap_or_else(|| {
+            panic!(
+                "an adopted pass books its eviction with no demotion sink installed; \
+             compaction and context rows present: {names:?}"
+            )
+        });
+    match &evicted.value {
+        SeriesValue::Counter { total } => assert!(
+            *total > 0,
+            "messages left the feed, so the row is not zero: {total}"
+        ),
+        other => panic!("compaction.evicted.messages is a counter series, got {other:?}"),
     }
 }
 

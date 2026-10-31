@@ -309,8 +309,10 @@ impl ToolMiddleware for VerifyMiddleware {
 /// Backs `loopctl.verify.passes`. Both verdicts share the counter and are
 /// told apart by the `outcome` label, because a pass rate is a ratio and a
 /// denominator that counts only passes measures nothing. It is recorded
-/// where the verdict is turned into the block the model reads, so what is
-/// counted is exactly what was reported.
+/// where this middleware renders the verdict, so what is counted is exactly
+/// what this middleware reported — not necessarily what the model read: the
+/// documented cap-outermost order lets `OutputLimitMiddleware` truncate the
+/// verdict block away, which is a fact about the wire, not about the check.
 fn record_verdict(passed: bool) {
     tracing::debug!(
         target: "loopctl::metrics",

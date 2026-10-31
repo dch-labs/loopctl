@@ -196,13 +196,18 @@ pub(super) fn replay_reasoning_tail(text: &str) -> String {
 ///
 /// `action` names the outcomes the converters can produce: `native` (the
 /// block rides back in the provider's own thinking shape), `as_text` (it
-/// rides back wrapped in a `<thinking>` block because the host enabled
-/// reasoning replay), and `skipped` (it rides back as nothing). Counted one
+/// rides back as text because the host enabled reasoning replay — the
+/// Messages converter wraps it in a `<thinking>` block, the OpenAI converter
+/// sends the tail through its reasoning field), and `skipped` (it rides back
+/// as nothing). Counted one
 /// event per block per request, so the ratio between the actions is the
-/// ratio of reasoning the model can see to reasoning it cannot. Shared
-/// because every dialect decides the same question over its own history —
-/// Gemini answers `skipped` always, having no reasoning channel to replay
-/// into.
+/// ratio of reasoning the model can see to reasoning it cannot. Called by
+/// the three dialects that decide the question over their own history at
+/// all — OpenAI, Anthropic, and Gemini, the last answering `skipped`
+/// always, having no reasoning channel to replay into. The Bedrock
+/// converter is not among them: it drops a Thinking part outright and
+/// books nothing, so a Bedrock-only build sees no events on either
+/// reasoning row rather than zeros.
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 pub(super) fn record_reasoning_block(action: &'static str) {
     tracing::debug!(

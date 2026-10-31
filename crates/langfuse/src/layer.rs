@@ -104,8 +104,10 @@ struct SpanMeta {
     /// Which Langfuse object kind this span renders as.
     ///
     /// The two values of [`LangfuseTarget`]: a run span renders as the
-    /// trace, every other span as a span-kind observation — the span's
-    /// name at open decides which.
+    /// trace, every other span as an observation — the span's name at
+    /// open decides which. Inside the observation arm the name decides
+    /// once more: a turn closes as a `generation`-kind observation with a
+    /// `generation-create` body, every other span as a span-kind one.
     target: LangfuseTarget,
 
     /// The Langfuse `traceId` this observation hangs under.

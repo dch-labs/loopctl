@@ -455,6 +455,82 @@ async fn deprecated_think_coexistence_scenario(capture: &MetricCapture) {
     );
 }
 
+/// A tool answering under the builtin `Think` wire name.
+///
+/// The per-turn marks key on the tool's *name*, so a stand-in exercises the
+/// same seam without pulling `builtin_tools` into this binary.
+struct ThinkNamedTool;
+
+impl Tool for ThinkNamedTool {
+    fn name(&self) -> &'static str {
+        "Think"
+    }
+    fn description(&self) -> &'static str {
+        "Scratchpad stand-in"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(self.name(), self.description(), json!({"type": "object"}))
+    }
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        Box::pin(async { Ok(ToolOutput::text("a thought")) })
+    }
+}
+
+/// A reused loop re-marks its first call at every run boundary.
+///
+/// Turn numbers are per-run figures — `accept_input` restarts them at 0 — so
+/// marks that only compare the incoming number read a fresh run's turn 0 as
+/// the previous run's turn 0 and leave that run's first `Think` call
+/// unmarked, under-counting `loopctl.think.first_in_turn` once per run.
+/// Fail-first: against marks that are not re-armed at run start the second
+/// run settles no `first_in_turn` event and this pin reddens. The loop-wide
+/// half is pinned beside it, because over-clearing would re-emit
+/// `loopctl.tools.first_calls` per run and that row means first-in-the-loop.
+async fn first_call_marks_rearm_at_a_run_boundary(capture: &MetricCapture) {
+    let before = capture.events().len();
+    let registry = ToolRegistry::new();
+    registry.register(ThinkNamedTool);
+    let mut loop_ = BareLoop::new(
+        Arc::new(MockApiClient::new("m").with_responses(vec![
+            turn("r1", "Think", json!({})),
+            terminal(),
+            turn("r2", "Think", json!({})),
+            terminal(),
+        ])),
+        registry,
+        SessionConfig::default(),
+    );
+    loop_
+        .run("first run", &RunConfig::default())
+        .await
+        .expect("run one completes");
+    loop_
+        .run("second run", &RunConfig::default())
+        .await
+        .expect("run two completes on the same loop");
+    let delta: Vec<String> = capture.events()[before..].to_vec();
+    let in_turn = delta
+        .iter()
+        .filter(|event| event.contains("metric=loopctl.think.first_in_turn"))
+        .count();
+    assert_eq!(
+        in_turn, 2,
+        "each run marks its own turn's first Think call: {delta:?}"
+    );
+    let ever = delta
+        .iter()
+        .filter(|event| event.contains("metric=loopctl.tools.first_calls"))
+        .count();
+    assert_eq!(
+        ever, 1,
+        "first-in-the-loop is loop-lifetime: the name marks once across runs: {delta:?}"
+    );
+}
+
 #[tokio::test]
 async fn every_call_and_retrieve_settles_one_labeled_event() {
     let capture = Arc::new(MetricCapture {
@@ -466,6 +542,7 @@ async fn every_call_and_retrieve_settles_one_labeled_event() {
     );
     direct_path_scenario(&capture).await;
     pipeline_path_scenario(&capture).await;
+    first_call_marks_rearm_at_a_run_boundary(&capture).await;
     #[cfg(all(feature = "testing", feature = "vector_memory"))]
     store_internal_distinguishability_scenario(&capture);
     #[cfg(all(feature = "testing", feature = "builtin_tools"))]

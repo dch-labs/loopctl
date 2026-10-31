@@ -469,10 +469,10 @@ impl AttachmentStore {
     /// [`record_pinned_telemetry`](Self::record_pinned_telemetry).
     #[must_use]
     pub fn consolidated_message(&self) -> Option<Message> {
+        self.record_pinned_telemetry();
         if self.attachments.is_empty() {
             return None;
         }
-        self.record_pinned_telemetry();
         Some(Message::new(Role::User, self.render_all()))
     }
 
@@ -485,9 +485,11 @@ impl AttachmentStore {
     /// are recorded where the set becomes a request (this store's own
     /// consolidation seam) rather than at each pin, so a gauge read never
     /// counts a pin that a later replacement made stale, and the histogram
-    /// samples the set that is actually being carried. A kind with nothing
-    /// pinned records nothing: absence is not zero pins on a dashboard, it
-    /// is no reading.
+    /// samples the set that is actually being carried. Every kind is read at
+    /// every consolidation, an empty kind as zero: the count says what is
+    /// pinned *now*, so removing the last attachment of a kind takes its
+    /// series to 0 instead of leaving it at its old height. The histogram has
+    /// no empty sample to take, so an empty kind records no tokens estimate.
     pub fn record_pinned_telemetry(&self) {
         for (kind, kind_label) in [
             (AttachmentKind::Memory, "memory"),
@@ -500,6 +502,13 @@ impl AttachmentStore {
                 .filter(|stored| stored.kind() == kind)
                 .cloned()
                 .collect();
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.attachments.count",
+                kind = kind_label,
+                value = i64::try_from(pinned.len()).unwrap_or(i64::MAX),
+                "attachments of this kind pinned to every request"
+            );
             if pinned.is_empty() {
                 continue;
             }
@@ -508,13 +517,6 @@ impl AttachmentStore {
                 Role::User,
                 parts,
             )]);
-            tracing::debug!(
-                target: "loopctl::metrics",
-                metric = "loopctl.attachments.count",
-                kind = kind_label,
-                value = i64::try_from(pinned.len()).unwrap_or(i64::MAX),
-                "attachments of this kind pinned to every request"
-            );
             tracing::debug!(
                 target: "loopctl::metrics",
                 metric = "loopctl.attachments.tokens_estimate",

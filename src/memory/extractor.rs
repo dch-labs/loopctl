@@ -254,6 +254,7 @@ pub async fn extract_from_record(
         ExtractionStrategy::Llm => {
             let Some(client) = client else {
                 emit_attempt_metric(NO_CLIENT);
+                emit_pass_duration(pass_started);
                 return Err(LoopError::Api(
                     "the Llm extraction strategy requires an ApiClient".into(),
                 ));
@@ -262,6 +263,7 @@ pub async fn extract_from_record(
                 Ok(mined) => mined,
                 Err(failure) => {
                     emit_attempt_metric(failure.outcome);
+                    emit_pass_duration(pass_started);
                     return Err(failure.error);
                 }
             }
@@ -299,12 +301,7 @@ pub async fn extract_from_record(
     memories.truncate(config.max_memories);
     let outcome = settle_outcome(fallback_outcome);
     emit_extraction_metrics(&memories, outcome);
-    tracing::debug!(
-        target: "loopctl::metrics",
-        metric = "loopctl.memory.extract.duration_ms",
-        value = pass_started.elapsed().as_millis(),
-        "one extraction pass settled"
-    );
+    emit_pass_duration(pass_started);
     Ok(memories)
 }
 
@@ -1222,6 +1219,22 @@ fn emit_attempt_metric(outcome: &'static str) {
         target: "loopctl::metrics",
         metric = "loopctl.memory.extract.attempts",
         outcome
+    );
+}
+
+/// Emit the `loopctl.memory.extract.duration_ms` histogram for one pass.
+///
+/// Recorded on every pass that reached a strategy, settled or failed: the
+/// attempt counter counts both, so a histogram of only the successes reports
+/// how long the provider takes when it answers rather than what a pass cost.
+/// A pass that never reached a strategy (too few turns, a failure excluded by
+/// config) records nothing, because it measured nothing.
+fn emit_pass_duration(pass_started: std::time::Instant) {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.memory.extract.duration_ms",
+        value = pass_started.elapsed().as_millis(),
+        "one extraction pass reached its end"
     );
 }
 

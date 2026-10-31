@@ -1,4 +1,3 @@
-#![allow(clippy::all, clippy::pedantic, clippy::restriction)]
 //! Telemetry — one loop run, counted twice.
 //!
 //! A run's numbers reach a host through two independent collectors, and this
@@ -33,6 +32,8 @@
 //! engine's first emission and the run must execute on the thread that
 //! installed it. Hence `current_thread` and
 //! [`tracing::subscriber::set_default`], not `set_global_default`.
+
+#![allow(clippy::all, clippy::pedantic, clippy::restriction)]
 
 use std::collections::BTreeMap;
 use std::future::Future;

@@ -1017,7 +1017,10 @@ impl<C: ApiClient> BareLoop<C> {
             self.tool_not_found(tc)
         };
         Self::emit_tool_call_metric(&tc.tool, &result);
-        self.record_first_calls(&tc.tool, turn_idx);
+        let executed = Self::executed_tool_name(tc, &result);
+        if !result.resolved_tool_name.is_empty() || self.tools.get(executed).is_some() {
+            self.record_first_calls(executed, turn_idx);
+        }
         result
     }
 

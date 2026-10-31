@@ -15,8 +15,10 @@
 //! - **The site is code.** Emission sites are located by the literal
 //!   `metric = "<name>"` field the crate's emission idiom requires, and
 //!   only in code — a name inside a doc example, a module narrative, or a
-//!   comment is prose that can never emit anything, so it cannot satisfy
-//!   the gate.
+//!   comment *line* is prose that can never emit anything, so it cannot
+//!   satisfy the gate. The strip works line by line, so it is a line that
+//!   opens with a comment marker that is excluded; an emission call with a
+//!   trailing note is still the code it looks like.
 //! - **Every row is read.** A row is found by its opener, which always
 //!   sits at a line's start, and its name is the first quoted string from
 //!   there on — which is what makes a row rustfmt wrapped across lines
@@ -143,11 +145,45 @@ fn declared_names(registry_src: &str) -> Vec<String> {
 /// false positive this audit was written to prevent, and the reason the
 /// search runs over code alone.
 fn code_only(source: &str) -> String {
-    source
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::with_capacity(source.len());
+    let mut in_block = false;
+    for line in source.lines() {
+        let mut kept = String::new();
+        let mut in_str = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_block {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block = false;
+                }
+                continue;
+            }
+            if c == '"' {
+                in_str = !in_str;
+                kept.push(c);
+                continue;
+            }
+            if c == '/' && !in_str {
+                // A `//` ends the code on this line; a `/*` ends it until the
+                // closing `*/`, which may sit lines away. Either way, a
+                // `metric = "…"` inside a comment is prose about a metric, not
+                // a site that emits it.
+                if chars.peek() == Some(&'/') {
+                    break;
+                }
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    in_block = true;
+                    continue;
+                }
+            }
+            kept.push(c);
+        }
+        out.push_str(&kept);
+        out.push('\n');
+    }
+    out
 }
 
 /// Walks `dir` collecting the text of every `.rs` file.
@@ -161,7 +197,11 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
         let entry = entry.unwrap_or_else(|e| panic!("cannot read entry in {}: {e}", dir.display()));
         let path = entry.path();
         let name = entry.file_name();
-        if name == "target" {
+        // `target` is generated; `tests` and `examples` are prose about
+        // metrics rather than emitters of them. A companion crate's test that
+        // spells `metric = "…"` must not stand in for library code that never
+        // emits the row.
+        if name == "target" || name == "tests" || name == "examples" {
             continue;
         }
         let file_type = entry
@@ -189,6 +229,52 @@ fn emission_haystack() -> String {
         haystack.push('\n');
     }
     haystack
+}
+
+#[test]
+fn a_commented_metric_is_not_an_emission_site() {
+    // The gate reads code. A row named only in prose — a trailing comment, or
+    // a block comment spanning lines — has no emitter and must not pass.
+    let trailing = r#"let x = 1; // metric = "loopctl.invented.row""#;
+    assert!(
+        !code_only(trailing).contains("loopctl.invented.row"),
+        "a metric named only after code on a line is a comment"
+    );
+    let block = "/*\nmetric = \"loopctl.invented.row\"\n*/\nfn real() {}\n";
+    assert!(
+        !code_only(block).contains("loopctl.invented.row"),
+        "a metric named inside a block comment is prose"
+    );
+    assert!(
+        code_only(block).contains("fn real() {}"),
+        "the code around a comment is still code: {:?}",
+        code_only(block)
+    );
+    let real = "metric = \"loopctl.invented.row\",";
+    assert!(
+        code_only(real).contains("loopctl.invented.row"),
+        "stripping comments must never strip a string literal"
+    );
+}
+
+#[test]
+fn the_scan_skips_test_and_example_sources() {
+    let mut files = Vec::new();
+    collect_rs(std::path::Path::new("crates"), &mut files);
+    assert!(
+        !files.is_empty(),
+        "the companion crates are scanned at all, or this pin verifies nothing"
+    );
+    let strays: Vec<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| s.contains("/tests/") || s.contains("/examples/"))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "a test or example spelling `metric = \"…\"` is prose about a row, not an \
+         emitter of it: {strays:?}"
+    );
 }
 
 #[test]

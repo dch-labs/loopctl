@@ -340,6 +340,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// become retrievable memories. An empty eviction list is a no-op,
     /// and a sink that rejects the batch is warned about, never failed
     /// — compaction's own success must not hinge on the memory layer.
+    ///
+    /// `loopctl.compaction.evicted.messages` is booked here, before the
+    /// handover, because the row counts messages that left the feed —
+    /// true of every eviction whatever the sink does with them, including
+    /// the default [`NoopDemotionSink`](crate::compact::demote::NoopDemotionSink),
+    /// which keeps nothing. A sink that stores is already counted by its
+    /// own `loopctl.demotion.delivered`.
     pub(super) async fn demote_evicted(
         &self,
         evicted: &[Message],
@@ -349,6 +356,12 @@ impl<C: ApiClient> BareLoop<C> {
         if evicted.is_empty() {
             return;
         }
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.compaction.evicted.messages",
+            messages = evicted.len(),
+            "messages left the feed as a compaction pass evicted them"
+        );
         let meta = crate::compact::demote::DemotionContext {
             reason,
             turn,

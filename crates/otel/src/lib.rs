@@ -265,12 +265,19 @@ fn http_endpoint(base: &str, signal_path: &str) -> String {
     if base.is_empty() {
         return String::new();
     }
-    let trimmed = base.trim_end_matches('/');
+    let (address, query) = match base.split_once('?') {
+        Some((address, query)) => (address, Some(query)),
+        None => (base, None),
+    };
+    let trimmed = address.trim_end_matches('/');
     let root = trimmed
         .strip_suffix(TRACES_PATH)
         .or_else(|| trimmed.strip_suffix(METRICS_PATH))
         .unwrap_or(trimmed);
-    format!("{root}{signal_path}")
+    match query {
+        Some(query) => format!("{root}{signal_path}?{query}"),
+        None => format!("{root}{signal_path}"),
+    }
 }
 
 /// Why installation failed.

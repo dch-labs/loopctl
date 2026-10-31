@@ -157,11 +157,15 @@ required-features = ["metrics", "testing"]
 
 [[test]]
 name = "emission_catalog_contract"
-required-features = ["metrics", "testing"]
+required-features = ["metrics", "testing", "vector_index", "vector_memory"]
 
 [[test]]
 name = "metrics_layer_e2e"
-required-features = ["metrics", "testing"]
+required-features = ["metrics", "testing", "manifest"]
+
+[[test]]
+name = "tool_call_metrics"
+required-features = ["testing", "tool_health"]
 
 [[test]]
 name = "tracing_spans"

@@ -128,7 +128,7 @@ impl ToolRegistry {
     /// order; every landed registration bumps
     /// [`version`](Self::version).
     ///
-    /// A registration narrates itself twice.
+    /// A registration narrates itself on more than one series.
     /// `loopctl.tools.registry.mutations` with `op="register"` counts the
     /// change that landed; a name already in the registry draws a `WARN`
     /// first, because an overwrite silently changes what anything already

@@ -225,7 +225,7 @@ package-check:
 		printf 'package-check: cargo package --list failed, so the tarball was never listed\n' >&2; \
 		exit 1; \
 	}; \
-	stray=$$(printf '%s\n' "$$listing" | grep -E '^[^/]+\.md$$' | grep -vEx 'CHANGELOG.md|README.md|TESTING.md' || true); \
+	stray=$$(printf '%s\n' "$$listing" | grep -Ei '^[^/]+\.(md|markdown)$$' | grep -vEx 'CHANGELOG.md|README.md|TESTING.md' || true); \
 	if [ -n "$$stray" ]; then \
 		printf 'package-check: the tarball carries crate-root documents that are not part of the crate:\n' >&2; \
 		printf '%s\n' "$$stray" | sed 's/^/  /' >&2; \

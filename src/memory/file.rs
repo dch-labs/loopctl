@@ -1316,6 +1316,23 @@ impl LoopMemory for FileMemoryStore {
             let mut entries = recover_guard(shared.entries.write());
             shared.append_line(&line)?;
             entries.push(entry);
+            let held = entries.len();
+            drop(entries);
+            let on_disk = std::fs::metadata(shared.backing_path()).map_or(0, |m| m.len());
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.memory.entries",
+                store = "file",
+                value = held,
+                "entries held by the file store"
+            );
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.memory.persist.file_bytes",
+                backend = "file",
+                value = on_disk,
+                "memory file size as the entry was appended"
+            );
             Ok(())
         })
     }

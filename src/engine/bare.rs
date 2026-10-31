@@ -777,18 +777,41 @@ struct FirstCallMarks {
     ///
     /// Backs `loopctl.think.first_in_turn`: the first `Think` call of a
     /// turn is worth marking, a repeat within the same turn is noise. The
-    /// set is cleared when the turn number moves, so its contents always
-    /// describe exactly one turn — never a stale carry-over.
+    /// set is cleared when the turn number moves and at the start of every
+    /// run, so its contents always describe exactly one turn — never a
+    /// stale carry-over.
     in_turn: std::collections::HashSet<String>,
 
     /// The turn number [`in_turn`](Self::in_turn) currently describes.
     ///
     /// The generation stamp that lets the per-turn set detect a turn
     /// boundary without the loop having to remember to clear it: a dispatch
-    /// that arrives with a larger number clears `in_turn` first, then
-    /// adopts that number. Defaults to 0, the pre-first-turn state, where
-    /// every name is by definition first-in-turn.
+    /// that arrives with a number other than this one clears `in_turn`
+    /// first, then adopts that number. Defaults to 0, the pre-first-turn
+    /// state, where every name is by definition first-in-turn, and reset to
+    /// [`usize::MAX`] at every run start — turn numbers are per-run figures
+    /// that restart at 0, so without the sentinel a reused loop's next run
+    /// would open on the number its previous run last settled on.
     turn: usize,
+}
+
+impl FirstCallMarks {
+    /// Open a new run: forget which names were marked this turn, and hold the
+    /// turn stamp at a value no real turn index can reach.
+    ///
+    /// `accept_input` restarts turn numbering at 0 for every run, so the
+    /// per-turn stamp cannot tell a new run's turn 0 from the previous run's
+    /// — it has to be told. Without this, the first `Think` call of every
+    /// run after the first on a reused loop arrives on a stamp that already
+    /// carries `Think` and goes unmarked, silently under-counting
+    /// `loopctl.think.first_in_turn` once per run.
+    ///
+    /// `seen` is deliberately untouched: `loopctl.tools.first_calls` marks
+    /// the first call of a name for the life of the loop, not per run.
+    fn begin_run(&mut self) {
+        self.in_turn.clear();
+        self.turn = usize::MAX;
+    }
 }
 
 /// The identity calibration ratio, in thousandths of the raw estimate.
@@ -3297,6 +3320,10 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 self.steering.open_run();
                 let _slot_guard = steering::SteeringCloseGuard::new(Arc::clone(&self.steering));
                 self.machine.accept_input(input);
+                // Turn indices are per-run, so the per-turn marks need
+                // telling: a fresh run's turn 0 must not read as the
+                // previous run's turn 0. `seen` keeps its loop-wide meaning.
+                crate::error::recover_guard(self.first_calls.lock()).begin_run();
                 self.deferred_transient_tokens = 0;
                 self.overflow_retry = None;
                 self.truncation_retry = None;

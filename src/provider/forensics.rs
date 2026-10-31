@@ -120,7 +120,7 @@ pub(super) fn wire_failure_class(status: u16) -> &'static str {
     }
 }
 
-/// One log line for one classified wire failure, fields attached.
+/// One forensic log line and one counter event per classified wire failure.
 ///
 /// Permanent failures (`auth`, `other`) log at `WARN` — nobody retries
 /// those, the line is the whole report. Retryable shapes (rate-limit,
@@ -167,7 +167,8 @@ pub(super) fn log_wire_failure(status: u16, meta: &ProviderMeta) {
     }
 }
 
-/// One line for one transport failure (no response, so no id).
+/// One forensic line and one `class=network` counter event per transport
+/// failure (no response, so no id).
 ///
 /// The `network` class of the failure taxonomy: there is no status line
 /// and no header to carry, only the transport's own message. `DEBUG` — a

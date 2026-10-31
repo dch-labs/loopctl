@@ -173,14 +173,15 @@ const DEMOTION_SINK_LABEL: &str = "memory";
 /// in-memory reference store to a vector-backed store — the sink only
 /// calls `store`, so the backend decides what recall means.
 ///
-/// Every call settles its own telemetry on the `loopctl::metrics` target,
-/// and the three events partition cleanly rather than overlapping:
-/// `loopctl.compaction.evicted.messages` counts the messages that left the
-/// feed whatever the store then did with them, `loopctl.demotion.delivered`
-/// counts the passes whose rendered entry landed, and
-/// `loopctl.demotion.errors` the passes whose entry was refused — so
-/// delivered and errors together count attempts, and no event carries a
-/// magnitude the eviction counter has not already reported.
+/// Every non-empty delivery settles its own telemetry on the
+/// `loopctl::metrics` target, and the two events it owns partition
+/// cleanly rather than overlapping: `loopctl.demotion.delivered` counts
+/// the passes whose rendered entry landed, `loopctl.demotion.errors` the
+/// passes whose entry was refused — together they count attempts.
+/// The family's third event, `loopctl.compaction.evicted.messages`, is
+/// booked by the evicting pass in the engine rather than here: it counts
+/// the messages that left the feed whatever the store then did with them,
+/// and a loop on the default sink evicts while storing nothing.
 #[derive(Clone)]
 pub struct MemoryDemotionSink {
     /// The store receiving rendered trajectories.
@@ -252,12 +253,6 @@ impl DemotionSink for MemoryDemotionSink {
                 .with_tag(format!("session:{}", meta.session_id));
             let category = entry.category;
             let stored = self.memory.store(entry).await;
-            tracing::debug!(
-                target: "loopctl::metrics",
-                metric = "loopctl.compaction.evicted.messages",
-                messages = evicted.len(),
-                "messages left the feed for the demotion sink"
-            );
             if let Err(error) = stored {
                 tracing::debug!(
                     target: "loopctl::metrics",

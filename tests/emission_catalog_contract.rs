@@ -480,8 +480,10 @@ async fn embed_scenario() {
 /// Drive the memoizing middleware through a miss and the hit it enables.
 ///
 /// Two turns call the same tool with the same input, so the second is
-/// served from the cache: the pair is what makes the hits/misses ratio the
-/// two declared rows exist to carry measurable in both directions.
+/// served from the cache. That miss-then-hit pair is the point: it gives
+/// `loopctl.memoize.hits` and `loopctl.memoize.misses` — the two declared
+/// rows this scenario exists to carry — a sample each, from a run where the
+/// middleware really did miss and then really did hit.
 async fn memoize_scenario() {
     let registry_tools = ToolRegistry::new();
     registry_tools.register(PlainTool);
@@ -576,7 +578,10 @@ async fn every_live_emission_validates_against_the_catalog() {
         "loopctl.memoize.hits",
         "loopctl.memoize.misses",
         "loopctl.demotion.delivered",
-        "loopctl.compaction.evicted.messages",
+        // `loopctl.compaction.evicted.messages` is deliberately absent: a sink
+        // books only what a delivery can settle, and this scenario calls
+        // `demote` directly. The pass that evicts books it now, which is
+        // behaviour the delivery suite pins: `tests/demotion_sink.rs`.
         "loopctl.memory.stored",
     ];
     #[cfg(feature = "vector_memory")]

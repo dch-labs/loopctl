@@ -191,9 +191,11 @@ impl ManifestDocument {
     /// A manifest that resolves also reports the choice it made: a
     /// `loopctl.profile.active` gauge labelled by the profile's own name,
     /// since the resolved document carries no other record of it (resolution
-    /// drops the overlays). A document resolved with no overlay reports
-    /// `"base"`, the nameless profile, so a dashboard sees one shape for "the
-    /// manifest as authored" instead of a missing series. The gauge settles
+    /// drops the overlays). A document resolved with no overlay reports the
+    /// reserved label `"(none)"` instead: nothing an overlay is ever named
+    /// carries parentheses, and a document is free to declare a profile it
+    /// calls `base` — one label doing double duty could not show whether the
+    /// overlay ran. The gauge settles
     /// only on success: a document that fails validation or interpolation
     /// leaves no series behind, so a profile seen on a dashboard is always
     /// one some process actually ran.
@@ -229,7 +231,7 @@ impl ManifestDocument {
         tracing::debug!(
             target: "loopctl::metrics",
             metric = "loopctl.profile.active",
-            profile = profile.unwrap_or("base"),
+            profile = profile.unwrap_or("(none)"),
             value = 1,
             "a manifest resolved under this profile"
         );

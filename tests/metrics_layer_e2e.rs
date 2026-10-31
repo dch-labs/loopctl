@@ -190,23 +190,16 @@ async fn the_demotion_sink_settles_exactly_its_declared_shape() {
         _ => panic!("demotion.delivered is a counter series"),
     }
 
-    // The magnitude the event used to carry is not lost, it simply rides the
-    // row that declares it: two messages left the feed, and that is the
-    // eviction counter's delta rather than a numeric on the delivery counter.
-    let evicted_series = snap
-        .series
-        .iter()
-        .find(|s| s.name == "loopctl.compaction.evicted.messages")
-        .expect("the eviction is counted where its magnitude is declared");
-    match evicted_series.value {
-        SeriesValue::Counter { total } => assert_eq!(total, 2, "both messages left the feed"),
-        _ => panic!("compaction.evicted.messages is a counter series"),
-    }
-    assert_eq!(
-        evicted_series.labels.len(),
-        0,
-        "the row declares no labels: {:?}",
-        evicted_series.labels
+    // A delivery on its own books only what a sink can know. The eviction
+    // row belongs to the pass that evicted, so a direct `demote` call
+    // settles `demotion.delivered` and nothing else; the eviction counter is
+    // pinned by the engine's own delivery path, exercised end to end in
+    // `tests/demotion_sink.rs`.
+    assert!(
+        snap.series
+            .iter()
+            .all(|s| s.name != "loopctl.compaction.evicted.messages"),
+        "the sink alone must not book a row the engine owns"
     );
 
     assert_eq!(
@@ -291,7 +284,7 @@ version: 1
 budgets:
   turns: 200
 metadata:
-  name: ${env:NO_SUCH_VAR_ANYWHERE}
+  name: ${NO_SUCH_VAR_ANYWHERE}
 tools:
   - id: shell
     builtin: shell
@@ -327,8 +320,9 @@ tools:
         .expect("a resolved manifest reports its profile");
     assert_eq!(
         active.labels,
-        std::collections::BTreeMap::from([("profile", "base".to_string())]),
-        "the nameless overlay reports the manifest as authored"
+        std::collections::BTreeMap::from([("profile", "(none)".to_string())]),
+        "a document resolved with no overlay reports the reserved label, so a profile \
+         a host actually named `base` cannot be confused with it"
     );
     assert_eq!(snap.unknown_labels, 0, "profile is a declared label");
 }

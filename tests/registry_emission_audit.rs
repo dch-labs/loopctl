@@ -365,6 +365,7 @@ fn emission_site_in(src: &str, name: &str) -> bool {
             && !inside_token_consumer(src, at, &code)
             && is_tracing_event(src, at)
             && aimed_at_the_target
+            && !dormant_macro_body(src, &code, at)
         {
             return true;
         }
@@ -806,11 +807,81 @@ fn split_as(item: &str) -> Option<(&str, &str)> {
         if i + 2 >= bytes.len() {
             break;
         }
-        if &item[i..i + 2] == "as" && ws(i - 1) && ws(i + 2) {
+        if matches!((bytes.get(i), bytes.get(i + 1)), (Some(b'a'), Some(b's')))
+            && ws(i - 1)
+            && ws(i + 2)
+        {
             return Some((item[..i].trim(), item[i + 2..].trim()));
         }
     }
     None
+}
+
+/// Whether the candidate at `at` sits inside the body of a `macro_rules!`
+/// definition that nothing in this file ever invokes. A macro body is prose
+/// until a call expands it, so a metric written there feeds no row while the
+/// definition sleeps; one invocation anywhere in the file wakes it.
+fn dormant_macro_body(src: &str, code: &[bool], at: usize) -> bool {
+    let marker = "macro_rules!";
+    let mut from = 0usize;
+    while let Some(relative) = src.get(from..).and_then(|tail| tail.find(marker)) {
+        let head = from.saturating_add(relative);
+        from = head.saturating_add(marker.len());
+        if !code.get(head).copied().unwrap_or(true) {
+            continue;
+        }
+        let mut name_at = from;
+        while matches!(
+            src.as_bytes().get(name_at),
+            Some(b' ' | b'\t' | b'\n' | b'\r')
+        ) {
+            name_at = name_at.saturating_add(1);
+        }
+        let name_start = name_at;
+        while matches!(
+            src.as_bytes().get(name_at),
+            Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b >= 0x80
+        ) {
+            name_at = name_at.saturating_add(1);
+        }
+        let Some(name) = src.get(name_start..name_at) else {
+            continue;
+        };
+        let mut open = name_at;
+        while matches!(src.as_bytes().get(open), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            open = open.saturating_add(1);
+        }
+        if src.as_bytes().get(open) != Some(&b'{') {
+            continue;
+        }
+        if let Some(close) = matching_close(src, open)
+            && at > open
+            && at < close
+        {
+            return !has_invocation(src, code, name);
+        }
+    }
+    false
+}
+
+/// Whether `name!` appears in code anywhere in the file, outside its own
+/// definition — a definition carries no bang after its name, so it never
+/// matches its own needle.
+fn has_invocation(src: &str, code: &[bool], name: &str) -> bool {
+    let needle = format!("{name}!");
+    let mut from = 0usize;
+    while let Some(relative) = src.get(from..).and_then(|tail| tail.find(needle.as_str())) {
+        let head = from.saturating_add(relative);
+        from = head.saturating_add(needle.len());
+        let is_the_word = !matches!(
+            src.as_bytes().get(head.saturating_sub(1)),
+            Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b':' || *b >= 0x80
+        );
+        if is_the_word && code.get(head).copied().unwrap_or(true) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The index of the innermost `{` whose `}` has not yet closed at `at`, seen
@@ -2087,6 +2158,67 @@ fn emit() { debug!(target: "loopctl::metrics", metric = "loopctl.pub.count", n =
     assert!(
         emission_site_in(pub_import, "loopctl.pub.count"),
         "a public import binds the name locally like any use"
+    );
+}
+
+/// A metric field written inside a macro body is prose until something
+/// expands it: a definition nothing calls emits nothing, while one invocation
+/// anywhere in the file makes the body a live site.
+#[test]
+fn a_metric_inside_a_macro_body_counts_only_when_the_macro_runs() {
+    let dormant = r#"
+use tracing::debug;
+macro_rules! never_called {
+    () => { debug!(target: "loopctl::metrics", metric = "loopctl.dormant.count", n = 1) };
+}
+"#;
+    assert!(
+        !emission_site_in(dormant, "loopctl.dormant.count"),
+        "a definition nothing invokes never runs, so its body emits nothing"
+    );
+    let invoked = r#"
+use tracing::debug;
+macro_rules! emit_it {
+    () => { debug!(target: "loopctl::metrics", metric = "loopctl.invoked.count", n = 1) };
+}
+fn f() { emit_it!(); }
+"#;
+    assert!(
+        emission_site_in(invoked, "loopctl.invoked.count"),
+        "one invocation anywhere expands the body into a live site"
+    );
+    let unicode_name = concat!(
+        "use tracing::debug;\n",
+        "macro_rules! café {\n",
+        "    () => { debug!(target: \"loopctl::metrics\", metric = \"loopctl.unicode.macro\", n = 1) };\n",
+        "}\n",
+    );
+    assert!(
+        !emission_site_in(unicode_name, "loopctl.unicode.macro"),
+        "a never-invoked macro keeps sleeping whatever alphabet names it"
+    );
+}
+
+/// Identifiers in Rust span Unicode, and a `use` item may carry one: the
+/// rename matcher reads bytes at those offsets and must survive them.
+#[test]
+fn a_unicode_identifier_survives_the_scan() {
+    let plain = r#"
+use crate::café;
+use tracing::debug;
+fn f() { debug!(target: "loopctl::metrics", metric = "loopctl.unicode.count", n = 1); }
+"#;
+    assert!(
+        emission_site_in(plain, "loopctl.unicode.count"),
+        "a café import is legal rust and the scan must not panic on it"
+    );
+    let renamed = r#"
+use crate::café as tracing;
+fn f() { tracing::debug!(target: "loopctl::metrics", metric = "loopctl.unicode.count", n = 1); }
+"#;
+    assert!(
+        !emission_site_in(renamed, "loopctl.unicode.count"),
+        "the rename matcher reads bytes too: café as tracing vetoes"
     );
 }
 

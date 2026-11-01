@@ -6,7 +6,7 @@
 //! Frontier models handle a wide tool list; small models pick the
 //! wrong tool, conflate similar ones, or call tools that do not exist
 //! — and every schema spends window tokens on every request. A
-//! [`ToolSelector`] narrows what the model sees each turn (P8: the
+//! [`ToolSelector`] narrows what the model sees each turn (the
 //! cheap alternative to a bigger model is less confusion).
 //!
 //! The engine consults the configured selector at each request build
@@ -81,6 +81,18 @@ pub trait ToolSelector: Send + Sync {
     /// Returned schemas must be members of `all` — the engine
     /// advertises the selection verbatim.
     fn select(&self, ctx: &SelectionContext<'_>, all: &[ToolSchema]) -> Vec<ToolSchema>;
+
+    /// The selector's stable name, as it appears on the `selector`
+    /// label of tool-selection telemetry.
+    ///
+    /// A host-written selector keeps the default `"custom"`, so a
+    /// dashboard never attributes a hand-rolled selection to one of the
+    /// crate's own strategies; the built-ins override it with their own
+    /// spelling. The value is a label, not an identity — two selectors
+    /// of the same kind share one name by design.
+    fn name(&self) -> &'static str {
+        "custom"
+    }
 }
 
 /// The async companion to [`ToolSelector`], for selections that need
@@ -117,6 +129,15 @@ pub trait AsyncToolSelector: Send + Sync {
         ctx: &'a SelectionContext<'a>,
         all: &'a [ToolSchema],
     ) -> Pin<Box<dyn Future<Output = Vec<ToolSchema>> + Send + 'a>>;
+
+    /// The selector's stable name, as it appears on the `selector`
+    /// label of tool-selection telemetry.
+    ///
+    /// Same contract as [`ToolSelector::name`]: host implementations keep
+    /// the `"custom"` default, built-ins name themselves.
+    fn name(&self) -> &'static str {
+        "custom"
+    }
 }
 
 /// A semantic selector: embeds each tool once per registry generation
@@ -246,6 +267,10 @@ impl<P: crate::memory::vector::EmbeddingProvider> EmbeddingSelector<P> {
 
 #[cfg(feature = "vector_index")]
 impl<P: crate::memory::vector::EmbeddingProvider> AsyncToolSelector for EmbeddingSelector<P> {
+    fn name(&self) -> &'static str {
+        "embedding"
+    }
+
     fn select<'a>(
         &'a self,
         ctx: &'a SelectionContext<'a>,
@@ -361,7 +386,7 @@ fn cosine(left: &[f32], right: &[f32]) -> f32 {
 /// [`with_timeout`](Self::with_timeout) (default 10 seconds) and by
 /// the optional [`with_budget`](Self::with_budget) gate, with each
 /// conversation excerpt capped at 400 bytes so the prompt grows with
-/// the tool list, never with the history's bodies — the P8 trade-off
+/// the tool list, never with the history's bodies — the trade-off
 /// stated plainly: this selector spends tokens to save window.
 pub struct RewritingSelector<C> {
     /// The model the rewrite calls ride on.
@@ -525,6 +550,10 @@ impl<C: crate::api::ApiClient> RewritingSelector<C> {
 }
 
 impl<C: crate::api::ApiClient> AsyncToolSelector for RewritingSelector<C> {
+    fn name(&self) -> &'static str {
+        "rewriting"
+    }
+
     fn select<'a>(
         &'a self,
         ctx: &'a SelectionContext<'a>,
@@ -607,6 +636,10 @@ impl<C: crate::api::ApiClient> AsyncToolSelector for RewritingSelector<C> {
 pub struct StaticSelector;
 
 impl ToolSelector for StaticSelector {
+    fn name(&self) -> &'static str {
+        "static"
+    }
+
     fn select(&self, _ctx: &SelectionContext<'_>, all: &[ToolSchema]) -> Vec<ToolSchema> {
         all.to_vec()
     }
@@ -799,6 +832,10 @@ fn contains_phrase(lowered: &str, phrase: &str) -> bool {
 }
 
 impl ToolSelector for KeywordSelector {
+    fn name(&self) -> &'static str {
+        "keyword"
+    }
+
     fn select(&self, ctx: &SelectionContext<'_>, all: &[ToolSchema]) -> Vec<ToolSchema> {
         let Some(query) = ctx.latest_user_message else {
             return all.to_vec();

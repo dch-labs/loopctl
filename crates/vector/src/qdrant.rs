@@ -17,7 +17,7 @@
 //! metric event every loopctl index emits.
 //!
 //! ```toml
-//! loopctl-vector = { version = "0.3", features = ["qdrant"] }
+//! loopctl-vector = { version = "0.5", features = ["qdrant"] }
 //! ```
 
 use std::future::Future;

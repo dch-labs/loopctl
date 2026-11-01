@@ -120,7 +120,7 @@ pub(super) fn wire_failure_class(status: u16) -> &'static str {
     }
 }
 
-/// One log line for one classified wire failure, fields attached.
+/// One forensic log line and one counter event per classified wire failure.
 ///
 /// Permanent failures (`auth`, `other`) log at `WARN` — nobody retries
 /// those, the line is the whole report. Retryable shapes (rate-limit,
@@ -133,6 +133,12 @@ pub(super) fn log_wire_failure(status: u16, meta: &ProviderMeta) {
     let class = wire_failure_class(status);
     let empty = RateLimitSnapshot::default();
     let quota = meta.rate_limit.as_ref().unwrap_or(&empty);
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.provider.wire_failures",
+        class,
+        "one provider wire failure classified"
+    );
     match class {
         "auth" | "other" => {
             tracing::warn!(
@@ -161,13 +167,20 @@ pub(super) fn log_wire_failure(status: u16, meta: &ProviderMeta) {
     }
 }
 
-/// One line for one transport failure (no response, so no id).
+/// One forensic line and one `class=network` counter event per transport
+/// failure (no response, so no id).
 ///
 /// The `network` class of the failure taxonomy: there is no status line
 /// and no header to carry, only the transport's own message. `DEBUG` — a
 /// connect failure is usually transient and the retry narrates it at the
 /// caller's level.
 pub(super) fn log_transport_failure(error: &str) {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.provider.wire_failures",
+        class = "network",
+        "one provider transport failure"
+    );
     tracing::debug!(
         target: "loopctl::provider::forensics",
         class = "network",

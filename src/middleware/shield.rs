@@ -13,7 +13,7 @@
 //! feeds the shield's internal history so multi-call combination rules
 //! (a `curl` followed by `| sh`) can fire across turns.
 //!
-//! Opt-in (P5): nothing changes for a loop that does not install it. A
+//! Opt-in: nothing changes for a loop that does not install it. A
 //! default-constructed loop does not.
 
 use std::future::Future;
@@ -32,8 +32,10 @@ use crate::tool::shield::{SafetyAction, ShieldContext, ToolSafetyShield};
 /// as a tracing warning. The shield is
 /// shared behind an `Arc` so the same instance can serve a host's other
 /// evaluations. `record_invocation` is the post-dispatch state update,
-/// not an evaluation step: this middleware calls it after every
-/// dispatched call so the shield's history stays current. Install the
+/// not an evaluation step: this middleware calls it after a
+/// dispatched call that the shield is watching — a call outside
+/// `watched_tools`, or any call while that set is empty, is left
+/// unrecorded, because the history is a record of the watched tools. Install the
 /// middleware exactly once per session — two installed instances
 /// evaluate every call twice, and a host also calling
 /// `record_invocation` on the shared handle records duplicate state,

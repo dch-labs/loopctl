@@ -1,6 +1,6 @@
 [package]
 name = "loopctl-hnsw"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -11,13 +11,13 @@ keywords = ["agent", "loopctl", "hnsw", "ann", "vector"]
 categories = ["api-bindings", "data-structures"]
 
 [dependencies]
-loopctl = { path = "../..", version = "=0.4.1", default-features = false, features = ["vector_index"] }
+loopctl = { path = "../..", version = "=0.5.0", default-features = false, features = ["vector_index"] }
 fastrand = "2"
 tracing = "0.1"
 uuid = "1"
 
 [dev-dependencies]
-loopctl = { path = "../..", version = "=0.4.1", default-features = false, features = ["vector_memory", "testing"] }
+loopctl = { path = "../..", version = "=0.5.0", default-features = false, features = ["vector_memory", "testing"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 
 [lints.clippy]

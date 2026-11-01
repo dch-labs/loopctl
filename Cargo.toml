@@ -1,6 +1,6 @@
 [package]
 name = "loopctl"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A trait-based framework for building agent loops with pluggable LLM clients, tools, and memory"
@@ -23,7 +23,7 @@ path = "src/lib.rs"
 
 [dependencies]
 futures = "0.3"
-loopctl-derive = { path = "crates/derive", version = "=0.4.1", optional = true }
+loopctl-derive = { path = "crates/derive", version = "=0.5.0", optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
@@ -143,6 +143,10 @@ required-features = ["mcp"]
 name = "mcp_server"
 required-features = ["mcp"]
 
+[[example]]
+name = "telemetry"
+required-features = ["metrics", "testing"]
+
 [[test]]
 name = "metrics"
 required-features = ["metrics"]
@@ -153,11 +157,15 @@ required-features = ["metrics", "testing"]
 
 [[test]]
 name = "emission_catalog_contract"
-required-features = ["metrics", "testing"]
+required-features = ["metrics", "testing", "vector_index", "vector_memory"]
 
 [[test]]
 name = "metrics_layer_e2e"
-required-features = ["metrics", "testing"]
+required-features = ["metrics", "testing", "manifest"]
+
+[[test]]
+name = "tool_call_metrics"
+required-features = ["testing", "tool_health"]
 
 [[test]]
 name = "tracing_spans"

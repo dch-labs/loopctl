@@ -244,9 +244,25 @@ pub struct RegistrySnapshot {
 
     /// Count of counter-kind events that carried numeric values.
     ///
-    /// Counters count passes (`+1` per event); a numeric field on one
-    /// means the emission site and the declaration disagree about what
-    /// the signal measures.
+    /// Counters count passes (`+1` per event); a numeric on one means the
+    /// emission site and the declaration disagree about what the signal
+    /// measures — unless the field is named for the metric's own unit tail,
+    /// which the layer instead reads as the event's delta.
+    ///
+    /// The crate's own stream carries such disagreements **deliberately**, so
+    /// a non-zero figure is expected, not diagnostic. Every counter event
+    /// contributes one per numeric field not named for its unit, which makes
+    /// the figure workload arithmetic rather than a constant:
+    /// `loopctl.tools.calls` (`duration_ms`) per dispatched call,
+    /// `loopctl.prune.cleared` (`parts`, `tokens`) per reclamation pass,
+    /// `loopctl.window.token_counter` (`ratio`, `per_message`) per counter
+    /// construction, and `loopctl.memory.retrieve.results` (`k_requested`,
+    /// `k_returned`) per retrieve, among others. That list is what the crate
+    /// emits at the time of writing rather than a closed census. So treat the
+    /// figure as a baseline a run establishes: read a **rise above what the
+    /// same workload established** as the signal that a site began
+    /// disagreeing with its own declaration, and never an absolute value as
+    /// one.
     pub numeric_on_counter: u64,
 
     /// Count of gauge/histogram events with no resolvable scalar.

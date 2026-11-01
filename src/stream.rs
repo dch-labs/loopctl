@@ -1248,6 +1248,23 @@ struct OpenPart {
     tool_input: String,
 }
 
+/// Count a thinking lane that closed with nothing to keep.
+///
+/// Backs `loopctl.reasoning.dropped_at_turn_end`. The lane opened at the
+/// turn's start and closes at its end carrying no text, no signature, and
+/// no redacted payload, so the turn joins no reasoning part to the history
+/// — the one place a reasoning block is discarded at the turn boundary
+/// rather than at some later request, which is why it is counted apart from
+/// the reasoning-block actions the provider converters record on the way to
+/// the wire.
+fn record_empty_thinking_lane() {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.reasoning.dropped_at_turn_end",
+        "a thinking lane closed empty and joined no history"
+    );
+}
+
 impl StreamAccumulator {
     /// Create a new accumulator in the initial state.
     ///
@@ -1423,6 +1440,10 @@ impl StreamAccumulator {
                             signature: slot.thinking_signature,
                             redacted: slot.thinking_redacted,
                         })
+                    }
+                    OpenPartKind::Thinking => {
+                        record_empty_thinking_lane();
+                        None
                     }
                     OpenPartKind::Tool if !slot.tool_name.is_empty() => {
                         let input: Value = if slot.tool_input.is_empty() {

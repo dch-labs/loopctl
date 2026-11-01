@@ -145,6 +145,15 @@ pub struct ManifestDocument {
     raw: Value,
 }
 
+/// The `loopctl.profile.active` label for a document resolved with no overlay.
+///
+/// Reserved rather than merely unlikely: [`ManifestDocument::parse`] refuses a
+/// declared profile of this name, so the overlay-applied and overlay-absent
+/// cases cannot land on one series. A document is otherwise free to declare a
+/// profile it calls `base`, and a label doing double duty could not show
+/// whether an overlay ran.
+const NO_PROFILE_LABEL: &str = "(none)";
+
 impl ManifestDocument {
     /// Parse manifest text.
     ///
@@ -155,11 +164,22 @@ impl ManifestDocument {
     /// # Errors
     ///
     /// [`ManifestError`] describing the first failure, with a
-    /// [`Span`]-derived position whenever the strict pass can attribute one.
+    /// [`Span`]-derived position whenever the strict pass can attribute one;
+    /// [`ManifestError::OverlayRule`] when a declared profile claims the
+    /// reserved no-overlay label `"(none)"`.
     pub fn parse(text: &str) -> Result<Self, ManifestError> {
         let typed: Manifest =
             serde_yaml_ng::from_str(text).map_err(|error| ManifestError::from_yaml(&error))?;
         validate::check_version(&typed)?;
+        if typed.profiles.contains_key(NO_PROFILE_LABEL) {
+            return Err(ManifestError::OverlayRule {
+                path: format!("profiles.{NO_PROFILE_LABEL}"),
+                detail: format!(
+                    "`{NO_PROFILE_LABEL}` is reserved for the no-overlay label on \
+                     `loopctl.profile.active`"
+                ),
+            });
+        }
         let raw: Value =
             serde_yaml_ng::from_str(text).map_err(|error| ManifestError::from_yaml(&error))?;
         Ok(Self { typed, raw })
@@ -187,6 +207,18 @@ impl ManifestDocument {
     /// written — any string whose written form carries a `${secret:…}`
     /// reference, plus MCP server `env` maps wholesale — so resolved
     /// secrets never reach a recorded pin.
+    ///
+    /// A manifest that resolves also reports the choice it made: a
+    /// `loopctl.profile.active` gauge labelled by the profile's own name,
+    /// since the resolved document carries no other record of it (resolution
+    /// drops the overlays). A document resolved with no overlay reports the
+    /// reserved label `"(none)"` instead, a name no document may declare:
+    /// [`Self::parse`] refuses a profile of that name, because a document is
+    /// free to call an overlay `base` and one label doing double duty could
+    /// not show whether the overlay ran. The gauge settles
+    /// only on success: a document that fails validation or interpolation
+    /// leaves no series behind, so a profile seen on a dashboard is always
+    /// one some process actually ran.
     ///
     /// # Errors
     ///
@@ -216,6 +248,13 @@ impl ManifestDocument {
         let canonical =
             serde_json::to_value(&pinned).map_err(|error| projection_failure(&error))?;
         let rendered = canonical.to_string();
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.profile.active",
+            profile = profile.unwrap_or(NO_PROFILE_LABEL),
+            value = 1,
+            "a manifest resolved under this profile"
+        );
         Ok(ResolvedManifest {
             manifest: runtime,
             canonical_json: canonical,
@@ -514,6 +553,24 @@ mod tests {
         assert!(
             matches!(error, ManifestError::UnknownProfile { ref name, .. } if name == "absent"),
             "the missing profile is named, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_reserved_no_overlay_label_cannot_be_a_profile_name() {
+        // The `resolve` doc promises `"(none)"` is reserved. A promise a
+        // document can break is not a promise: one profile declaring the name
+        // and the overlay-applied and overlay-absent cases share a series
+        // again, which is the whole reason the label exists.
+        let text = format!(
+            "{BASE}\nprofiles:\n  \"{NO_PROFILE_LABEL}\":\n    metadata:\n      name: staged\n"
+        );
+        let error = ManifestDocument::parse(&text)
+            .expect_err("a profile may not claim the label the no-overlay case carries");
+        assert!(
+            matches!(&error, ManifestError::OverlayRule { path, .. }
+                if path == &format!("profiles.{NO_PROFILE_LABEL}")),
+            "the refusal names the reserved key, got: {error:?}"
         );
     }
 

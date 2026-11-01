@@ -104,8 +104,10 @@ struct SpanMeta {
     /// Which Langfuse object kind this span renders as.
     ///
     /// The two values of [`LangfuseTarget`]: a run span renders as the
-    /// trace, every other span as a span-kind observation — the span's
-    /// name at open decides which.
+    /// trace, every other span as an observation — the span's name at
+    /// open decides which. Inside the observation arm the name decides
+    /// once more: a turn closes as a `generation`-kind observation with a
+    /// `generation-create` body, every other span as a span-kind one.
     target: LangfuseTarget,
 
     /// The Langfuse `traceId` this observation hangs under.
@@ -442,17 +444,24 @@ where
                 }
             }
             LangfuseTarget::Observation => {
+                let generation = meta.name == mapping::TURN_SPAN;
                 let mut body = serde_json::json!({
                     "id": meta.observation_id,
                     "traceId": meta.trace_id,
                     "name": meta.name,
                     "startTime": ingest::rfc3339(meta.start),
                     "endTime": ingest::rfc3339_now(),
-                    "type": "span",
                     "metadata": serde_json::Value::Object(
                         serde_json::Map::<String, serde_json::Value>::from_iter(meta.metadata),
                     ),
                 });
+                if !generation {
+                    ingest::set(
+                        &mut body,
+                        "type",
+                        serde_json::Value::String("span".to_string()),
+                    );
+                }
                 if let Some(parent) = meta.parent_observation_id {
                     ingest::set(
                         &mut body,
@@ -477,7 +486,14 @@ where
                         serde_json::Value::String("ERROR".to_string()),
                     );
                 }
-                self.sink.push(ingest::envelope("span-create", &body));
+                self.sink.push(ingest::envelope(
+                    if generation {
+                        "generation-create"
+                    } else {
+                        "span-create"
+                    },
+                    &body,
+                ));
             }
         }
     }

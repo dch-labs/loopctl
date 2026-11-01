@@ -29,7 +29,9 @@ use loopctl::engine::core::Loop;
 use loopctl::engine::{BareLoop, RunConfig};
 use loopctl::stream::{MessageMetadata, MessageStart, StreamEvent};
 use loopctl::structured::{RequestOptions, ToolConstraint};
-use loopctl::testing::{MockApiClient, MockResponse};
+use loopctl::testing::MockApiClient;
+#[cfg(feature = "tool_health")]
+use loopctl::testing::MockResponse;
 use loopctl::tool::ToolRegistry;
 
 #[tokio::test]

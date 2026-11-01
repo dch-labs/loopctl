@@ -214,7 +214,7 @@ async fn the_cloud_would_receive_traces_observations_and_scores() {
         .collect();
     let observations: Vec<&Value> = events
         .iter()
-        .filter(|e| e["type"] == "span-create")
+        .filter(|e| e["type"] == "span-create" || e["type"] == "generation-create")
         .collect();
     let scores: Vec<&Value> = events
         .iter()
@@ -318,7 +318,7 @@ async fn the_cloud_would_receive_traces_observations_and_scores() {
         })
         .expect("the failed trace carries an outcome score");
     assert_eq!(
-        failed_outcome["body"]["stringValue"], "error",
+        failed_outcome["body"]["value"], "error",
         "the failed run's outcome score reads its own run"
     );
 

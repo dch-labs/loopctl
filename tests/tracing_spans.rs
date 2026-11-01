@@ -1544,10 +1544,14 @@ impl loopctl::compact::ContextCompactor for NonShrinkingCompactor {
 
 /// A compactor that shrinks to one small summary message, recording the
 /// target each pass was aimed at.
+// Consumed only by the streaming scenario below, so it reads as dead code
+// in a build without `streaming`.
+#[cfg(feature = "streaming")]
 struct TargetRecordingShrinker {
     targets: Mutex<Vec<u64>>,
 }
 
+#[cfg(feature = "streaming")]
 impl loopctl::compact::ContextCompactor for TargetRecordingShrinker {
     fn compact(
         &self,

@@ -33,8 +33,8 @@
 //!
 //! ```toml
 //! [dependencies]
-//! loopctl = { version = "0.3", features = ["vector_memory"] }
-//! loopctl-vector = { version = "0.3", features = ["qdrant"] }
+//! loopctl = { version = "0.5", features = ["vector_memory"] }
+//! loopctl-vector = { version = "0.5", features = ["qdrant"] }
 //! ```
 //!
 //! The vector *entries* (text, category, metadata) still live in the

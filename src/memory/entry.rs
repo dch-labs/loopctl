@@ -353,6 +353,26 @@ pub enum MemoryCategory {
     Working,
 }
 
+impl MemoryCategory {
+    /// The category's stable `snake_case` spelling.
+    ///
+    /// This is the same vocabulary the serde representation of the enum
+    /// uses, so a category read back from a store and a category
+    /// observed live carry one label spelling — the metric label, the
+    /// entry tag, and the serialized form can never disagree.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trajectory => "trajectory",
+            Self::Insight => "insight",
+            Self::ErrorPattern => "error_pattern",
+            Self::Strategy => "strategy",
+            Self::Fact => "fact",
+            Self::Working => "working",
+        }
+    }
+}
+
 /// Statistics from a memory consolidation pass.
 ///
 /// Returned by [`LoopMemory::consolidate`](super::LoopMemory::consolidate) so callers can monitor the

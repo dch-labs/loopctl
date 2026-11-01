@@ -22,7 +22,7 @@
 //! metric event every loopctl index emits.
 //!
 //! ```toml
-//! loopctl-vector = { version = "0.3", features = ["pgvector"] }
+//! loopctl-vector = { version = "0.5", features = ["pgvector"] }
 //! ```
 
 use std::future::Future;

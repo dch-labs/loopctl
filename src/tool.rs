@@ -188,6 +188,40 @@ impl ToolSchema {
             input_schema,
         }
     }
+
+    /// Estimate the token cost of advertising `schemas`.
+    ///
+    /// Schemas are not messages, so a
+    /// [`TokenCounter`](crate::compact::TokenCounter) cannot read them; this
+    /// applies the same heuristic the default
+    /// [`HeuristicTokenCounter`](crate::compact::HeuristicTokenCounter) uses
+    /// to the JSON the wire actually carries — rendered characters divided by
+    /// the shared [`CHARS_PER_TOKEN`](crate::compact::CHARS_PER_TOKEN)
+    /// divisor. A hint in the same sense the message estimate is: only a
+    /// provider's own usage figures are authoritative. Hosts sizing an
+    /// advertised surface against the window get the identical figure the
+    /// crate's own telemetry records, rather than one that drifts from it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::tool::ToolSchema;
+    ///
+    /// let schemas = vec![ToolSchema::new("echo", "Echoes", serde_json::json!({
+    ///     "type": "object"
+    /// }))];
+    /// assert!(ToolSchema::estimate_tokens(&schemas) > 0);
+    /// ```
+    #[must_use]
+    pub fn estimate_tokens(schemas: &[Self]) -> u64 {
+        schemas
+            .iter()
+            .map(|schema| {
+                serde_json::to_string(schema).map_or(0, |json| json.chars().count() as u64)
+            })
+            .sum::<u64>()
+            / crate::compact::CHARS_PER_TOKEN
+    }
 }
 
 /// Advisory rendering hint attached to a [`ToolOutput`].

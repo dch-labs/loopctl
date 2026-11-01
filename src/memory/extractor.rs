@@ -223,6 +223,12 @@ pub async fn extract(
 /// `min_turns` and `include_failures` gates before dispatching to the
 /// configured strategy.
 ///
+/// The pass reports `loopctl.memory.extract.duration_ms` measured on the
+/// process's own monotonic clock. This is a free function with no
+/// [`LoopManagers`](crate::managers::LoopManagers) in reach, so the span is
+/// not routed through the determinism seam: a pinned clock freezes the
+/// engine's durations, not this one.
+///
 /// # Errors
 ///
 /// - [`LoopError::Api`] when the `Llm` strategy's provider
@@ -234,6 +240,7 @@ pub async fn extract_from_record(
     config: &ExtractionConfig,
     client: Option<&dyn ApiClient>,
 ) -> Result<Vec<ExtractedMemory>, LoopError> {
+    let pass_started = std::time::Instant::now();
     if record.turns.len() < config.min_turns {
         return Ok(Vec::new());
     }
@@ -247,6 +254,7 @@ pub async fn extract_from_record(
         ExtractionStrategy::Llm => {
             let Some(client) = client else {
                 emit_attempt_metric(NO_CLIENT);
+                emit_pass_duration(pass_started);
                 return Err(LoopError::Api(
                     "the Llm extraction strategy requires an ApiClient".into(),
                 ));
@@ -255,6 +263,7 @@ pub async fn extract_from_record(
                 Ok(mined) => mined,
                 Err(failure) => {
                     emit_attempt_metric(failure.outcome);
+                    emit_pass_duration(pass_started);
                     return Err(failure.error);
                 }
             }
@@ -292,6 +301,7 @@ pub async fn extract_from_record(
     memories.truncate(config.max_memories);
     let outcome = settle_outcome(fallback_outcome);
     emit_extraction_metrics(&memories, outcome);
+    emit_pass_duration(pass_started);
     Ok(memories)
 }
 
@@ -1212,6 +1222,22 @@ fn emit_attempt_metric(outcome: &'static str) {
     );
 }
 
+/// Emit the `loopctl.memory.extract.duration_ms` histogram for one pass.
+///
+/// Recorded on every pass that reached a strategy, settled or failed: the
+/// attempt counter counts both, so a histogram of only the successes reports
+/// how long the provider takes when it answers rather than what a pass cost.
+/// A pass that never reached a strategy (too few turns, a failure excluded by
+/// config) records nothing, because it measured nothing.
+fn emit_pass_duration(pass_started: std::time::Instant) {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.memory.extract.duration_ms",
+        value = pass_started.elapsed().as_millis(),
+        "one extraction pass reached its end"
+    );
+}
+
 /// The attempt outcome for a pass that never reached its provider: the
 /// `Llm` strategy is configured but no client was supplied (the pass
 /// errors), or the `Hybrid` strategy is in the same state (the pass
@@ -1239,19 +1265,14 @@ fn settle_outcome(fallback: Option<&'static str>) -> &'static str {
 
 /// The stable `snake_case` telemetry label for a memory category.
 ///
-/// The labels are the contract for the `loopctl.memory.extracted`
-/// counter, matching the trajectory module's outcome-label convention so
-/// downstream dashboards see one vocabulary. Debug-formatted variant
-/// names are deliberately not used — they are unstable presentation.
+/// One spelling with [`MemoryCategory::as_str`], the published vocabulary:
+/// the labels are the contract for the `loopctl.memory.extracted` counter,
+/// matching the trajectory module's outcome-label convention so downstream
+/// dashboards see one vocabulary. Debug-formatted variant names are
+/// deliberately not used — they are unstable presentation, and a second
+/// hand-written list of the same six words is a second thing to drift.
 fn category_label(category: MemoryCategory) -> &'static str {
-    match category {
-        MemoryCategory::Strategy => "strategy",
-        MemoryCategory::ErrorPattern => "error_pattern",
-        MemoryCategory::Insight => "insight",
-        MemoryCategory::Fact => "fact",
-        MemoryCategory::Working => "working",
-        MemoryCategory::Trajectory => "trajectory",
-    }
+    category.as_str()
 }
 
 #[cfg(test)]
@@ -1394,6 +1415,54 @@ mod tests {
             token_summary: TokenSummary::default(),
             turns,
         }
+    }
+
+    /// The `metrics` gate is load-bearing: the assertion reads the registry,
+    /// and `crate::metrics` is configured out of a build without that feature.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn a_failed_llm_pass_still_measures_its_duration() {
+        // `extract.attempts` counts a failed Llm pass; the duration histogram
+        // must cover that same pass, or it answers only how long the provider
+        // takes when it answers and hides what a pass that never got an answer
+        // cost.
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let store = std::sync::Arc::new(crate::metrics::MetricsRegistry::default());
+        let subscriber = tracing_subscriber::registry().with(crate::metrics::MetricsLayer::new(
+            std::sync::Arc::clone(&store),
+        ));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let config = ExtractionConfig {
+            strategy: ExtractionStrategy::Llm,
+            min_turns: 1,
+            include_failures: true,
+            ..ExtractionConfig::default()
+        };
+        let rec = record(TrajectoryOutcome::Failure, vec![turn(0, "ship it", vec![])]);
+        let error = extract_from_record(&rec, &config, None)
+            .await
+            .expect_err("an Llm strategy with no client cannot run");
+        assert!(
+            error.to_string().contains("ApiClient"),
+            "the failure names the missing client: {error}"
+        );
+
+        let snapshot = store.snapshot();
+        let duration = snapshot
+            .series
+            .iter()
+            .find(|s| s.name == "loopctl.memory.extract.duration_ms")
+            .expect("a failed pass is measured, not only counted");
+        assert!(
+            matches!(
+                &duration.value,
+                crate::metrics::SeriesValue::Histogram { .. }
+            ),
+            "duration_ms is a histogram series, got {:?}",
+            duration.value
+        );
     }
 
     fn write_record(record: &TrajectoryRecord) -> std::path::PathBuf {

@@ -20,8 +20,8 @@
 //!
 //! ```toml
 //! [dependencies]
-//! loopctl = "0.3"
-//! loopctl-sqlite = "0.3"
+//! loopctl = "0.5"
+//! loopctl-sqlite = "0.5"
 //! ```
 //!
 //! ```no_run

@@ -211,8 +211,11 @@ pub use types::{
 ///
 /// Four is the long-standing cross-tokenizer average; hosts
 /// needing accuracy install a preset [`RatioTokenCounter`] or
-/// their own counter instead.
-const CHARS_PER_TOKEN: u64 = 4;
+/// their own counter instead. Public because
+/// [`ToolSchema::estimate_tokens`](crate::tool::ToolSchema::estimate_tokens)
+/// shares the divisor so a schema figure and a message figure are never
+/// divided differently.
+pub const CHARS_PER_TOKEN: u64 = 4;
 
 /// Per-message framing characters added to each rendered message.
 ///
@@ -1548,6 +1551,13 @@ impl ContextManager {
     /// estimates — per-request overhead and transients are not part of
     /// them.
     ///
+    /// The `loopctl.compaction.headroom_pct` event this builds settles
+    /// carries the same figure on the percent scale its `_pct` suffix
+    /// names: the telemetry field stays the `0.0..=1.0` fraction it has
+    /// always reported, while the series a threshold is written against
+    /// reads `90` for ninety percent of the window free. One computation
+    /// feeds both, so the two cannot drift apart.
+    ///
     /// # Example
     ///
     /// ```
@@ -1649,6 +1659,14 @@ impl ContextManager {
         };
         let pre_user_tokens = estimate_role_tokens(pre_messages, Role::User);
         let post_user_tokens = estimate_role_tokens(post_messages, Role::User);
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.compaction.headroom_pct",
+            // `_pct` names read as percent on the wire; `mul_add` is the
+            // house idiom for a multiply the side-effect lint must flag.
+            value = headroom_pct.mul_add(100.0, 0.0),
+            "window headroom after a compaction pass"
+        );
 
         CompactTelemetry {
             trigger,

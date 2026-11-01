@@ -12,6 +12,13 @@
 //! subsystem registry series (`loopctl.tools.calls.*` and kin) riding
 //! the same stamp — the example composes a `MetricsLayer` over the
 //! registry so the engine's metric events actually reach it.
+//!
+//! The endpoint is built through [`loopctl_otel::traces_endpoint`] rather than
+//! passed bare. OTLP/HTTP delivers each signal at its own path, and the SDK
+//! appends that path only for an endpoint it resolves from the environment — a
+//! supplied one is used verbatim — so a bare `http://localhost:4318` posts to
+//! `/` and the collector answers `404`. Spans leave in a batch, so that failure
+//! surfaces only at the closing flush: the least useful moment to learn it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -65,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ship the last batch before the process exits.
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint("http://localhost:4318")
+        .with_endpoint(loopctl_otel::traces_endpoint("http://localhost:4318"))
         .with_timeout(std::time::Duration::from_secs(10))
         .build()?;
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()

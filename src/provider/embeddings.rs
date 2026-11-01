@@ -426,6 +426,20 @@ fn emit_batch_metric(
         duration_ms = %started.elapsed().as_millis(),
         "embedding batch settled"
     );
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.embed.requests",
+        provider,
+        outcome,
+        "one embedding request settled"
+    );
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.embed.inputs",
+        provider,
+        inputs = inputs,
+        "inputs carried by one embedding request"
+    );
 }
 
 /// Normalize a chat-style `OLLAMA_BASE_URL` value to the server root.

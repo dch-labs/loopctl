@@ -25,12 +25,55 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use loopctl::attachment::{AttachmentStore, FileAttachment};
+use loopctl::compact::CompactReason;
+use loopctl::compact::ContextManager;
+use loopctl::compact::TruncatingCompactor;
+use loopctl::compact::demote::{DemotionContext, DemotionSink, MemoryDemotionSink};
 use loopctl::config::SessionConfig;
 use loopctl::engine::{BareLoop, RunConfig, core::Loop};
+use loopctl::manifest::{EnvMap, ManifestDocument};
+use loopctl::memory::{FileMemoryStore, InMemoryStore, LoopMemory};
+use loopctl::message::Message;
 use loopctl::metrics::{MetricsLayer, MetricsObserver, MetricsRegistry, SeriesValue};
 use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
 use loopctl::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema};
 use tracing_subscriber::layer::SubscriberExt as _;
+
+/// A tool whose result carries the bulk of a turn.
+///
+/// The growth knob for the compaction scenarios: the scripted preamble stays
+/// short so no single turn can outgrow the window on its own, and the repeated
+/// payload is what pushes the history past the threshold. A pass requested
+/// against one oversized turn fails the run instead of compacting it.
+struct GrowingTool;
+
+impl Tool for GrowingTool {
+    fn name(&self) -> &'static str {
+        "recall"
+    }
+    fn description(&self) -> &'static str {
+        "Returns a fact"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            self.name().to_string(),
+            self.description().to_string(),
+            serde_json::json!({"type": "object"}),
+        )
+    }
+    fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        Box::pin(async {
+            Ok(ToolOutput::text(
+                "the launch code is ARC-7 ".to_string() + &"supporting detail ".repeat(8),
+            ))
+        })
+    }
+}
 
 /// A tool that echoes a fixed successful output.
 struct EchoTool;
@@ -134,6 +177,443 @@ async fn the_layer_captures_the_engines_own_tool_emissions() {
     assert_eq!(
         observer.snapshot().tools.get("echo").map(|s| s.calls),
         Some(1)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_demotion_sink_settles_exactly_its_declared_shape() {
+    let store = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&store)));
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let memory = Arc::new(InMemoryStore::new());
+    let sink = MemoryDemotionSink::new(Arc::clone(&memory) as Arc<dyn LoopMemory>);
+    let evicted = vec![
+        Message::user("the plan was to ship on Tuesday"),
+        Message::assistant("shipping Wednesday instead"),
+    ];
+    sink.demote(
+        &evicted,
+        DemotionContext {
+            reason: CompactReason::ThresholdExceeded,
+            turn: 3,
+            session_id: uuid::Uuid::new_v4(),
+        },
+    )
+    .await
+    .expect("the memory-backed sink accepts the delivery");
+    drop(guard);
+
+    let snap = store.snapshot();
+    let delivered = snap
+        .series
+        .iter()
+        .find(|s| s.name == "loopctl.demotion.delivered")
+        .expect("a landed delivery counts as delivered");
+    assert_eq!(
+        delivered.labels.len(),
+        1,
+        "the row declares only `sink`, so one label may land: {:?}",
+        delivered.labels
+    );
+    assert_eq!(
+        delivered.labels.get("sink").map(String::as_str),
+        Some("memory"),
+        "the declared label lands under its declared name"
+    );
+    match delivered.value {
+        SeriesValue::Counter { total } => assert_eq!(total, 1, "one delivery, counted once"),
+        _ => panic!("demotion.delivered is a counter series"),
+    }
+
+    // A delivery on its own books only what a sink can know. The eviction
+    // row belongs to the pass that evicted, so a direct `demote` call
+    // settles `demotion.delivered` and nothing else; the eviction counter is
+    // pinned by the engine's own delivery path, exercised end to end in
+    // `tests/demotion_sink.rs`.
+    assert!(
+        snap.series
+            .iter()
+            .all(|s| s.name != "loopctl.compaction.evicted.messages"),
+        "the sink alone must not book a row the engine owns"
+    );
+
+    assert_eq!(
+        snap.unknown_labels,
+        0,
+        "the demotion events must not put the crate on the unknown-label drift counter: {:?}",
+        snap.series.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        snap.numeric_on_counter,
+        0,
+        "a demotion counter carrying a numeric the row does not name is drift: {:?}",
+        snap.series.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_file_store_gauges_move_with_a_store_not_only_a_flush() {
+    let dir = tempfile::tempdir().expect("a temp dir for the backing file");
+    let memory = FileMemoryStore::open(dir.path().join("memory.jsonl"))
+        .expect("a file store creates its backing file");
+
+    let store = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&store)));
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    memory
+        .store(loopctl::memory::MemoryEntry::new(
+            loopctl::memory::MemoryCategory::Fact,
+            "the launch code is ARC-7",
+        ))
+        .await
+        .expect("the append settles");
+    drop(guard);
+
+    let snap = store.snapshot();
+    let held = snap
+        .series
+        .iter()
+        .find(|s| {
+            s.name == "loopctl.memory.entries"
+                && s.labels.get("store").map(String::as_str) == Some("file")
+        })
+        .expect("an append books the entries gauge with no flush in sight");
+    match &held.value {
+        SeriesValue::Gauge { value } => assert!(
+            (*value - 1.0).abs() < f64::EPSILON,
+            "one entry was appended, so the gauge reads one: {value}"
+        ),
+        other => panic!("memory.entries is a gauge series, got {other:?}"),
+    }
+
+    let bytes = snap
+        .series
+        .iter()
+        .find(|s| {
+            s.name == "loopctl.memory.persist.file_bytes"
+                && s.labels.get("backend").map(String::as_str) == Some("file")
+        })
+        .expect("the same append books the on-disk size");
+    match &bytes.value {
+        SeriesValue::Gauge { value } => assert!(
+            *value > 0.0,
+            "the appended line is on disk, so the file is not empty: {value}"
+        ),
+        other => panic!("persist.file_bytes is a gauge series, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_emptied_attachment_kind_reads_zero_not_its_old_height() {
+    let store = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&store)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut pinned = AttachmentStore::new();
+    pinned.insert(Arc::new(FileAttachment::path_only("notes.md")));
+    assert!(
+        pinned.consolidated_message().is_some(),
+        "one pin renders a consolidated message"
+    );
+
+    let id = pinned
+        .attachments()
+        .first()
+        .expect("one attachment is pinned")
+        .id();
+    assert!(pinned.remove(&id), "a pin is removable by its own id");
+    assert!(
+        pinned.consolidated_message().is_none(),
+        "with nothing pinned there is nothing to consolidate"
+    );
+
+    let snap = store.snapshot();
+    let count = snap
+        .series
+        .iter()
+        .find(|s| {
+            s.name == "loopctl.attachments.count"
+                && s.labels.get("kind").map(String::as_str) == Some("file")
+        })
+        .expect("the pinned set is recorded under its kind");
+    match &count.value {
+        SeriesValue::Gauge { value } => assert!(
+            *value <= f64::EPSILON,
+            "the last file attachment is gone, so the gauge reads zero rather than {value}"
+        ),
+        other => panic!("attachments.count is a gauge series, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_adopted_compaction_books_its_eviction_with_no_sink_installed() {
+    let registry = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&registry)));
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let tools = ToolRegistry::new();
+    tools.register(GrowingTool);
+    let mut responses = Vec::new();
+    for i in 0..10 {
+        responses.push(MockResponse {
+            // Long enough that the tiny window is exceeded by the third turn:
+            // a short scripted turn never crosses the threshold, and the pass
+            // this test is about never being requested is not the same as a
+            // pass that was requested and adopted.
+            text: "go".to_string(),
+            tool_call: Some(MockToolCall {
+                id: format!("c{i}"),
+                name: "recall".to_string(),
+                input: serde_json::json!({}),
+            }),
+            stop_reason: "tool_use".to_string(),
+        });
+    }
+    responses.push(MockResponse {
+        text: "done".to_string(),
+        tool_call: None,
+        stop_reason: "end_turn".to_string(),
+    });
+
+    let config = SessionConfig::default()
+        .with_context_window(900)
+        .with_compact_threshold(50);
+    let mut loop_ = BareLoop::new(
+        Arc::new(
+            MockApiClient::new("m")
+                .without_usage()
+                .with_responses(responses),
+        ),
+        tools,
+        config,
+    );
+    // The tiny window is what forces the pass. The compactor's knobs sit below
+    // the size that window compacts at, so a machine-requested pass removes
+    // messages instead of shaving nothing and tripping the no-progress guard.
+    loop_.set_context_manager(Arc::new(
+        ContextManager::new(Arc::new(
+            TruncatingCompactor::new()
+                .with_min_messages(2)
+                .with_preserve_recent(2),
+        ))
+        .with_context_window(900),
+    ));
+    loop_
+        .run("grow until compact", &RunConfig::default())
+        .await
+        .expect("the run completes");
+    drop(guard);
+
+    let snap = registry.snapshot();
+    let names: Vec<&str> = snap
+        .series
+        .iter()
+        .filter(|s| s.name.contains("compaction") || s.name.contains("context"))
+        .map(|s| s.name)
+        .collect();
+    let evicted = snap
+        .series
+        .iter()
+        .find(|s| s.name == "loopctl.compaction.evicted.messages")
+        .unwrap_or_else(|| {
+            panic!(
+                "an adopted pass books its eviction with no demotion sink installed; \
+             compaction and context rows present: {names:?}"
+            )
+        });
+    match &evicted.value {
+        SeriesValue::Counter { total } => assert!(
+            *total > 0,
+            "messages left the feed, so the row is not zero: {total}"
+        ),
+        other => panic!("compaction.evicted.messages is a counter series, got {other:?}"),
+    }
+}
+
+#[test]
+fn headroom_reaches_the_wire_on_the_percent_scale() {
+    let store = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&store)));
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let manager =
+        ContextManager::new(Arc::new(TruncatingCompactor::new())).with_context_window(200_000);
+    let pre = vec![Message::user("a".repeat(799_980))];
+    let post = vec![Message::user("a".repeat(79_980))];
+    let telemetry = manager.build_telemetry(
+        CompactReason::ThresholdExceeded,
+        &pre,
+        &post,
+        None,
+        std::time::Instant::now(),
+    );
+    drop(guard);
+
+    assert!(
+        (telemetry.headroom_pct - 0.9).abs() < f64::EPSILON,
+        "the telemetry field keeps reporting the fraction its doc states, got {}",
+        telemetry.headroom_pct
+    );
+
+    let snap = store.snapshot();
+    let gauge = snap
+        .series
+        .iter()
+        .find(|s| s.name == "loopctl.compaction.headroom_pct")
+        .expect("a pass settles its headroom gauge");
+    match gauge.value {
+        SeriesValue::Gauge { value } => assert!(
+            (value - 90.0).abs() < f64::EPSILON,
+            "a name ending `_pct` carries a percent, so ninety percent of the window free \
+             must read 90 — an alert written as `headroom_pct < 20` is meaningless against \
+             0.9: {value}"
+        ),
+        _ => panic!("compaction.headroom_pct is a declared gauge series"),
+    }
+    assert_eq!(
+        snap.unknown_labels, 0,
+        "the gauge declares no labels, so none may arrive: {:?}",
+        gauge.labels
+    );
+}
+
+#[test]
+fn a_profile_reports_only_after_it_has_actually_resolved() {
+    let store = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&store)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let sound_yaml = "\
+version: 1
+budgets:
+  turns: 200
+metadata:
+  name: demo
+tools:
+  - id: shell
+    builtin: shell
+";
+    let broken_yaml = "\
+version: 1
+budgets:
+  turns: 200
+metadata:
+  name: ${NO_SUCH_VAR_ANYWHERE}
+tools:
+  - id: shell
+    builtin: shell
+";
+
+    let broken = ManifestDocument::parse(broken_yaml)
+        .expect("the shape parses; it fails on resolution, not syntax");
+    assert!(
+        broken.resolve(None, &EnvMap::default()).is_err(),
+        "a document referencing an unset variable must fail to resolve, or this test \
+         pins nothing"
+    );
+    assert!(
+        store
+            .snapshot()
+            .series
+            .iter()
+            .all(|s| s.name != "loopctl.profile.active"),
+        "a resolution that never completed must not report the profile as active — a \
+         dashboard reading that gauge would otherwise claim this process ran a manifest \
+         it rejected"
+    );
+
+    let sound = ManifestDocument::parse(sound_yaml).expect("the sound fixture parses");
+    sound
+        .resolve(None, &EnvMap::default())
+        .expect("the sound fixture resolves");
+    let snap = store.snapshot();
+    let active = snap
+        .series
+        .iter()
+        .find(|s| s.name == "loopctl.profile.active")
+        .expect("a resolved manifest reports its profile");
+    assert_eq!(
+        active.labels,
+        std::collections::BTreeMap::from([("profile", "(none)".to_string())]),
+        "a document resolved with no overlay reports the reserved label, so a profile \
+         a host actually named `base` cannot be confused with it"
+    );
+    assert_eq!(snap.unknown_labels, 0, "profile is a declared label");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_clock_freezes_the_memory_retrieve_span() {
+    use loopctl::managers::LoopManagers;
+    use loopctl::memory::{MemoryCategory, MemoryEntry};
+    use loopctl::testing::StepClock;
+
+    let store = Arc::new(MetricsRegistry::default());
+    let subscriber = tracing_subscriber::registry().with(MetricsLayer::new(Arc::clone(&store)));
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let memory = Arc::new(InMemoryStore::new());
+    memory
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "the launch code is ARC-7",
+        ))
+        .await
+        .expect("the store accepts the entry");
+
+    // Every monotonic read advances a quarter second, so any span measured
+    // through the seam is at least that long — while an in-memory retrieve
+    // measured on the real clock rounds to zero.
+    let managers = LoopManagers::new()
+        .with_memory(Arc::clone(&memory) as Arc<dyn LoopMemory>)
+        .with_clock(Arc::new(StepClock::new(std::time::Duration::from_millis(
+            250,
+        ))));
+
+    let client = Arc::new(
+        MockApiClient::new("test-model").with_responses(vec![MockResponse {
+            text: "done".to_string(),
+            tool_call: None,
+            stop_reason: "end_turn".to_string(),
+        }]),
+    );
+    let mut agent = BareLoop::new_with_managers(
+        client,
+        ToolRegistry::new(),
+        SessionConfig::default(),
+        managers,
+    );
+    agent
+        .run("what is the launch code", &RunConfig::default())
+        .await
+        .expect("the memory-carrying run completes");
+    drop(guard);
+
+    let snap = store.snapshot();
+    let series = snap
+        .series
+        .iter()
+        .find(|s| s.name == "loopctl.memory.retrieve.duration_ms")
+        .expect("a turn with a memory store reports its retrieve span");
+    let (bounds, counts) = match &series.value {
+        SeriesValue::Histogram { summary } => (&summary.bounds, &summary.counts),
+        _ => panic!("memory.retrieve.duration_ms is a declared histogram"),
+    };
+    assert_eq!(counts.iter().sum::<u64>(), 1, "one retrieve, one sample");
+    let filled = counts
+        .iter()
+        .position(|c| *c > 0)
+        .expect("the sample landed in a bucket");
+    let landed_at = bounds
+        .get(filled)
+        .copied()
+        .expect("a quarter second sits inside the bounded range, not the overflow slot");
+    assert!(
+        landed_at >= 250,
+        "the retrieve span must be measured through the pinned clock, whose quarter-second \
+         step cannot land in a bucket below 250 ms — the engine read the real clock instead \
+         (bucket bound {landed_at}), so a frozen run would not reproduce this duration"
     );
 }
 

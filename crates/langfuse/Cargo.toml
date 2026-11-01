@@ -1,6 +1,6 @@
 [package]
 name = "loopctl-langfuse"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -11,7 +11,7 @@ keywords = ["langfuse", "observability", "tracing", "agent", "llm"]
 categories = ["development-tools::debugging", "api-bindings"]
 
 [dependencies]
-loopctl = { path = "../..", version = "=0.4.1", default-features = false, features = ["metrics"] }
+loopctl = { path = "../..", version = "=0.5.0", default-features = false, features = ["metrics"] }
 base64 = "0.23"
 httpdate = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
@@ -24,7 +24,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 
 [dev-dependencies]
-loopctl = { path = "../..", version = "=0.4.1", features = ["testing"] }
+loopctl = { path = "../..", version = "=0.5.0", features = ["testing"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

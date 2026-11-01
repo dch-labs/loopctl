@@ -23,8 +23,8 @@
 //!
 //! ```toml
 //! [dependencies]
-//! loopctl = { version = "0.3", features = ["vector_memory"] }
-//! loopctl-hnsw = "0.3"
+//! loopctl = { version = "0.5", features = ["vector_memory"] }
+//! loopctl-hnsw = "0.5"
 //! ```
 //!
 //! [`VectorIndex`]: loopctl::memory::vector::VectorIndex
@@ -616,12 +616,6 @@ fn emit_search_metric(k: usize, matches: &[VectorMatch], started: std::time::Ins
 mod tests {
     use super::HnswParams;
 
-    /// Degenerate tombstone ratios sanitize to the default.
-    ///
-    /// Non-finite, zero, and negative ratios all mean "not a usable
-    /// threshold" — the first never triggers compaction, the others fire
-    /// it on every removal — so the sanitized parameter set must carry
-    /// the default `1.0` instead.
     #[test]
     fn a_degenerate_tombstone_ratio_sanitizes_to_the_default() {
         for degenerate in [f32::NAN, f32::INFINITY, 0.0, -0.5] {

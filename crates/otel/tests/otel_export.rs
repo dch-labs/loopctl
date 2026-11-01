@@ -147,6 +147,19 @@ fn attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a Value> {
         .map(|kv| &kv.value)
 }
 
+/// Every value exported under `key`, so a key exported twice is visible.
+///
+/// [`attr`] answers the first match, which is exactly what a duplicated
+/// attribute hides: a backend that keeps the first occurrence and one that
+/// keeps the last disagree about what the span said.
+fn attrs<'a>(span: &'a SpanData, key: &str) -> Vec<&'a Value> {
+    span.attributes
+        .iter()
+        .filter(|kv| kv.key.as_str() == key)
+        .map(|kv| &kv.value)
+        .collect()
+}
+
 fn find_span<'a>(spans: &'a [SpanData], name: &str) -> Option<&'a SpanData> {
     spans.iter().find(|span| span.name == name)
 }
@@ -202,6 +215,47 @@ async fn the_collector_sees_genai_shaped_spans() {
         find_span(&spans, "agent.turn").is_some(),
         "turn span keeps its loopctl-defined name, got: {:?}",
         spans.iter().map(|s| s.name.as_ref()).collect::<Vec<_>>()
+    );
+
+    // One `query` per turn span. The field opens unset and the engine
+    // records the assembled input onto it, and a recorded `tracing` field
+    // is *added* to an `OTel` span's attributes rather than replacing an
+    // entry — so a span that opened with `""` exported the empty opener
+    // beside the real text under the same key, and a collector that keeps
+    // the first occurrence it sees reads an empty input for every turn.
+    let turn_queries: Vec<Vec<String>> = spans
+        .iter()
+        .filter(|span| span.name == "agent.turn")
+        .map(|span| {
+            attrs(span, "query")
+                .into_iter()
+                .map(|value| value.as_str().to_string())
+                .collect()
+        })
+        .collect();
+    assert!(
+        !turn_queries.is_empty(),
+        "the run above exports turn spans to inspect"
+    );
+    for query in &turn_queries {
+        assert_eq!(
+            query.len(),
+            1,
+            "one `query` per turn span; a second is an opening value exported \
+             beside the recorded text: {query:?}"
+        );
+        assert!(
+            query.iter().all(|value| !value.is_empty()),
+            "the single `query` carries the assembled input, never an empty opener: \
+             {query:?}"
+        );
+    }
+    assert!(
+        turn_queries
+            .iter()
+            .flatten()
+            .any(|value| value.contains("otel e2e")),
+        "the turn that opened the run exports the text that started it: {turn_queries:?}"
     );
 
     // Identity mapping: the engine's fields arrive verbatim.

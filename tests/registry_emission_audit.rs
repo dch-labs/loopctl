@@ -425,7 +425,8 @@ fn inside_token_consumer(src: &str, at: usize, code: &[bool]) -> bool {
                 continue;
             }
             if src.contains("tracing::")
-                && imported_from_tracing(src, name, head).is_some_and(is_tracing_event_macro)
+                && imported_from_tracing(src, name, head)
+                    .is_some_and(|(origin, _)| is_tracing_event_macro(origin))
             {
                 continue;
             }
@@ -588,27 +589,42 @@ fn matching_close(src: &str, open: usize) -> Option<usize> {
 /// fails here rather than passing on an event no subscriber reads. Two further
 /// refusals guard the name itself: a local `macro_rules!` of the event's name
 /// shadows the import for every call written below its definition, and an
-/// `as tracing` rename of another crate spells every `tracing::…` path — bare
-/// or qualified — that other crate's name.
+/// `as tracing` rename of another crate spells every relative `tracing::…`
+/// path — bare or qualified — that other crate's name. An absolute `::tracing`
+/// anchors to the extern prelude, where no rename reaches: it, and any import
+/// that arrived by one, rides out the rename untouched.
 fn is_tracing_event(src: &str, at: usize) -> bool {
     let Some((name, _)) = enclosing_macro(src, at) else {
         return false;
     };
-    if src.contains(" as tracing") && tracing_renamed_in_scope(src, &code_mask(src), at) {
-        return false;
-    }
+    let absolute = name.starts_with("::");
     let spelled = name.trim_start_matches(':');
     if let Some((path, last)) = spelled.rsplit_once("::") {
-        // Qualified: the path must name tracing, the last segment an event.
-        return path == "tracing" && is_tracing_event_macro(last);
+        // Qualified: the path must name tracing, the last segment an event,
+        // and a relative spelling must survive the rename check.
+        return path == "tracing"
+            && is_tracing_event_macro(last)
+            && (absolute || !renamed_veto(src, at));
     }
     // Bare: the import carries the six-name rule, since under a rename the
     // name at the call site says nothing about which macro it came from —
+    // unless it arrived by an absolute path, which no rename can reach —
     // and under a same-named `macro_rules!` written above the call the
     // import says nothing either, because the local definition wins.
-    imported_from_tracing(src, spelled, at).is_some_and(is_tracing_event_macro)
-        && (!src.contains("macro_rules!")
-            || !shadowed_by_macro_rules(src, &code_mask(src), spelled, at))
+    match imported_from_tracing(src, spelled, at) {
+        Some((origin, from_absolute)) if is_tracing_event_macro(origin) => {
+            (from_absolute || !renamed_veto(src, at))
+                && (!src.contains("macro_rules!")
+                    || !shadowed_by_macro_rules(src, &code_mask(src), spelled, at))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an `as tracing` rename reaches the call site: the text decides
+/// whether to look, the scope machinery decides the answer.
+fn renamed_veto(src: &str, at: usize) -> bool {
+    src.contains(" as tracing") && tracing_renamed_in_scope(src, &code_mask(src), at)
 }
 
 /// The macros tracing offers for writing an event.
@@ -631,15 +647,18 @@ fn is_tracing_event_macro(name: &str) -> bool {
 ///
 /// Covers the plain, braced and `as`-renamed spellings: a rename binds the name
 /// on its right and arrives from the one on its left, and a braced list binds
-/// each entry the same way. A file importing through a re-export is outside what
+/// each entry the same way. The answer carries whether the winning `use` was
+/// written as an absolute path — such an import resolves through the extern
+/// prelude, immune to any `as tracing` rename, and the caller needs to know.
+/// A file importing through a re-export is outside what
 /// a textual check can settle, and the same rule applies to it as to any unseen
 /// path: the row fails loud.
 ///
 /// Only code counts. A string reciting an import line -- a codegen template, a
 /// doc example -- binds nothing where it is written.
-fn imported_from_tracing<'a>(src: &'a str, name: &'a str, at: usize) -> Option<&'a str> {
+fn imported_from_tracing<'a>(src: &'a str, name: &'a str, at: usize) -> Option<(&'a str, bool)> {
     let code = code_mask(src);
-    let mut best: Option<(usize, Option<&'a str>)> = None;
+    let mut best: Option<(usize, Option<(&'a str, bool)>)> = None;
     let mut from = 0usize;
     while let Some(relative) = src.get(from..).and_then(|tail| tail.find("use ")) {
         let start = from.saturating_add(relative);
@@ -667,16 +686,17 @@ fn imported_from_tracing<'a>(src: &'a str, name: &'a str, at: usize) -> Option<&
             best = Some((scope, origin));
         }
     }
-    best.and_then(|(_, origin)| origin)
+    best.and_then(|(_, binding)| binding)
 }
 
 /// What the `use` item written at `start` binds `name` to, if it binds it at
-/// all: `Some(Some(origin))` when the binding arrives from the `tracing` root,
-/// `Some(None)` when it arrives from anywhere else -- a binding from another
-/// crate is still a binding, and it shadows -- and `None` when the item never
-/// carries this name into scope. The item counts only when its block reaches
-/// the call site `at`; `scope` is the block's rank, `0` for the file root, so
-/// the caller can let the innermost binder of the name win.
+/// all: `Some(Some((origin, absolute)))` when the binding arrives from the
+/// `tracing` root — absolute stating whether the item was written as a `::`
+/// path — `Some(None)` when it arrives from anywhere else, since a binding
+/// from another crate is still a binding and it shadows, and `None` when the
+/// item never carries this name into scope. The item counts only when its
+/// block reaches the call site `at`; `scope` is the block's rank, `0` for the
+/// file root, so the caller can let the innermost binder of the name win.
 fn binds_name<'a>(
     src: &'a str,
     code: &[bool],
@@ -684,7 +704,7 @@ fn binds_name<'a>(
     at: usize,
     item: &'a str,
     name: &'a str,
-) -> Option<(usize, Option<&'a str>)> {
+) -> Option<(usize, Option<(&'a str, bool)>)> {
     let mut bound: Option<Option<&'a str>> = None;
     if let Some(brace) = item.find('{') {
         let (path, opened) = item.split_at(brace);
@@ -739,7 +759,7 @@ fn binds_name<'a>(
         }
         Some(_) => return None,
     };
-    Some((scope, origin))
+    Some((scope, origin.map(|origin| (origin, item.starts_with("::")))))
 }
 
 /// Whether the text before an entry, a name, or a `::*` names the `tracing`
@@ -823,13 +843,16 @@ fn shadowed_by_macro_rules(src: &str, code: &[bool], name: &str, at: usize) -> b
     false
 }
 
-/// Whether an in-scope `use … as tracing;` has rebound the crate name itself
-/// to another crate: below such a rename, every path spelled `tracing::…` —
-/// a qualified call or another import line — resolves to that other crate, so
-/// nothing in its reach can be tracing's own. The rename counts from its own
-/// block inward, exactly as the bindings `binds_name` reads, and renaming
-/// tracing to itself is no rename at all.
+/// Whether the name `tracing` itself has been rebound by the time of the call
+/// site `at`, so paths spelled `tracing::…` spell something else. Renames bind
+/// and rank exactly as the imports `binds_name` reads — a braced list renames
+/// through any of its entries — and where two bind the name at one spot the
+/// deeper block wins: a `use ::tracing as tracing;` written nearer than an
+/// outer rename anchors the name back to the crate and lifts the veto, while
+/// any other nearer binding keeps it. Only absolute paths restore: a relative
+/// one resolves through the rename it stands under.
 fn tracing_renamed_in_scope(src: &str, code: &[bool], at: usize) -> bool {
+    let mut best: Option<(usize, bool)> = None;
     let mut from = 0usize;
     while let Some(relative) = src.get(from..).and_then(|tail| tail.find("use ")) {
         let start = from.saturating_add(relative);
@@ -850,23 +873,50 @@ fn tracing_renamed_in_scope(src: &str, code: &[bool], at: usize) -> bool {
             .get(start.saturating_add(4)..end)
             .unwrap_or_default()
             .trim();
-        let Some((left, bound)) = item.split_once(" as ") else {
+        let mut candidate: Option<bool> = None;
+        if let Some(brace) = item.find('{') {
+            let (path, opened) = item.split_at(brace);
+            let inner = opened
+                .get(1..opened.rfind('}').unwrap_or(opened.len()))
+                .unwrap_or_default();
+            for entry in inner.split(',') {
+                let entry = entry.trim();
+                let (source, binding) = match entry.split_once(" as ") {
+                    Some((source, binding)) => (source.trim(), binding.trim()),
+                    None => (entry, entry),
+                };
+                if binding != "tracing" {
+                    continue;
+                }
+                // `use ::tracing::{self as tracing};` restores the crate;
+                // every other entry landing the name renames it.
+                candidate = Some(source == "self" && path.trim().starts_with("::"));
+                break;
+            }
+        } else if let Some((left, binding)) = item.split_once(" as ")
+            && binding.trim() == "tracing"
+        {
+            candidate = Some(left.trim() == "::tracing");
+        }
+        let Some(restore) = candidate else {
             continue;
         };
-        if bound.trim() != "tracing" || left.trim().trim_start_matches("::") == "tracing" {
-            continue;
-        }
-        match enclosing_block(src, code, start) {
-            None => return true,
+        let scope = match enclosing_block(src, code, start) {
+            None => 0,
             Some(open)
                 if matching_close(src, open).is_some_and(|close| at >= open && at < close) =>
             {
-                return true;
+                open
             }
-            Some(_) => {}
+            Some(_) => continue,
+        };
+        if best.is_none_or(|(farther, _)| scope > farther) {
+            best = Some((scope, restore));
         }
     }
-    false
+    // The deepest binding of the name reaching the call decides: only a
+    // restore — never a rename — clears the veto.
+    best.is_some_and(|(_, restore)| !restore)
 }
 
 /// Whether an argument list names the target the metrics layer keeps.
@@ -1778,6 +1828,103 @@ fn emit() {
     assert!(
         !emission_site_in(bare, "loopctl.bare.count"),
         "an import written under the rename arrives from the other crate too"
+    );
+}
+
+#[test]
+fn a_braced_as_tracing_rename_still_vetoes() {
+    let braced = r#"
+use other::{inner as tracing};
+fn emit() {
+    tracing::debug!(target: "loopctl::metrics", metric = "loopctl.braced.count", n = 1);
+}
+"#;
+    assert!(
+        !emission_site_in(braced, "loopctl.braced.count"),
+        "a braced rename lands the name `tracing` just as a bare one does"
+    );
+}
+
+#[test]
+fn an_absolute_tracing_path_ignores_the_rename() {
+    let absolute_import = r#"
+use log as tracing;
+use ::tracing::debug as emit_metric;
+fn emit() {
+    emit_metric!(target: "loopctl::metrics", metric = "loopctl.absolute_import.count", n = 1);
+}
+"#;
+    assert!(
+        emission_site_in(absolute_import, "loopctl.absolute_import.count"),
+        "an import anchored to the extern prelude resolves through no local rename"
+    );
+    let absolute_call = r#"
+use log as tracing;
+fn emit() {
+    ::tracing::debug!(target: "loopctl::metrics", metric = "loopctl.absolute_call.count", n = 1);
+}
+"#;
+    assert!(
+        emission_site_in(absolute_call, "loopctl.absolute_call.count"),
+        "a call spelled ::tracing:: rides out the rename the same way"
+    );
+}
+
+#[test]
+fn a_self_restore_under_a_rename_restores_the_name() {
+    let restored = r#"
+use log as tracing;
+fn outer() {
+    use ::tracing as tracing;
+    tracing::debug!(target: "loopctl::metrics", metric = "loopctl.restore.count", n = 1);
+}
+"#;
+    assert!(
+        emission_site_in(restored, "loopctl.restore.count"),
+        "the nearer absolute self-restore wins the name, so the call is tracing's"
+    );
+    let rebound = r#"
+use ::tracing as tracing;
+fn outer() {
+    use log as tracing;
+    tracing::debug!(target: "loopctl::metrics", metric = "loopctl.rebound.count", n = 1);
+}
+"#;
+    assert!(
+        !emission_site_in(rebound, "loopctl.rebound.count"),
+        "and the nearer rename wins the other way, vetting the outer restore"
+    );
+}
+
+#[test]
+fn a_shadow_definition_spares_earlier_and_outside_calls() {
+    let before = r#"
+use tracing::debug;
+fn main() {
+    debug!(target: "loopctl::metrics", metric = "loopctl.before.count", n = 1);
+    macro_rules! debug {
+        ($($t:tt)*) => {};
+    }
+}
+"#;
+    assert!(
+        emission_site_in(before, "loopctl.before.count"),
+        "a definition written below the call shadows nothing above it"
+    );
+    let outside = r#"
+use tracing::debug;
+fn main() {
+    {
+        macro_rules! debug {
+            ($($t:tt)*) => {};
+        }
+    }
+    debug!(target: "loopctl::metrics", metric = "loopctl.outside.count", n = 1);
+}
+"#;
+    assert!(
+        emission_site_in(outside, "loopctl.outside.count"),
+        "a definition in a block that closed before the call reaches no further"
     );
 }
 

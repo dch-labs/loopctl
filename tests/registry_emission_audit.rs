@@ -585,19 +585,30 @@ fn matching_close(src: &str, open: usize) -> Option<usize> {
 /// `use tracing::debug as dbg` makes `dbg!` an event and leaves `debug!` out of
 /// scope -- because a binding is no clue to the macro behind it. A macro
 /// re-exported behind another path is therefore unseen, and the row it serves
-/// fails here rather than passing on an event no subscriber reads.
+/// fails here rather than passing on an event no subscriber reads. Two further
+/// refusals guard the name itself: a local `macro_rules!` of the event's name
+/// shadows the import for every call written below its definition, and an
+/// `as tracing` rename of another crate spells every `tracing::…` path — bare
+/// or qualified — that other crate's name.
 fn is_tracing_event(src: &str, at: usize) -> bool {
     let Some((name, _)) = enclosing_macro(src, at) else {
         return false;
     };
-    let spelled = name.trim_start_matches(':');
-    match spelled.rsplit_once("::") {
-        // Qualified: the path must name tracing, the last segment an event.
-        Some((path, last)) => path == "tracing" && is_tracing_event_macro(last),
-        // Bare: the import carries the six-name rule, since under a rename the
-        // name at the call site says nothing about which macro it came from.
-        None => imported_from_tracing(src, spelled, at).is_some_and(is_tracing_event_macro),
+    if src.contains(" as tracing") && tracing_renamed_in_scope(src, &code_mask(src), at) {
+        return false;
     }
+    let spelled = name.trim_start_matches(':');
+    if let Some((path, last)) = spelled.rsplit_once("::") {
+        // Qualified: the path must name tracing, the last segment an event.
+        return path == "tracing" && is_tracing_event_macro(last);
+    }
+    // Bare: the import carries the six-name rule, since under a rename the
+    // name at the call site says nothing about which macro it came from —
+    // and under a same-named `macro_rules!` written above the call the
+    // import says nothing either, because the local definition wins.
+    imported_from_tracing(src, spelled, at).is_some_and(is_tracing_event_macro)
+        && (!src.contains("macro_rules!")
+            || !shadowed_by_macro_rules(src, &code_mask(src), spelled, at))
 }
 
 /// The macros tracing offers for writing an event.
@@ -763,6 +774,99 @@ fn enclosing_block(src: &str, code: &[bool], at: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Whether a `macro_rules!` definition of this very name reaches the call site
+/// `at`. A macro definition binds textually — from the definition to the end
+/// of the block it sits in and into the blocks nested there — and a local
+/// definition outranks any import of the same spelling, so the call expands
+/// code this scan cannot read. Unfollowable is unfollowable: the caller
+/// refuses the site rather than crediting an expansion that may run no event.
+fn shadowed_by_macro_rules(src: &str, code: &[bool], name: &str, at: usize) -> bool {
+    let marker = "macro_rules!";
+    let mut from = 0usize;
+    while let Some(relative) = src.get(from..).and_then(|tail| tail.find(marker)) {
+        let head = from.saturating_add(relative);
+        from = head.saturating_add(marker.len());
+        if !code.get(head).copied().unwrap_or(true) {
+            continue;
+        }
+        let mut after = from;
+        while matches!(
+            src.as_bytes().get(after),
+            Some(b' ' | b'\t' | b'\n' | b'\r')
+        ) {
+            after = after.saturating_add(1);
+        }
+        let word = after;
+        while matches!(
+            src.as_bytes().get(after),
+            Some(b) if b.is_ascii_alphanumeric() || *b == b'_'
+        ) {
+            after = after.saturating_add(1);
+        }
+        if src.get(word..after) != Some(name) {
+            continue;
+        }
+        // Textual order: a definition written below the call shadows nothing.
+        if head >= at {
+            continue;
+        }
+        match enclosing_block(src, code, head) {
+            None => return true,
+            Some(open) if matching_close(src, open).is_some_and(|close| at < close) => {
+                return true;
+            }
+            Some(_) => {}
+        }
+    }
+    false
+}
+
+/// Whether an in-scope `use … as tracing;` has rebound the crate name itself
+/// to another crate: below such a rename, every path spelled `tracing::…` —
+/// a qualified call or another import line — resolves to that other crate, so
+/// nothing in its reach can be tracing's own. The rename counts from its own
+/// block inward, exactly as the bindings `binds_name` reads, and renaming
+/// tracing to itself is no rename at all.
+fn tracing_renamed_in_scope(src: &str, code: &[bool], at: usize) -> bool {
+    let mut from = 0usize;
+    while let Some(relative) = src.get(from..).and_then(|tail| tail.find("use ")) {
+        let start = from.saturating_add(relative);
+        from = start.saturating_add(4);
+        let inside_a_word = start > 0
+            && matches!(
+                src.as_bytes().get(start.saturating_sub(1)),
+                Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b':'
+            );
+        if inside_a_word || !code.get(start).copied().unwrap_or(true) {
+            continue;
+        }
+        let end = src
+            .get(start..)
+            .and_then(|tail| tail.find(';'))
+            .map_or(src.len(), |offset| start.saturating_add(offset));
+        let item = src
+            .get(start.saturating_add(4)..end)
+            .unwrap_or_default()
+            .trim();
+        let Some((left, bound)) = item.split_once(" as ") else {
+            continue;
+        };
+        if bound.trim() != "tracing" || left.trim().trim_start_matches("::") == "tracing" {
+            continue;
+        }
+        match enclosing_block(src, code, start) {
+            None => return true,
+            Some(open)
+                if matching_close(src, open).is_some_and(|close| at >= open && at < close) =>
+            {
+                return true;
+            }
+            Some(_) => {}
+        }
+    }
+    false
 }
 
 /// Whether an argument list names the target the metrics layer keeps.
@@ -1577,7 +1681,7 @@ mod loud {
 fn a_module_level_import_reaches_calls_in_nested_bodies() {
     let nested = r#"
 use tracing::debug;
-mod engine {
+fn outer() {
     fn emit() {
         debug!(target: "loopctl::metrics", metric = "loopctl.nested.count", n = 1);
     }
@@ -1631,6 +1735,49 @@ mod noisy {
     assert!(
         !emission_site_in(shadowed, "loopctl.shadow.count"),
         "the nearer log::debug import shadows the outer tracing one"
+    );
+}
+
+#[test]
+fn a_local_macro_named_like_the_event_is_no_import() {
+    let shadowed = r#"
+use tracing::debug;
+fn main() {
+    macro_rules! debug {
+        ($($t:tt)*) => {};
+    }
+    debug!(target: "loopctl::metrics", metric = "loopctl.local.count", n = 1);
+}
+"#;
+    assert!(
+        !emission_site_in(shadowed, "loopctl.local.count"),
+        "the file's own `debug` shadows the import below its definition: the call \
+         expands code this scan cannot follow, so it credits nothing"
+    );
+}
+
+#[test]
+fn a_crate_renamed_to_tracing_is_never_tracing() {
+    let qualified = r#"
+use log as tracing;
+fn emit() {
+    tracing::debug!(target: "loopctl::metrics", metric = "loopctl.qualified.count", n = 1);
+}
+"#;
+    assert!(
+        !emission_site_in(qualified, "loopctl.qualified.count"),
+        "a path spelled tracing:: under an `as tracing` rename spells the other crate"
+    );
+    let bare = r#"
+use log as tracing;
+use tracing::debug;
+fn emit() {
+    debug!(target: "loopctl::metrics", metric = "loopctl.bare.count", n = 1);
+}
+"#;
+    assert!(
+        !emission_site_in(bare, "loopctl.bare.count"),
+        "an import written under the rename arrives from the other crate too"
     );
 }
 

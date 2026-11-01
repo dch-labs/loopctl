@@ -361,12 +361,71 @@ fn emission_site_in(src: &str, name: &str) -> bool {
             Some((text, metric_at)) => aimed_at_metrics(text, *metric_at),
             None => false,
         };
-        if is_macro_argument(src, at) && is_tracing_event(src, at) && aimed_at_the_target {
+        if is_macro_argument(src, at)
+            && !inside_token_consumer(src, at, &code)
+            && is_tracing_event(src, at)
+            && aimed_at_the_target
+        {
             return true;
         }
         from = at.saturating_add(1);
     }
     false
+}
+
+/// A macro that reads the tokens inside it instead of running them.
+///
+/// What goes in comes out as text or as a value, never as executed code.
+const TOKEN_CONSUMERS: [&str; 8] = [
+    "stringify",
+    "concat",
+    "include",
+    "include_str",
+    "include_bytes",
+    "env",
+    "option_env",
+    "cfg",
+];
+
+/// Whether `at` sits inside the argument list of such a macro.
+///
+/// A call handed to `stringify!` is text: no subscriber ever sees that event, so
+/// a field written inside it books no sample however faithfully it is spelled.
+/// A `macro_rules!` body is deliberately absent from the list -- its tokens run
+/// at every call, so a row fed only from a macro definition is a site this scan
+/// cannot follow, and the row fails loud rather than being written off as dead.
+/// The check costs a search per consumer per candidate, so it runs last of the
+/// conditions guarding a site.
+fn inside_token_consumer(src: &str, at: usize, code: &[bool]) -> bool {
+    TOKEN_CONSUMERS.iter().any(|name| {
+        let needle = format!("{name}!");
+        let mut from = 0usize;
+        loop {
+            let Some(relative) = src.get(from..).and_then(|tail| tail.find(needle.as_str())) else {
+                return false;
+            };
+            // The needle spans `name!`, so the byte just past it is the bracket
+            // a call to it would open with.
+            let head = from.saturating_add(relative);
+            let open = head.saturating_add(needle.len());
+            from = open.saturating_add(1);
+            // `my_stringify!` and `crate::stringify!` are not this macro, and a
+            // bang that opens nothing is not a call to it either.
+            let is_the_word = !matches!(
+                src.as_bytes().get(head.saturating_sub(1)),
+                Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b':'
+            );
+            if !is_the_word
+                || src.as_bytes().get(open) != Some(&b'(')
+                || !code.get(head).copied().unwrap_or(true)
+            {
+                continue;
+            }
+            if matching_close(src, open).is_some_and(|close| at > open && at < close) {
+                return true;
+            }
+        }
+    })
 }
 
 /// Locate `metric` `=` `"name"`, at any spacing around the `=`.
@@ -514,32 +573,47 @@ fn matching_close(src: &str, open: usize) -> Option<usize> {
 ///
 /// A bare `debug!` is settled by the file, which is as far as this resolves a
 /// path: the name is whichever macro the file imported, so an import line naming
-/// it decides. A macro re-exported behind another path is therefore unseen, and
-/// the row it serves fails here rather than passing on an event no subscriber
-/// reads.
+/// it decides what it is and from where. A rename is settled there too --
+/// `use tracing::debug as dbg` makes `dbg!` an event and leaves `debug!` out of
+/// scope -- because a binding is no clue to the macro behind it. A macro
+/// re-exported behind another path is therefore unseen, and the row it serves
+/// fails here rather than passing on an event no subscriber reads.
 fn is_tracing_event(src: &str, at: usize) -> bool {
     let Some((name, _)) = enclosing_macro(src, at) else {
         return false;
     };
-    let macro_name = name.rsplit(':').next().unwrap_or_default();
-    if !matches!(
-        macro_name,
-        "trace" | "debug" | "info" | "warn" | "error" | "event"
-    ) {
-        return false;
-    }
-    match name.trim_start_matches(':').rsplit_once("::") {
-        Some((path, _)) => path == "tracing",
-        None => imports_from_tracing(src, macro_name),
+    let spelled = name.trim_start_matches(':');
+    match spelled.rsplit_once("::") {
+        // Qualified: the path must name tracing, the last segment an event.
+        Some((path, last)) => path == "tracing" && is_tracing_event_macro(last),
+        // Bare: the import carries the six-name rule, since under a rename the
+        // name at the call site says nothing about which macro it came from.
+        None => imported_from_tracing(src, spelled).is_some_and(is_tracing_event_macro),
     }
 }
 
-/// Whether the file imports `name` from `tracing`, by `use` line.
+/// The macros tracing offers for writing an event.
+const TRACING_EVENT_MACROS: [&str; 6] = ["trace", "debug", "info", "warn", "error", "event"];
+
+/// Whether `name` is one of them. `span!` is a tracing macro too and writes a
+/// span, which the metrics layer never sees as an event.
+fn is_tracing_event_macro(name: &str) -> bool {
+    TRACING_EVENT_MACROS.contains(&name)
+}
+
+/// The tracing-side name `name` is bound to when this file imports it from
+/// `tracing`; `None` when it does not.
 ///
-/// Covers the plain, braced and glob spellings. A file that renames on import
-/// is outside what a textual check can settle, and the same rule as above
-/// applies to it: unseen, so it fails loud.
-fn imports_from_tracing(src: &str, name: &str) -> bool {
+/// Covers the plain, braced, glob and `as`-renamed spellings: a rename binds the
+/// name on its right and arrives from the one on its left, and a glob binds every
+/// macro tracing exports under its own name. A file importing through a
+/// re-export is outside what a textual check can settle, and the same rule
+/// applies to it as to any unseen path: the row fails loud.
+///
+/// Only code counts. A string reciting an import line -- a codegen template, a
+/// doc example -- binds nothing where it is written.
+fn imported_from_tracing<'a>(src: &'a str, name: &'a str) -> Option<&'a str> {
+    let code = code_mask(src);
     let mut from = 0usize;
     while let Some(relative) = src.get(from..).and_then(|tail| tail.find("use tracing::")) {
         let start = from.saturating_add(relative);
@@ -548,27 +622,29 @@ fn imports_from_tracing(src: &str, name: &str) -> bool {
             .and_then(|tail| tail.find(';'))
             .map_or(src.len(), |offset| start.saturating_add(offset));
         from = end.saturating_add(1);
+        if !code.get(start).copied().unwrap_or(true) {
+            continue;
+        }
         let list = src.get(start..end).unwrap_or_default();
         if list.contains("::*") {
-            return true;
+            return Some(name);
         }
-        let names = match list.find('{') {
+        let entries = match list.find('{') {
             Some(brace) => list.get(brace.saturating_add(1)..).unwrap_or_default(),
             None => list.rsplit("::").next().unwrap_or_default(),
         };
-        if names.split(',').any(|entry| {
-            entry
-                .split(" as ")
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_end_matches('}')
-                == name
-        }) {
-            return true;
+        for entry in entries.split(',') {
+            let entry = entry.trim().trim_end_matches('}').trim();
+            let (origin, bound) = match entry.split_once(" as ") {
+                Some((origin, bound)) => (origin.trim(), bound.trim()),
+                None => (entry, entry),
+            };
+            if bound == name {
+                return Some(origin);
+            }
         }
     }
-    false
+    None
 }
 
 /// Whether an argument list names the target the metrics layer keeps.
@@ -620,9 +696,14 @@ fn top_level_arguments(args: &str) -> Vec<Range<usize>> {
                 index = line_comment_end(bytes, index);
                 continue;
             }
-            b'r' | b'b' if bytes.get(index.saturating_add(1)) == Some(&b'#') => {
-                index = raw_string_end(bytes, index).unwrap_or(bytes.len());
-                continue;
+            b'r' if bytes.get(index.saturating_add(1)) == Some(&b'#') => {
+                // `r#type` is a raw identifier, not the head of a string: only a
+                // terminator makes it one, and reading an identifier as an
+                // unterminated string would hide the rest of the file.
+                if let Some(past) = raw_string_end(bytes, index) {
+                    index = past;
+                    continue;
+                }
             }
             b'"' => {
                 index = string_end(bytes, index).unwrap_or(bytes.len());
@@ -653,7 +734,8 @@ fn line_comment_end(bytes: &[u8], at: usize) -> usize {
         .unwrap_or(bytes.len())
 }
 
-/// One past the raw string whose `r` (or `b`) is at `at`, any hash count.
+/// One past the raw string whose `r` is at `at`, any hash count. `None` when
+/// the `r#` opens a raw identifier instead, which has no terminator.
 fn raw_string_end(bytes: &[u8], at: usize) -> Option<usize> {
     let mut hashes = 0usize;
     while bytes.get(at.saturating_add(1).saturating_add(hashes)) == Some(&b'#') {
@@ -718,8 +800,9 @@ fn code_mask(src: &str) -> Vec<bool> {
             Some(b'/') if bytes.get(index.saturating_add(1)) == Some(&b'/') => {
                 Some(line_comment_end(bytes, index))
             }
-            Some(b'r' | b'b') if bytes.get(index.saturating_add(1)) == Some(&b'#') => {
-                Some(raw_string_end(bytes, index).unwrap_or(bytes.len()))
+            Some(b'r') if bytes.get(index.saturating_add(1)) == Some(&b'#') => {
+                // A raw identifier masks nothing; see `top_level_arguments`.
+                raw_string_end(bytes, index)
             }
             Some(b'"') => Some(string_end(bytes, index).unwrap_or(bytes.len())),
             Some(b'\'') => Some(char_or_lifetime_end(bytes, index)),
@@ -736,6 +819,96 @@ fn code_mask(src: &str) -> Vec<bool> {
         }
     }
     mask
+}
+
+#[test]
+fn a_raw_identifier_masks_nothing_after_it() {
+    // `r#type` is an identifier, not the head of a raw string. Read as one with
+    // no terminator in sight, it swallows the rest of the file and the audit
+    // loses every emitter written below it — generated protobuf shapes are the
+    // common case, since a proto field named `type` arrives as `r#type`.
+    let source = concat!(
+        "pub struct Field {\n    pub r#type: i32,\n}\n",
+        "pub fn emit() {\n",
+        "    tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.real.row\");\n",
+        "}\n",
+        "pub fn quoted() -> &'static str { r#\"metric = \"loopctl.dead.row\"\"# }\n",
+    );
+    assert!(
+        emission_site_in(source, "loopctl.real.row"),
+        "a raw identifier must not blind the scan to the emitter below it"
+    );
+    assert!(
+        !emission_site_in(source, "loopctl.dead.row"),
+        "a real raw string further down is still prose"
+    );
+}
+
+#[test]
+fn a_call_handed_to_a_token_consuming_macro_emits_nothing() {
+    // `stringify!` turns the tokens inside it into text. The `tracing::debug!`
+    // handed to it never runs, so it feeds no row however real it looks, and
+    // the same holds for every macro that reads its arguments rather than
+    // running them.
+    assert!(
+        !emission_site_in(
+            r#"pub fn snippet() -> &'static str { stringify!(tracing::debug!(target: "loopctl::metrics", metric = "loopctl.dead.row")) }"#,
+            "loopctl.dead.row"
+        ),
+        "a stringified call is text about an emission, not one"
+    );
+    assert!(
+        !emission_site_in(
+            r#"const DOC: &str = concat!(env!("CARGO_PKG_VERSION"), tracing::debug!(target: "loopctl::metrics", metric = "loopctl.dead.row"));"#,
+            "loopctl.dead.row"
+        ),
+        "another token consumer swallows the call the same way"
+    );
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!(target: "loopctl::metrics", metric = "loopctl.dead.row", "spoken");"#,
+            "loopctl.dead.row"
+        ),
+        "the plain call stays a site"
+    );
+}
+
+#[test]
+fn an_import_quoted_in_a_string_binds_nothing() {
+    // A string holding `use tracing::debug;` is text — a codegen template, a
+    // doc example — and binds no name where it is written. The file's own
+    // import is the one that decides what a bare `debug!` is.
+    let source = concat!(
+        "pub const SNIPPET: &str = \"use tracing::debug;\";\n",
+        "use log::debug;\n",
+        "fn emit() { debug!(target: \"loopctl::metrics\", metric = \"loopctl.dead.row\"); }\n",
+    );
+    assert!(
+        !emission_site_in(source, "loopctl.dead.row"),
+        "an import quoted inside a literal binds nothing"
+    );
+}
+
+#[test]
+fn a_renamed_import_binds_the_name_it_arrives_as() {
+    // `use tracing::debug as dbg;` puts `dbg` in scope and leaves `debug`
+    // outside: the binding is what a call site spells.
+    let renamed = concat!(
+        "use tracing::debug as dbg;\n",
+        "fn emit() { dbg!(target: \"loopctl::metrics\", metric = \"loopctl.dead.row\"); }\n",
+    );
+    assert!(
+        emission_site_in(renamed, "loopctl.dead.row"),
+        "the bound name is tracing's macro"
+    );
+    let stale = concat!(
+        "use tracing::debug as dbg;\n",
+        "fn emit() { debug!(target: \"loopctl::metrics\", metric = \"loopctl.dead.row\"); }\n",
+    );
+    assert!(
+        !emission_site_in(stale, "loopctl.dead.row"),
+        "the renamed-away name is not in this file's scope"
+    );
 }
 
 #[test]

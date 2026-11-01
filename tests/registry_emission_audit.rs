@@ -228,16 +228,97 @@ fn emission_sources() -> Vec<String> {
         collect_rs(Path::new("crates"), &mut files);
         files
     };
-    files.iter().map(|file| code_only(&read(file))).collect()
+    files
+        .iter()
+        .map(|file| strip_cfg_test(&code_only(&read(file))))
+        .collect()
+}
+
+/// Blank the items annotated `#[cfg(test)]`, leaving every other byte alone.
+///
+/// An emitter that only compiles for the test build ships nothing, so it cannot
+/// be the site that keeps a declared row — the same reason the scan skips the
+/// `tests` directory, applied inside a file that is otherwise production code.
+/// Blanking rather than deleting keeps every remaining byte at its offset, so
+/// the bracket walks still see whole calls. `#[cfg(not(test))]` is the shipped
+/// half and stays standing; a compound `#[cfg(all(test, feature = "x"))]` item
+/// is excluded along with the plain one.
+fn strip_cfg_test(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let code = code_mask(source);
+    let mut keep = vec![true; bytes.len()];
+    let mut from = 0usize;
+    while let Some(relative) = source.get(from..).and_then(|tail| tail.find("#[cfg(")) {
+        let attr = from.saturating_add(relative);
+        let Some(closer) = source
+            .get(attr..)
+            .and_then(|tail| tail.find(")]"))
+            .map(|offset| attr.saturating_add(offset))
+        else {
+            break;
+        };
+        from = closer.saturating_add(")]".len());
+        let inner = source
+            .get(attr.saturating_add("#[cfg(".len())..closer)
+            .unwrap_or_default();
+        if !inner.contains("test") || inner.contains("not(test") {
+            continue;
+        }
+        let Some(end) = item_end(source, &code, from) else {
+            break;
+        };
+        for slot in keep.iter_mut().skip(attr).take(end.saturating_sub(attr)) {
+            *slot = false;
+        }
+    }
+    let blanked = bytes
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            if *byte == b'\n' || keep.get(index).copied().unwrap_or(true) {
+                *byte
+            } else {
+                b' '
+            }
+        })
+        .collect::<Vec<u8>>();
+    // Excluded ranges always cover whole literals, so replacing their bytes
+    // with spaces leaves valid text behind.
+    String::from_utf8(blanked).unwrap_or_default()
+}
+
+/// Where the item following an attribute ends: the `;` of a declaration, or the
+/// bracket closing its block.
+///
+/// Delimiters inside a string are skipped, so a message containing `{` cannot
+/// start a block that has to be matched.
+fn item_end(source: &str, code: &[bool], from: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = from;
+    while let Some(byte) = bytes.get(index).copied() {
+        if code.get(index).copied().unwrap_or(true) {
+            match byte {
+                b';' => return Some(index.saturating_add(1)),
+                b'{' => return matching_close(source, index).map(|close| close.saturating_add(1)),
+                _ => {}
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    None
 }
 
 /// Whether `name` has an emission site in `sources`.
 ///
 /// A site is `metric = "name"` appearing as a *field* of a tracing event aimed
-/// at the metrics target, which is the only shape an emission takes
-/// (`tracing::debug!` with `target: "loopctl::metrics"`). Two shapes are refused:
-/// text inside a string literal — prose *about* a row, and prose has never
-/// written a sample — and a field of anything that is not a macro call.
+/// at the metrics target — `tracing::debug!` with `target: "loopctl::metrics"`,
+/// the shape every shipped emitter uses. Two shapes are refused: text inside a
+/// string literal — prose *about* a row, and prose has never written a sample —
+/// and a field of anything that is not a macro call.
+///
+/// The target is recognised by its spelling rather than by what it evaluates
+/// to, which is a real limit of this gate; see [`aimed_at_metrics`] for what it
+/// costs and why it is drawn there.
 ///
 /// Spacing around `=` is not load-bearing. `cargo fmt` cannot normalise it
 /// inside a macro arm it cannot parse as expressions (`target:` is one), so an
@@ -329,16 +410,23 @@ fn is_macro_argument(src: &str, at: usize) -> bool {
 ///
 /// Bracket matching treats every bracket as one nesting class, the way the
 /// backwards walk always has — the question is which call a field belongs to,
-/// not how the file parses.
+/// not how the file parses. Delimiters written inside a string or a comment are
+/// skipped: an unmatched `[` in a log message is prose, and counting it would
+/// report the call as unlocatable.
 fn enclosing_macro(src: &str, at: usize) -> Option<(&str, Range<usize>)> {
     let bytes = src.as_bytes();
+    let code = code_mask(src);
     let mut depth = 0usize;
     for (seen, byte) in bytes.iter().take(at).rev().enumerate() {
+        let here = at.saturating_sub(1).saturating_sub(seen);
+        if !code.get(here).copied().unwrap_or(true) {
+            continue;
+        }
         match *byte {
             b')' | b']' | b'}' => depth = depth.saturating_add(1),
             b'(' | b'[' | b'{' => {
                 if depth == 0 {
-                    let open = at.saturating_sub(1).saturating_sub(seen);
+                    let open = here;
                     let mut before = open;
                     while matches!(
                         bytes.get(before.saturating_sub(1)),
@@ -374,10 +462,18 @@ fn enclosing_macro(src: &str, at: usize) -> Option<(&str, Range<usize>)> {
 }
 
 /// The index of the bracket closing the one at `open`.
+///
+/// Delimiters inside a string or a comment do not count, or a `)` written in a
+/// message would close the call early and the arguments handed to the target
+/// check would stop where the prose happened to end.
 fn matching_close(src: &str, open: usize) -> Option<usize> {
     let bytes = src.as_bytes();
+    let code = code_mask(src);
     let mut depth = 0usize;
     for (index, byte) in bytes.iter().enumerate().skip(open) {
+        if !code.get(index).copied().unwrap_or(true) {
+            continue;
+        }
         match byte {
             b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
             b')' | b']' | b'}' => {
@@ -408,19 +504,166 @@ fn is_tracing_event(src: &str, at: usize) -> bool {
 
 /// Whether an argument list names the target the metrics layer keeps.
 ///
-/// Both spellings count: the literal every shipped emitter writes, and
-/// `MetricsLayer::TARGET`, which the crate's own test emitters use. The layer
-/// drops an event whose target differs from its own, so a field aimed anywhere
-/// else never reaches a row however faithfully it names one.
+/// Two spellings are recognised: the literal most shipped emitters write, and
+/// `MetricsLayer::TARGET`, which the rest write and the crate's test emitters
+/// use. The layer drops an event whose target differs from its own, so a field
+/// aimed anywhere else never reaches a row however faithfully it names one.
+///
+/// The match is textual, deliberately. An alias holding the same string —
+/// `Self::TARGET`, or a local `const` — is a working emitter this gate cannot
+/// see, because deciding that would mean following `use` and `const`
+/// declarations across files. Such an emitter reads as no site at all, which is
+/// the failure this audit can hear about: the row fails loud rather than passing
+/// on a target the layer would have dropped. So the rule the crate holds to is
+/// that an emitter writes one of the two spellings above.
+///
+/// Only an argument of the call itself can set an event's target, so `target:`
+/// is read at the start of a top-level argument — never inside a string literal
+/// or a nested group. An event whose message merely quotes the field still
+/// lands on the module path, and a `target:` handed to something nested belongs
+/// to that call rather than to the event.
 fn aimed_at_metrics(args: &str) -> bool {
-    let Some(relative) = args.find("target:") else {
-        return false;
-    };
-    let value = args
-        .get(relative.saturating_add("target:".len())..)
-        .unwrap_or_default()
-        .trim_start();
-    value.starts_with("\"loopctl::metrics\"") || value.starts_with("MetricsLayer::TARGET")
+    top_level_arguments(args).into_iter().any(|span| {
+        let argument = args.get(span).unwrap_or_default().trim_start();
+        let Some(after) = argument.strip_prefix("target:") else {
+            return false;
+        };
+        let value = after.trim_start();
+        value.starts_with("\"loopctl::metrics\"") || value.starts_with("MetricsLayer::TARGET")
+    })
+}
+
+/// The spans of `args`'s top-level arguments, split at the commas between them.
+///
+/// A comma inside a string, a char literal or a nested bracket group belongs to
+/// something else. Splitting there would invent an argument starting wherever a
+/// message happened to say `target:`, which is the false site this replaces.
+fn top_level_arguments(args: &str) -> Vec<Range<usize>> {
+    let bytes = args.as_bytes();
+    let mut spans = Vec::new();
+    let (mut start, mut depth, mut index) = (0usize, 0i32, 0usize);
+    while let Some(byte) = bytes.get(index).copied() {
+        match byte {
+            b'/' if bytes.get(index.saturating_add(1)) == Some(&b'/') => {
+                index = line_comment_end(bytes, index);
+                continue;
+            }
+            b'r' | b'b' if bytes.get(index.saturating_add(1)) == Some(&b'#') => {
+                index = raw_string_end(bytes, index).unwrap_or(bytes.len());
+                continue;
+            }
+            b'"' => {
+                index = string_end(bytes, index).unwrap_or(bytes.len());
+                continue;
+            }
+            b'\'' => {
+                index = char_or_lifetime_end(bytes, index);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                spans.push(start..index);
+                start = index.saturating_add(1);
+            }
+            _ => {}
+        }
+        index = index.saturating_add(1);
+    }
+    spans.push(start..bytes.len());
+    spans
+}
+
+/// One past the `//` comment starting at `at`.
+fn line_comment_end(bytes: &[u8], at: usize) -> usize {
+    (at..bytes.len())
+        .find(|&index| bytes.get(index) == Some(&b'\n'))
+        .unwrap_or(bytes.len())
+}
+
+/// One past the raw string whose `r` (or `b`) is at `at`, any hash count.
+fn raw_string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut hashes = 0usize;
+    while bytes.get(at.saturating_add(1).saturating_add(hashes)) == Some(&b'#') {
+        hashes = hashes.saturating_add(1);
+    }
+    let quote = at.saturating_add(1).saturating_add(hashes);
+    if bytes.get(quote) != Some(&b'"') {
+        return None;
+    }
+    let content = quote.saturating_add(1);
+    let terminator = std::iter::once(b'"')
+        .chain(std::iter::repeat_n(b'#', hashes))
+        .collect::<Vec<_>>();
+    let closed = (content..bytes.len()).find(|&index| {
+        bytes
+            .get(index..)
+            .is_some_and(|tail| tail.starts_with(terminator.as_slice()))
+    })?;
+    Some(closed.saturating_add(terminator.len()))
+}
+
+/// One past the string literal opened at `at`, honouring backslash escapes.
+fn string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut index = at.saturating_add(1);
+    while let Some(byte) = bytes.get(index).copied() {
+        match byte {
+            b'\\' => index = index.saturating_add(2),
+            b'"' => return Some(index.saturating_add(1)),
+            _ => index = index.saturating_add(1),
+        }
+    }
+    None
+}
+
+/// One past a char literal, or past the apostrophe of a lifetime.
+///
+/// Lifetimes appear in argument types (`&'a str`), and treating one as the open
+/// of a literal would swallow the rest of the argument list.
+fn char_or_lifetime_end(bytes: &[u8], at: usize) -> usize {
+    if bytes.get(at.saturating_add(1)) == Some(&b'\\') {
+        return (at.saturating_add(2)..bytes.len())
+            .find(|&index| bytes.get(index) == Some(&b'\''))
+            .map_or(bytes.len(), |index| index.saturating_add(1));
+    }
+    if bytes.get(at.saturating_add(2)) == Some(&b'\'') {
+        return at.saturating_add(3);
+    }
+    at.saturating_add(1)
+}
+
+/// Which bytes of `src` are code rather than literal text or a comment.
+///
+/// A bracket typed inside a string is punctuation in a message, not nesting, so
+/// both walks consult this instead of counting every byte. Delimiters outside a
+/// literal are unaffected: real nesting still reads exactly as it did.
+fn code_mask(src: &str) -> Vec<bool> {
+    let bytes = src.as_bytes();
+    let mut mask = vec![true; bytes.len()];
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let literal_end = match bytes.get(index).copied() {
+            Some(b'/') if bytes.get(index.saturating_add(1)) == Some(&b'/') => {
+                Some(line_comment_end(bytes, index))
+            }
+            Some(b'r' | b'b') if bytes.get(index.saturating_add(1)) == Some(&b'#') => {
+                Some(raw_string_end(bytes, index).unwrap_or(bytes.len()))
+            }
+            Some(b'"') => Some(string_end(bytes, index).unwrap_or(bytes.len())),
+            Some(b'\'') => Some(char_or_lifetime_end(bytes, index)),
+            _ => None,
+        };
+        match literal_end {
+            Some(past) => {
+                for slot in mask.iter_mut().skip(index).take(past.saturating_sub(index)) {
+                    *slot = false;
+                }
+                index = past;
+            }
+            None => index = index.saturating_add(1),
+        }
+    }
+    mask
 }
 
 #[test]
@@ -536,6 +779,122 @@ fn a_site_is_a_tracing_event_aimed_at_the_metrics_target() {
             "loopctl.dead.row"
         ),
         "a macro that is not a tracing event reaches no subscriber"
+    );
+    // The unrecognised spelling is deliberate, not an oversight: see
+    // `aimed_at_metrics`. A row emitted only through an alias fails here rather
+    // than passing on something the layer would drop.
+    assert!(
+        !emission_site_in(
+            "tracing::debug!(target: Self::TARGET, metric = \"loopctl.dead.row\");",
+            "loopctl.dead.row"
+        ),
+        "an alias to the target is out of scope for a textual match"
+    );
+}
+
+#[test]
+fn a_target_inside_a_string_or_a_nested_argument_is_not_a_field() {
+    // Only a top-level argument sets an event's target. The same text inside
+    // the message, or inside a nested call, leaves the event on the module
+    // path — which the layer drops — so neither may be credited as a site.
+    let quoted_in_message = concat!(
+        "tracing::debug!(r#\"say target: \"loopctl::metrics\" aloud\"#",
+        ", metric = \"loopctl.dead.row\");"
+    );
+    assert!(
+        !emission_site_in(quoted_in_message, "loopctl.dead.row"),
+        "a message that quotes the field sets no target"
+    );
+    let nested = concat!(
+        "tracing::debug!(annotate(target: \"loopctl::metrics\"), ",
+        "metric = \"loopctl.dead.row\");"
+    );
+    assert!(
+        !emission_site_in(nested, "loopctl.dead.row"),
+        "a nested argument is not the event's target"
+    );
+    // A top-level `target:` still counts wherever it sits in the list: the
+    // order of fields is not part of the promise.
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!(metric = "loopctl.dead.row", target: "loopctl::metrics");"#,
+            "loopctl.dead.row"
+        ),
+        "a later argument is the same field"
+    );
+}
+
+#[test]
+fn an_emitter_that_only_builds_for_tests_is_not_a_production_site() {
+    // A declared row is a promise about the shipped library. An emitter inside
+    // `#[cfg(test)]` never compiles into that library, so it cannot be the site
+    // that keeps the row, while a `#[cfg(not(test))]` emitter does.
+    let source = concat!(
+        "pub fn emit() {\n",
+        "    tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.real.row\");\n",
+        "}\n",
+        "#[cfg(test)]\n",
+        "mod checks {\n",
+        "    fn only_in_tests() {\n",
+        "        tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.test.only.row\");\n",
+        "    }\n",
+        "}\n",
+        "#[cfg(not(test))]\n",
+        "pub fn still_ships() {\n",
+        "    tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.still.real.row\");\n",
+        "}\n",
+    );
+    let stripped = strip_cfg_test(source);
+    let sources = [stripped.clone()];
+    assert!(
+        has_emission_site(&sources, "loopctl.real.row"),
+        "a production emitter must survive the exclusion"
+    );
+    assert!(
+        has_emission_site(&sources, "loopctl.still.real.row"),
+        "cfg(not(test)) is the shipped half, so its emitter counts"
+    );
+    assert!(
+        !has_emission_site(&sources, "loopctl.test.only.row"),
+        "an emitter that exists only under cfg(test) ships nothing"
+    );
+    assert_eq!(
+        stripped.len(),
+        source.len(),
+        "blanking preserves offsets, so the walks still see whole calls"
+    );
+}
+
+#[test]
+fn a_delimiter_inside_a_string_is_not_nesting() {
+    // Locating the call a field belongs to asks which brackets wrap it. A
+    // bracket written inside a message is punctuation in prose, not nesting,
+    // and counting it either hides the real call (a `[` before the field reads
+    // as the enclosing bracket) or truncates the arguments (a `)` after it
+    // closes the call early, losing a `target:` that follows).
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!("retry [attempt 1", target: "loopctl::metrics", metric = "loopctl.dead.row");"#,
+            "loopctl.dead.row"
+        ),
+        "a bracket inside the message before the field must not hide the call"
+    );
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!(metric = "loopctl.dead.row", "closing ) paren", target: "loopctl::metrics");"#,
+            "loopctl.dead.row"
+        ),
+        "a bracket inside the message after the field must not drop the target"
+    );
+    // And the walk must still respect real nesting: a field handed to a nested
+    // macro belongs to that macro, whose arguments have nothing to say about
+    // the outer event's target.
+    assert!(
+        !emission_site_in(
+            r#"tracing::debug!(target: "loopctl::engine", wrap(metric = "loopctl.dead.row"));"#,
+            "loopctl.dead.row"
+        ),
+        "nesting outside a string still changes which call the field belongs to"
     );
 }
 

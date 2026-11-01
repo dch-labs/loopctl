@@ -250,6 +250,10 @@ fn strip_cfg_test(source: &str) -> String {
     let mut from = 0usize;
     while let Some(relative) = source.get(from..).and_then(|tail| tail.find("#[cfg(")) {
         let attr = from.saturating_add(relative);
+        if !code.get(attr).copied().unwrap_or(true) {
+            from = attr.saturating_add(1);
+            continue;
+        }
         let Some(closer) = source
             .get(attr..)
             .and_then(|tail| tail.find(")]"))
@@ -330,22 +334,34 @@ fn has_emission_site(sources: &[String], name: &str) -> bool {
 }
 
 /// One source, one row name.
+///
+/// A match inside a literal is prose, so the literal mask is consulted before
+/// anything else: a message that quotes an emitter, even in the shape
+/// `debug!(metric = "…")`, describes a row without writing a sample.
 fn emission_site_in(src: &str, name: &str) -> bool {
+    let code = code_mask(src);
     let mut from = 0usize;
     while let Some(tail) = src.get(from..) {
         let Some(offset) = find_metric_field(tail, name) else {
             return false;
         };
         let at = from.saturating_add(offset);
-        if is_macro_argument(src, at)
-            && is_tracing_event(src, at)
-            && aimed_at_metrics(
-                enclosing_macro(src, at)
-                    .and_then(|(_, args)| src.get(args).map(str::to_owned))
-                    .as_deref()
-                    .unwrap_or_default(),
-            )
-        {
+        if !code.get(at).copied().unwrap_or(true) {
+            from = at.saturating_add(1);
+            continue;
+        }
+        let aimed = enclosing_macro(src, at).and_then(|(_, span)| {
+            if at >= span.end {
+                return None;
+            }
+            let text = src.get(span.clone())?;
+            Some((text.to_owned(), at.saturating_sub(span.start)))
+        });
+        let aimed_at_the_target = match &aimed {
+            Some((text, metric_at)) => aimed_at_metrics(text, *metric_at),
+            None => false,
+        };
+        if is_macro_argument(src, at) && is_tracing_event(src, at) && aimed_at_the_target {
             return true;
         }
         from = at.saturating_add(1);
@@ -491,15 +507,68 @@ fn matching_close(src: &str, open: usize) -> Option<usize> {
 /// Whether the field at `at` belongs to a tracing event macro.
 ///
 /// A `metric` field handed to any other macro reaches no subscriber at all,
-/// whatever its fields say.
+/// whatever its fields say, so the path is checked and not only the last
+/// segment: `log::info!` takes a `metric` field just as readily and books
+/// nothing. A qualified name must name `tracing`, in either the relative or the
+/// absolute spelling.
+///
+/// A bare `debug!` is settled by the file, which is as far as this resolves a
+/// path: the name is whichever macro the file imported, so an import line naming
+/// it decides. A macro re-exported behind another path is therefore unseen, and
+/// the row it serves fails here rather than passing on an event no subscriber
+/// reads.
 fn is_tracing_event(src: &str, at: usize) -> bool {
     let Some((name, _)) = enclosing_macro(src, at) else {
         return false;
     };
-    matches!(
-        name.rsplit(':').next().unwrap_or_default(),
+    let macro_name = name.rsplit(':').next().unwrap_or_default();
+    if !matches!(
+        macro_name,
         "trace" | "debug" | "info" | "warn" | "error" | "event"
-    )
+    ) {
+        return false;
+    }
+    match name.trim_start_matches(':').rsplit_once("::") {
+        Some((path, _)) => path == "tracing",
+        None => imports_from_tracing(src, macro_name),
+    }
+}
+
+/// Whether the file imports `name` from `tracing`, by `use` line.
+///
+/// Covers the plain, braced and glob spellings. A file that renames on import
+/// is outside what a textual check can settle, and the same rule as above
+/// applies to it: unseen, so it fails loud.
+fn imports_from_tracing(src: &str, name: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(relative) = src.get(from..).and_then(|tail| tail.find("use tracing::")) {
+        let start = from.saturating_add(relative);
+        let end = src
+            .get(start..)
+            .and_then(|tail| tail.find(';'))
+            .map_or(src.len(), |offset| start.saturating_add(offset));
+        from = end.saturating_add(1);
+        let list = src.get(start..end).unwrap_or_default();
+        if list.contains("::*") {
+            return true;
+        }
+        let names = match list.find('{') {
+            Some(brace) => list.get(brace.saturating_add(1)..).unwrap_or_default(),
+            None => list.rsplit("::").next().unwrap_or_default(),
+        };
+        if names.split(',').any(|entry| {
+            entry
+                .split(" as ")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches('}')
+                == name
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether an argument list names the target the metrics layer keeps.
@@ -522,8 +591,11 @@ fn is_tracing_event(src: &str, at: usize) -> bool {
 /// or a nested group. An event whose message merely quotes the field still
 /// lands on the module path, and a `target:` handed to something nested belongs
 /// to that call rather than to the event.
-fn aimed_at_metrics(args: &str) -> bool {
+fn aimed_at_metrics(args: &str, metric_at: usize) -> bool {
     top_level_arguments(args).into_iter().any(|span| {
+        if span.end > metric_at {
+            return false;
+        }
         let argument = args.get(span).unwrap_or_default().trim_start();
         let Some(after) = argument.strip_prefix("target:") else {
             return false;
@@ -805,22 +877,26 @@ fn a_target_inside_a_string_or_a_nested_argument_is_not_a_field() {
         !emission_site_in(quoted_in_message, "loopctl.dead.row"),
         "a message that quotes the field sets no target"
     );
+    // A field handed to a nested macro is that macro's input, not a field of
+    // the event: the event records `note`, and the name inside never reaches a
+    // field visitor.
     let nested = concat!(
-        "tracing::debug!(annotate(target: \"loopctl::metrics\"), ",
-        "metric = \"loopctl.dead.row\");"
+        "tracing::debug!(target: \"loopctl::metrics\", ",
+        "note = other!(metric = \"loopctl.dead.row\"));"
     );
     assert!(
         !emission_site_in(nested, "loopctl.dead.row"),
-        "a nested argument is not the event's target"
+        "a field inside a nested macro is not a field of the event"
     );
-    // A top-level `target:` still counts wherever it sits in the list: the
-    // order of fields is not part of the promise.
+    // A `target:` after a field is not tracing syntax at all: the option is
+    // parsed ahead of the fields, and `debug!(metric = "…", target: "…")` is a
+    // compile error, so nothing that cannot compile may be a site.
     assert!(
-        emission_site_in(
+        !emission_site_in(
             r#"tracing::debug!(metric = "loopctl.dead.row", target: "loopctl::metrics");"#,
             "loopctl.dead.row"
         ),
-        "a later argument is the same field"
+        "a target that follows a field names no event"
     );
 }
 
@@ -866,25 +942,138 @@ fn an_emitter_that_only_builds_for_tests_is_not_a_production_site() {
 }
 
 #[test]
-fn a_delimiter_inside_a_string_is_not_nesting() {
-    // Locating the call a field belongs to asks which brackets wrap it. A
-    // bracket written inside a message is punctuation in prose, not nesting,
-    // and counting it either hides the real call (a `[` before the field reads
-    // as the enclosing bracket) or truncates the arguments (a `)` after it
-    // closes the call early, losing a `target:` that follows).
+fn a_cfg_attribute_quoted_in_a_string_blanks_nothing() {
+    // `strip_cfg_test` looks for an attribute, and a string can hold the
+    // characters of one. A match read inside a literal opens a blanked range
+    // that runs to the end of the next item, swallowing a real emitter with it.
+    let quoted = concat!(
+        "pub fn note() -> &'static str { \"annotate with #[cfg(test)]\" }\n",
+        "pub fn emit() {\n",
+        "    tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.real.row\");\n",
+        "}\n",
+    );
+    let sources = [strip_cfg_test(quoted)];
     assert!(
-        emission_site_in(
-            r#"tracing::debug!("retry [attempt 1", target: "loopctl::metrics", metric = "loopctl.dead.row");"#,
+        has_emission_site(&sources, "loopctl.real.row"),
+        "an attribute quoted inside a string must not blank the item after it"
+    );
+    // A real attribute still blanks its item, and only its item.
+    let real = concat!(
+        "pub fn emit() {\n",
+        "    tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.real.row\");\n",
+        "}\n",
+        "#[cfg(test)]\n",
+        "mod checks {\n",
+        "    fn t() {\n",
+        "        tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.test.row\");\n",
+        "    }\n",
+        "}\n",
+    );
+    let real_sources = [strip_cfg_test(real)];
+    assert!(
+        has_emission_site(&real_sources, "loopctl.real.row"),
+        "the production emitter outside the attribute still counts"
+    );
+    assert!(
+        !has_emission_site(&real_sources, "loopctl.test.row"),
+        "the item the attribute governs is still excluded"
+    );
+}
+
+#[test]
+fn a_metric_event_must_come_from_tracing() {
+    // The final name segment is only half the question. A macro named `info!`
+    // from another crate records its fields somewhere else entirely, and a
+    // subscriber that never sees the event books no row.
+    assert!(
+        !emission_site_in(
+            r#"log::info!(target: "loopctl::metrics", metric = "loopctl.dead.row", "m");"#,
             "loopctl.dead.row"
         ),
-        "a bracket inside the message before the field must not hide the call"
+        "an event macro from another crate reaches no metrics subscriber"
+    );
+    assert!(
+        !emission_site_in(
+            r#"crate::telemetry::debug!(target: "loopctl::metrics", metric = "loopctl.dead.row");"#,
+            "loopctl.dead.row"
+        ),
+        "a project macro borrowing the name is not tracing"
     );
     assert!(
         emission_site_in(
-            r#"tracing::debug!(metric = "loopctl.dead.row", "closing ) paren", target: "loopctl::metrics");"#,
+            "::tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.dead.row\");",
             "loopctl.dead.row"
         ),
-        "a bracket inside the message after the field must not drop the target"
+        "the absolute path names the same macro"
+    );
+    // Unqualified is still decidable, because the file says which macro it is.
+    let from_tracing = concat!(
+        "use tracing::debug;\n",
+        "fn emit() { debug!(target: \"loopctl::metrics\", metric = \"loopctl.dead.row\"); }\n",
+    );
+    assert!(
+        emission_site_in(from_tracing, "loopctl.dead.row"),
+        "a `use tracing::debug` import makes the bare name tracing's own"
+    );
+    assert!(
+        !emission_site_in(
+            "use log::debug;\nfn emit() { debug!(target: \"loopctl::metrics\", metric = \"loopctl.dead.row\"); }\n",
+            "loopctl.dead.row"
+        ),
+        "the same bare name imported from log is not an emission"
+    );
+}
+
+#[test]
+fn a_metric_field_quoted_in_an_argument_is_not_the_field_of_the_event() {
+    // A genuine metrics event can carry a string that quotes the field — a
+    // hint, a catalog dump. The quoted name reaches no field visitor, so it
+    // must not stand in as the emitter of the row it spells.
+    let call = format!(
+        "tracing::debug!(target: \"loopctl::metrics\", metric = \"loopctl.real.row\", r#\"{hint}\"#);",
+        hint = r#"example: debug!(metric = "loopctl.dead.row")"#
+    );
+    assert!(
+        emission_site_in(&call, "loopctl.real.row"),
+        "the event's own field is a site"
+    );
+    assert!(
+        !emission_site_in(&call, "loopctl.dead.row"),
+        "a row named only inside the message is not emitted by it"
+    );
+}
+
+#[test]
+fn a_delimiter_inside_a_string_is_not_nesting() {
+    // Locating the call a field belongs to asks which brackets wrap it. A
+    // bracket written inside a message is punctuation in prose, not nesting,
+    // and counting it reads as the enclosing bracket, which makes the real call
+    // unlocatable.
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!(target: "loopctl::metrics", note = "retry [attempt 1", metric = "loopctl.dead.row");"#,
+            "loopctl.dead.row"
+        ),
+        "a bracket inside a value before the field must not hide the call"
+    );
+    // A delimiter inside a *field value* ahead of the metric field: read as
+    // nesting, it closes the call early and the arguments handed to the target
+    // check stop short of the field.
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!(target: "loopctl::metrics", note = "saw ) here", metric = "loopctl.dead.row");"#,
+            "loopctl.dead.row"
+        ),
+        "a bracket inside a field value must not end the argument list early"
+    );
+    // And the shipped shape: options and fields first, message last, with an
+    // unmatched bracket inside that message.
+    assert!(
+        emission_site_in(
+            r#"tracing::debug!(target: "loopctl::metrics", metric = "loopctl.dead.row", "closing ) paren");"#,
+            "loopctl.dead.row"
+        ),
+        "a bracket inside the trailing message must not drop the field"
     );
     // And the walk must still respect real nesting: a field handed to a nested
     // macro belongs to that macro, whose arguments have nothing to say about

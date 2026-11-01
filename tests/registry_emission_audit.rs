@@ -404,26 +404,32 @@ fn inside_token_consumer(src: &str, at: usize, code: &[bool]) -> bool {
             let Some(relative) = src.get(from..).and_then(|tail| tail.find(needle.as_str())) else {
                 return false;
             };
-            // The needle spans `name!`, so the byte just past it is the bracket
-            // a call to it would open with.
             let head = from.saturating_add(relative);
-            let open = head.saturating_add(needle.len());
-            from = open.saturating_add(1);
+            from = head.saturating_add(needle.len());
+            let mut open = from;
+            while matches!(src.as_bytes().get(open), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                open = open.saturating_add(1);
+            }
             // `my_stringify!` and `crate::stringify!` are not this macro, and a
-            // bang that opens nothing is not a call to it either.
             let is_the_word = !matches!(
                 src.as_bytes().get(head.saturating_sub(1)),
                 Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b':'
             );
             if !is_the_word
-                || src.as_bytes().get(open) != Some(&b'(')
+                || !matches!(src.as_bytes().get(open), Some(b'(' | b'[' | b'{'))
                 || !code.get(head).copied().unwrap_or(true)
             {
                 continue;
             }
-            if matching_close(src, open).is_some_and(|close| at > open && at < close) {
-                return true;
+            if !matching_close(src, open).is_some_and(|close| at > open && at < close) {
+                continue;
             }
+            if src.contains("tracing::")
+                && imported_from_tracing(src, name, head).is_some_and(is_tracing_event_macro)
+            {
+                continue;
+            }
+            return true;
         }
     })
 }
@@ -572,8 +578,10 @@ fn matching_close(src: &str, open: usize) -> Option<usize> {
 /// absolute spelling.
 ///
 /// A bare `debug!` is settled by the file, which is as far as this resolves a
-/// path: the name is whichever macro the file imported, so an import line naming
-/// it decides what it is and from where. A rename is settled there too --
+/// path: the name is whichever macro the imports in scope of the call bind it
+/// to, so an import line naming it decides what it is and from where, and the
+/// block nearest the call that carries such a line wins. A rename is settled
+/// there too --
 /// `use tracing::debug as dbg` makes `dbg!` an event and leaves `debug!` out of
 /// scope -- because a binding is no clue to the macro behind it. A macro
 /// re-exported behind another path is therefore unseen, and the row it serves
@@ -588,7 +596,7 @@ fn is_tracing_event(src: &str, at: usize) -> bool {
         Some((path, last)) => path == "tracing" && is_tracing_event_macro(last),
         // Bare: the import carries the six-name rule, since under a rename the
         // name at the call site says nothing about which macro it came from.
-        None => imported_from_tracing(src, spelled).is_some_and(is_tracing_event_macro),
+        None => imported_from_tracing(src, spelled, at).is_some_and(is_tracing_event_macro),
     }
 }
 
@@ -601,47 +609,157 @@ fn is_tracing_event_macro(name: &str) -> bool {
     TRACING_EVENT_MACROS.contains(&name)
 }
 
-/// The tracing-side name `name` is bound to when this file imports it from
-/// `tracing`; `None` when it does not.
+/// When this file binds `name` from `tracing`, the tracing-side name behind the
+/// binding — decided at the call site `at` and nowhere else: a `use` binds the
+/// block it is declared in and every block nested inside it, never a sibling,
+/// and where two bind the same spelling at one spot the nearer block wins, so
+/// an inner `use log::debug;` shadows an outer `use tracing::debug;`. The crate
+/// root's glob (`use tracing::*;`) binds the event macros under their own
+/// names; a glob over a submodule binds what that submodule exports, which a
+/// textual check cannot see, so it binds nothing.
 ///
-/// Covers the plain, braced, glob and `as`-renamed spellings: a rename binds the
-/// name on its right and arrives from the one on its left, and a glob binds every
-/// macro tracing exports under its own name. A file importing through a
-/// re-export is outside what a textual check can settle, and the same rule
-/// applies to it as to any unseen path: the row fails loud.
+/// Covers the plain, braced and `as`-renamed spellings: a rename binds the name
+/// on its right and arrives from the one on its left, and a braced list binds
+/// each entry the same way. A file importing through a re-export is outside what
+/// a textual check can settle, and the same rule applies to it as to any unseen
+/// path: the row fails loud.
 ///
 /// Only code counts. A string reciting an import line -- a codegen template, a
 /// doc example -- binds nothing where it is written.
-fn imported_from_tracing<'a>(src: &'a str, name: &'a str) -> Option<&'a str> {
+fn imported_from_tracing<'a>(src: &'a str, name: &'a str, at: usize) -> Option<&'a str> {
     let code = code_mask(src);
+    let mut best: Option<(usize, Option<&'a str>)> = None;
     let mut from = 0usize;
-    while let Some(relative) = src.get(from..).and_then(|tail| tail.find("use tracing::")) {
+    while let Some(relative) = src.get(from..).and_then(|tail| tail.find("use ")) {
         let start = from.saturating_add(relative);
+        from = start.saturating_add(4);
+        let inside_a_word = start > 0
+            && matches!(
+                src.as_bytes().get(start.saturating_sub(1)),
+                Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b':'
+            );
+        if inside_a_word || !code.get(start).copied().unwrap_or(true) {
+            continue;
+        }
         let end = src
             .get(start..)
             .and_then(|tail| tail.find(';'))
             .map_or(src.len(), |offset| start.saturating_add(offset));
-        from = end.saturating_add(1);
-        if !code.get(start).copied().unwrap_or(true) {
+        let item = src
+            .get(start.saturating_add(4)..end)
+            .unwrap_or_default()
+            .trim();
+        let Some((scope, origin)) = binds_name(src, &code, start, at, item, name) else {
             continue;
-        }
-        let list = src.get(start..end).unwrap_or_default();
-        if list.contains("::*") {
-            return Some(name);
-        }
-        let entries = match list.find('{') {
-            Some(brace) => list.get(brace.saturating_add(1)..).unwrap_or_default(),
-            None => list.rsplit("::").next().unwrap_or_default(),
         };
-        for entry in entries.split(',') {
-            let entry = entry.trim().trim_end_matches('}').trim();
-            let (origin, bound) = match entry.split_once(" as ") {
-                Some((origin, bound)) => (origin.trim(), bound.trim()),
+        if best.is_none_or(|(farther, _)| scope > farther) {
+            best = Some((scope, origin));
+        }
+    }
+    best.and_then(|(_, origin)| origin)
+}
+
+/// What the `use` item written at `start` binds `name` to, if it binds it at
+/// all: `Some(Some(origin))` when the binding arrives from the `tracing` root,
+/// `Some(None)` when it arrives from anywhere else -- a binding from another
+/// crate is still a binding, and it shadows -- and `None` when the item never
+/// carries this name into scope. The item counts only when its block reaches
+/// the call site `at`; `scope` is the block's rank, `0` for the file root, so
+/// the caller can let the innermost binder of the name win.
+fn binds_name<'a>(
+    src: &'a str,
+    code: &[bool],
+    start: usize,
+    at: usize,
+    item: &'a str,
+    name: &'a str,
+) -> Option<(usize, Option<&'a str>)> {
+    let mut bound: Option<Option<&'a str>> = None;
+    if let Some(brace) = item.find('{') {
+        let (path, opened) = item.split_at(brace);
+        let inner = opened
+            .get(1..opened.rfind('}').unwrap_or(opened.len()))
+            .unwrap_or_default();
+        for entry in inner.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() || entry.ends_with("::*") {
+                continue;
+            }
+            let (source, binding) = match entry.split_once(" as ") {
+                Some((source, binding)) => (source.trim(), binding.trim()),
                 None => (entry, entry),
             };
-            if bound == name {
-                return Some(origin);
+            if binding == name {
+                bound = Some(
+                    under_tracing_root(path)
+                        .then_some(source)
+                        .filter(|source| !source.contains("::")),
+                );
+                break;
             }
+        }
+    } else {
+        let (left, renamed) = match item.split_once(" as ") {
+            Some((left, right)) => (left.trim(), Some(right.trim())),
+            None => (item, None),
+        };
+        if let Some(stem) = left.strip_suffix("::*") {
+            if under_tracing_root(stem) {
+                bound = Some(Some(name));
+            }
+        } else if left != "*" {
+            let last = left.rsplit("::").next().unwrap_or_default();
+            if renamed.unwrap_or(last) == name {
+                bound = Some(
+                    under_tracing_root(
+                        left.get(..left.len().saturating_sub(last.len()))
+                            .unwrap_or_default(),
+                    )
+                    .then_some(last),
+                );
+            }
+        }
+    }
+    let origin = bound?;
+    let scope = match enclosing_block(src, code, start) {
+        None => 0,
+        Some(open) if matching_close(src, open).is_some_and(|close| at >= open && at < close) => {
+            open
+        }
+        Some(_) => return None,
+    };
+    Some((scope, origin))
+}
+
+/// Whether the text before an entry, a name, or a `::*` names the `tracing`
+/// crate root itself — with or without the leading `::` an absolute path
+/// carries, and with or without the trailing `::` a braced list leaves behind.
+fn under_tracing_root(path: &str) -> bool {
+    path.trim()
+        .trim_start_matches("::")
+        .trim()
+        .trim_end_matches("::")
+        == "tracing"
+}
+
+/// The index of the innermost `{` whose `}` has not yet closed at `at`, seen
+/// through comments and strings; `None` at the file root. Blocks are braces
+/// only: an item binds within the braces it sits in and every block nested
+/// inside them, which is exactly how a `use` reaches the names it shadows.
+fn enclosing_block(src: &str, code: &[bool], at: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut i = at;
+    while i > 0 {
+        i = i.saturating_sub(1);
+        if !code.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        match bytes.get(i) {
+            Some(b'}') => depth = depth.saturating_add(1),
+            Some(b'{') if depth == 0 => return Some(i),
+            Some(b'{') => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
     None
@@ -1389,6 +1507,130 @@ fn a_name_that_lives_only_in_prose_is_not_an_emission_site() {
     assert!(
         code_only(code).contains("metric = \"loopctl.dead.row\""),
         "a real call site must survive the strip: {code:?}"
+    );
+}
+
+#[test]
+fn an_aliased_tracing_import_reclaims_the_spelling_it_binds() {
+    let aliased = r#"
+use tracing::debug as stringify;
+fn emit() {
+    stringify!(target: "loopctl::metrics", metric = "loopctl.alias.count", n = 1);
+}
+"#;
+    assert!(
+        emission_site_in(aliased, "loopctl.alias.count"),
+        "stringify! imported from tracing emits: the event runs, the macro does not"
+    );
+    let plain = r#"
+fn emit() {
+    stringify!(target: "loopctl::metrics", metric = "loopctl.plain.count", n = 1);
+}
+"#;
+    assert!(
+        !emission_site_in(plain, "loopctl.plain.count"),
+        "the same spelling with no tracing import still eats its tokens"
+    );
+}
+
+#[test]
+fn a_braced_or_bracketed_consumer_still_swallows_its_tokens() {
+    let braced = r#"
+fn emit() {
+    stringify! { tracing::debug!(target: "loopctl::metrics", metric = "loopctl.brace.count", n = 1) };
+    stringify![tracing::debug!(target: "loopctl::metrics", metric = "loopctl.brack.count", n = 1)];
+    stringify! (tracing::debug!(target: "loopctl::metrics", metric = "loopctl.space.count", n = 1));
+}
+"#;
+    for name in [
+        "loopctl.brace.count",
+        "loopctl.brack.count",
+        "loopctl.space.count",
+    ] {
+        assert!(
+            !emission_site_in(braced, name),
+            "tokens handed to a consumer emit nothing regardless of delimiter: {name}"
+        );
+    }
+}
+
+#[test]
+fn a_sibling_modules_import_binds_nothing_at_the_call_site() {
+    let siblings = r#"
+mod quiet {
+    use tracing::debug;
+    fn hush() {}
+}
+mod loud {
+    fn emit() {
+        debug!(target: "loopctl::metrics", metric = "loopctl.sibling.count", n = 1);
+    }
+}
+"#;
+    assert!(
+        !emission_site_in(siblings, "loopctl.sibling.count"),
+        "quiet's import does not reach loud's call site"
+    );
+}
+
+#[test]
+fn a_module_level_import_reaches_calls_in_nested_bodies() {
+    let nested = r#"
+use tracing::debug;
+mod engine {
+    fn emit() {
+        debug!(target: "loopctl::metrics", metric = "loopctl.nested.count", n = 1);
+    }
+}
+"#;
+    assert!(
+        emission_site_in(nested, "loopctl.nested.count"),
+        "a module-level import covers calls in the bodies nested inside it"
+    );
+}
+
+#[test]
+fn a_crate_root_glob_binds_the_event_macros_under_their_own_names() {
+    let rooted = r#"
+use tracing::*;
+fn emit() {
+    debug!(target: "loopctl::metrics", metric = "loopctl.rootglob.count", n = 1);
+}
+"#;
+    assert!(
+        emission_site_in(rooted, "loopctl.rootglob.count"),
+        "a glob over the tracing root imports debug, so the bare call is an event"
+    );
+}
+
+#[test]
+fn a_submodule_glob_binds_no_event_macros() {
+    let sub_glob = r#"
+use tracing::field::*;
+fn emit() {
+    debug!(target: "loopctl::metrics", metric = "loopctl.subglob.count", n = 1);
+}
+"#;
+    assert!(
+        !emission_site_in(sub_glob, "loopctl.subglob.count"),
+        "a glob over a submodule imports no debug; the bare call binds nothing here"
+    );
+}
+
+#[test]
+fn a_nearer_import_shadows_the_outer_tracing_one() {
+    let shadowed = r#"
+use tracing::debug;
+mod noisy {
+    use log::debug;
+    fn emit() {
+        debug!(target: "loopctl::metrics", metric = "loopctl.shadow.count", n = 1);
+    }
+}
+"#;
+    assert!(
+        !emission_site_in(shadowed, "loopctl.shadow.count"),
+        "the nearer log::debug import shadows the outer tracing one"
     );
 }
 

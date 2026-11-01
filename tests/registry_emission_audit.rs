@@ -426,7 +426,7 @@ fn inside_token_consumer(src: &str, at: usize, code: &[bool]) -> bool {
             }
             if src.contains("tracing::")
                 && imported_from_tracing(src, name, head)
-                    .is_some_and(|(origin, _)| is_tracing_event_macro(origin))
+                    .is_some_and(|(origin, _, _)| is_tracing_event_macro(origin))
             {
                 continue;
             }
@@ -606,14 +606,15 @@ fn is_tracing_event(src: &str, at: usize) -> bool {
             && is_tracing_event_macro(last)
             && (absolute || !renamed_veto(src, at));
     }
-    // Bare: the import carries the six-name rule, since under a rename the
+    // Bare: the import carries the six-name rule, judged where the import was
+    // written rather than where the call sits, since under a rename the
     // name at the call site says nothing about which macro it came from —
     // unless it arrived by an absolute path, which no rename can reach —
     // and under a same-named `macro_rules!` written above the call the
     // import says nothing either, because the local definition wins.
     match imported_from_tracing(src, spelled, at) {
-        Some((origin, from_absolute)) if is_tracing_event_macro(origin) => {
-            (from_absolute || !renamed_veto(src, at))
+        Some((origin, from_absolute, use_start)) if is_tracing_event_macro(origin) => {
+            (from_absolute || !renamed_veto(src, use_start))
                 && (!src.contains("macro_rules!")
                     || !shadowed_by_macro_rules(src, &code_mask(src), spelled, at))
         }
@@ -621,10 +622,11 @@ fn is_tracing_event(src: &str, at: usize) -> bool {
     }
 }
 
-/// Whether an `as tracing` rename reaches the call site: the text decides
-/// whether to look, the scope machinery decides the answer.
+/// Whether an `as tracing` rename reaches `at`: the scope machinery decides,
+/// with no textual fast path — a rename can be spaced however its writer
+/// pleased, so only the parse itself can rule it out.
 fn renamed_veto(src: &str, at: usize) -> bool {
-    src.contains(" as tracing") && tracing_renamed_in_scope(src, &code_mask(src), at)
+    tracing_renamed_in_scope(src, &code_mask(src), at)
 }
 
 /// The macros tracing offers for writing an event.
@@ -643,7 +645,8 @@ fn is_tracing_event_macro(name: &str) -> bool {
 /// an inner `use log::debug;` shadows an outer `use tracing::debug;`. The crate
 /// root's glob (`use tracing::*;`) binds the event macros under their own
 /// names; a glob over a submodule binds what that submodule exports, which a
-/// textual check cannot see, so it binds nothing.
+/// textual check cannot see, so it binds nothing — and a glob never outranks
+/// a named import written beside it in the same block.
 ///
 /// Covers the plain, braced and `as`-renamed spellings: a rename binds the name
 /// on its right and arrives from the one on its left, and a braced list binds
@@ -656,9 +659,21 @@ fn is_tracing_event_macro(name: &str) -> bool {
 ///
 /// Only code counts. A string reciting an import line -- a codegen template, a
 /// doc example -- binds nothing where it is written.
-fn imported_from_tracing<'a>(src: &'a str, name: &'a str, at: usize) -> Option<(&'a str, bool)> {
+/// What a `use` item bound: the tracing-side origin name and whether the
+/// item was written as an absolute path.
+type Binding<'a> = Option<(&'a str, bool)>;
+
+/// A binding ranked for scope resolution: the block it sits in, whether it
+/// arrived by glob, and what it bound.
+type RankedBinding<'a> = (usize, bool, Binding<'a>);
+
+fn imported_from_tracing<'a>(
+    src: &'a str,
+    name: &'a str,
+    at: usize,
+) -> Option<(&'a str, bool, usize)> {
     let code = code_mask(src);
-    let mut best: Option<(usize, Option<(&'a str, bool)>)> = None;
+    let mut best: Option<(usize, bool, usize, Binding<'a>)> = None;
     let mut from = 0usize;
     while let Some(relative) = src.get(from..).and_then(|tail| tail.find("use ")) {
         let start = from.saturating_add(relative);
@@ -679,14 +694,18 @@ fn imported_from_tracing<'a>(src: &'a str, name: &'a str, at: usize) -> Option<(
             .get(start.saturating_add(4)..end)
             .unwrap_or_default()
             .trim();
-        let Some((scope, origin)) = binds_name(src, &code, start, at, item, name) else {
+        let Some((scope, is_glob, origin)) = binds_name(src, &code, start, at, item, name) else {
             continue;
         };
-        if best.is_none_or(|(farther, _)| scope > farther) {
-            best = Some((scope, origin));
+        if best.is_none_or(|(farther, incumbent_glob, _, _)| {
+            scope > farther || (scope == farther && incumbent_glob && !is_glob)
+        }) {
+            best = Some((scope, is_glob, start, origin));
         }
     }
-    best.and_then(|(_, binding)| binding)
+    best.and_then(|(_, _, use_start, binding)| {
+        binding.map(|(origin, absolute)| (origin, absolute, use_start))
+    })
 }
 
 /// What the `use` item written at `start` binds `name` to, if it binds it at
@@ -704,8 +723,9 @@ fn binds_name<'a>(
     at: usize,
     item: &'a str,
     name: &'a str,
-) -> Option<(usize, Option<(&'a str, bool)>)> {
+) -> Option<RankedBinding<'a>> {
     let mut bound: Option<Option<&'a str>> = None;
+    let is_glob = !item.contains('{') && item.ends_with("::*");
     if let Some(brace) = item.find('{') {
         let (path, opened) = item.split_at(brace);
         let inner = opened
@@ -716,8 +736,8 @@ fn binds_name<'a>(
             if entry.is_empty() || entry.ends_with("::*") {
                 continue;
             }
-            let (source, binding) = match entry.split_once(" as ") {
-                Some((source, binding)) => (source.trim(), binding.trim()),
+            let (source, binding) = match split_as(entry) {
+                Some((source, binding)) => (source, binding),
                 None => (entry, entry),
             };
             if binding == name {
@@ -730,8 +750,8 @@ fn binds_name<'a>(
             }
         }
     } else {
-        let (left, renamed) = match item.split_once(" as ") {
-            Some((left, right)) => (left.trim(), Some(right.trim())),
+        let (left, renamed) = match split_as(item) {
+            Some((left, right)) => (left, Some(right)),
             None => (item, None),
         };
         if let Some(stem) = left.strip_suffix("::*") {
@@ -759,7 +779,11 @@ fn binds_name<'a>(
         }
         Some(_) => return None,
     };
-    Some((scope, origin.map(|origin| (origin, item.starts_with("::")))))
+    Some((
+        scope,
+        is_glob,
+        origin.map(|origin| (origin, item.starts_with("::"))),
+    ))
 }
 
 /// Whether the text before an entry, a name, or a `::*` names the `tracing`
@@ -771,6 +795,22 @@ fn under_tracing_root(path: &str) -> bool {
         .trim()
         .trim_end_matches("::")
         == "tracing"
+}
+
+/// Split a `use` item at the word `as`, tolerating any whitespace around it:
+/// `left as right` with spaces, tabs or newlines on either side of the word.
+fn split_as(item: &str) -> Option<(&str, &str)> {
+    let bytes = item.as_bytes();
+    let ws = |at: usize| matches!(bytes.get(at), Some(b' ' | b'\t' | b'\n' | b'\r'));
+    for i in 1..bytes.len() {
+        if i + 2 >= bytes.len() {
+            break;
+        }
+        if &item[i..i + 2] == "as" && ws(i - 1) && ws(i + 2) {
+            return Some((item[..i].trim(), item[i + 2..].trim()));
+        }
+    }
+    None
 }
 
 /// The index of the innermost `{` whose `}` has not yet closed at `at`, seen
@@ -881,22 +921,29 @@ fn tracing_renamed_in_scope(src: &str, code: &[bool], at: usize) -> bool {
                 .unwrap_or_default();
             for entry in inner.split(',') {
                 let entry = entry.trim();
-                let (source, binding) = match entry.split_once(" as ") {
-                    Some((source, binding)) => (source.trim(), binding.trim()),
+                let (source, binding) = match split_as(entry) {
+                    Some((source, binding)) => (source, binding),
                     None => (entry, entry),
                 };
                 if binding != "tracing" {
                     continue;
                 }
-                // `use ::tracing::{self as tracing};` restores the crate;
-                // every other entry landing the name renames it.
-                candidate = Some(source == "self" && path.trim().starts_with("::"));
+                // `use ::tracing::{self as tracing};` restores the crate; any
+                // other root — and any relative spelling — renames it.
+                candidate = Some(
+                    source == "self" && path.trim().starts_with("::") && under_tracing_root(path),
+                );
                 break;
             }
-        } else if let Some((left, binding)) = item.split_once(" as ")
-            && binding.trim() == "tracing"
+        } else if let Some((left, binding)) = split_as(item)
+            && binding == "tracing"
         {
-            candidate = Some(left.trim() == "::tracing");
+            if left == "tracing" {
+                // A relative self-import binds nothing new; an outer rename
+                // still speaks through its own binding.
+                continue;
+            }
+            candidate = Some(left == "::tracing");
         }
         let Some(restore) = candidate else {
             continue;
@@ -1925,6 +1972,121 @@ fn main() {
     assert!(
         emission_site_in(outside, "loopctl.outside.count"),
         "a definition in a block that closed before the call reaches no further"
+    );
+}
+
+/// A rename is spaced however its writer pleased: the veto reads the item as
+/// a parser does, not as a single-space literal, so a newline, a tab, or a
+/// stray double space between `as` and `tracing` changes nothing.
+#[test]
+fn a_rename_spaced_any_way_still_vetoes() {
+    for spaced in [
+        "use other as\n    tracing;",
+        "use other as\ttracing;",
+        "use other  as tracing;",
+        "use other as tracing ;",
+    ] {
+        let source = format!(
+            "{spaced}\nfn emit() {{ tracing::debug!(target: \"loopctl::metrics\", \
+             metric = \"loopctl.spaced.count\", n = 1); }}"
+        );
+        assert!(
+            !emission_site_in(&source, "loopctl.spaced.count"),
+            "the rename however spaced still vetoes: {spaced:?}"
+        );
+    }
+}
+
+/// Rust ranks a named import above a glob written beside it in the same
+/// block, whatever the textual order, so the audit must let the named one
+/// decide what the bare call is.
+#[test]
+fn a_named_import_outranks_a_same_scope_glob() {
+    let others_named = r#"
+use tracing::*;
+use other::debug;
+fn emit() { debug!(target: "loopctl::metrics", metric = "loopctl.globorder.count", n = 1); }
+"#;
+    assert!(
+        !emission_site_in(others_named, "loopctl.globorder.count"),
+        "the named other import wins however late it is written"
+    );
+    let tracings_named = r#"
+use tracing::debug;
+use other::*;
+fn emit() { debug!(target: "loopctl::metrics", metric = "loopctl.globorder.count", n = 1); }
+"#;
+    assert!(
+        emission_site_in(tracings_named, "loopctl.globorder.count"),
+        "the named tracing import wins however early the glob is written"
+    );
+}
+
+/// Only the `::tracing` root restores the name: a braced `self as tracing`
+/// arriving from any other crate is a rename like any other.
+#[test]
+fn a_wrong_root_self_restore_is_a_rename() {
+    let wrong_root = r#"
+use ::other::{self as tracing};
+fn emit() { tracing::debug!(target: "loopctl::metrics", metric = "loopctl.root.count", n = 1); }
+"#;
+    assert!(
+        !emission_site_in(wrong_root, "loopctl.root.count"),
+        "::other::{{self as tracing}} lands the name on other, not tracing"
+    );
+}
+
+/// `use tracing as tracing;` binds nothing new, so it neither vetoes nor
+/// restores: the crate name is exactly what it already was.
+#[test]
+fn a_relative_self_import_binds_nothing() {
+    let self_import = r#"
+use tracing as tracing;
+fn emit() { tracing::debug!(target: "loopctl::metrics", metric = "loopctl.self.count", n = 1); }
+"#;
+    assert!(
+        emission_site_in(self_import, "loopctl.self.count"),
+        "a relative self-import is a no-op, and the call stays tracing's"
+    );
+}
+
+/// A bare import resolves where its `use` line sits, so a rename written in a
+/// deeper block cannot rebind it retroactively: the call it serves still
+/// emits.
+#[test]
+fn a_deeper_rename_does_not_rebind_an_earlier_import() {
+    let deeper = r#"
+use tracing::debug as emit_metric;
+fn outer() {
+    use other as tracing;
+    emit_metric!(target: "loopctl::metrics", metric = "loopctl.deeper.count", n = 1);
+}
+"#;
+    assert!(
+        emission_site_in(deeper, "loopctl.deeper.count"),
+        "the import resolved before the inner rename existed"
+    );
+}
+
+/// `pub use` binds locally like any `use`, in both directions: a public
+/// rename vetoes and a public import credits.
+#[test]
+fn a_pub_use_binds_like_a_use() {
+    let pub_rename = r#"
+pub use other as tracing;
+fn emit() { tracing::debug!(target: "loopctl::metrics", metric = "loopctl.pub.count", n = 1); }
+"#;
+    assert!(
+        !emission_site_in(pub_rename, "loopctl.pub.count"),
+        "a public rename reaches the call site like a private one"
+    );
+    let pub_import = r#"
+pub use tracing::debug;
+fn emit() { debug!(target: "loopctl::metrics", metric = "loopctl.pub.count", n = 1); }
+"#;
+    assert!(
+        emission_site_in(pub_import, "loopctl.pub.count"),
+        "a public import binds the name locally like any use"
     );
 }
 

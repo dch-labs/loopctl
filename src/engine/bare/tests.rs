@@ -18093,6 +18093,41 @@ impl crate::compact::ContextCompactor for GrowingPassCompactor {
     }
 }
 
+/// The compactor that "compacts" into more — but smaller — messages
+/// than it was handed.
+///
+/// Token-honest shrinkage with message-count growth: the manager
+/// classifies the pass `Compacted` (the count moved, the measured
+/// feed shrank), the driver's token check passes, and only the
+/// manual seam's history-split rule refuses it — the exact shape
+/// the split finding aimed at.
+struct SplitBustingCompactor {
+    calls: Arc<Mutex<usize>>,
+}
+
+impl crate::compact::ContextCompactor for SplitBustingCompactor {
+    fn compact(
+        &self,
+        _messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        let mut calls = crate::error::recover_guard(self.calls.lock());
+        *calls = calls.saturating_add(1);
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::compacted(
+                vec![
+                    Message::user("s"),
+                    Message::assistant("s"),
+                    Message::user("s"),
+                ],
+                context.tokens_before,
+                1,
+            ),
+        ))
+    }
+}
+
 /// An observer that counts only `on_compaction`, to prove a refused
 /// pass spoke nowhere: the refusal lands before the event this probe
 /// watches, so its count must stay zero. The counter rides as a shared
@@ -18273,6 +18308,75 @@ async fn compact_manual_refuses_a_pass_that_grew_the_feed() {
         agent.machine().context_tokens(),
         tokens_before,
         "the growing feed's recount never landed either"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(calls.lock()),
+        1,
+        "the pass ran — the refusal is about its result, not a skip"
+    );
+    assert_eq!(
+        compactions.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refusal precedes every side effect: no observer event, no demotion, no savings ledger"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_refuses_a_pass_that_outgrew_the_history_split() {
+    // The split finding: a pass can shrink the tokens while growing
+    // the message count, and the manual install commits only
+    // `history_len` messages — the excess would stage in the pending
+    // buffer as input the host never staged. The seam refuses that
+    // feed like the growth it is: CompactionStalled, nothing
+    // installed, nothing staged, nothing demoted, no observer event,
+    // the conversation exactly as it was.
+    let client = MockClient::new("test-model");
+    let long_answer = "o".repeat(800);
+    client.add_text_response(&long_answer);
+    let calls = Arc::new(Mutex::new(0usize));
+    let compactions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe_compactions = Arc::clone(&compactions);
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(SilenceProbe {
+            compactions: probe_compactions,
+        }))
+        .with_context_manager(Arc::new(
+            crate::compact::ContextManager::new(Arc::new(SplitBustingCompactor {
+                calls: Arc::clone(&calls),
+            }))
+            .with_context_window(100_000),
+        ));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    agent.run("first", &make_run_config()).await.unwrap();
+    let history_before = agent.machine().full_history().len();
+    let tokens_before = agent.machine().context_tokens();
+    let err = agent
+        .compact_manual()
+        .await
+        .expect_err("a feed the split cannot commit is a stall, not a success");
+    assert!(
+        matches!(err, LoopError::CompactionStalled { .. }),
+        "the split refusal ends the way the machine's own guard ends it, got {err}"
+    );
+    assert_eq!(
+        agent.machine().full_history().len(),
+        history_before,
+        "the outgrown feed was never installed — the conversation is intact"
+    );
+    assert_eq!(
+        agent.machine().history().len(),
+        history_before,
+        "and nothing staged in its place — committed history alone"
+    );
+    assert_eq!(
+        agent.machine().context_tokens(),
+        tokens_before,
+        "the outgrown feed's recount never landed either"
     );
     assert_eq!(
         *crate::error::recover_guard(calls.lock()),

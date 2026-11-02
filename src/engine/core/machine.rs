@@ -1211,13 +1211,20 @@ impl LoopMachine {
     /// rather than the pre-pass one. The state itself is left where the
     /// guard found it; a terminal machine stays terminal and its next
     /// [`accept_input`](Self::accept_input) re-estimates the counters
-    /// the way it always does. The `history_len` split keeps nothing
-    /// pending on this seam's own path:
-    /// [`guard_manual_compaction`](Self::guard_manual_compaction) keeps
-    /// staged input out of the pass, so at rest `messages` is a
-    /// rewrite of committed history alone and every message installs
-    /// committed — the split parameter is the shape the
-    /// [`adopt_pruned`](Self::adopt_pruned) family passes share. Like
+    /// the way it always does. Messages beyond `history_len` are
+    /// installed as pending, not committed: the split commits the
+    /// first `history_len` messages and stages the rest in the
+    /// pending buffer as input the next run feeds. The seam's own
+    /// engine-driven path stages nothing —
+    /// [`guard_manual_compaction`](Self::guard_manual_compaction)
+    /// keeps staged input out of the pass, and the driver refuses a
+    /// manual pass whose message count outgrew the committed history
+    /// it rewrites (see
+    /// [`compact_manual`](crate::engine::BareLoop::compact_manual)),
+    /// so at rest `messages` is a rewrite of committed history alone
+    /// and installs committed whole — the split parameter is the
+    /// shape the [`adopt_pruned`](Self::adopt_pruned) family passes
+    /// share. Like
     /// [`rewind_to`](Self::rewind_to), a stale `deferred_compaction`
     /// latch is cleared: the shortened feed must re-arm the threshold
     /// check naturally.

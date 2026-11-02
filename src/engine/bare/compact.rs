@@ -179,8 +179,13 @@ pub(super) enum CompactPass {
     ///
     /// The manager classified the pass `Compacted` — its message
     /// count changed — while the driver's own measurement says the
-    /// rewritten feed is at or above the conversation's pre-pass size.
-    /// That is the machine's own no-progress rule, applied here inside
+    /// rewritten feed is at or above the conversation's pre-pass
+    /// size, or the pass is a manual one whose rewrite carries more
+    /// messages than the committed history it rewrites — the
+    /// install splits at `history_len`, so the excess would stage
+    /// as pending input, and a feed the seam cannot install is as
+    /// empty-handed as one that grew. That is the machine's own
+    /// no-progress rule, applied here inside
     /// the pass and ahead of every side effect: nothing was demoted,
     /// nothing recorded, no observer spoke and no hook ran, so the
     /// conversation, the sink, and the ledger stand exactly as the
@@ -203,7 +208,9 @@ pub(super) enum CompactPass {
         ///
         /// At or above `tokens_before` — the measurement that
         /// triggered the refusal and the `used` payload the resulting
-        /// `CompactionStalled` names. The growing feed itself is
+        /// `CompactionStalled` names; on the manual seam's
+        /// message-count refusal, the measured size of the outgrown
+        /// feed. The refused feed itself is
         /// dropped here, never installed, never demoted.
         tokens_after: u64,
     },
@@ -365,7 +372,9 @@ impl<C: ApiClient> BareLoop<C> {
             Ok(EnsureContextResult::Compacted(outcome)) => {
                 let tokens_after = self
                     .context_figure(outcome.tokens_after.saturating_add(self.overhead_tokens()));
-                if tokens_after >= tokens_before {
+                let manual_outgrew_history = reason == crate::compact::types::CompactReason::Manual
+                    && outcome.messages.len() > self.machine.history().len();
+                if tokens_after >= tokens_before || manual_outgrew_history {
                     return Ok(CompactPass::NoProgress {
                         tokens_before,
                         tokens_after,
@@ -553,10 +562,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`LoopError::ContextExceeded`] when the pass succeeded but its
     /// result still does not fit the window, and
     /// [`LoopError::CompactionStalled`] when the pass rewrote the feed
-    /// but did not shrink it — the shared no-progress rule refuses the
-    /// growing result before anything is demoted, recorded, or
-    /// narrated, and the conversation is left exactly as it was. The
-    /// failure mappings are the ones the automatic pass propagates to
+    /// but did not shrink it, or rewrote it into more messages than
+    /// the committed history holds — the install commits `history_len`
+    /// messages and stages the rest as pending input, so the excess
+    /// would run uninvited — the shared no-progress rule refuses
+    /// both before anything is demoted, recorded, or narrated, and
+    /// the conversation is left exactly as it was. The failure
+    /// mappings are the ones the automatic pass propagates to
     /// its run.
     pub async fn compact_manual(&mut self) -> Result<EnsureContextResult, LoopError> {
         self.machine.guard_manual_compaction()?;

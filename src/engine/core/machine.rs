@@ -1220,11 +1220,14 @@ impl LoopMachine {
     /// a turn is in flight would drop the outstanding tool-call
     /// message the run still owes results to.
     ///
-    /// The installed feed is coalesced first, the same fold
-    /// [`compaction_result`](Self::compaction_result) applies: runs of
-    /// adjacent assistant messages fold into one, so a summary
-    /// landing before an assistant preserved tail — the shape strict
-    /// providers reject outright — never reaches history or the wire.
+    /// The committed side of the split is coalesced — the same fold
+    /// [`compaction_result`](Self::compaction_result) applies — after
+    /// the split, so runs of adjacent assistant messages fold into
+    /// one and a summary landing before an assistant preserved tail —
+    /// the shape strict providers reject outright — never reaches
+    /// history or the wire, while a message the split stages for
+    /// pending stays staged exactly where the caller put it: the
+    /// fold never pulls a message across the commit boundary.
     ///
     /// Messages beyond `history_len` are installed as pending, not
     /// committed — and a staged tail never rides a request:
@@ -1275,11 +1278,10 @@ impl LoopMachine {
         context_tokens: u64,
     ) -> Result<(), LoopError> {
         self.guard_manual_compaction()?;
-        let messages = crate::message::coalesce_adjacent_assistants(messages);
         let split = history_len.min(messages.len());
         let mut history = messages;
         let pending = history.split_off(split);
-        self.history = history;
+        self.history = crate::message::coalesce_adjacent_assistants(history);
         self.pending = pending;
         self.context_tokens = context_tokens;
         self.deferred_compaction = false;
@@ -2207,7 +2209,41 @@ mod tests {
         assert_eq!(
             machine.full_history().len(),
             2,
-            "nothing staged — the fold happened before the split"
+            "nothing staged — the fold stays inside the committed side"
+        );
+    }
+
+    #[test]
+    fn install_manual_compaction_keeps_a_staged_assistant_out_of_the_committed_feed() {
+        // The fold must stay inside the committed side of the split:
+        // folding first would merge a message the caller staged for
+        // pending into committed history, where the next
+        // `accept_input` could no longer discard it.
+        let mut machine = small_machine();
+        machine
+            .install_manual_compaction(
+                vec![
+                    Message::assistant("the summary"),
+                    Message::assistant("the staged tail"),
+                ],
+                1,
+                4,
+            )
+            .expect("a resting machine takes the split install");
+        assert_eq!(
+            machine.history().len(),
+            1,
+            "the committed side holds exactly the messages before the split"
+        );
+        assert_eq!(
+            machine.history()[0].text_content(),
+            "the summary",
+            "the fold never pulls a staged message across the commit boundary"
+        );
+        assert_eq!(
+            machine.full_history().len(),
+            2,
+            "the staged tail still waits in pending, unfolded"
         );
     }
 

@@ -18015,3 +18015,497 @@ async fn run_end_totals_sum_heterogeneous_turn_usage() {
         "the reported totals are exactly the sum of the turn records"
     );
 }
+
+/// Echoes the conversation back unchanged, whatever its size.
+///
+/// The manager classifies a pass by message count and measured tokens,
+/// so this echo must classify as `NoAction` — the manual seam's honest
+/// decline arm pins through it.
+struct NoChangeCompactor;
+
+impl crate::compact::ContextCompactor for NoChangeCompactor {
+    fn compact(
+        &self,
+        messages: Vec<Message>,
+        _target_tokens: u64,
+        _context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::no_change(messages),
+        ))
+    }
+}
+
+/// A compactor that always errors.
+///
+/// The manual seam must hand the host the engine's `CompactionFailed`
+/// mapping with this text riding along verbatim.
+struct FailCompactor;
+
+impl crate::compact::ContextCompactor for FailCompactor {
+    fn compact(
+        &self,
+        messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::failed(
+                messages,
+                context.tokens_before,
+                "the summarizer exploded",
+            ),
+        ))
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn compact_manual_installs_the_compacted_history_and_the_wire_shows_it() {
+    // The host's `/compact` promise, on the wire: after a manual pass
+    // the next provider request carries the compacted telling, not the
+    // superseded turns — and the loop keeps serving. The captured
+    // request, not just the vector, is the evidence.
+    let (client, requests) = WireCaptureClient::new();
+    client.push_final_turn("ok", "the first long answer");
+    client.push_final_turn("ok", "the second long answer");
+    client.push_final_turn("ok", "after the pass");
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(ShrinkingPassCompactor))
+            .with_context_window(100_000),
+    ));
+    let config = make_config().with_context_window(1_000_000);
+    let mut agent =
+        BareLoop::new_with_managers(Arc::new(client), ToolRegistry::new(), config, managers);
+    agent.run("first", &make_run_config()).await.unwrap();
+    agent.run("second", &make_run_config()).await.unwrap();
+    let tokens_before = agent.machine().context_tokens();
+    let result = agent
+        .compact_manual()
+        .await
+        .expect("a machine at rest between runs admits the manual pass");
+    let outcome = match result {
+        crate::compact::EnsureContextResult::Compacted(outcome) => outcome,
+        crate::compact::EnsureContextResult::NoAction(_) => {
+            panic!("a shrinking compactor must land Compacted on a multi-turn history")
+        }
+    };
+    assert!(outcome.success, "the pass succeeded");
+    assert_eq!(
+        agent.machine().full_history().len(),
+        outcome.messages.len(),
+        "the compacted feed is the machine's history now"
+    );
+    assert!(
+        agent.machine().context_tokens() < tokens_before,
+        "the recount lands immediately, before any run: {tokens_before} -> {}",
+        agent.machine().context_tokens()
+    );
+    agent.run("third", &make_run_config()).await.unwrap();
+
+    let log = crate::error::recover_guard(requests.lock()).clone();
+    let third = log.last().expect("the third run issued a model call");
+    let rendered: Vec<String> = third
+        .messages
+        .iter()
+        .map(crate::message::Message::text_content)
+        .collect();
+    assert!(
+        rendered.iter().any(|text| text.contains("rrrr")),
+        "the summarized telling rides the request: {rendered:?}"
+    );
+    assert!(
+        !rendered
+            .iter()
+            .any(|text| text.contains("first long answer") || text.contains("second long answer")),
+        "the superseded turns are gone from the wire: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_declines_and_leaves_everything_untouched() {
+    // The honest decline: a compactor that changes nothing classifies
+    // NoAction, and the seam adopts nothing, re-feeds nothing, and
+    // invalidates nothing.
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    client.add_text_response("two");
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(NoChangeCompactor)),
+    ));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    agent.run("first", &make_run_config()).await.unwrap();
+    let history_before = agent.machine().full_history().len();
+    let tokens_before = agent.machine().context_tokens();
+    let result = agent
+        .compact_manual()
+        .await
+        .expect("the pass runs while at rest");
+    match result {
+        crate::compact::EnsureContextResult::NoAction(messages) => assert_eq!(
+            messages.len(),
+            history_before,
+            "the decline hands back the unchanged conversation"
+        ),
+        crate::compact::EnsureContextResult::Compacted(_) => {
+            panic!("a compactor that changes nothing must classify as NoAction")
+        }
+    }
+    assert_eq!(agent.machine().full_history().len(), history_before);
+    assert_eq!(
+        agent.machine().context_tokens(),
+        tokens_before,
+        "a decline re-feeds nothing"
+    );
+    agent.run("second", &make_run_config()).await.unwrap();
+    assert!(
+        agent.machine().full_history().len() > history_before,
+        "the loop runs on after a decline"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_refuses_a_machine_caught_mid_turn() {
+    // The refusal a host displays: a machine caught awaiting the model
+    // refuses the pass, naming the state and the way out, and the
+    // refused pass touches nothing.
+    let mut machine = crate::engine::core::LoopMachine::from_history(vec![Message::user("prior")]);
+    machine.accept_input("go");
+    let policy = crate::engine::core::MachinePolicy {
+        max_turns: 3,
+        context_window: 200_000,
+        compact_threshold: 80,
+        auto_compact: true,
+    };
+    assert!(matches!(
+        machine.next_step(policy),
+        crate::engine::core::MachineStep::CallLLM { .. }
+    ));
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(ShrinkingPassCompactor)),
+    ));
+    let client = MockClient::new("test-model");
+    let mut agent = BareLoop::from_machine_with_managers(
+        machine,
+        make_config(),
+        Arc::new(client),
+        ToolRegistry::new(),
+        managers,
+    );
+    let error = agent
+        .compact_manual()
+        .await
+        .expect_err("a machine awaiting the model refuses the manual pass");
+    match error {
+        crate::error::LoopError::InvalidInput(text) => assert!(
+            text.contains("while a turn is in flight"),
+            "the refusal names why: {text}"
+        ),
+        other => panic!("the refusal is InvalidInput, not {other:?}"),
+    }
+    assert_eq!(
+        agent.machine().full_history().len(),
+        2,
+        "a refused pass touches nothing"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_reports_a_failing_compactor_as_compaction_failed() {
+    // The compactor's own failure text reaches the host verbatim — the
+    // same mapping the automatic pass propagates to its run.
+    let machine = crate::engine::core::LoopMachine::from_history(vec![
+        Message::user("a"),
+        Message::assistant("b"),
+        Message::user("c"),
+    ]);
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(FailCompactor)),
+    ));
+    let client = MockClient::new("test-model");
+    let mut agent = BareLoop::from_machine_with_managers(
+        machine,
+        make_config(),
+        Arc::new(client),
+        ToolRegistry::new(),
+        managers,
+    );
+    let error = agent
+        .compact_manual()
+        .await
+        .expect_err("an errored compactor fails the pass");
+    match error {
+        crate::error::LoopError::CompactionFailed { cause, used, limit } => {
+            assert!(
+                cause.contains("exploded"),
+                "the compactor's own text rides the variant: {cause}"
+            );
+            assert!(
+                used > 0 && limit >= used,
+                "the failure keeps the payload pair: {used} of {limit}"
+            );
+        }
+        other => panic!("an errored pass maps to CompactionFailed, not {other:?}"),
+    }
+    assert_eq!(
+        agent.machine().full_history().len(),
+        3,
+        "the failed pass leaves the history intact"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_reports_a_still_oversized_result_as_context_exceeded() {
+    // A pass that succeeded its compactor but still does not fit the
+    // window is an over-window refusal, not a failure — the manager's
+    // window is set below what even the shrunk feed occupies.
+    let machine = crate::engine::core::LoopMachine::from_history(vec![
+        Message::user("a fairly long user telling".repeat(6)),
+        Message::assistant("a fairly long assistant answer".repeat(6)),
+        Message::user("and one more exchange".repeat(4)),
+    ]);
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(ShrinkingPassCompactor))
+            .with_context_window(8),
+    ));
+    let client = MockClient::new("test-model");
+    let mut agent = BareLoop::from_machine_with_managers(
+        machine,
+        make_config(),
+        Arc::new(client),
+        ToolRegistry::new(),
+        managers,
+    );
+    let error = agent
+        .compact_manual()
+        .await
+        .expect_err("a result that still overflows the window fails the pass");
+    match error {
+        crate::error::LoopError::ContextExceeded { used, limit } => {
+            assert_eq!(limit, 8, "the refusal carries the window the pass failed");
+            assert!(
+                used > limit,
+                "and a conversation that does not fit: {used} of {limit}"
+            );
+        }
+        other => panic!("the still-does-not-fit arm maps to ContextExceeded, not {other:?}"),
+    }
+    assert_eq!(
+        agent.machine().full_history().len(),
+        3,
+        "the refused result never lands"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_keeps_the_cancel_signal_the_host_already_holds() {
+    // The whole point of the seam over a rebuild: the signal the host
+    // cloned stays bound to this loop across the pass.
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    client.add_text_response("two");
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(ShrinkingPassCompactor)),
+    ));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let signal = agent.cancel_signal();
+    agent.run("first", &make_run_config()).await.unwrap();
+    let _result = agent
+        .compact_manual()
+        .await
+        .expect("the pass runs while at rest");
+    assert!(
+        Arc::ptr_eq(&signal, &agent.cancel_signal()),
+        "the cancel signal the host already holds stays live across the pass"
+    );
+    agent.run("second", &make_run_config()).await.unwrap();
+}
+
+#[tokio::test]
+async fn compact_manual_notifies_observers_like_an_automatic_pass() {
+    // A manual pass is a compaction as far as the observer contract
+    // goes: on_compaction fires, exactly once, through the engine's own
+    // ceremony — the same path the automatic pass takes.
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            ShrinkingPassCompactor,
+        ))));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    agent.run("first", &make_run_config()).await.unwrap();
+    agent.compact_manual().await.expect("the pass runs at rest");
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        1,
+        "the manual pass fired on_compaction exactly once"
+    );
+}
+
+/// A hook that watches the compaction ceremony and holds a verdict:
+/// it records the trigger each side of the pass saw, and its
+/// `on_pre_compact` answer is either the allow that lets the pass run
+/// or the abort that vetoes it.
+#[cfg(feature = "hooks")]
+struct CompactWitnessHook {
+    aborting: bool,
+    pre: Mutex<Option<CompactTrigger>>,
+    post: Mutex<Option<CompactTrigger>>,
+}
+
+#[cfg(feature = "hooks")]
+impl CompactWitnessHook {
+    fn new(aborting: bool) -> Arc<Self> {
+        Arc::new(Self {
+            aborting,
+            pre: Mutex::new(None),
+            post: Mutex::new(None),
+        })
+    }
+
+    fn seen_pre(&self) -> Option<CompactTrigger> {
+        *crate::error::recover_guard(self.pre.lock())
+    }
+
+    fn seen_post(&self) -> Option<CompactTrigger> {
+        *crate::error::recover_guard(self.post.lock())
+    }
+}
+
+#[cfg(feature = "hooks")]
+impl Hook for CompactWitnessHook {
+    fn name(&self) -> &'static str {
+        "CompactWitnessHook"
+    }
+
+    fn on_pre_compact(
+        &self,
+        ctx: &PreCompactContext,
+    ) -> Option<crate::hooks::context::CompactResult> {
+        *crate::error::recover_guard(self.pre.lock()) = Some(ctx.trigger);
+        Some(if self.aborting {
+            crate::hooks::context::CompactResult::abort("not now")
+        } else {
+            crate::hooks::context::CompactResult::allow()
+        })
+    }
+
+    fn on_post_compact(&self, ctx: &PostCompactContext) {
+        *crate::error::recover_guard(self.post.lock()) = Some(ctx.trigger);
+    }
+}
+
+/// A loop at rest with a compactor that shrinks and a witness hook in
+/// the executor, the seam's own harness plus the hooks side.
+#[cfg(feature = "hooks")]
+fn loop_with_compact_witness(aborting: bool) -> (BareLoop<MockClient>, Arc<CompactWitnessHook>) {
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    client.add_text_response("two");
+    let hook = CompactWitnessHook::new(aborting);
+    let executor = Arc::new(HookExecutor::new().with_hook(hook.clone()));
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(ShrinkingPassCompactor))
+            .with_context_window(100_000),
+    ));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    agent.set_hook_executor(executor);
+    (agent, hook)
+}
+
+#[cfg(feature = "hooks")]
+#[tokio::test]
+async fn compact_manual_reaches_hooks_as_the_manual_trigger() {
+    // What the host's /compact looks like from inside a hook: both
+    // sides of the ceremony see the manual trigger, on the seam the
+    // host actually drives — not the unit-mapped value alone.
+    let (mut agent, hook) = loop_with_compact_witness(false);
+    agent.run("first", &make_run_config()).await.unwrap();
+    agent.run("second", &make_run_config()).await.unwrap();
+    agent
+        .compact_manual()
+        .await
+        .expect("a machine at rest admits the manual pass");
+    assert_eq!(
+        hook.seen_pre(),
+        Some(CompactTrigger::Manual),
+        "the pre-compact hook was asked under the manual trigger"
+    );
+    assert_eq!(
+        hook.seen_post(),
+        Some(CompactTrigger::Manual),
+        "the post-compact hook reports the manual trigger"
+    );
+}
+
+#[cfg(feature = "hooks")]
+#[tokio::test]
+async fn an_aborting_pre_compact_hook_declines_the_manual_pass() {
+    // The veto the seam promises: an aborting on_pre_compact hook
+    // turns the pass into the honest NoAction — nothing adopted,
+    // nothing re-fed, no post-compact event, the conversation exactly
+    // as it stood.
+    let (mut agent, hook) = loop_with_compact_witness(true);
+    agent.run("first", &make_run_config()).await.unwrap();
+    agent.run("second", &make_run_config()).await.unwrap();
+    let history_before = agent.machine().full_history().len();
+    let tokens_before = agent.machine().context_tokens();
+    let result = agent
+        .compact_manual()
+        .await
+        .expect("a veto is a decline, not an error");
+    match result {
+        crate::compact::EnsureContextResult::NoAction(messages) => assert_eq!(
+            messages.len(),
+            history_before,
+            "the veto hands back the unchanged conversation"
+        ),
+        crate::compact::EnsureContextResult::Compacted(_) => {
+            panic!("an aborting pre-compact hook must veto the pass")
+        }
+    }
+    assert_eq!(
+        agent.machine().full_history().len(),
+        history_before,
+        "the vetoed pass adopts nothing"
+    );
+    assert_eq!(
+        agent.machine().context_tokens(),
+        tokens_before,
+        "the vetoed pass re-feeds nothing"
+    );
+    assert_eq!(
+        hook.seen_pre(),
+        Some(CompactTrigger::Manual),
+        "the hook was asked under the manual trigger before the veto"
+    );
+    assert_eq!(
+        hook.seen_post(),
+        None,
+        "a vetoed pass never reaches the post-compact hook"
+    );
+}

@@ -1128,6 +1128,98 @@ impl LoopMachine {
         Ok(removed)
     }
 
+    /// Guard for the host-requested manual compaction seam.
+    ///
+    /// A manual pass rewrites the merged conversation and re-feeds the
+    /// machine's context figure — the same kind of wholesale history
+    /// change [`rewind_to`](Self::rewind_to) makes — so it is only ever
+    /// sound while the machine is at rest: at
+    /// [`Start`](MachineState::Start), or in a
+    /// [`Terminal`](MachineState::Terminal) state a host may resume
+    /// from (the between-runs rest where a `/compact`-style command
+    /// finds a long-lived loop, before the next
+    /// [`accept_input`](Self::accept_input) resurrects the machine).
+    /// Any in-flight state refuses with [`LoopError::InvalidInput`]
+    /// naming the state and the cancel-then-resolve path, in
+    /// `rewind_to`'s refusal shape — the text is written to be
+    /// displayed to the user who asked for the pass.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::InvalidInput`] when a turn is in flight
+    /// (`AwaitingModel`, `AwaitingTools`, or `AwaitingCompaction`) —
+    /// cancel the run and let it resolve first.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use loopctl::engine::core::LoopMachine;
+    /// # use loopctl::message::Message;
+    /// let machine =
+    ///     LoopMachine::from_history(vec![Message::user("a"), Message::assistant("b")]);
+    /// machine
+    ///     .guard_manual_compaction()
+    ///     .expect("a resting machine admits the manual pass");
+    /// ```
+    pub fn guard_manual_compaction(&self) -> Result<(), LoopError> {
+        match &self.state {
+            MachineState::Start | MachineState::Terminal(_) => Ok(()),
+            in_flight => Err(LoopError::InvalidInput(format!(
+                "cannot compact committed history while a turn is in \
+                 flight (state: {in_flight:?}); cancel the run and let \
+                 it resolve first"
+            ))),
+        }
+    }
+
+    /// Install the result of a manual compaction pass.
+    ///
+    /// The terminal-tolerant sibling of
+    /// [`adopt_pruned`](Self::adopt_pruned): a host requests a manual
+    /// pass while the machine is at rest, and at rest between runs the
+    /// machine typically sits [`Terminal`](MachineState::Terminal) —
+    /// so unlike the in-run adoption, this install has its effect on a
+    /// terminal machine too. `messages` replaces
+    /// [`full_history`](Self::full_history) with `history_len` messages
+    /// committed and the rest pending (the split the pass started
+    /// from), and `context_tokens` — the driver's recount of the
+    /// compacted feed — lands as the machine's figure so the host
+    /// reports, and the next run's trigger reads, the compacted size
+    /// rather than the pre-pass one. The state itself is left where the
+    /// guard found it; a terminal machine stays terminal and its next
+    /// [`accept_input`](Self::accept_input) re-estimates the counters
+    /// the way it always does. Like [`rewind_to`](Self::rewind_to), a
+    /// stale `deferred_compaction` latch is cleared: the shortened feed
+    /// must re-arm the threshold check naturally.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use loopctl::engine::core::LoopMachine;
+    /// # use loopctl::message::Message;
+    /// let mut machine = LoopMachine::from_history(vec![
+    ///     Message::user("a"),
+    ///     Message::assistant("b"),
+    /// ]);
+    /// machine.install_manual_compaction(vec![Message::user("a shorter telling")], 2, 5);
+    /// assert_eq!(machine.history().len(), 1, "the compacted feed is the history now");
+    /// assert_eq!(machine.context_tokens(), 5, "the recount lands beside the feed");
+    /// ```
+    pub fn install_manual_compaction(
+        &mut self,
+        messages: Vec<Message>,
+        history_len: usize,
+        context_tokens: u64,
+    ) {
+        let split = history_len.min(messages.len());
+        let mut history = messages;
+        let pending = history.split_off(split);
+        self.history = history;
+        self.pending = pending;
+        self.context_tokens = context_tokens;
+        self.deferred_compaction = false;
+    }
+
     /// Discard the current run's pending messages without committing.
     ///
     /// Called by the driver when a run fails because the conversation
@@ -1854,6 +1946,105 @@ mod tests {
     }
 
     #[test]
+    fn guard_manual_compaction_admits_a_resting_machine() {
+        let mut machine = small_machine();
+        machine
+            .guard_manual_compaction()
+            .expect("a machine at Start admits the manual pass");
+        machine.accept_input("go");
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.cancel();
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::Done(MachineOutcome::Cancelled)
+        ));
+        machine
+            .guard_manual_compaction()
+            .expect("a terminal machine is at rest and admits the pass");
+    }
+
+    #[test]
+    fn guard_manual_compaction_refuses_while_a_turn_is_in_flight() {
+        let mut machine = small_machine();
+        machine.accept_input("go");
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::CallLLM { .. }
+        ));
+        let error = machine
+            .guard_manual_compaction()
+            .expect_err("an in-flight turn refuses the manual pass");
+        assert!(
+            error.to_string().contains("while a turn is in flight"),
+            "the refusal names why, in text a host can display: {error}"
+        );
+    }
+
+    #[test]
+    fn install_manual_compaction_replaces_history_on_a_terminal_machine() {
+        let mut machine = small_machine();
+        machine.accept_input("go");
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.cancel();
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::Done(MachineOutcome::Cancelled)
+        ));
+        machine.install_manual_compaction(vec![Message::user("a shorter telling")], 2, 7);
+        assert_eq!(
+            machine.full_history()[0].text_content(),
+            "a shorter telling",
+            "a terminal machine at rest takes the compacted feed — a host's /compact works between runs"
+        );
+        assert_eq!(
+            machine.context_tokens(),
+            7,
+            "the recount lands beside the feed, terminal or not"
+        );
+        assert!(
+            matches!(machine.state(), MachineState::Terminal(_)),
+            "the install leaves the machine's own state where the guard found it"
+        );
+        machine.accept_input("fresh");
+        assert_eq!(
+            machine.full_history().last().unwrap().text_content(),
+            "fresh",
+            "the compacted machine resumes like any other"
+        );
+    }
+
+    #[test]
+    fn install_manual_compaction_preserves_the_pending_split() {
+        let mut machine = small_machine();
+        machine.install_manual_compaction(
+            vec![Message::user("summary"), Message::assistant("in-flight")],
+            1,
+            3,
+        );
+        assert_eq!(
+            machine.history().len(),
+            1,
+            "the committed side holds the summary"
+        );
+        assert_eq!(
+            machine.full_history().len(),
+            2,
+            "the merged view keeps the pass's split"
+        );
+        assert_eq!(
+            machine.context_tokens(),
+            3,
+            "the figure lands with the feed"
+        );
+    }
+
+    #[test]
     fn rewind_to_beyond_the_length_removes_nothing() {
         let mut machine = small_machine();
         let removed = machine
@@ -1877,6 +2068,20 @@ mod tests {
         assert!(
             !machine.deferred_compaction,
             "the latch re-arms with the history it now has"
+        );
+    }
+
+    #[test]
+    fn install_manual_compaction_clears_the_deferred_compaction_latch() {
+        // A manual compaction installs a shorter feed the same way a
+        // rewind does; a stale latch must not outlive it and suppress
+        // the threshold against the recounted history.
+        let mut machine = small_machine();
+        machine.deferred_compaction = true;
+        machine.install_manual_compaction(vec![Message::user("a shorter telling")], 2, 5);
+        assert!(
+            !machine.deferred_compaction,
+            "the installed feed re-arms the threshold check naturally"
         );
     }
 

@@ -2014,6 +2014,24 @@ fn outer() {
     );
 }
 
+/// A braced `use ::tracing::{self as tracing};` from the crate's own root
+/// restores the name exactly like the bare spelling, so it lifts an outer
+/// rename's veto for the calls it covers.
+#[test]
+fn a_braced_self_restore_from_the_tracing_root_lifts_the_veto() {
+    let braced = r#"
+use log as tracing;
+fn outer() {
+    use ::tracing::{self as tracing};
+    tracing::debug!(target: "loopctl::metrics", metric = "loopctl.root.braced", n = 1);
+}
+"#;
+    assert!(
+        emission_site_in(braced, "loopctl.root.braced"),
+        "the braced self-restore from the ::tracing root wins the name back from the rename"
+    );
+}
+
 #[test]
 fn a_shadow_definition_spares_earlier_and_outside_calls() {
     let before = r#"

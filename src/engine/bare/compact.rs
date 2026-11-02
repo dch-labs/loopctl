@@ -11,7 +11,7 @@
 use super::{ApiClient, BareLoop, LoopError};
 #[cfg(feature = "hooks")]
 use super::{CompactTrigger, PostCompactContext, PreCompactContext};
-use crate::compact::EnsureContextResult;
+use crate::compact::{CompactionOutcome, EnsureContextResult};
 
 use crate::capabilities::Compactable;
 #[cfg(feature = "hooks")]
@@ -97,6 +97,85 @@ pub(super) struct CompactStepFailure {
     pub(super) tokens_after: u64,
 }
 
+/// The verdict of one compaction pass, before it is shaped for a
+/// consumer.
+///
+/// [`BareLoop::run_compaction`](BareLoop::run_compaction) reshapes it
+/// into the [`CompactStepOutcome`] the driver feeds back into the
+/// machine when the machine requested the pass;
+/// [`BareLoop::compact_manual`](BareLoop::compact_manual) installs the
+/// compacted feed into a resting machine and hands the verdict's own
+/// record to the host.
+pub(super) enum CompactPass {
+    /// The pass produced a rewritten history.
+    ///
+    /// The full [`CompactionOutcome`](crate::compact::CompactionOutcome)
+    /// rides along — the compacted list, the figures, the eviction
+    /// list, and the stage account — so both consumers act on one pass
+    /// record: the step flow takes the list and the eviction count,
+    /// the manual seam hands the whole record to the host after
+    /// installing the list.
+    Compacted {
+        /// The manager's pass record, whole.
+        ///
+        /// The compacted message list, the before/after figures the
+        /// manager normalized to its own counter, the eviction slice
+        /// already handed to the demotion sink, and the stage account —
+        /// the same record the automatic path reports to its observers.
+        /// The step flow reaches only for the list and the eviction
+        /// count; the manual seam hands the whole record to the host
+        /// verbatim after installing the list, so what the host reads
+        /// is what the pass did.
+        outcome: CompactionOutcome,
+
+        /// Driver-measured conversation size ahead of the pass.
+        ///
+        /// Taken before the manager was consulted, with the loop's own
+        /// counter and calibration — the provider-token scale every
+        /// `tokens_*` figure in this family shares, so the pair compares
+        /// like with like and against the machine's trigger.
+        tokens_before: u64,
+
+        /// Driver-scale measurement of the compacted feed.
+        ///
+        /// The post-pass conversation size on that same scale, request
+        /// overhead included — the figure a manual install sets the
+        /// machine's context count to, and the figure the `on_compaction`
+        /// observer event and the signal event carry beside
+        /// `tokens_before`.
+        tokens_after: u64,
+    },
+
+    /// The pass ran and declined: no manager installed, a pre-compact
+    /// hook vetoed the pass, or the compaction found nothing to give
+    /// back.
+    ///
+    /// The conversation is unchanged; both figures are real
+    /// measurements of it (never a hard-coded zero) so the machine's
+    /// no-progress guard keeps comparing evidence.
+    Declined {
+        /// Driver-measured conversation size ahead of the pass.
+        ///
+        /// The same figure every outcome of the family opens with —
+        /// the counter's and calibration's reading of the conversation
+        /// before anything ran — so a decline still reports evidence on
+        /// the shared scale rather than silence.
+        tokens_before: u64,
+
+        /// Driver-scale measurement of the unchanged conversation.
+        ///
+        /// Re-measured after the decline when the manager hands back a
+        /// list it declined to compact (overhead included, as a
+        /// successful pass's figure is) — a conversation that grew
+        /// while the pass was in flight reads honestly, which is what
+        /// keeps the machine's no-progress guard comparing two real
+        /// measurements. The declines that never reach a list — no
+        /// manager installed, a pre-compact hook veto — have nothing
+        /// new to measure and carry `tokens_before` unchanged.
+        tokens_after: u64,
+    },
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// Record what one compaction pass bought, in tokens and in time.
     ///
@@ -133,7 +212,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// with the pass's opening figures — the trigger, the turn, the measured
     /// context against its window, and the message count the pass starts
     /// from — on the session's own id. A named step rather than an inline
-    /// block so [`run_compaction`](Self::run_compaction) reads as the
+    /// block so [`compaction_pass`](Self::compaction_pass) reads as the
     /// sequence of decisions it makes: notify, reduce, record.
     fn note_pre_compaction(
         &self,
@@ -166,10 +245,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// pre-compact hook veto) and
     /// [`on_compaction`](crate::observer::LoopObserver::on_compaction) with
     /// the full pass telemetry when compaction occurred, and the
-    /// post-compact hook; returns a
-    /// [`CompactStepOutcome`] — the measured before/after pair plus the
-    /// compacted list when one was produced — for the driver to feed back
-    /// into the machine.
+    /// post-compact hook; returns a [`CompactPass`] — the measured
+    /// before/after pair plus the full [`CompactionOutcome`] when one
+    /// was produced — which [`run_compaction`](Self::run_compaction)
+    /// reshapes for the driver and which
+    /// [`compact_manual`](Self::compact_manual) installs directly.
     ///
     /// When no `ContextManager` is set, a pre-compact hook aborts the pass,
     /// or the manager reports [`EnsureContextResult::NoAction`], the
@@ -191,22 +271,20 @@ impl<C: ApiClient> BareLoop<C> {
     /// compactor ran and errored — the real cause rides the variant —
     /// and [`LoopError::ContextExceeded`] when a pass succeeded but
     /// its result still does not fit the context window.
-    pub(super) async fn run_compaction(
+    pub(super) async fn compaction_pass(
         &mut self,
         turn: usize,
         reason: crate::compact::types::CompactReason,
-    ) -> Result<CompactStepOutcome, CompactStepFailure> {
+    ) -> Result<CompactPass, CompactStepFailure> {
         let history = self.machine.full_history();
         let tokens_before = self.context_figure(
             self.count_context(&history)
                 .saturating_add(self.overhead_tokens()),
         );
         let Some(ctx_manager) = self.managers.context_manager() else {
-            return Ok(CompactStepOutcome {
+            return Ok(CompactPass::Declined {
                 tokens_before,
                 tokens_after: tokens_before,
-                compacted: None,
-                evicted_messages: 0,
             });
         };
 
@@ -217,11 +295,9 @@ impl<C: ApiClient> BareLoop<C> {
         let hook = self.pre_compact_hook(&history, reason);
         #[cfg(feature = "hooks")]
         if hook.abort {
-            return Ok(CompactStepOutcome {
+            return Ok(CompactPass::Declined {
                 tokens_before,
                 tokens_after: tokens_before,
-                compacted: None,
-                evicted_messages: 0,
             });
         }
         #[cfg(not(feature = "hooks"))]
@@ -254,7 +330,6 @@ impl<C: ApiClient> BareLoop<C> {
 
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
-                let evicted_messages = outcome.evicted.len();
                 self.demote_evicted(&outcome.evicted, reason, turn).await;
                 let tokens_after = self
                     .context_figure(outcome.tokens_after.saturating_add(self.overhead_tokens()));
@@ -280,17 +355,17 @@ impl<C: ApiClient> BareLoop<C> {
                 });
                 #[cfg(feature = "hooks")]
                 self.notify_post_compact_hook(
+                    CompactTrigger::from(reason),
                     messages_before,
                     messages_after,
                     tokens_after,
                     tokens_saved,
                     self.managers.clock().elapsed_since(compact_start),
                 );
-                Ok(CompactStepOutcome {
+                Ok(CompactPass::Compacted {
+                    outcome,
                     tokens_before,
                     tokens_after,
-                    compacted: Some(outcome.messages),
-                    evicted_messages,
                 })
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
@@ -303,11 +378,9 @@ impl<C: ApiClient> BareLoop<C> {
                     self.count_context(&messages)
                         .saturating_add(self.overhead_tokens()),
                 );
-                Ok(CompactStepOutcome {
+                Ok(CompactPass::Declined {
                     tokens_before,
                     tokens_after,
-                    compacted: None,
-                    evicted_messages: 0,
                 })
             }
             Err(overflow) => {
@@ -345,6 +418,147 @@ impl<C: ApiClient> BareLoop<C> {
                         tokens_after: self.context_figure(overflow.tokens_used),
                     }),
                 }
+            }
+        }
+    }
+
+    /// The step-shaped face of [`compaction_pass`](Self::compaction_pass):
+    /// runs the same routine and reshapes its verdict into the
+    /// [`CompactStepOutcome`] the driver feeds back into the machine
+    /// when the machine requested the pass via
+    /// [`MachineStep::Compact`](crate::engine::core::MachineStep::Compact).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the pass's failures unchanged — see
+    /// [`compaction_pass`](Self::compaction_pass).
+    pub(super) async fn run_compaction(
+        &mut self,
+        turn: usize,
+        reason: crate::compact::types::CompactReason,
+    ) -> Result<CompactStepOutcome, CompactStepFailure> {
+        match self.compaction_pass(turn, reason).await? {
+            CompactPass::Compacted {
+                outcome,
+                tokens_before,
+                tokens_after,
+            } => Ok(CompactStepOutcome {
+                evicted_messages: outcome.evicted.len(),
+                tokens_before,
+                tokens_after,
+                compacted: Some(outcome.messages),
+            }),
+            CompactPass::Declined {
+                tokens_before,
+                tokens_after,
+            } => Ok(CompactStepOutcome {
+                tokens_before,
+                tokens_after,
+                compacted: None,
+                evicted_messages: 0,
+            }),
+        }
+    }
+
+    /// Run a manual compaction pass over this loop's history.
+    ///
+    /// The host seam for a `/compact`-style command and for headless
+    /// scheduled passes: the loop drives its own installed
+    /// [`ContextManager`](crate::compact::ContextManager) through the
+    /// engine's own compaction ceremony — the opening observer event,
+    /// the pre-compact hook veto (hooks see the pass under the manual
+    /// trigger), demotion of everything the pass evicted, telemetry,
+    /// the `on_compaction` observer event, the post-compact hook, and
+    /// the `loopctl.compaction` signal event with reason `manual` —
+    /// and then installs what the pass won: the machine takes the
+    /// compacted history through
+    /// [`install_manual_compaction`](crate::engine::core::LoopMachine::install_manual_compaction),
+    /// the token recount lands with it, and the usage anchor and any
+    /// prepared turn are invalidated exactly as a rewind invalidates
+    /// them. The host reads the figures *before* the next
+    /// run: the reported count and the next run's trigger both see the
+    /// compacted size.
+    ///
+    /// The pass works only while the loop is not running: the machine
+    /// is guarded like [`rewind_history_to`](Self::rewind_history_to),
+    /// and a turn in flight refuses with an error naming the state and
+    /// the cancel-then-resolve path — text written to be displayed to
+    /// the user who asked. A machine at rest between runs (a
+    /// `Terminal` one awaiting the next
+    /// [`accept_input`](crate::engine::core::LoopMachine::accept_input))
+    /// is explicitly admitted: this is where a long-lived host's
+    /// `/compact` finds it.
+    ///
+    /// [`EnsureContextResult::NoAction`] is the honest decline: the
+    /// conversation sat below the threshold, a pre-compact hook vetoed
+    /// the pass, or no manager was installed — history, figures, and
+    /// anchor are left untouched, and the signal event narrates a noop.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::InvalidInput`] when a turn is in flight;
+    /// [`LoopError::CompactionFailed`] when the compactor ran and
+    /// errored (its own text rides the variant), and
+    /// [`LoopError::ContextExceeded`] when the pass succeeded but its
+    /// result still does not fit the window — the same mapping the
+    /// automatic pass propagates to its run.
+    pub async fn compact_manual(&mut self) -> Result<EnsureContextResult, LoopError> {
+        self.machine.guard_manual_compaction()?;
+        let turn = self.machine.turns_taken();
+        let history_len = self.machine.history().len();
+        match self
+            .compaction_pass(turn, crate::compact::types::CompactReason::Manual)
+            .await
+        {
+            Ok(CompactPass::Compacted {
+                outcome,
+                tokens_before,
+                tokens_after,
+            }) => {
+                let evicted = outcome.evicted.len();
+                self.machine.install_manual_compaction(
+                    outcome.messages.clone(),
+                    history_len,
+                    tokens_after,
+                );
+                self.anchor = None;
+                self.prepared_turn = None;
+                crate::tracing_spans::event_compaction(
+                    crate::compact::types::CompactReason::Manual,
+                    tokens_before,
+                    tokens_after,
+                    crate::tracing_spans::CompactionPassOutcome::Applied,
+                );
+                if evicted > 0 {
+                    tracing::debug!(
+                        target: "loopctl::metrics",
+                        metric = "loopctl.compaction.evicted.messages",
+                        messages = evicted,
+                        "messages left the feed as a manual compaction was installed"
+                    );
+                }
+                Ok(EnsureContextResult::Compacted(outcome))
+            }
+            Ok(CompactPass::Declined {
+                tokens_before,
+                tokens_after,
+            }) => {
+                crate::tracing_spans::event_compaction(
+                    crate::compact::types::CompactReason::Manual,
+                    tokens_before,
+                    tokens_after,
+                    crate::tracing_spans::CompactionPassOutcome::Noop,
+                );
+                Ok(EnsureContextResult::NoAction(self.machine.full_history()))
+            }
+            Err(failure) => {
+                crate::tracing_spans::event_compaction(
+                    crate::compact::types::CompactReason::Manual,
+                    failure.tokens_before,
+                    failure.tokens_after,
+                    crate::tracing_spans::CompactionPassOutcome::Failed,
+                );
+                Err(failure.error)
             }
         }
     }
@@ -395,7 +609,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// reaches hooks as [`Manual`](CompactTrigger::Manual) — then asks
     /// the [`HookExecutor`](crate::hooks::HookExecutor) to run every
     /// registered `on_pre_compact` hook. An `abort: true` result makes
-    /// [`run_compaction`](Self::run_compaction) skip compaction
+    /// [`compaction_pass`](Self::compaction_pass) skip compaction
     /// entirely for this trigger; the merged `new_instructions` and
     /// `additional_context` are threaded into the compactor's
     /// [`CompactionContext`](crate::compact::types::CompactionContext).
@@ -433,10 +647,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`HookExecutor`](crate::hooks::HookExecutor). No-op when there
     /// is no hook executor. Called only on the
     /// [`EnsureContextResult::Compacted`] path — the `NoAction` path
-    /// skips it.
+    /// skips it. The `trigger` names the pass for the hook: the
+    /// machine's own passes report
+    /// [`Auto`](CompactTrigger::Auto); a host-requested
+    /// [`compact_manual`](Self::compact_manual) reports
+    /// [`Manual`](CompactTrigger::Manual).
     #[cfg(feature = "hooks")]
     fn notify_post_compact_hook(
         &self,
+        trigger: CompactTrigger,
         messages_before: usize,
         messages_after: usize,
         tokens_after: u64,
@@ -447,7 +666,7 @@ impl<C: ApiClient> BareLoop<C> {
             return;
         };
         let ctx = PostCompactContext {
-            trigger: CompactTrigger::Auto,
+            trigger,
             messages_compacted: messages_before.saturating_sub(messages_after),
             tokens_saved,
             tokens_after,

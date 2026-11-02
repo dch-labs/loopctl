@@ -1211,10 +1211,28 @@ impl LoopMachine {
     /// rather than the pre-pass one. The state itself is left where the
     /// guard found it; a terminal machine stays terminal and its next
     /// [`accept_input`](Self::accept_input) re-estimates the counters
-    /// the way it always does. Messages beyond `history_len` are
-    /// installed as pending, not committed: the split commits the
-    /// first `history_len` messages and stages the rest in the
-    /// pending buffer as input the next run feeds. The seam's own
+    /// the way it always does.
+    ///
+    /// The install is guarded by
+    /// [`guard_manual_compaction`](Self::guard_manual_compaction) and
+    /// refuses exactly where the guard refuses, changing nothing: the
+    /// method is a public seam in its own right, and an install while
+    /// a turn is in flight would drop the outstanding tool-call
+    /// message the run still owes results to.
+    ///
+    /// The installed feed is coalesced first, the same fold
+    /// [`compaction_result`](Self::compaction_result) applies: runs of
+    /// adjacent assistant messages fold into one, so a summary
+    /// landing before an assistant preserved tail — the shape strict
+    /// providers reject outright — never reaches history or the wire.
+    ///
+    /// Messages beyond `history_len` are installed as pending, not
+    /// committed — and a staged tail never rides a request:
+    /// [`accept_input`](Self::accept_input), and therefore every
+    /// [`Loop::run`](crate::engine::core::Loop::run), clears the
+    /// pending buffer before staging its own prompt, discarding the
+    /// tail. A direct caller that wants the whole feed committed
+    /// passes `history_len` equal to `messages.len()`. The seam's own
     /// engine-driven path stages nothing —
     /// [`guard_manual_compaction`](Self::guard_manual_compaction)
     /// keeps staged input out of the pass, and the driver refuses a
@@ -1229,6 +1247,12 @@ impl LoopMachine {
     /// latch is cleared: the shortened feed must re-arm the threshold
     /// check naturally.
     ///
+    /// # Errors
+    ///
+    /// [`LoopError::InvalidInput`] exactly where
+    /// [`guard_manual_compaction`](Self::guard_manual_compaction)
+    /// refuses — a turn in flight, or staged input waiting to run.
+    ///
     /// # Example
     ///
     /// ```
@@ -1238,7 +1262,9 @@ impl LoopMachine {
     ///     Message::user("a"),
     ///     Message::assistant("b"),
     /// ]);
-    /// machine.install_manual_compaction(vec![Message::user("a shorter telling")], 2, 5);
+    /// machine
+    ///     .install_manual_compaction(vec![Message::user("a shorter telling")], 2, 5)
+    ///     .expect("a resting machine installs the compacted feed");
     /// assert_eq!(machine.history().len(), 1, "the compacted feed is the history now");
     /// assert_eq!(machine.context_tokens(), 5, "the recount lands beside the feed");
     /// ```
@@ -1247,7 +1273,9 @@ impl LoopMachine {
         messages: Vec<Message>,
         history_len: usize,
         context_tokens: u64,
-    ) {
+    ) -> Result<(), LoopError> {
+        self.guard_manual_compaction()?;
+        let messages = crate::message::coalesce_adjacent_assistants(messages);
         let split = history_len.min(messages.len());
         let mut history = messages;
         let pending = history.split_off(split);
@@ -1255,6 +1283,7 @@ impl LoopMachine {
         self.pending = pending;
         self.context_tokens = context_tokens;
         self.deferred_compaction = false;
+        Ok(())
     }
 
     /// Discard the current run's pending messages without committing.
@@ -2052,7 +2081,10 @@ mod tests {
             machine.next_step(test_policy(3)),
             MachineStep::Done(MachineOutcome::Cancelled)
         ));
-        machine.install_manual_compaction(vec![Message::user("a shorter telling")], 2, 7);
+        machine.discard_pending();
+        machine
+            .install_manual_compaction(vec![Message::user("a shorter telling")], 2, 7)
+            .expect("a terminal machine at rest installs the compacted feed");
         assert_eq!(
             machine.full_history()[0].text_content(),
             "a shorter telling",
@@ -2078,11 +2110,13 @@ mod tests {
     #[test]
     fn install_manual_compaction_preserves_the_pending_split() {
         let mut machine = small_machine();
-        machine.install_manual_compaction(
-            vec![Message::user("summary"), Message::assistant("in-flight")],
-            1,
-            3,
-        );
+        machine
+            .install_manual_compaction(
+                vec![Message::user("summary"), Message::assistant("in-flight")],
+                1,
+                3,
+            )
+            .expect("a resting machine takes the split install");
         assert_eq!(
             machine.history().len(),
             1,
@@ -2097,6 +2131,112 @@ mod tests {
             machine.context_tokens(),
             3,
             "the figure lands with the feed"
+        );
+    }
+
+    #[test]
+    fn install_manual_compaction_refuses_a_turn_in_flight_and_keeps_the_conversation() {
+        // The install is a public seam a host can reach without the
+        // loop's wrapper; while tools are outstanding it must refuse
+        // rather than replace the conversation the run still owes
+        // results to.
+        let mut machine = small_machine();
+        machine.accept_input("go");
+        assert!(matches!(
+            machine.next_step(test_policy(3)),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.model_response(tool_response("echo", &["echo"], 10), 0);
+        assert!(matches!(
+            machine.state(),
+            MachineState::AwaitingTools { .. }
+        ));
+        let conversation: Vec<(Role, String)> = machine
+            .full_history()
+            .iter()
+            .map(|message| (message.role, message.text_content()))
+            .collect();
+        let refusal = machine
+            .install_manual_compaction(vec![Message::user("a shorter telling")], 0, 1)
+            .expect_err("a turn in flight refuses the install");
+        assert!(
+            matches!(refusal, LoopError::InvalidInput(_)),
+            "the install refuses the way its guard does, got {refusal}"
+        );
+        let after: Vec<(Role, String)> = machine
+            .full_history()
+            .iter()
+            .map(|message| (message.role, message.text_content()))
+            .collect();
+        assert_eq!(
+            after, conversation,
+            "an install while a turn is in flight keeps the conversation — \
+             the outstanding tool-call message is the run's live state"
+        );
+    }
+
+    #[test]
+    fn install_manual_compaction_folds_adjacent_assistant_runs() {
+        // A summary landing before an assistant-role preserved tail is
+        // the shape strict providers reject outright; the install folds
+        // the run the way the in-run adoption does so the shape never
+        // reaches history or the wire.
+        let mut machine = small_machine();
+        machine
+            .install_manual_compaction(
+                vec![
+                    Message::user("u"),
+                    Message::assistant("the summary"),
+                    Message::assistant("the kept tail"),
+                ],
+                3,
+                5,
+            )
+            .expect("a resting machine installs the compacted feed");
+        let history = machine.history();
+        assert_eq!(
+            history.len(),
+            2,
+            "the adjacent assistant run folds into one message"
+        );
+        assert_eq!(
+            history.last().unwrap().text_content(),
+            "the summary\n\nthe kept tail",
+            "the fold keeps both tellings in order, summary first"
+        );
+        assert_eq!(
+            machine.full_history().len(),
+            2,
+            "nothing staged — the fold happened before the split"
+        );
+    }
+
+    #[test]
+    fn install_manual_compaction_stages_a_tail_the_next_accept_input_discards() {
+        // The split stages messages beyond `history_len` in pending,
+        // and the next run's `accept_input` clears pending before
+        // staging its own prompt — the tail never rides a request. A
+        // direct caller that wants the whole feed committed passes
+        // `history_len` equal to `messages.len()`.
+        let mut machine = small_machine();
+        machine
+            .install_manual_compaction(
+                vec![Message::user("summary"), Message::user("a staged tail")],
+                1,
+                3,
+            )
+            .expect("a resting machine takes the split install");
+        assert_eq!(machine.history().len(), 1, "the split commits one");
+        assert_eq!(machine.full_history().len(), 2, "the rest waits in pending");
+        machine.accept_input("next");
+        assert_eq!(
+            machine
+                .full_history()
+                .iter()
+                .map(Message::text_content)
+                .collect::<Vec<_>>(),
+            vec!["summary".to_string(), "next".to_string()],
+            "the staged tail was discarded, never fed — only the new prompt runs"
         );
     }
 
@@ -2134,7 +2274,9 @@ mod tests {
         // the threshold against the recounted history.
         let mut machine = small_machine();
         machine.deferred_compaction = true;
-        machine.install_manual_compaction(vec![Message::user("a shorter telling")], 2, 5);
+        machine
+            .install_manual_compaction(vec![Message::user("a shorter telling")], 2, 5)
+            .expect("a resting machine installs the compacted feed");
         assert!(
             !machine.deferred_compaction,
             "the installed feed re-arms the threshold check naturally"

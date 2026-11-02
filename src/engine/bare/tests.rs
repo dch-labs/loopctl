@@ -18128,6 +18128,37 @@ impl crate::compact::ContextCompactor for SplitBustingCompactor {
     }
 }
 
+/// The compactor whose summary wears an assistant tail beside it.
+///
+/// A token-shrinking pass whose output opens with an assistant
+/// summary followed by an assistant preserved tail — the
+/// adjacent-assistant shape strict providers reject outright, and the
+/// exact result class the coalesce finding aimed at: the pass is a
+/// legitimate `Compacted`, and only the install's fold keeps the
+/// shape out of history.
+struct AdjacentAssistantCompactor;
+
+impl crate::compact::ContextCompactor for AdjacentAssistantCompactor {
+    fn compact(
+        &self,
+        _messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::compacted(
+                vec![
+                    Message::user("k"),
+                    Message::assistant("the summary rrrr"),
+                    Message::assistant("the kept tail"),
+                ],
+                context.tokens_before,
+                1,
+            ),
+        ))
+    }
+}
+
 /// An observer that counts only `on_compaction`, to prove a refused
 /// pass spoke nowhere: the refusal lands before the event this probe
 /// watches, so its count must stay zero. The counter rides as a shared
@@ -18208,6 +18239,54 @@ async fn compact_manual_installs_the_compacted_history_and_the_wire_shows_it() {
             .iter()
             .any(|text| text.contains("first long answer") || text.contains("second long answer")),
         "the superseded turns are gone from the wire: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_folds_adjacent_assistants_the_pass_produced() {
+    // The coalesce finding: a manual pass can wear an assistant
+    // summary ahead of an assistant preserved tail, and the automatic
+    // path folds that run at adoption while the manual install once
+    // let it through — strict providers reject the shape outright, so
+    // the installed history must arrive folded.
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    client.add_text_response("two");
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(AdjacentAssistantCompactor))
+            .with_context_window(100_000),
+    ));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    agent.run("first", &make_run_config()).await.unwrap();
+    agent.run("second", &make_run_config()).await.unwrap();
+    let result = agent
+        .compact_manual()
+        .await
+        .expect("a machine at rest between runs admits the manual pass");
+    assert!(
+        matches!(result, crate::compact::EnsureContextResult::Compacted(_)),
+        "a token-shrinking pass with a moved message count lands Compacted"
+    );
+    let history = agent.machine().full_history();
+    assert!(
+        !history
+            .windows(2)
+            .any(|pair| { pair[0].role == Role::Assistant && pair[1].role == Role::Assistant }),
+        "the installed history never carries adjacent assistants"
+    );
+    let folded = history
+        .iter()
+        .find(|message| message.role == Role::Assistant)
+        .expect("the folded summary is an assistant message");
+    assert_eq!(
+        folded.text_content(),
+        "the summary rrrr\n\nthe kept tail",
+        "the fold keeps both tellings in order, not one at the other's cost"
     );
 }
 

@@ -532,10 +532,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// the `loopctl.compaction` signal event with reason `manual` —
     /// and then installs what the pass won: the machine takes the
     /// compacted history through
-    /// [`install_manual_compaction`](crate::engine::core::LoopMachine::install_manual_compaction),
-    /// the token recount lands with it, and the usage anchor and any
-    /// prepared turn are invalidated exactly as a rewind invalidates
-    /// them. The host reads the figures *before* the next
+    /// [`install_manual_compaction`](crate::engine::core::LoopMachine::install_manual_compaction)
+    /// — the guarded install, which folds runs of adjacent assistant
+    /// messages the way the in-run adoption does so a summary landing
+    /// before an assistant preserved tail never reaches history or
+    /// the wire — the token recount lands with it, and the usage
+    /// anchor and any prepared turn are invalidated exactly as a rewind
+    /// invalidates them. The host reads the figures *before* the next
     /// run: the reported count and the next run's trigger both see the
     /// compacted size.
     ///
@@ -556,7 +559,8 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// [`LoopError::InvalidInput`] when a turn is in flight;
+    /// [`LoopError::InvalidInput`] when a turn is in flight or input
+    /// is staged unstarted;
     /// [`LoopError::CompactionFailed`] when the compactor ran and
     /// errored (its own text rides the variant),
     /// [`LoopError::ContextExceeded`] when the pass succeeded but its
@@ -588,7 +592,7 @@ impl<C: ApiClient> BareLoop<C> {
                     outcome.messages.clone(),
                     history_len,
                     tokens_after,
-                );
+                )?;
                 self.anchor = None;
                 self.prepared_turn = None;
                 crate::tracing_spans::event_compaction(

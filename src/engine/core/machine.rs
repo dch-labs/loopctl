@@ -1144,11 +1144,23 @@ impl LoopMachine {
     /// `rewind_to`'s refusal shape — the text is written to be
     /// displayed to the user who asked for the pass.
     ///
+    /// Staged input refuses too, and for the same reason in a quieter
+    /// shape: [`accept_input`](Self::accept_input) at rest leaves the
+    /// host's next prompt in the pending buffer, and a pass compacts
+    /// `full_history` — a summary folding that prompt in and the
+    /// install committing it would run the user's input for them, or
+    /// swallow it into a summary. The contract the seam keeps: a
+    /// manual pass compacts committed history only, so a host stages
+    /// its input after the pass, not before it.
+    ///
     /// # Errors
     ///
     /// [`LoopError::InvalidInput`] when a turn is in flight
     /// (`AwaitingModel`, `AwaitingTools`, or `AwaitingCompaction`) —
-    /// cancel the run and let it resolve first.
+    /// cancel the run and let it resolve first — or when input is
+    /// staged and unstarted (`Start` with a non-empty pending buffer)
+    /// — run the staged turn (which compacts on its own if the feed
+    /// needs it) and compact after it.
     ///
     /// # Example
     ///
@@ -1163,7 +1175,18 @@ impl LoopMachine {
     /// ```
     pub fn guard_manual_compaction(&self) -> Result<(), LoopError> {
         match &self.state {
-            MachineState::Start | MachineState::Terminal(_) => Ok(()),
+            MachineState::Start | MachineState::Terminal(_) => {
+                if !self.pending.is_empty() {
+                    return Err(LoopError::InvalidInput(format!(
+                        "cannot compact committed history while {} staged \
+                         message(s) wait to run; run the staged turn first \
+                         (it compacts on its own if the feed needs it) and \
+                         compact after it",
+                        self.pending.len()
+                    )));
+                }
+                Ok(())
+            }
             in_flight => Err(LoopError::InvalidInput(format!(
                 "cannot compact committed history while a turn is in \
                  flight (state: {in_flight:?}); cancel the run and let \
@@ -1188,9 +1211,16 @@ impl LoopMachine {
     /// rather than the pre-pass one. The state itself is left where the
     /// guard found it; a terminal machine stays terminal and its next
     /// [`accept_input`](Self::accept_input) re-estimates the counters
-    /// the way it always does. Like [`rewind_to`](Self::rewind_to), a
-    /// stale `deferred_compaction` latch is cleared: the shortened feed
-    /// must re-arm the threshold check naturally.
+    /// the way it always does. The `history_len` split keeps nothing
+    /// pending on this seam's own path:
+    /// [`guard_manual_compaction`](Self::guard_manual_compaction) keeps
+    /// staged input out of the pass, so at rest `messages` is a
+    /// rewrite of committed history alone and every message installs
+    /// committed — the split parameter is the shape the
+    /// [`adopt_pruned`](Self::adopt_pruned) family passes share. Like
+    /// [`rewind_to`](Self::rewind_to), a stale `deferred_compaction`
+    /// latch is cleared: the shortened feed must re-arm the threshold
+    /// check naturally.
     ///
     /// # Example
     ///
@@ -1961,9 +1991,10 @@ mod tests {
             machine.next_step(test_policy(3)),
             MachineStep::Done(MachineOutcome::Cancelled)
         ));
+        machine.discard_pending();
         machine
             .guard_manual_compaction()
-            .expect("a terminal machine is at rest and admits the pass");
+            .expect("a terminal machine at rest with no staged input admits the pass");
     }
 
     #[test]
@@ -1980,6 +2011,24 @@ mod tests {
         assert!(
             error.to_string().contains("while a turn is in flight"),
             "the refusal names why, in text a host can display: {error}"
+        );
+    }
+
+    #[test]
+    fn guard_manual_compaction_refuses_while_input_is_staged() {
+        let mut machine = small_machine();
+        machine.accept_input("queued but never run");
+        let error = machine
+            .guard_manual_compaction()
+            .expect_err("a staged prompt must not be compacted away before it runs");
+        assert!(
+            error.to_string().contains("staged"),
+            "the refusal names the staged input, in text a host can display: {error}"
+        );
+        assert_eq!(
+            machine.full_history().len(),
+            machine.history().len() + 1,
+            "the refusal changes nothing — the staged prompt still waits to run"
         );
     }
 

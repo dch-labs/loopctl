@@ -174,6 +174,39 @@ pub(super) enum CompactPass {
         /// new to measure and carry `tokens_before` unchanged.
         tokens_after: u64,
     },
+
+    /// The pass rewrote the feed, but not smaller.
+    ///
+    /// The manager classified the pass `Compacted` — its message
+    /// count changed — while the driver's own measurement says the
+    /// rewritten feed is at or above the conversation's pre-pass size.
+    /// That is the machine's own no-progress rule, applied here inside
+    /// the pass and ahead of every side effect: nothing was demoted,
+    /// nothing recorded, no observer spoke and no hook ran, so the
+    /// conversation, the sink, and the ledger stand exactly as the
+    /// pass found them. Both consumers end the way the machine's
+    /// guard ends a run — with
+    /// [`CompactionStalled`](crate::error::LoopError::CompactionStalled)
+    /// — because a compactor that grew the feed has nothing to offer:
+    /// the automatic path fails its run, the manual seam refuses to
+    /// install, and the history stays intact either way.
+    NoProgress {
+        /// Driver-measured conversation size ahead of the pass.
+        ///
+        /// The pre-pass figure the rewritten feed failed to go under
+        /// — the shared-scale reading every outcome of this family
+        /// opens with, so the pair still compares after the refusal
+        /// and the signal event still narrates both sides of it.
+        tokens_before: u64,
+
+        /// Driver-scale measurement of the rewritten feed.
+        ///
+        /// At or above `tokens_before` — the measurement that
+        /// triggered the refusal and the `used` payload the resulting
+        /// `CompactionStalled` names. The growing feed itself is
+        /// dropped here, never installed, never demoted.
+        tokens_after: u64,
+    },
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -330,9 +363,15 @@ impl<C: ApiClient> BareLoop<C> {
 
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
-                self.demote_evicted(&outcome.evicted, reason, turn).await;
                 let tokens_after = self
                     .context_figure(outcome.tokens_after.saturating_add(self.overhead_tokens()));
+                if tokens_after >= tokens_before {
+                    return Ok(CompactPass::NoProgress {
+                        tokens_before,
+                        tokens_after,
+                    });
+                }
+                self.demote_evicted(&outcome.evicted, reason, turn).await;
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
                 self.record_pass_savings(tokens_saved, compact_start);
                 #[cfg(feature = "hooks")]
@@ -430,7 +469,11 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Propagates the pass's failures unchanged — see
+    /// Propagates the pass's failures unchanged, and turns the pass's
+    /// `NoProgress` verdict into the machine's own
+    /// [`CompactionStalled`](LoopError::CompactionStalled) — the
+    /// automatic path ends its run on the stall exactly as the
+    /// machine's no-progress guard would; see
     /// [`compaction_pass`](Self::compaction_pass).
     pub(super) async fn run_compaction(
         &mut self,
@@ -456,6 +499,14 @@ impl<C: ApiClient> BareLoop<C> {
                 tokens_after,
                 compacted: None,
                 evicted_messages: 0,
+            }),
+            CompactPass::NoProgress {
+                tokens_before,
+                tokens_after,
+            } => Err(CompactStepFailure {
+                error: LoopError::CompactionStalled { used: tokens_after },
+                tokens_before,
+                tokens_after,
             }),
         }
     }
@@ -498,10 +549,15 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// [`LoopError::InvalidInput`] when a turn is in flight;
     /// [`LoopError::CompactionFailed`] when the compactor ran and
-    /// errored (its own text rides the variant), and
+    /// errored (its own text rides the variant),
     /// [`LoopError::ContextExceeded`] when the pass succeeded but its
-    /// result still does not fit the window — the same mapping the
-    /// automatic pass propagates to its run.
+    /// result still does not fit the window, and
+    /// [`LoopError::CompactionStalled`] when the pass rewrote the feed
+    /// but did not shrink it — the shared no-progress rule refuses the
+    /// growing result before anything is demoted, recorded, or
+    /// narrated, and the conversation is left exactly as it was. The
+    /// failure mappings are the ones the automatic pass propagates to
+    /// its run.
     pub async fn compact_manual(&mut self) -> Result<EnsureContextResult, LoopError> {
         self.machine.guard_manual_compaction()?;
         let turn = self.machine.turns_taken();
@@ -550,6 +606,18 @@ impl<C: ApiClient> BareLoop<C> {
                     crate::tracing_spans::CompactionPassOutcome::Noop,
                 );
                 Ok(EnsureContextResult::NoAction(self.machine.full_history()))
+            }
+            Ok(CompactPass::NoProgress {
+                tokens_before,
+                tokens_after,
+            }) => {
+                crate::tracing_spans::event_compaction(
+                    crate::compact::types::CompactReason::Manual,
+                    tokens_before,
+                    tokens_after,
+                    crate::tracing_spans::CompactionPassOutcome::Failed,
+                );
+                Err(LoopError::CompactionStalled { used: tokens_after })
             }
             Err(failure) => {
                 crate::tracing_spans::event_compaction(

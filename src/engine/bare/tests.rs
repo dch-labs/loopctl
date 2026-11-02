@@ -18059,6 +18059,60 @@ impl crate::compact::ContextCompactor for FailCompactor {
     }
 }
 
+/// The compactor that "compacts" into a bigger feed than it was handed.
+///
+/// The manager classifies by message count as well as measured tokens:
+/// change the count while growing the feed and the pass still lands in
+/// the `Compacted` class — the exact result class the review's growth
+/// finding aimed at. The counter serves the staged-input contract too:
+/// a guard-refused pass must never reach this double at all.
+struct GrowingPassCompactor {
+    calls: Arc<Mutex<usize>>,
+}
+
+impl crate::compact::ContextCompactor for GrowingPassCompactor {
+    fn compact(
+        &self,
+        _messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        let mut calls = crate::error::recover_guard(self.calls.lock());
+        *calls = calls.saturating_add(1);
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::compacted(
+                vec![
+                    Message::user("g".repeat(2_000)),
+                    Message::assistant("h".repeat(2_000)),
+                    Message::user("i".repeat(2_000)),
+                ],
+                context.tokens_before,
+                1,
+            ),
+        ))
+    }
+}
+
+/// An observer that counts only `on_compaction`, to prove a refused
+/// pass spoke nowhere: the refusal lands before the event this probe
+/// watches, so its count must stay zero. The counter rides as a shared
+/// handle so the test can read it through the plain `Arc` the manager
+/// registration takes.
+struct SilenceProbe {
+    compactions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::observer::LoopObserver for SilenceProbe {
+    fn name(&self) -> &'static str {
+        "silence-probe"
+    }
+
+    fn on_compaction(&self, _ctx: &crate::observer::CompactedContext) {
+        self.compactions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[tokio::test]
 #[cfg(feature = "streaming")]
 async fn compact_manual_installs_the_compacted_history_and_the_wire_shows_it() {
@@ -18166,6 +18220,124 @@ async fn compact_manual_declines_and_leaves_everything_untouched() {
     assert!(
         agent.machine().full_history().len() > history_before,
         "the loop runs on after a decline"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_refuses_a_pass_that_grew_the_feed() {
+    // The review's growth finding: a rewritten-but-larger feed still
+    // classifies `Compacted` at the manager. The seam applies the
+    // machine's own no-progress rule before any side effect —
+    // CompactionStalled, nothing installed, nothing demoted, no
+    // observer event, the conversation exactly as it was asked.
+    let client = MockClient::new("test-model");
+    client.add_text_response("one");
+    client.add_text_response("two");
+    let calls = Arc::new(Mutex::new(0usize));
+    let compactions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe_compactions = Arc::clone(&compactions);
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(SilenceProbe {
+            compactions: probe_compactions,
+        }))
+        .with_context_manager(Arc::new(
+            crate::compact::ContextManager::new(Arc::new(GrowingPassCompactor {
+                calls: Arc::clone(&calls),
+            }))
+            .with_context_window(100_000),
+        ));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    agent.run("first", &make_run_config()).await.unwrap();
+    agent.run("second", &make_run_config()).await.unwrap();
+    let history_before = agent.machine().full_history().len();
+    let tokens_before = agent.machine().context_tokens();
+    let err = agent
+        .compact_manual()
+        .await
+        .expect_err("a rewritten feed that grew is a stall, not a success");
+    assert!(
+        matches!(err, LoopError::CompactionStalled { .. }),
+        "a growing pass ends the way the machine's own guard ends it, got {err}"
+    );
+    assert_eq!(
+        agent.machine().full_history().len(),
+        history_before,
+        "the growing feed was never installed — the conversation is intact"
+    );
+    assert_eq!(
+        agent.machine().context_tokens(),
+        tokens_before,
+        "the growing feed's recount never landed either"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(calls.lock()),
+        1,
+        "the pass ran — the refusal is about its result, not a skip"
+    );
+    assert_eq!(
+        compactions.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refusal precedes every side effect: no observer event, no demotion, no savings ledger"
+    );
+}
+
+#[tokio::test]
+async fn compact_manual_refuses_a_machine_with_staged_input() {
+    // The review's staged-input finding: `accept_input` at rest leaves
+    // the host's next prompt in the pending buffer, and a pass
+    // compacts the merged feed — installing it would commit the user's
+    // unwritten turn. The seam compacts committed history only, so
+    // staged input refuses, and refuses before the compactor runs.
+    let mut machine = crate::engine::core::LoopMachine::from_history(vec![
+        Message::user("a"),
+        Message::assistant("b"),
+    ]);
+    machine.accept_input("queued but never run");
+    let calls = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(GrowingPassCompactor {
+            calls: Arc::clone(&calls),
+        }))
+        .with_context_window(100_000),
+    ));
+    let mut agent = BareLoop::from_machine_with_managers(
+        machine,
+        make_config(),
+        Arc::new(MockClient::new("test-model")),
+        ToolRegistry::new(),
+        managers,
+    );
+    let err = agent
+        .compact_manual()
+        .await
+        .expect_err("staged input is not compacted away before it runs");
+    assert!(
+        matches!(err, LoopError::InvalidInput(_)),
+        "the staged refusal is the displayable input error, got {err}"
+    );
+    assert!(
+        err.to_string().contains("staged"),
+        "the refusal names what blocks the pass, for the host to display: {err}"
+    );
+    assert_eq!(
+        agent.machine().history().len(),
+        2,
+        "the committed history is untouched"
+    );
+    assert_eq!(
+        agent.machine().full_history().len(),
+        3,
+        "the staged prompt still waits in pending — swallowed by nothing"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(calls.lock()),
+        0,
+        "the guard refuses before the compactor is reached"
     );
 }
 
@@ -18305,9 +18477,12 @@ async fn compact_manual_reports_a_still_oversized_result_as_context_exceeded() {
 #[tokio::test]
 async fn compact_manual_keeps_the_cancel_signal_the_host_already_holds() {
     // The whole point of the seam over a rebuild: the signal the host
-    // cloned stays bound to this loop across the pass.
+    // cloned stays bound to this loop across the pass. The history is
+    // sized so the pass genuinely shrinks it — a rewritten feed that
+    // grew would be refused as a stall, as the growth pin proves.
     let client = MockClient::new("test-model");
-    client.add_text_response("one");
+    let long_answer = "o".repeat(800);
+    client.add_text_response(&long_answer);
     client.add_text_response("two");
     let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
         crate::compact::ContextManager::new(Arc::new(ShrinkingPassCompactor)),
@@ -18335,9 +18510,11 @@ async fn compact_manual_keeps_the_cancel_signal_the_host_already_holds() {
 async fn compact_manual_notifies_observers_like_an_automatic_pass() {
     // A manual pass is a compaction as far as the observer contract
     // goes: on_compaction fires, exactly once, through the engine's own
-    // ceremony — the same path the automatic pass takes.
+    // ceremony — the same path the automatic pass takes. The history
+    // is sized so the pass genuinely shrinks it.
     let client = MockClient::new("test-model");
-    client.add_text_response("one");
+    let long_answer = "o".repeat(800);
+    client.add_text_response(&long_answer);
     let compactions = Arc::new(Mutex::new(0usize));
     let managers = crate::managers::LoopManagers::new()
         .with_observer(Arc::new(CompactionCounter {
@@ -18419,8 +18596,10 @@ impl Hook for CompactWitnessHook {
 #[cfg(feature = "hooks")]
 fn loop_with_compact_witness(aborting: bool) -> (BareLoop<MockClient>, Arc<CompactWitnessHook>) {
     let client = MockClient::new("test-model");
-    client.add_text_response("one");
-    client.add_text_response("two");
+    let long_one = "o".repeat(800);
+    let long_two = "t".repeat(800);
+    client.add_text_response(&long_one);
+    client.add_text_response(&long_two);
     let hook = CompactWitnessHook::new(aborting);
     let executor = Arc::new(HookExecutor::new().with_hook(hook.clone()));
     let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(

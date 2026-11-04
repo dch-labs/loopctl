@@ -143,10 +143,23 @@ impl ToolRegistry {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — the surrounding bindings are elided
-    /// registry.register(ReadFileTool);
-    /// registry.register(WriteFileTool);
+    /// ```rust
+    /// # use std::future::Future;
+    /// # use std::pin::Pin;
+    /// use loopctl::tool::{FnTool, ToolContext, ToolError, ToolOutput, ToolRegistry};
+    /// use serde_json::json;
+    /// # fn echo(input: serde_json::Value, _ctx: &ToolContext)
+    /// #     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send>> {
+    /// #     let _ = input;
+    /// #     Box::pin(async { Ok(ToolOutput::text("echo")) })
+    /// # }
+    /// # let registry = ToolRegistry::new();
+    /// registry.register(FnTool::new(
+    ///     "echo".into(),
+    ///     "Echo the text.".into(),
+    ///     json!({"type": "object"}),
+    ///     echo,
+    /// ));
     /// ```
     pub fn register(&self, tool: impl Tool + 'static) {
         let name = tool.name().to_string();
@@ -308,10 +321,25 @@ impl ToolRegistry {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — the surrounding bindings are elided
-    /// if let Some(tool) = registry.get("read_file") {
-    ///     let result = tool.call(input, &ctx).await;
+    /// ```rust
+    /// # use std::future::Future;
+    /// # use std::pin::Pin;
+    /// # use loopctl::tool::{FnTool, ToolContext, ToolError, ToolOutput, ToolRegistry};
+    /// # use serde_json::json;
+    /// # fn echo(input: serde_json::Value, _ctx: &ToolContext)
+    /// #     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send>> {
+    /// #     let _ = input;
+    /// #     Box::pin(async { Ok(ToolOutput::text("echo")) })
+    /// # }
+    /// # let registry = ToolRegistry::new();
+    /// # registry.register(FnTool::new(
+    /// #     "echo".into(),
+    /// #     "Echo the text.".into(),
+    /// #     json!({"type": "object"}),
+    /// #     echo,
+    /// # ));
+    /// if let Some(tool) = registry.get("echo") {
+    ///     assert_eq!(tool.name(), "echo");
     /// }
     /// ```
     #[must_use]
@@ -330,10 +358,25 @@ impl ToolRegistry {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — the surrounding bindings are elided
-    /// if registry.contains("bash") {
-    ///     // Safe to call registry.get("bash")
+    /// ```rust
+    /// # use std::future::Future;
+    /// # use std::pin::Pin;
+    /// # use loopctl::tool::{FnTool, ToolContext, ToolError, ToolOutput, ToolRegistry};
+    /// # use serde_json::json;
+    /// # fn echo(input: serde_json::Value, _ctx: &ToolContext)
+    /// #     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send>> {
+    /// #     let _ = input;
+    /// #     Box::pin(async { Ok(ToolOutput::text("echo")) })
+    /// # }
+    /// # let registry = ToolRegistry::new();
+    /// # registry.register(FnTool::new(
+    /// #     "echo".into(),
+    /// #     "Echo the text.".into(),
+    /// #     json!({"type": "object"}),
+    /// #     echo,
+    /// # ));
+    /// if registry.contains("echo") {
+    ///     // Safe to call registry.get("echo")
     /// }
     /// ```
     #[must_use]
@@ -357,8 +400,23 @@ impl ToolRegistry {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — the surrounding bindings are elided
+    /// ```rust
+    /// # use std::future::Future;
+    /// # use std::pin::Pin;
+    /// # use loopctl::tool::{FnTool, ToolContext, ToolError, ToolOutput, ToolRegistry};
+    /// # use serde_json::json;
+    /// # fn echo(input: serde_json::Value, _ctx: &ToolContext)
+    /// #     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send>> {
+    /// #     let _ = input;
+    /// #     Box::pin(async { Ok(ToolOutput::text("echo")) })
+    /// # }
+    /// # let registry = ToolRegistry::new();
+    /// # registry.register(FnTool::new(
+    /// #     "echo".into(),
+    /// #     "Echo the text.".into(),
+    /// #     json!({"type": "object"}),
+    /// #     echo,
+    /// # ));
     /// let schemas = registry.all_schemas();
     /// for schema in &schemas {
     ///     println!("  - {}: {}", schema.tool, schema.description);
@@ -398,9 +456,24 @@ impl ToolRegistry {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — the surrounding bindings are elided
-    /// assert_eq!(registry.len(), 3); // three tools registered
+    /// ```rust
+    /// # use std::future::Future;
+    /// # use std::pin::Pin;
+    /// # use loopctl::tool::{FnTool, ToolContext, ToolError, ToolOutput, ToolRegistry};
+    /// # use serde_json::json;
+    /// # fn echo(input: serde_json::Value, _ctx: &ToolContext)
+    /// #     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send>> {
+    /// #     let _ = input;
+    /// #     Box::pin(async { Ok(ToolOutput::text("echo")) })
+    /// # }
+    /// # let registry = ToolRegistry::new();
+    /// # registry.register(FnTool::new(
+    /// #     "echo".into(),
+    /// #     "Echo the text.".into(),
+    /// #     json!({"type": "object"}),
+    /// #     echo,
+    /// # ));
+    /// assert_eq!(registry.len(), 1); // one tool registered
     /// ```
     #[must_use]
     pub fn len(&self) -> usize {
@@ -414,11 +487,24 @@ impl ToolRegistry {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — references a user-defined type the fence does not define
+    /// ```rust
+    /// # use std::future::Future;
+    /// # use std::pin::Pin;
+    /// use loopctl::tool::{FnTool, ToolRegistry, ToolContext, ToolError, ToolOutput};
+    /// use serde_json::json;
+    /// # fn echo(input: serde_json::Value, _ctx: &ToolContext)
+    /// #     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send>> {
+    /// #     let _ = input;
+    /// #     Box::pin(async { Ok(ToolOutput::text("echo")) })
+    /// # }
     /// let registry = ToolRegistry::new();
     /// assert!(registry.is_empty());
-    /// registry.register(MyTool);
+    /// registry.register(FnTool::new(
+    ///     "echo".into(),
+    ///     "Echo the text.".into(),
+    ///     json!({"type": "object"}),
+    ///     echo,
+    /// ));
     /// assert!(!registry.is_empty());
     /// ```
     #[must_use]

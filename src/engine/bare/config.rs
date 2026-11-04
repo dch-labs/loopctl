@@ -45,10 +45,23 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — references a user-defined type the fence does not define
-    /// let mut agent = BareLoop::new(client, registry, config);
-    /// agent.set_reflector(Arc::new(MyReflector));
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # fn main() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use loopctl::testing::{MockApiClient, test_config};
+    /// # use loopctl::tool::ToolRegistry;
+    /// # use std::sync::Arc;
+    /// # let client = MockApiClient::new("demo");
+    /// # let registry = ToolRegistry::new();
+    /// # let config = test_config();
+    /// # let mut agent = BareLoop::new(Arc::new(client), registry, config);
+    /// use loopctl::reflection::NoopReflector;
+    ///
+    /// agent.set_reflector(Arc::new(NoopReflector));
+    /// # }
+    /// # #[cfg(not(feature = "testing"))]
+    /// # fn main() {}
     /// ```
     pub fn set_reflector(&mut self, reflector: Arc<dyn Reflector>) {
         self.debug_assert_idle();
@@ -67,10 +80,35 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — references a user-defined type the fence does not define
-    /// let mut agent = BareLoop::new(client, registry, config);
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # fn main() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use loopctl::reflection::{FailureAnalysis, RecoveryAction, RecoveryStrategy};
+    /// # use loopctl::testing::{MockApiClient, test_config};
+    /// # use loopctl::tool::ToolRegistry;
+    /// # use std::future::Future;
+    /// # use std::pin::Pin;
+    /// # use std::sync::Arc;
+    /// # struct MyStrategy;
+    /// # impl RecoveryStrategy for MyStrategy {
+    /// #     fn decide(
+    /// #         &self,
+    /// #         _analysis: &FailureAnalysis,
+    /// #         _attempt: u32,
+    /// #         _max_attempts: u32,
+    /// #     ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
+    /// #         Box::pin(async move { RecoveryAction::Skip("nothing to do".into()) })
+    /// #     }
+    /// # }
+    /// # let client = MockApiClient::new("demo");
+    /// # let registry = ToolRegistry::new();
+    /// # let config = test_config();
+    /// # let mut agent = BareLoop::new(Arc::new(client), registry, config);
     /// agent.set_recovery_strategy(Arc::new(MyStrategy));
+    /// # }
+    /// # #[cfg(not(feature = "testing"))]
+    /// # fn main() {}
     /// ```
     pub fn set_recovery_strategy(&mut self, strategy: Arc<dyn RecoveryStrategy>) {
         self.debug_assert_idle();
@@ -658,13 +696,26 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// // ignore — schematic fragment — references a user-defined type the fence does not define
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # fn main() {
+    /// # use loopctl::engine::BareLoop;
+    /// # use loopctl::testing::{MockApiClient, test_config};
+    /// # use loopctl::tool::ToolRegistry;
     /// use loopctl::observer::LoopObserver;
     /// use std::sync::Arc;
-    ///
-    /// let mut agent = BareLoop::new(client, registry, config);
+    /// # struct MyObserver;
+    /// # impl LoopObserver for MyObserver {
+    /// #     fn name(&self) -> &str { "my-observer" }
+    /// # }
+    /// # let client = MockApiClient::new("demo");
+    /// # let registry = ToolRegistry::new();
+    /// # let config = test_config();
+    /// let mut agent = BareLoop::new(Arc::new(client), registry, config);
     /// agent.register_observer(Arc::new(MyObserver));
+    /// # }
+    /// # #[cfg(not(feature = "testing"))]
+    /// # fn main() {}
     /// ```
     pub fn register_observer(&mut self, observer: Arc<dyn crate::observer::LoopObserver>) {
         self.debug_assert_idle();

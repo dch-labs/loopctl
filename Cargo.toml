@@ -3,13 +3,13 @@ name = "loopctl"
 version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "A trait-based framework for building agent loops with pluggable LLM clients, tools, and memory"
+description = "A Rust framework for building agent loops from composable traits"
 repository = "https://github.com/dch-labs/loopctl"
 homepage = "https://loopctl.rs"
 documentation = "https://docs.rs/loopctl"
 keywords = ["agent", "framework", "llm", "loop"]
 categories = ["api-bindings", "development-tools"]
-exclude = ["tests/cassettes/**"]
+exclude = ["tests/cassettes/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
 readme = "README.md"
 rust-version = "1.98"
 
@@ -146,6 +146,10 @@ required-features = ["mcp"]
 [[example]]
 name = "telemetry"
 required-features = ["metrics", "testing"]
+
+[[example]]
+name = "local-quickstart"
+required-features = ["ollama"]
 
 [[test]]
 name = "metrics"

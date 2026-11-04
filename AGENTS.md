@@ -102,7 +102,7 @@ The most strictly enforced rule. `Cargo.toml [lints.clippy]` denies
 
 | Instead of | Use |
 |------------|-----|
-| `result.unwrap()` | `result.map_err(|e| LoopError::…)?` |
+| `result.unwrap()` | `result.map_err(\|e\| LoopError::…)?` |
 | `option.unwrap()` | `option.ok_or(LoopError::…)?` |
 | `vec[i]` | `vec.get(i).ok_or(LoopError::…)?` |
 | `panic!("…")` / `expect("never")` | `Err(LoopError::…)`; `unreachable!()` is banned too |

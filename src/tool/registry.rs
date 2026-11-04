@@ -338,9 +338,8 @@ impl ToolRegistry {
     /// #     json!({"type": "object"}),
     /// #     echo,
     /// # ));
-    /// if let Some(tool) = registry.get("echo") {
-    ///     assert_eq!(tool.name(), "echo");
-    /// }
+    /// let tool = registry.get("echo").expect("echo is registered");
+    /// assert_eq!(tool.name(), "echo");
     /// ```
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -375,6 +374,7 @@ impl ToolRegistry {
     /// #     json!({"type": "object"}),
     /// #     echo,
     /// # ));
+    /// assert!(registry.contains("echo"));
     /// if registry.contains("echo") {
     ///     // Safe to call registry.get("echo")
     /// }

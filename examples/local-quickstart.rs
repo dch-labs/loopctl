@@ -1,15 +1,17 @@
 //! The smallest agent that talks to a real model — your local Ollama.
 //!
 //! ```sh
-//! ollama pull qwen3:8b
+//! ollama pull qwen3.8:27b
 //! cargo run --example local-quickstart --features ollama
 //! ```
 //!
 //! No API key and no cloud: the client points at `http://localhost:11434`
-//! by default, and any model you have pulled works as the first argument.
-//! The model decides to call the `now` tool, the loop dispatches the call
-//! and feeds the result back, and the run ends with the model's final
-//! answer — the whole agent loop in about seventy lines.
+//! by default, and any tool-calling model you have pulled works as the
+//! first argument — the run asks the model to call the `now` tool, so a
+//! model without tool support cannot complete it. The model decides to
+//! call the tool, the loop dispatches the call and feeds the result back,
+//! and the run ends with the model's final answer — the whole agent loop
+//! in about seventy lines.
 
 #![allow(clippy::expect_used, clippy::doc_markdown)]
 
@@ -44,13 +46,11 @@ fn now_fn(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Any model your local Ollama serves; `qwen3:8b` is the default.
     let model = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwen3:8b".to_string());
+        .unwrap_or_else(|| "qwen3.8:27b".to_string());
     let client = provider::ollama(&model)?;
 
-    // 2. One tool the model can call.
     let tools = ToolRegistry::new();
     tools.register(
         FnTool::new(
@@ -62,7 +62,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .read_only(),
     );
 
-    // 3. Construct and run the loop.
     let mut agent = BareLoop::new(Arc::new(client), tools, SessionConfig::default());
     let cancel_signal = agent.cancel_signal();
     tokio::spawn(async move {

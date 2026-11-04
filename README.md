@@ -40,7 +40,7 @@ A framework in genre, a library in shape — loopctl never owns your main loop. 
 surface is traits (`Tool`, `ApiClient`, observers); the engine is one more component
 you take or leave, down to driving its sans-IO state machine (`LoopMachine`) yourself,
 with a serializable, resumable run state, no panics anywhere in non-test code
-(clippy-denied), and `default = []` — zero dependencies until you opt into each one.
+(clippy-denied), and `default = []` — no optional dependencies until you opt into each one.
 
 ## Modules
 
@@ -75,7 +75,7 @@ with a serializable, resumable run state, no panics anywhere in non-test code
 
 ### Run an Agent on Your Local Ollama
 
-No API key required — just a local [Ollama](https://ollama.com) with any model pulled:
+No API key required — just a local [Ollama](https://ollama.com) with any tool-calling model pulled:
 
 ```sh
 ollama pull qwen3.8:27b

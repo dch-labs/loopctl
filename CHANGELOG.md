@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **`examples/local-quickstart.rs` — the key-free first contact** — the README's first example was `rust,no_run` scaffolding whose client bindings were `unimplemented!()` bodies: a stranger could not copy anything from the front page and reach a model answering. The new example is the whole loop in ~70 lines against a local Ollama — `provider::ollama` client (no API key, `http://localhost:11434` by default), one `FnTool`, one `run()` — registered under `required-features = ["ollama"]` so the `make examples` CI leg compiles it, and leading the README Quick Start with its two-command reproduction (`ollama pull qwen3:8b` + `cargo run --example local-quickstart --features ollama`).
+
+- **`CONTRIBUTING.md`, `SECURITY.md`, and GitHub issue/PR templates** — the repo had no contributor-facing surface: no CONTRIBUTING (the rules live in `AGENTS.md`, but nothing told a stranger that), no security policy, no issue or PR templates. CONTRIBUTING summarizes the enforced rules (one logical change per PR, `make ci` green, changelog discipline, `default = []`, the no-panic policy, multi-line docs) and defers to the canon; SECURITY states the pre-1.0 support line and the private-vulnerability-reporting path with honest scope notes (the library makes no network calls unless a provider client is constructed; tools run model-requested code by design and hosts gate execution).
+
+### Changed
+
+- **The crate description and README now say what loopctl is** — every public surface carried the commodity line ("A trait-based framework for building agent loops with pluggable LLM clients, tools and memory"), identical to the category it differentiates from. `Cargo.toml`'s description (the crates.io line, effective at the next publish) and the README's title line now read "A Rust framework for building agent loops from composable traits — bring your own model and tools; tuned so smaller local models run agent loops with the discipline a frontier model carries in its weights" — what it is, who it is for, and the tuning that distinguishes it, without gating the project to one regime. The README gains a "Why loopctl" section — any model can drive the loop; the compensation layer (constrained tool calls, verify-on-write, memoization, context re-injection, aggressive compaction) moves what a frontier model holds in its weights into enforced loop structure, on by default since 0.4.0, with `FrontierProfile` as the opt-out — plus the CI badge it lacked, a Quick Start that runs key-free against local Ollama before it teaches, a Development section that points at the Makefile as the contract instead of enumerating legs in prose, and license links to the real single `LICENSE` file instead of the nonexistent `LICENSE-APACHE`/`LICENSE-MIT`.
+
+- **Nine more doc examples run instead of rotting — and the pattern for the rest is proven** — nine schematic doc fragments are now runnable fences: the three `BareLoop` setter docs (`set_reflector`, `set_recovery_strategy` with a real `MyStrategy` impl, `register_observer` with a `MyObserver`) and the six `ToolRegistry` method docs (`register`, `get`, `contains`, `all_schemas`, `len`, `is_empty`), the latter client-free via a hidden `FnTool` fixture. Client-dependent fences use a hidden `#[cfg(feature = "testing")]` main function so they execute under `--all-features` and compile trivially under `default = []` — green under both feature sets, and the fences bite rather than pass vacuously: the `register_observer` fence fails compilation if the observer stub omits the required `LoopObserver::name` method. Remaining ignored blocks keep their one-line reasons.
+
+- **The release workflow now publishes every companion crate** — it previously published three crates in hardcoded steps; it now publishes all eight (`loopctl-derive`, `loopctl`, `loopctl-sqlite`, `loopctl-hnsw`, `loopctl-otel`, `loopctl-langfuse`, `loopctl-client`, and `loopctl-vector` — the last via its own manifest path, it being workspace-excluded), and the GitHub release notes link them all.
+
 ## [0.5.0] - 2026-11-03
 
 ### Added

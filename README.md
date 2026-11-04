@@ -1,7 +1,8 @@
 # loopctl
 
-A trait-based framework for building agent loops with pluggable LLM clients, tools, and memory.
+A Rust framework for building agent loops from composable traits — bring your own model and tools; tuned so smaller local models run agent loops with the discipline.
 
+[![CI](https://github.com/dch-labs/loopctl/actions/workflows/ci.yml/badge.svg)](https://github.com/dch-labs/loopctl/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/loopctl.svg)](https://crates.io/crates/loopctl)
 [![docs.rs](https://docs.rs/loopctl/badge.svg)](https://docs.rs/loopctl)
 [![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
@@ -15,6 +16,32 @@ API client abstraction, tool registry, loop detection and convergence, fallback 
 cancellation, and a default loop engine (`BareLoop`). You bring your own LLM provider client
 and tool implementations; the framework handles the rest.
 
+## Why loopctl
+
+Any model can drive the loop — the difference is what happens when the model is
+smaller than frontier grade. A frontier model holds its agent discipline in its
+weights: it emits valid tool calls, stays on goal, checks its own work. A smaller
+model fails at those in predictable ways, so loopctl moves that discipline into
+enforced loop structure, so that local model running on Ollama, vLLM, or llama.cpp 
+runs an agent loop that stays on task (`FrontierProfile` is the opt-out for models that don't need the help):
+
+- **Constrained tool calls** — tool schemas compile to provider grammars (vLLM guided
+  decoding), so a malformed call cannot be emitted, only a valid one.
+- **Verify-on-write** — write-class tool calls trigger a pluggable verifier, and the
+  errors feed the next turn instead of shipping silently.
+- **Tool-call memoization** — repeat calls return cached output instead of re-running
+  and polluting the context.
+- **Context re-injection** — the goal and plan are re-emitted at every turn boundary,
+  so a smaller model does not drift off-task after ten turns.
+- **Aggressive compaction** — context is kept tight, because a smaller model's
+  effective reasoning degrades faster than a frontier model's as the window fills.
+
+A framework in genre, a library in shape — loopctl never owns your main loop. The
+surface is traits (`Tool`, `ApiClient`, observers); the engine is one more component
+you take or leave, down to driving its sans-IO state machine (`LoopMachine`) yourself,
+with a serializable, resumable run state, no panics anywhere in non-test code
+(clippy-denied), and `default = []` — no optional dependencies until you opt into each one.
+
 ## Modules
 
 | Module | Description |
@@ -25,7 +52,7 @@ and tool implementations; the framework handles the rest.
 | [`capabilities`](https://docs.rs/loopctl/latest/loopctl/capabilities/index.html) | Capability traits (`Observable`, `Detectable`, `Compactable`, etc.) |
 | [`compact`](https://docs.rs/loopctl/latest/loopctl/compact/index.html) | Context compaction: `ContextCompactor` trait, `TruncatingCompactor`, `TokenSplitter` |
 | [`config`](https://docs.rs/loopctl/latest/loopctl/config/index.html) | Session configuration (`LoopConfig`) |
-| [`contributor`](https://docs.rs/loopctl/latest/loopctl/contributor/index.html) | `ContextContributor` — turn-boundary context injection (re-emit goals and plans so small models don't drift) |
+| [`contributor`](https://docs.rs/loopctl/latest/loopctl/contributor/index.html) | `ContextContributor` — turn-boundary context injection (re-emit goals and plans so smaller models don't drift) |
 | [`detection`](https://docs.rs/loopctl/latest/loopctl/detection/index.html) | Loop detection, convergence detection, `DetectionManager` |
 | [`engine`](https://docs.rs/loopctl/latest/loopctl/engine/index.html) | `BareLoop<C>` — the default agent loop engine (stream → accumulate → dispatch tools → repeat) |
 | [`error`](https://docs.rs/loopctl/latest/loopctl/error/index.html) | Central `LoopError` enum for all framework operations |
@@ -45,6 +72,19 @@ and tool implementations; the framework handles the rest.
 | [`testing`](https://docs.rs/loopctl/latest/loopctl/testing/index.html) | Mock API client, mock tools, and test fixture factories. *Requires `testing` feature.* |
 
 ## Quick Start
+
+### Run an Agent on Your Local Ollama
+
+No API key required — just a local [Ollama](https://ollama.com) with any tool-calling model pulled:
+
+```sh
+ollama pull qwen3.8:27b
+cargo run --example local-quickstart --features ollama
+```
+
+The example ([`examples/local-quickstart.rs`](examples/local-quickstart.rs)) registers one
+tool, points `BareLoop` at your local model, and prints the model's final answer — the
+whole loop in about seventy lines.
 
 ### Implement a Tool
 
@@ -87,37 +127,27 @@ impl Tool for EchoTool {
 use loopctl::engine::BareLoop;
 use loopctl::engine::core::Loop;
 use loopctl::engine::RunConfig;
+use loopctl::provider;
 use loopctl::tool::ToolRegistry;
 use loopctl::config::SessionConfig;
 use std::sync::Arc;
 
-// 1. Bring your own API client (implements ApiClient trait)
-# struct MyClient;
-# use loopctl::api::ApiClient;
-# impl ApiClient for MyClient {
-#     fn model(&self) -> String { "llm-70b".to_string() }
-#     fn create_message(&self, _req: &loopctl::api::StreamRequest)
-#         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<loopctl::api::NonStreamingResponse, loopctl::api::error::ApiError>> + Send + '_>> {
-#         unimplemented!()
-#     }
-#     fn stream_messages(&self, _req: &loopctl::api::StreamRequest)
-#         -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>> + Send + 'static>> {
-#         unimplemented!()
-#     }
-# }
-let client = Arc::new(MyClient);
+// A client for a local Ollama model (localhost:11434 by default); no API key, needs the "ollama" feature.
+let client = Arc::new(provider::ollama("qwen3.8:27b")?);
 
-// 2. Register tools
-let mut registry = ToolRegistry::new();
-// registry.register(EchoTool);
+// Register tools (any `Tool` impl — see "Implement a Tool" above).
+let registry = ToolRegistry::new();
+registry.register(EchoTool);
 
-// 3. Configure
+// Configure
 let config = SessionConfig::default();
 
-// 4. Run
+// Run
 let mut agent = BareLoop::new(client, registry, config);
-// let result = agent.run("Use the echo tool to say hello", &RunConfig::default()).await?;
-// println!("Completed in {} turns", result.turn_count());
+let result = agent
+    .run("Use the echo tool to say hello", &RunConfig::default())
+    .await?;
+println!("Completed in {} turns", result.turn_count());
 ```
 
 ### Use the Testing Module
@@ -158,32 +188,39 @@ reject or ignore `response_format`, and loopctl since 0.3.0 rejects request
 options a client cannot forward rather than degrading silently).
 
 ```rust,no_run
-# use loopctl::api::ApiClient;
-# use loopctl::message::Message;
-# use loopctl::structured::{request_structured, request_structured_prompted, StructuredOutput};
-# use serde::Deserialize;
-# #[derive(Deserialize)]
-# struct RouteDecision { route: String, confidence: f64 }
-# impl StructuredOutput for RouteDecision {
-#     fn name() -> &'static str { "route_decision" }
-#     fn schema() -> serde_json::Value {
-#         serde_json::json!({
-#             "type": "object",
-#             "properties": {
-#                 "route": {"type": "string"},
-#                 "confidence": {"type": "number"}
-#             },
-#             "required": ["route", "confidence"],
-#             "additionalProperties": false
-#         })
-#     }
-# }
+use serde::Deserialize;
+
+use loopctl::api::ApiClient;
+use loopctl::message::Message;
+use loopctl::structured::{StructuredOutput, request_structured, request_structured_prompted};
+
+// The type the model must fill in — the schema below is the contract.
+#[derive(Deserialize)]
+struct RouteDecision {
+    route: String,
+    confidence: f64,
+}
+
+impl StructuredOutput for RouteDecision {
+    fn name() -> &'static str { "route_decision" }
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "route": {"type": "string"},
+                "confidence": {"type": "number"}
+            },
+            "required": ["route", "confidence"],
+            "additionalProperties": false
+        })
+    }
+}
+
 async fn demo(
     client: &dyn ApiClient,
     messages: Vec<Message>,
 ) -> Result<(), loopctl::structured::StructuredError> {
-    // Native path — the provider enforces the schema (OpenAI strict mode,
-    // Anthropic forced tool):
+    // Native path — the provider enforces the schema (OpenAI strict mode, Anthropic forced tool):
     let _decision: RouteDecision = request_structured(client, messages.clone(), None).await?;
 
     // Prompted path — the schema rides the system prompt; the output is
@@ -275,13 +312,23 @@ Two cross-cutting concerns run alongside the main loop:
 ## Development
 
 ```bash
-make ci        # fmt + check + clippy (all-features and default) + tests + docs + examples + redaction minimal-feature gate
-               # (the gate builds an isolated probe crate — a separate dependency build, cached under `target/redaction-minimal`)
-make test      # run all tests
-make lint      # auto-format
+make ci    # the full gate — the Makefile is the contract; `make -n ci` lists every leg
+make test  # tests: default features, all-features, doctests, companion crates
+make lint  # auto-format
 ```
+
+Deliberately outside `ci`, each with its own purpose:
+
+```bash
+make conformance   # the provider wire contract, replayed hermetically from cassettes
+make doc-census    # doctest census totals: runnable fences and reasoned ignores
+make e2e           # live provider gates — needs real credentials, owner-side
+make vector-e2e    # live vector-backend gates — needs Qdrant/pgvector reachable
+```
+
+The contribution rules live in [CONTRIBUTING.md](CONTRIBUTING.md); the full
+contract in [AGENTS.md](AGENTS.md).
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under the terms in [`LICENSE`](LICENSE) — MIT OR Apache-2.0, at your option.

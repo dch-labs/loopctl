@@ -65,6 +65,31 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+      - name: Publish HNSW companion crate
+        run: cargo publish -p loopctl-hnsw
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish OTel companion crate
+        run: cargo publish -p loopctl-otel
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish Langfuse companion crate
+        run: cargo publish -p loopctl-langfuse
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish client companion crate
+        run: cargo publish -p loopctl-client
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish vector companion crate
+        run: cargo publish --manifest-path crates/vector/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -76,4 +101,9 @@ jobs:
             Published to [crates.io](https://crates.io/crates/loopctl):
             [loopctl](https://crates.io/crates/loopctl),
             [loopctl-derive](https://crates.io/crates/loopctl-derive),
-            [loopctl-sqlite](https://crates.io/crates/loopctl-sqlite).
+            [loopctl-sqlite](https://crates.io/crates/loopctl-sqlite),
+            [loopctl-hnsw](https://crates.io/crates/loopctl-hnsw),
+            [loopctl-otel](https://crates.io/crates/loopctl-otel),
+            [loopctl-langfuse](https://crates.io/crates/loopctl-langfuse),
+            [loopctl-client](https://crates.io/crates/loopctl-client),
+            [loopctl-vector](https://crates.io/crates/loopctl-vector).

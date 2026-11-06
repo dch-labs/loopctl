@@ -38,7 +38,7 @@ darwin-clippy:
 
 windows-check:
 	cargo check --target x86_64-pc-windows-msvc --features shell_tools,fs_tools,search_tools
-	cargo check --target x86_64-pc-windows-msvc -p loopctl-client 2>&1 | grep -q 'unix-only by design'
+	cargo check --target x86_64-pc-windows-msvc -p loopctl-client
 
 fmt:
 	cargo fmt --all -- --check
@@ -208,9 +208,13 @@ vector-e2e:
 client-check:
 	cargo fmt -p loopctl-client -- --check
 	cargo clippy -p loopctl-client --all-targets -- -D warnings
+	cargo clippy -p loopctl-client --all-targets --features tls -- -D warnings
 	cargo check -p loopctl-client
+	cargo check -p loopctl-client --features tls
 	RUSTDOCFLAGS="-D warnings" cargo doc -p loopctl-client --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc -p loopctl-client --no-deps --features tls
 	cargo test -p loopctl-client
+	cargo test -p loopctl-client --features tls
 
 # The published tarball is a shipped artifact, so the no-internal-metadata rule
 # applies to it. Cargo packs tracked files *plus* untracked-but-not-ignored

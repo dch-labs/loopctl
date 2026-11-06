@@ -8,10 +8,9 @@
 //! same interface, so a binary chooses a mode without the call sites
 //! changing shape.
 //!
-//! The protocol is HTTP/1.1 REST + SSE over a per-user unix socket
-//! (the crate is unix-only by design — the transport *is* the socket)
-//! with `/v1` versioned paths and JSON bodies: every verb is one
-//! request/response, the observation surface is
+//! The protocol is HTTP/1.1 REST + SSE with `/v1` versioned paths
+//! and JSON bodies: every verb is one request/response, the
+//! observation surface is
 //! `GET /v1/loops/{id}/events?since=<cursor>` streaming
 //! trajectory-JSONL events whose SSE `id` is the resume cursor (a
 //! stale cursor answers `410 Gone`, surfaced as the typed
@@ -21,9 +20,40 @@
 //! either direction — an old server is never silently absorbed, and
 //! neither is a too-new one.
 //!
+//! ## Local and remote sessions
+//!
+//! The default transport is the per-user unix socket on the same
+//! machine — an endpoint that exists on unix only. A daemon on
+//! another machine is reached through the same verbs over
+//! [`Endpoint::Tcp`] — trusted networks only, the bearer token
+//! crossing in the clear — or `Endpoint::Tls` (behind the `tls`
+//! feature), where the connection is encrypted and the daemon
+//! verified against a certificate authority you name; the remote
+//! endpoints compile and run on every platform, so a host that only
+//! ever dials a daemon needs no unix. The token rides every request
+//! as the `Authorization: Bearer` header, and a daemon that refuses
+//! it answers the typed [`Unauthorized`](ClientError::Unauthorized).
+//!
 //! ```toml
 //! [dependencies]
 //! loopctl-client = "0.5"
+//! ```
+//!
+//! ```rust,no_run
+//! use loopctl_client::{ConnectOptions, DaemonClient, LoopctlClient as _};
+//!
+//! # async fn demo() -> Result<(), loopctl_client::ClientError> {
+//! let client = DaemonClient::connect(ConnectOptions::tcp(
+//!     "daemon.tailnet.ts.net",
+//!     8787,
+//!     Some("sekrit".to_string()),
+//! ))
+//! .await?;
+//! for pending in client.pending_gates().await? {
+//!     println!("waiting approval: {}", pending.gate_id);
+//! }
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ```rust,no_run
@@ -66,24 +96,20 @@
     )
 )]
 
-#[cfg(not(unix))]
-compile_error!(
-    "loopctl-client speaks the daemon's unix-socket protocol and has no \
-     non-unix transport; this crate is unix-only by design"
-);
-
 mod client;
 mod events;
 mod http;
+#[cfg(feature = "tls")]
+mod tls;
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 
 use uuid::Uuid;
 
 pub use client::ConnectOptions;
 pub use client::DaemonClient;
+pub use client::Endpoint;
 pub use client::RetryWindow;
 pub use client::SpawnAction;
 pub use client::SpawnPolicy;
@@ -473,6 +499,23 @@ impl ScheduleSummary {
     }
 }
 
+/// Render the cursor-expired diagnosis for either `since` shape.
+///
+/// A cursor the daemon no longer retains and a no-cursor subscription
+/// the daemon cannot serve from the beginning are different facts;
+/// each gets its own sentence.
+fn cursor_expired_display(since: Option<u64>) -> String {
+    match since {
+        Some(cursor) => format!(
+            "the event cursor {cursor} is no longer retained — relist events and resubscribe \
+             from the newest cursor"
+        ),
+        None => "the daemon no longer retains events from the beginning — relist events and \
+                 resubscribe from the newest cursor"
+            .to_string(),
+    }
+}
+
 /// Everything that can go wrong on the client side of the seam.
 ///
 /// One typed surface for both binaries: transport failures, the
@@ -482,11 +525,14 @@ impl ScheduleSummary {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientError {
-    /// No daemon is listening on the socket.
+    /// No daemon is listening on the endpoint.
     ///
     /// The in-process degrade signal: a host may fall back to
-    /// embedding the engine instead of demanding a daemon.
-    #[error("no daemon is listening on the socket — start one, spawn one, or run in-process")]
+    /// embedding the engine instead of demanding a daemon. The
+    /// endpoint is the local socket path or a remote `host:port`
+    /// that refused the connection — the absence is typed the same
+    /// either way.
+    #[error("no daemon is listening on the endpoint — start one, spawn one, or run in-process")]
     SocketAbsent,
 
     /// The standard socket path could not be resolved.
@@ -500,15 +546,16 @@ pub enum ClientError {
 
     /// Something answered, but it is not the family daemon.
     ///
-    /// The socket path reached an HTTP peer whose `/v1/hello` is a
-    /// miss — likely another service's socket.
-    #[error("the peer at {path} is not a loopctl daemon (no /v1/hello)")]
+    /// The endpoint reached an HTTP peer whose `/v1/hello` is a
+    /// miss — likely another service on the same socket or port.
+    #[error("the peer at {endpoint} is not a loopctl daemon (no /v1/hello)")]
     NotADaemon {
-        /// The socket path that answered.
+        /// The endpoint that answered.
         ///
-        /// Names the peer that failed the family check, so a
-        /// misconfigured `XDG_RUNTIME_DIR` is diagnosable.
-        path: PathBuf,
+        /// Names the peer that failed the family check — a socket
+        /// path or a `host:port` — so a misconfigured endpoint is
+        /// diagnosable.
+        endpoint: String,
     },
 
     /// The spawn action failed.
@@ -599,9 +646,7 @@ pub enum ClientError {
     /// The relist contract: the daemon no longer retains the history
     /// `since` names — list the current events and resubscribe from
     /// the newest cursor.
-    #[error(
-        "the event cursor {since:?} is no longer retained — relist events and resubscribe from the newest cursor"
-    )]
+    #[error("{}", cursor_expired_display(*since))]
     CursorExpired {
         /// The cursor the subscription passed as `since`.
         ///
@@ -620,6 +665,25 @@ pub enum ClientError {
         ///
         /// From the error envelope's `what` field when present.
         what: String,
+    },
+
+    /// The daemon refused this client's credentials.
+    ///
+    /// A 401/403 answer from a daemon that authenticates — the
+    /// bearer token was absent, wrong, or insufficient for the
+    /// action; the daemon's own message rides along verbatim.
+    #[error("unauthorized ({status}): {message}")]
+    Unauthorized {
+        /// The refusal's HTTP status — 401 or 403.
+        ///
+        /// Distinguishes a missing or rejected token from a
+        /// forbidden action where the daemon draws that line.
+        status: u16,
+
+        /// The daemon's human diagnosis.
+        ///
+        /// Printable as-is, per the error-surface contract.
+        message: String,
     },
 
     /// The daemon refused or failed the request.

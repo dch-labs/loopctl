@@ -10,6 +10,7 @@
 //! connection open and forwards frames the test pushes, so cursor
 //! semantics and SSE tolerance are pinned against a realistic feed.
 
+#![cfg(unix)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -34,6 +35,7 @@ use loopctl_client::RetryWindow;
 use loopctl_client::SpawnAction;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 
 struct InProcessFake;
@@ -174,6 +176,10 @@ struct RecordedRequest {
     method: String,
     /// The request path with query.
     path: String,
+    /// The `Host` header value, empty when the head carried none.
+    host: String,
+    /// The `Authorization` header value, when the request carried one.
+    authorization: Option<String>,
     /// The decoded body, empty when none.
     body: String,
 }
@@ -242,6 +248,29 @@ fn spawn_hello_mock(
     )
 }
 
+/// Serve connections that accept, read one request, and never answer.
+///
+/// The stalled peer: a daemon-shaped socket that accepts the
+/// exchange and stalls it forever — the liveness pins' subject.
+fn spawn_stalled_mock(dir: &tempfile::TempDir, name: &str) -> MockDaemon {
+    let socket = dir.path().join(name);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::UnixListener::bind(&socket).expect("the stalled socket binds");
+    let recorded = Arc::clone(&requests);
+    let handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_one_request(&mut stream).await;
+            recorded.lock().unwrap().push(request);
+            std::future::pending::<()>().await;
+        }
+    });
+    MockDaemon {
+        socket,
+        requests,
+        handle,
+    }
+}
+
 /// The handshake response bytes for one family/version/floor triple.
 fn hello_response(family: &str, protocol: u64, floor: u64) -> Vec<u8> {
     let body = serde_json::json!({
@@ -269,8 +298,17 @@ fn json_response(status: &str, body: &serde_json::Value) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A scripted event-stream answer whose content type and one frame the test controls.
+fn sse_response(content_type: &str, frame: &str) -> Vec<u8> {
+    format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n{frame}")
+        .into_bytes()
+}
+
 /// Read one full request (head + Content-Length body) from `stream`.
-async fn read_one_request(stream: &mut tokio::net::UnixStream) -> RecordedRequest {
+async fn read_one_request<Stream>(stream: &mut Stream) -> RecordedRequest
+where
+    Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 1024];
     let head_end = loop {
@@ -287,12 +325,22 @@ async fn read_one_request(stream: &mut tokio::net::UnixStream) -> RecordedReques
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
     let mut length = 0usize;
+    let mut authorization = None;
+    let mut host = String::new();
     for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length")
             && let Ok(parsed) = value.trim().parse::<usize>()
         {
             length = parsed;
+        }
+        if name.trim().eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.trim().to_string());
+        }
+        if name.trim().eq_ignore_ascii_case("host") {
+            host = value.trim().to_string();
         }
     }
     let body_start = head_end.saturating_add(4);
@@ -304,6 +352,8 @@ async fn read_one_request(stream: &mut tokio::net::UnixStream) -> RecordedReques
     RecordedRequest {
         method,
         path,
+        host,
+        authorization,
         body: String::from_utf8_lossy(&body).into_owned(),
     }
 }
@@ -329,6 +379,67 @@ fn client_test_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("the tempdir creates")
 }
 
+/// A mock daemon serving scripted raw responses over TCP.
+///
+/// The remote-transport twin of [`MockDaemon`]: same scripted-bytes
+/// contract, same request recording, at a loopback port instead of
+/// a socket path.
+struct TcpMockDaemon {
+    /// The mock's loopback port.
+    port: u16,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TcpMockDaemon {
+    /// Every request observed so far.
+    fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// Stop the accept loop.
+    fn stop(self) {
+        self.handle.abort();
+    }
+}
+
+/// Serve `responses` over TCP sequentially, one per connection.
+async fn spawn_mock_tcp(responses: Vec<Vec<u8>>) -> TcpMockDaemon {
+    spawn_mock_tcp_on("127.0.0.1", responses).await
+}
+
+/// Serve `responses` over TCP at one bind host, one per connection.
+///
+/// The addressable twin of [`spawn_mock_tcp`]: a pin that reaches the
+/// mock through a host literal of its own choosing — the `IPv6`
+/// loopback a bracketed-authority pin needs.
+async fn spawn_mock_tcp_on(bind: &str, responses: Vec<Vec<u8>>) -> TcpMockDaemon {
+    let listener = TcpListener::bind((bind, 0))
+        .await
+        .expect("the mock tcp listener binds");
+    let port = listener
+        .local_addr()
+        .expect("the tcp address resolves")
+        .port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    let handle = tokio::spawn(async move {
+        for response in responses {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_one_request(&mut stream).await;
+            recorded.lock().unwrap().push(request);
+            stream.write_all(&response).await.expect("the mock writes");
+        }
+    });
+    TcpMockDaemon {
+        port,
+        requests,
+        handle,
+    }
+}
+
 #[tokio::test]
 async fn connect_performs_the_versioned_handshake() {
     let dir = client_test_dir();
@@ -345,6 +456,12 @@ async fn connect_performs_the_versioned_handshake() {
         mock.requests()[0].path,
         "/v1/hello",
         "the handshake rides the versioned path"
+    );
+    assert_eq!(
+        mock.requests()[0].host,
+        "loopctl",
+        "the socket endpoint carries the fixed family authority — a unix \
+         socket has no authority of its own"
     );
     mock.stop();
 }
@@ -605,6 +722,60 @@ async fn verbs_hit_their_versioned_paths_with_json_bodies() {
 struct SseMock {
     daemon: MockDaemon,
     frames: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+/// The TCP twin of [`SseMock`]: handshake first, then one held-open
+/// event-stream connection the test pushes frames into.
+struct SseTcpMock {
+    daemon: TcpMockDaemon,
+    frames: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+/// Serve the handshake, then one held-open event-stream connection
+/// over TCP.
+///
+/// Path-aware like the socket twin: `/v1/hello` answers the
+/// handshake document, anything else answers the SSE head and
+/// forwards pushed frames until the sender drops.
+async fn spawn_sse_mock_tcp() -> SseTcpMock {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the events tcp socket binds");
+    let port = listener
+        .local_addr()
+        .expect("the tcp address resolves")
+        .port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (frames_tx, mut frames_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let recorded = Arc::clone(&requests);
+    let handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_one_request(&mut stream).await;
+            recorded.lock().unwrap().push(request.clone());
+            if request.path == "/v1/hello" {
+                stream
+                    .write_all(&hello_response("loopctl", 1, 1))
+                    .await
+                    .expect("the handshake");
+                continue;
+            }
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                        Connection: close\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.expect("the head");
+            while let Some(frame) = frames_rx.recv().await {
+                stream.write_all(frame.as_bytes()).await.expect("the frame");
+            }
+            return;
+        }
+    });
+    SseTcpMock {
+        daemon: TcpMockDaemon {
+            port,
+            requests,
+            handle,
+        },
+        frames: frames_tx,
+    }
 }
 
 /// Serve the handshake, then one held-open event-stream connection.
@@ -1381,5 +1552,961 @@ async fn one_interface_serves_both_modes() {
         delivered.cursor, 1,
         "subscribe is mode-unified in full — the stream surface, not only the verbs"
     );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_remote_tcp_endpoint_performs_the_handshake_and_verbs() {
+    let mock = spawn_mock_tcp(vec![
+        hello_response("loopctl", 1, 1),
+        json_response(
+            "200 OK",
+            &serde_json::json!([{"id": "watch-repos", "status": "idle", "model": null}]),
+        ),
+    ])
+    .await;
+    let options = ConnectOptions::tcp("127.0.0.1", mock.port, Some("sekrit".to_string()));
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("the remote family member at the floor connects");
+    let loops = client.list_loops().await.expect("the verb rides TCP");
+    assert_eq!(
+        loops[0].id, "watch-repos",
+        "the remote answer decodes through the shared wire types"
+    );
+    let requests = mock.requests();
+    assert_eq!(
+        requests[0].path, "/v1/hello",
+        "the remote handshake rides the versioned path"
+    );
+    assert_eq!(
+        requests[0].host,
+        format!("127.0.0.1:{}", mock.port),
+        "the remote request head addresses the endpoint's authority, never a placeholder"
+    );
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer sekrit"),
+        "the bearer token rides every remote request, the handshake included"
+    );
+    assert_eq!(
+        requests[1].authorization.as_deref(),
+        Some("Bearer sekrit"),
+        "the verb carries the same credentials as the handshake"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn an_ipv6_literal_endpoint_addresses_its_bracketed_authority() {
+    let mock = spawn_mock_tcp_on(
+        "::1",
+        vec![
+            hello_response("loopctl", 1, 1),
+            json_response("200 OK", &serde_json::json!([])),
+        ],
+    )
+    .await;
+    let options = ConnectOptions::tcp("::1", mock.port, Some("sekrit".to_string()));
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("the IPv6 loopback endpoint connects");
+    client
+        .list_loops()
+        .await
+        .expect("the verb rides the IPv6 connection");
+    let requests = mock.requests();
+    assert_eq!(
+        requests[0].host,
+        format!("[::1]:{}", mock.port),
+        "an IPv6 literal rides its authority bracketed, the form RFC 9110 \
+         reserves — never the ambiguous unbracketed join"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_remote_tcp_endpoint_without_a_token_sends_no_authorization() {
+    let mock = spawn_mock_tcp(vec![
+        hello_response("loopctl", 1, 1),
+        json_response("200 OK", &serde_json::json!([])),
+    ])
+    .await;
+    let options = ConnectOptions::tcp("127.0.0.1", mock.port, None);
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("a tokenless remote endpoint connects when the daemon allows it");
+    client.list_loops().await.expect("the verb rides TCP");
+    let requests = mock.requests();
+    assert!(
+        requests[0].authorization.is_none(),
+        "no token means no Authorization header, never an empty one"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn an_unauthorized_answer_is_typed_over_tcp() {
+    let refusal = json_response(
+        "401 Unauthorized",
+        &serde_json::json!({
+            "error": {"code": "bad_token", "message": "the token was rejected"}
+        }),
+    );
+    let mock = spawn_mock_tcp(vec![refusal]).await;
+    let options = ConnectOptions::tcp("127.0.0.1", mock.port, Some("wrong".to_string()));
+    let rejection = DaemonClient::connect(options).await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Unauthorized { status: 401, message })
+                if message == "the token was rejected"
+        ),
+        "a refused credential answers the typed error, not a generic Api: {rejection:?}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_forbidden_answer_is_typed_over_tcp() {
+    let refusal = json_response(
+        "403 Forbidden",
+        &serde_json::json!({
+            "error": {"code": "forbidden", "message": "the token may not do this"}
+        }),
+    );
+    let mock = spawn_mock_tcp(vec![refusal]).await;
+    let options = ConnectOptions::tcp("127.0.0.1", mock.port, Some("limited".to_string()));
+    let rejection = DaemonClient::connect(options).await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Unauthorized { status: 403, message })
+                if message == "the token may not do this"
+        ),
+        "a forbidden action answers the typed refusal with its own status, not a generic Api: \
+         {rejection:?}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_bearer_token_with_control_characters_is_refused() {
+    let mock = spawn_mock_tcp(vec![hello_response("loopctl", 1, 1)]).await;
+    let injected = "t\r\nContent-Length: 0\r\n\r\nGET /v1/gates";
+    let options = ConnectOptions::tcp("127.0.0.1", mock.port, Some(injected.to_string()));
+    let rejection = DaemonClient::connect(options).await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Transport(detail)) if detail.contains("CR, LF, or NUL")
+        ),
+        "a token carrying CR/LF is a typed transport refusal, never a spliced header: {rejection:?}"
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "the daemon received nothing — no byte of the injected token reached the wire"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_bearer_token_with_a_nul_byte_is_refused() {
+    let mock = spawn_mock_tcp(vec![hello_response("loopctl", 1, 1)]).await;
+    let injected = "sekrit\0Host: evil.example";
+    let options = ConnectOptions::tcp("127.0.0.1", mock.port, Some(injected.to_string()));
+    let rejection = DaemonClient::connect(options).await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Transport(detail)) if detail.contains("CR, LF, or NUL")
+        ),
+        "a token carrying NUL is a typed transport refusal, never a spliced header: {rejection:?}"
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "the daemon received nothing — no byte of the NUL-bearing token reached the wire"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_host_with_control_characters_is_refused() {
+    let mock = spawn_mock_tcp(vec![hello_response("loopctl", 1, 1)]).await;
+    let injected = "daemon\r\n.example:443";
+    let options = ConnectOptions::tcp(injected, mock.port, None);
+    let rejection = DaemonClient::connect(options).await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Transport(detail)) if detail.contains("CR, LF, or NUL")
+        ),
+        "a host carrying CR/LF is a typed transport refusal, never a spliced Host header: \
+         {rejection:?}"
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "the daemon received nothing — the injected host never reached the wire"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn the_event_stream_delivers_over_tcp_with_cursors() {
+    let sse = spawn_sse_mock_tcp().await;
+    let client = DaemonClient::connect(ConnectOptions::tcp("127.0.0.1", sse.daemon.port, None))
+        .await
+        .expect("the mock speaks the handshake over TCP");
+
+    let first = run_started_event(1).to_string();
+    let second = run_started_event(2).to_string();
+    sse.frames
+        .send(": keep-alive comment\r\n\r\n".to_string())
+        .ok();
+    sse.frames
+        .send(format!("id: 7\ndata: {first}\r\n\r\n"))
+        .ok();
+    sse.frames
+        .send(format!("id: 8\ndata: {second}\r\n\r\n"))
+        .ok();
+
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the remote stream opens");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first remote event arrives")
+        .expect("the remote stream is open")
+        .expect("the first remote frame parses");
+    assert_eq!(
+        event.cursor, 7,
+        "the SSE id is the cursor over TCP exactly as over the socket"
+    );
+    let second_event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the second remote event arrives")
+        .expect("the remote stream is open")
+        .expect("the second remote frame parses");
+    assert_eq!(
+        second_event.cursor, 8,
+        "remote cursors advance frame by frame: {second_event:?}"
+    );
+    sse.daemon.stop();
+}
+
+#[tokio::test]
+async fn an_absent_remote_daemon_is_the_typed_absence() {
+    let rejection = DaemonClient::connect(ConnectOptions::tcp("127.0.0.1", 1, None)).await;
+    assert!(
+        matches!(rejection, Err(ClientError::SocketAbsent)),
+        "a refused remote connection is the same typed absence the degrade path keys on: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn auto_spawn_never_runs_for_remote_endpoints() {
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let spawn_counter = Arc::clone(&spawns);
+    let action: SpawnAction = Arc::new(move || {
+        spawn_counter.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let options =
+        ConnectOptions::tcp("127.0.0.1", 1, None).with_spawn(action, RetryWindow::default());
+    let rejection = DaemonClient::connect(options).await;
+    assert!(
+        matches!(rejection, Err(ClientError::SocketAbsent)),
+        "an absent remote daemon surfaces the typed absence: {rejection:?}"
+    );
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        0,
+        "a daemon on another machine is not this process's to spawn — the action never ran"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_peer_answers_the_typed_deadline_rather_than_hanging() {
+    let dir = client_test_dir();
+    let mock = spawn_stalled_mock(&dir, "stalled.sock");
+    let options =
+        ConnectOptions::new(mock.socket()).with_deadline(std::time::Duration::from_millis(150));
+    let rejection = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        DaemonClient::connect(options),
+    )
+    .await
+    .expect("the stalled peer answers within the deadline instead of hanging");
+    assert!(
+        matches!(&rejection, Err(ClientError::Transport(detail))
+            if detail.contains("did not answer within")),
+        "a peer that accepts and stalls answers the typed deadline refusal: {rejection:?}"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "the stalled exchange was attempted exactly once"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_stalled_peer_cannot_outlast_the_spawn_window() {
+    let dir = client_test_dir();
+    let mock = spawn_stalled_mock(&dir, "stalled-window.sock");
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let spawn_counter = Arc::clone(&spawns);
+    let action: SpawnAction = Arc::new(move || {
+        spawn_counter.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let options = ConnectOptions::new(mock.socket())
+        .with_spawn(
+            action,
+            RetryWindow {
+                attempts: 3,
+                delay: std::time::Duration::from_millis(10),
+            },
+        )
+        .with_deadline(std::time::Duration::from_millis(80));
+    let rejection = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        DaemonClient::connect(options),
+    )
+    .await
+    .expect("the window closes even against a stalled peer")
+    .expect_err("no handshake ever completes against a stalled peer");
+    assert!(
+        matches!(&rejection, ClientError::ConnectTimeout { .. }),
+        "a stalled peer inside the window surfaces the window's typed timeout: {rejection:?}"
+    );
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "the action ran once — the window, not the stall, owns the wait"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_warming_daemons_transient_failures_retry_inside_the_window() {
+    let dir = client_test_dir();
+    let warming = json_response(
+        "404 Not Found",
+        &serde_json::json!({"error": {"code": "no_hello", "message": "warming up"}}),
+    );
+    let mock = spawn_mock(
+        &dir,
+        "warming.sock",
+        vec![warming, hello_response("loopctl", 1, 1)],
+    );
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let spawn_counter = Arc::clone(&spawns);
+    let action: SpawnAction = Arc::new(move || {
+        spawn_counter.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let options = ConnectOptions::new(mock.socket()).with_spawn(
+        action,
+        RetryWindow {
+            attempts: 4,
+            delay: std::time::Duration::from_millis(10),
+        },
+    );
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("the window retries the warming daemon's transient refusal");
+    assert_eq!(
+        client.handshake().0,
+        "loopctl",
+        "the third connection's hello is the one negotiated"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "the refused first exchange and the successful second are both on the record"
+    );
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "the action ran once before the retrying began"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_non_event_stream_answer_refuses_rather_than_streaming_silently() {
+    let dir = client_test_dir();
+    let mock = spawn_mock(
+        &dir,
+        "not-sse.sock",
+        vec![
+            hello_response("loopctl", 1, 1),
+            json_response("200 OK", &serde_json::json!([{"id": "watch-repos"}])),
+        ],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let rejection = client.subscribe("watch-repos", None).await;
+    assert!(
+        matches!(&rejection, Err(ClientError::MalformedResponse(text))
+            if text.contains("not an event stream")),
+        "a 2xx that is not an event stream refuses typed, never a silent empty stream: \
+         {:?}",
+        rejection.err().map(|error| error.to_string())
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_mixed_case_event_stream_media_type_is_accepted() {
+    let dir = client_test_dir();
+    let frame = format!("id: 5\ndata: {}\r\n\r\n", run_started_event(5));
+    let mock = spawn_mock(
+        &dir,
+        "mixed-case-sse.sock",
+        vec![
+            hello_response("loopctl", 1, 1),
+            sse_response("Text/Event-Stream", &frame),
+        ],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the media type's case cannot refuse an event stream");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the event arrives")
+        .expect("the stream is open")
+        .expect("the frame parses");
+    assert_eq!(
+        event.cursor, 5,
+        "the media type matches case-insensitively, the RFC's own rule: {event:?}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn an_event_stream_media_type_with_parameters_is_accepted() {
+    let dir = client_test_dir();
+    let frame = format!("id: 6\ndata: {}\r\n\r\n", run_started_event(6));
+    let mock = spawn_mock(
+        &dir,
+        "parametered-sse.sock",
+        vec![
+            hello_response("loopctl", 1, 1),
+            sse_response("text/event-stream; charset=utf-8", &frame),
+        ],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("a parameter tail cannot refuse an event stream");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the event arrives")
+        .expect("the stream is open")
+        .expect("the frame parses");
+    assert_eq!(
+        event.cursor, 6,
+        "everything after the media type is tolerated: {event:?}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn an_undelimited_frame_at_the_streams_end_refuses() {
+    let dir = client_test_dir();
+    let sse = spawn_sse_mock(&dir);
+    let client = DaemonClient::connect(ConnectOptions::new(sse.daemon.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let payload = run_started_event(9).to_string();
+    sse.frames
+        .send(format!("id: 9\r\ndata: {payload}\r\n"))
+        .ok();
+    drop(sse.frames);
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream's end arrives")
+        .expect("the stream is open");
+    assert!(
+        matches!(&outcome, Err(ClientError::MalformedResponse(text))
+            if text.contains("ended mid-frame")),
+        "a frame whose blank line never arrived refuses — its cursor never committed: \
+         {outcome:?}"
+    );
+    sse.daemon.stop();
+}
+
+#[tokio::test]
+async fn a_cursor_expired_answer_without_a_cursor_names_the_beginning() {
+    let dir = client_test_dir();
+    let gone = json_response(
+        "410 Gone",
+        &serde_json::json!({"error": {"code": "cursor_gone", "message": "retention"}}),
+    );
+    let mock = spawn_mock(
+        &dir,
+        "gone.sock",
+        vec![hello_response("loopctl", 1, 1), gone],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let Err(error) = client.subscribe("watch-repos", None).await else {
+        panic!("a 410 answers the typed relist error");
+    };
+    assert!(
+        matches!(&error, ClientError::CursorExpired { since: None }),
+        "the no-cursor shape is carried, not invented: {error:?}"
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains("from the beginning"),
+        "a no-cursor expiry names the beginning, never a None cursor: {text}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn an_oversized_error_body_keeps_its_status() {
+    let dir = client_test_dir();
+    let mut flood = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+         Connection: close\r\n\r\n"
+        .as_bytes()
+        .to_vec();
+    flood.extend(std::iter::repeat_n(b'x', 11 * 1024 * 1024));
+    let mock = spawn_mock(
+        &dir,
+        "flood.sock",
+        vec![hello_response("loopctl", 1, 1), flood],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let rejection = client.list_loops().await;
+    assert!(
+        matches!(&rejection, Err(ClientError::Api { status: 500, .. })),
+        "the status the daemon did send survives a flooded error body: {rejection:?}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_cursor_expired_answer_is_typed_over_tcp() {
+    let gone = json_response(
+        "410 Gone",
+        &serde_json::json!({"error": {"code": "cursor_gone", "message": "retention"}}),
+    );
+    let mock = spawn_mock_tcp(vec![hello_response("loopctl", 1, 1), gone]).await;
+    let client = DaemonClient::connect(ConnectOptions::tcp("127.0.0.1", mock.port, None))
+        .await
+        .expect("the mock speaks the handshake over TCP");
+    let rejection = client.subscribe("watch-repos", Some(9)).await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::CursorExpired { since: Some(9) })
+        ),
+        "the relist contract answers typed over TCP exactly as over the socket: {:?}",
+        rejection.err().map(|error| error.to_string())
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn an_unauthorized_answer_is_typed_over_the_socket() {
+    let dir = client_test_dir();
+    let refusal = json_response(
+        "401 Unauthorized",
+        &serde_json::json!({
+            "error": {"code": "bad_token", "message": "the token was rejected"}
+        }),
+    );
+    let mock = spawn_mock(
+        &dir,
+        "unauth.sock",
+        vec![hello_response("loopctl", 1, 1), refusal],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let rejection = client.list_loops().await;
+    assert!(
+        matches!(&rejection, Err(ClientError::Unauthorized { status: 401, message })
+            if message == "the token was rejected"),
+        "the credential refusal answers typed over the socket exactly as over TCP: \
+         {rejection:?}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_cursorless_subscription_addresses_the_plain_path() {
+    let dir = client_test_dir();
+    let stream_head =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    let mock = spawn_mock(
+        &dir,
+        "plain-path.sock",
+        vec![
+            hello_response("loopctl", 1, 1),
+            stream_head.as_bytes().to_vec(),
+        ],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens");
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the held connection settles when the mock ends");
+    assert!(ended.is_none(), "the empty stream ends cleanly: {ended:?}");
+    let requests = mock.requests();
+    assert_eq!(
+        requests[1].path, "/v1/loops/watch-repos/events",
+        "a cursorless subscription addresses the plain path, never an empty ?since="
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_zero_attempt_window_spawns_then_times_out_with_no_span() {
+    let dir = client_test_dir();
+    let absent = dir.path().join("absent-zero.sock");
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let spawn_counter = Arc::clone(&spawns);
+    let action: SpawnAction = Arc::new(move || {
+        spawn_counter.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let options = ConnectOptions::new(absent).with_spawn(
+        action,
+        RetryWindow {
+            attempts: 0,
+            delay: std::time::Duration::from_millis(1),
+        },
+    );
+    let rejection = DaemonClient::connect(options).await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::ConnectTimeout { window_ms: 0 })
+        ),
+        "zero attempts: the spawn ran, no retry followed, the window spanned nothing: \
+         {rejection:?}"
+    );
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "the action still ran — zero attempts bounds the retries, not the spawn"
+    );
+}
+
+#[tokio::test]
+async fn a_one_attempt_window_tries_once_and_spans_no_delay() {
+    let dir = client_test_dir();
+    let absent = dir.path().join("absent-one.sock");
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let spawn_counter = Arc::clone(&spawns);
+    let action: SpawnAction = Arc::new(move || {
+        spawn_counter.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let options = ConnectOptions::new(absent).with_spawn(
+        action,
+        RetryWindow {
+            attempts: 1,
+            delay: std::time::Duration::from_millis(1),
+        },
+    );
+    let rejection = DaemonClient::connect(options).await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::ConnectTimeout { window_ms: 0 })
+        ),
+        "one attempt: no delay separates it from the spawn, so the span is zero: \
+         {rejection:?}"
+    );
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        1,
+        "the action ran once for the one connect"
+    );
+}
+
+#[tokio::test]
+async fn a_spawn_action_runs_once_per_connect() {
+    let dir = client_test_dir();
+    let absent = dir.path().join("absent-twice.sock");
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let spawn_counter = Arc::clone(&spawns);
+    let action: SpawnAction = Arc::new(move || {
+        spawn_counter.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let options = ConnectOptions::new(absent).with_spawn(
+        action,
+        RetryWindow {
+            attempts: 1,
+            delay: std::time::Duration::from_millis(1),
+        },
+    );
+    let first = DaemonClient::connect(options.clone()).await;
+    let second = DaemonClient::connect(options).await;
+    assert!(first.is_err() && second.is_err(), "no daemon ever appears");
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        2,
+        "the action runs once per connect — two connects, two runs"
+    );
+}
+
+#[tokio::test]
+async fn the_autospawn_optout_honors_only_the_exact_value_one() {
+    for setting in ["0", "true"] {
+        let env = EnvGuard::acquire(&["LOOPCTL_NO_AUTOSPAWN", "XDG_RUNTIME_DIR"]);
+        env.set("LOOPCTL_NO_AUTOSPAWN", setting);
+        let dir = client_test_dir();
+        let runtime_root = dir.path().join("run");
+        std::fs::create_dir_all(&runtime_root).expect("the runtime dir creates");
+        env.set("XDG_RUNTIME_DIR", runtime_root.to_str().expect("utf8 path"));
+        let socket = runtime_root.join("loopctl").join("loopctl.sock");
+        let spawn_socket = socket.clone();
+        let action: SpawnAction = Arc::new(move || {
+            std::fs::create_dir_all(spawn_socket.parent().expect("the socket dir"))
+                .expect("the socket dir creates");
+            let listener = UnixListener::bind(&spawn_socket).expect("the spawned socket binds");
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => {
+                                buffer.extend_from_slice(&chunk[..read]);
+                                if buffer.windows(4).any(|quad| quad == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let response = hello_response("loopctl", 1, 1);
+                    stream.write_all(&response).await.ok();
+                }
+            });
+            Ok(())
+        });
+        let client = DaemonClient::connect_default(Some(action)).await;
+        assert!(
+            client.is_ok(),
+            "setting {setting:?} is not the opt-out — spawning proceeds and the daemon \
+             answers: {client:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_id_field_delivers_the_last_value() {
+    let dir = client_test_dir();
+    let sse = spawn_sse_mock(&dir);
+    let client = DaemonClient::connect(ConnectOptions::new(sse.daemon.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let payload = run_started_event(1).to_string();
+    sse.frames
+        .send(format!("id: 5\r\nid: 9\r\ndata: {payload}\r\n\r\n"))
+        .ok();
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the frame arrives")
+        .expect("the stream is open")
+        .expect("the repeated id parses");
+    assert_eq!(
+        event.cursor, 9,
+        "a repeated id field delivers the last value, the WHATWG-conform arm: {event:?}"
+    );
+    sse.daemon.stop();
+}
+
+#[tokio::test]
+async fn an_empty_id_field_refuses_the_frame() {
+    let dir = client_test_dir();
+    let sse = spawn_sse_mock(&dir);
+    let client = DaemonClient::connect(ConnectOptions::new(sse.daemon.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let payload = run_started_event(1).to_string();
+    sse.frames
+        .send(format!("id:\r\ndata: {payload}\r\n\r\n"))
+        .ok();
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the frame arrives")
+        .expect("the stream is open");
+    assert!(
+        matches!(&outcome, Err(ClientError::MalformedResponse(text))
+            if text.contains("was not numeric")),
+        "an empty id cannot advance the cursor contract and refuses: {outcome:?}"
+    );
+    sse.daemon.stop();
+}
+
+#[tokio::test]
+async fn an_empty_data_value_refuses_the_frame() {
+    let dir = client_test_dir();
+    let sse = spawn_sse_mock(&dir);
+    let client = DaemonClient::connect(ConnectOptions::new(sse.daemon.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    sse.frames.send("id: 9\r\ndata:\r\n\r\n".to_string()).ok();
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the frame arrives")
+        .expect("the stream is open");
+    assert!(
+        matches!(&outcome, Err(ClientError::MalformedResponse(text))
+            if text.contains("was not a trajectory event")),
+        "a data field with no value is not a payload and refuses: {outcome:?}"
+    );
+    sse.daemon.stop();
+}
+
+#[tokio::test]
+async fn an_unknown_field_is_tolerated() {
+    let dir = client_test_dir();
+    let sse = spawn_sse_mock(&dir);
+    let client = DaemonClient::connect(ConnectOptions::new(sse.daemon.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let payload = run_started_event(1).to_string();
+    sse.frames
+        .send(format!("event: add\r\nid: 9\r\ndata: {payload}\r\n\r\n"))
+        .ok();
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the frame arrives")
+        .expect("the stream is open")
+        .expect("the tolerated frame delivers");
+    assert_eq!(
+        event.cursor, 9,
+        "an unknown field before id and data changes nothing: {event:?}"
+    );
+    sse.daemon.stop();
+}
+
+#[tokio::test]
+async fn a_length_cut_mid_frame_refuses() {
+    let dir = client_test_dir();
+    let frame = format!("id: 9\r\ndata: {}\r\n\r\n", run_started_event(9));
+    let cut: String = frame.chars().take(20).collect();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{cut}",
+        cut.len()
+    );
+    let mock = spawn_mock(
+        &dir,
+        "cut.sock",
+        vec![hello_response("loopctl", 1, 1), response.into_bytes()],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens on the cut body");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the cut arrives")
+        .expect("the stream is open");
+    assert!(
+        matches!(&outcome, Err(ClientError::MalformedResponse(text))
+            if text.contains("ended mid-line")),
+        "a declared length that ends inside a frame's line refuses: {outcome:?}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_poisoned_stream_ends_and_a_fresh_connection_is_unaffected() {
+    let dir = client_test_dir();
+    let poisoned_feed = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+         id: 12\r\ndata: not-json\r\n\r\n";
+    let mock = spawn_mock(
+        &dir,
+        "poison.sock",
+        vec![
+            hello_response("loopctl", 1, 1),
+            poisoned_feed.as_bytes().to_vec(),
+        ],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the poisoned frame arrives")
+        .expect("the stream is open");
+    assert!(
+        matches!(first, Err(ClientError::MalformedResponse(_))),
+        "the malformed payload answers its typed error: {first:?}"
+    );
+    let after = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the poisoned stream settles");
+    assert!(
+        after.is_none(),
+        "a poisoned stream ends — the error never repeats: {after:?}"
+    );
+    let fresh = spawn_mock(&dir, "fresh.sock", vec![hello_response("loopctl", 1, 1)]);
+    let client_two = DaemonClient::connect(ConnectOptions::new(fresh.socket()))
+        .await
+        .expect("a fresh connection is unaffected by the poisoned one");
+    assert_eq!(
+        client_two.handshake().0,
+        "loopctl",
+        "the client object reconnects cleanly after a poisoned stream"
+    );
+    fresh.stop();
     mock.stop();
 }

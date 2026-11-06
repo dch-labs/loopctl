@@ -117,14 +117,26 @@ impl Frame {
         })?;
         Ok(Some(LedgerEvent { cursor, event }))
     }
+
+    /// Whether any field arrived for the frame being accumulated.
+    ///
+    /// The end-of-stream check: a frame whose blank-line delimiter
+    /// never arrived refuses when it holds anything — WHATWG SSE
+    /// discards it, this client types the refusal, and a cursor the
+    /// daemon never committed is never delivered to resume from.
+    fn holds_fields(&self) -> bool {
+        self.id.is_some() || !self.data.is_empty()
+    }
 }
 
 /// The streaming reader over one subscribed connection.
 ///
 /// Implements [`Stream`]; each item is the next [`LedgerEvent`] or a
 /// transport/malformed-response error. The stream ends (`None`) when
-/// the daemon closes the connection — resubscribe with the last seen
-/// cursor.
+/// the daemon closes the connection — and after an error item: the
+/// reader is poisoned, a later poll answers `None`, and the error
+/// never repeats. Either way the resume shape is the same —
+/// resubscribe with the last seen cursor.
 pub struct EventStream {
     /// Where this stream's events come from.
     ///
@@ -199,6 +211,9 @@ impl EventStream {
     /// let mut adapted = EventStream::from_pin_box(Box::pin(source));
     /// assert!(adapted.next().await.is_none());
     /// # }
+    /// # fn main() {
+    /// #     futures::executor::block_on(demo());
+    /// # }
     /// ```
     #[must_use]
     pub fn from_pin_box(
@@ -215,6 +230,7 @@ impl EventStream {
     /// reader or a boxed source both own their state outright), so
     /// the box is a convenience for hosts that store one subscription
     /// behind a trait object.
+    #[must_use]
     pub fn boxed(self) -> Pin<Box<Self>> {
         Box::pin(self)
     }
@@ -260,13 +276,15 @@ impl EventStream {
                     return Poll::Ready(Some(Err(error)));
                 }
                 Pulled::Ended => {
-                    let finished = frame.finish();
                     *reader = None;
-                    return match finished {
-                        Ok(Some(event)) => Poll::Ready(Some(Ok(event))),
-                        Ok(None) => Poll::Ready(None),
-                        Err(error) => Poll::Ready(Some(Err(error))),
-                    };
+                    if frame.holds_fields() {
+                        return Poll::Ready(Some(Err(ClientError::MalformedResponse(
+                            "the event stream ended mid-frame — its blank-line delimiter never \
+                             arrived, so its cursor never committed"
+                                .into(),
+                        ))));
+                    }
+                    return Poll::Ready(None);
                 }
                 Pulled::Line(line) => {
                     if line.is_empty() {

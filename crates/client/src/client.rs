@@ -1060,16 +1060,18 @@ impl LoopctlClient for DaemonClient {
                 path,
                 body: None,
             };
+            let started = std::time::Instant::now();
             let (status, mut reader) = open(&endpoint, self.deadline, &request).await?;
+            let remaining = self.deadline.saturating_sub(started.elapsed());
             if status == 410 {
                 return Err(ClientError::CursorExpired { since });
             }
             if !status_ok(status) {
-                let body =
-                    match crate::http::exchange_timeout(self.deadline, reader.drain_error_body()) {
-                        Ok(bounded) => bounded.await.unwrap_or_default(),
-                        Err(error) => return Err(error),
-                    };
+                let body = match crate::http::exchange_timeout(remaining, reader.drain_error_body())
+                {
+                    Ok(bounded) => bounded.await.unwrap_or_default(),
+                    Err(error) => return Err(error),
+                };
                 return Err(map_api_error(status, &body));
             }
             let answered = reader

@@ -579,9 +579,9 @@ pub enum ClientError {
     ConnectTimeout {
         /// The retry window's span, in milliseconds.
         ///
-        /// The delays between attempts that elapsed before giving
-        /// up — the immediate first attempt waits nothing, so the
-        /// span is exactly the waited delays; what a host should
+        /// The wall-clock time the post-spawn window spent before
+        /// giving up — every attempt and every delay together,
+        /// capped by the exchange deadline; what a host should
         /// compare its daemon's startup time against.
         window_ms: u64,
     },

@@ -882,16 +882,18 @@ pub(super) fn send<'a>(
     request: HttpRequest,
 ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, ClientError>> + Send + 'a>> {
     Box::pin(async move {
+        let started = std::time::Instant::now();
         let (status, mut reader) = open(endpoint, deadline, &request).await?;
+        let remaining = deadline.saturating_sub(started.elapsed());
         let body = if status_ok(status) {
-            let bounded = exchange_timeout(deadline, reader.read_to_body_end())?;
+            let bounded = exchange_timeout(remaining, reader.read_to_body_end())?;
             match bounded.await {
                 Ok(Ok(body)) => body,
                 Ok(Err(error)) => return Err(error),
                 Err(_) => return Err(exchange_deadline(deadline)),
             }
         } else {
-            match exchange_timeout(deadline, reader.drain_error_body()) {
+            match exchange_timeout(remaining, reader.drain_error_body()) {
                 Ok(bounded) => bounded.await.unwrap_or_default(),
                 Err(error) => return Err(error),
             }

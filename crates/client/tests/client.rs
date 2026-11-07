@@ -2799,3 +2799,97 @@ async fn a_204_verb_answer_completes_without_waiting_for_a_close() {
     );
     mock.stop();
 }
+
+/// Serve the handshake, then one exchange whose error head arrives
+/// late and whose body never completes.
+///
+/// The one-deadline pins' fixture: the head lands at 200 ms — inside
+/// the first deadline — and the body stalls forever, so only a client
+/// that shares one deadline across the head and the body answers near
+/// one deadline rather than near two.
+fn spawn_delayed_error_head_stall(
+    dir: &tempfile::TempDir,
+    name: &str,
+    status_line: &str,
+) -> PathBuf {
+    let socket = dir.path().join(name);
+    let head = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\
+         Connection: close\r\n\r\n{{\"started\""
+    )
+    .into_bytes();
+    let listener = UnixListener::bind(&socket).expect("the delayed-head socket binds");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_one_request(&mut stream).await;
+            if request.path == "/v1/hello" {
+                stream
+                    .write_all(&hello_response("loopctl", 1, 1))
+                    .await
+                    .expect("the handshake writes");
+                continue;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            stream.write_all(&head).await.expect("the late head writes");
+            std::future::pending::<()>().await;
+        }
+    });
+    socket
+}
+
+#[tokio::test]
+async fn a_late_head_then_stalled_body_cannot_double_the_deadline_on_a_verb() {
+    let dir = client_test_dir();
+    let socket = spawn_delayed_error_head_stall(&dir, "late-head-verb.sock", "401 Unauthorized");
+    let options = ConnectOptions::new(socket).with_deadline(std::time::Duration::from_millis(300));
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("the mock speaks the handshake");
+    let started = std::time::Instant::now();
+    let rejection = tokio::time::timeout(std::time::Duration::from_secs(5), client.list_loops())
+        .await
+        .expect("the late head and stalled body answer at all");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Unauthorized { status: 401, .. })
+        ),
+        "the refused status survives the bounded drain: {rejection:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(420),
+        "one deadline covers the whole exchange — a head at 200 ms and a stalled body \\\n             answer near 300 ms, never near 500: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_late_head_then_stalled_body_cannot_double_the_deadline_on_a_subscription() {
+    let dir = client_test_dir();
+    let socket =
+        spawn_delayed_error_head_stall(&dir, "late-head-subscription.sock", "403 Forbidden");
+    let options = ConnectOptions::new(socket).with_deadline(std::time::Duration::from_millis(300));
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("the mock speaks the handshake");
+    let started = std::time::Instant::now();
+    let rejection = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.subscribe("watch-repos", None),
+    )
+    .await
+    .expect("the late head and stalled body answer at all");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Unauthorized { status: 403, .. })
+        ),
+        "the refused status survives the bounded drain: {:?}",
+        rejection.err().map(|error| error.to_string())
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(420),
+        "one deadline covers the subscription's establishment too — never two: {elapsed:?}"
+    );
+}

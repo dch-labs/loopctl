@@ -20,6 +20,16 @@ use loopctl::memory::trajectory::TrajectoryEvent;
 use crate::ClientError;
 use crate::http::ByteStream;
 
+/// The most bytes one event frame may accumulate before its
+/// blank-line delimiter dispatches it.
+///
+/// Every line of the frame counts toward the bound — `id`, `data`,
+/// comments, the blank delimiter itself — so a peer that drips lines
+/// without ever delimiting a frame is refused at the bound rather
+/// than buffered without end; frames within it parse exactly as
+/// before.
+const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 /// One poll's raw outcome from the wire reader.
 ///
 /// The wire path's intermediate: what the socket read produced this
@@ -54,8 +64,11 @@ enum Pulled {
 pub struct LedgerEvent {
     /// The event's cursor, from the frame's `id` field.
     ///
-    /// Strictly increasing within one loop's stream; pass it back as
-    /// the `since` of a later subscription to resume here.
+    /// Strictly increasing within one loop's stream — a cursor that
+    /// does not advance past the last delivered one refuses the feed
+    /// rather than re-delivering an event a resume would see again.
+    /// Pass it back as the `since` of a later subscription to resume
+    /// here.
     pub cursor: u64,
 
     /// The typed event payload, trajectory-JSONL shaped.
@@ -83,6 +96,13 @@ struct Frame {
     /// Joined with newlines at dispatch into the one JSON payload;
     /// empty means the frame delivered nothing (keep-alive).
     data: Vec<String>,
+
+    /// The frame's accumulated size, delimiters included.
+    ///
+    /// Every line that passes through the accumulating frame counts
+    /// toward [`MAX_FRAME_BYTES`], so an undelimited drip cannot grow
+    /// the buffer without end; reset at each dispatch.
+    bytes: usize,
 }
 
 impl Frame {
@@ -100,6 +120,7 @@ impl Frame {
     fn finish(&mut self) -> Result<Option<LedgerEvent>, ClientError> {
         let id = self.id.take();
         let data = std::mem::take(&mut self.data);
+        self.bytes = 0;
         if data.is_empty() {
             return Ok(None);
         }
@@ -132,11 +153,14 @@ impl Frame {
 /// The streaming reader over one subscribed connection.
 ///
 /// Implements [`Stream`]; each item is the next [`LedgerEvent`] or a
-/// transport/malformed-response error. The stream ends (`None`) when
-/// the daemon closes the connection — and after an error item: the
-/// reader is poisoned, a later poll answers `None`, and the error
-/// never repeats. Either way the resume shape is the same —
-/// resubscribe with the last seen cursor.
+/// transport/malformed-response error. A daemon subscription ends
+/// (`None`) when the daemon closes the connection — and after an
+/// error item: the wire reader is poisoned, a later poll answers
+/// `None`, and the error never repeats. A boxed source (see
+/// [`from_pin_box`](Self::from_pin_box)) forwards its own items
+/// verbatim, so whether it yields anything after an error is the
+/// boxed source's to decide. Either way the resume shape is the same
+/// — resubscribe with the last seen cursor.
 pub struct EventStream {
     /// Where this stream's events come from.
     ///
@@ -164,6 +188,14 @@ enum Source {
         ///
         /// Reset by each blank-line dispatch.
         frame: Frame,
+
+        /// The last cursor this stream delivered.
+        ///
+        /// The monotonicity contract's memory: an event whose cursor
+        /// does not advance past it refuses the feed before delivery,
+        /// so a subscriber resuming from the last cursor can never
+        /// receive the same event twice.
+        delivered: Option<u64>,
     },
 
     /// A host-authored boxed stream, passed through verbatim.
@@ -183,6 +215,7 @@ impl EventStream {
             source: Source::Wire {
                 reader: Some(reader),
                 frame: Frame::default(),
+                delivered: None,
             },
         }
     }
@@ -195,7 +228,10 @@ impl EventStream {
     /// broadcast channel's receiver, a mapped engine observer feed —
     /// into exactly the type the daemon subscription returns, so
     /// `subscribe` call sites are mode-agnostic in full, not only in
-    /// signature.
+    /// signature. Items forward verbatim, termination included: the
+    /// poison-after-error guarantee belongs to daemon streams, so a
+    /// boxed source that yields more items after an error has that
+    /// answer honored, not the daemon's.
     ///
     /// # Examples
     ///
@@ -253,7 +289,12 @@ impl EventStream {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<LedgerEvent, ClientError>>> {
-        let Source::Wire { reader, frame } = &mut self.source else {
+        let Source::Wire {
+            reader,
+            frame,
+            delivered,
+        } = &mut self.source
+        else {
             return Poll::Ready(None);
         };
         loop {
@@ -287,9 +328,33 @@ impl EventStream {
                     return Poll::Ready(None);
                 }
                 Pulled::Line(line) => {
+                    frame.bytes = frame.bytes.saturating_add(line.len().saturating_add(1));
+                    if frame.bytes > MAX_FRAME_BYTES {
+                        *reader = None;
+                        return Poll::Ready(Some(Err(ClientError::MalformedResponse(
+                            "an event frame exceeded the size bound before its blank-line \
+                             delimiter arrived"
+                                .into(),
+                        ))));
+                    }
                     if line.is_empty() {
                         match frame.finish() {
-                            Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
+                            Ok(Some(event)) => {
+                                if let Some(last) = *delivered
+                                    && event.cursor <= last
+                                {
+                                    *reader = None;
+                                    return Poll::Ready(Some(Err(ClientError::MalformedResponse(
+                                        format!(
+                                            "the event cursor {} does not advance past the \
+                                             delivered {} — the feed is not strictly increasing",
+                                            event.cursor, last
+                                        ),
+                                    ))));
+                                }
+                                *delivered = Some(event.cursor);
+                                return Poll::Ready(Some(Ok(event)));
+                            }
                             Ok(None) => continue,
                             Err(error) => {
                                 *reader = None;

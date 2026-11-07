@@ -44,15 +44,23 @@ pub(crate) async fn connect(
     ca_pem: Option<&Path>,
     client_identity: Option<&Path>,
 ) -> Result<Box<dyn Wire>, ClientError> {
+    let ca_bytes = match ca_pem {
+        Some(path) => Some(read_pem_file(path, "the CA file").await?),
+        None => None,
+    };
+    let identity_bytes = match client_identity {
+        Some(path) => Some(read_pem_file(path, "the client identity").await?),
+        None => None,
+    };
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
-    match ca_pem {
-        Some(path) => load_ca(path, &mut roots)?,
+    match ca_bytes.as_deref() {
+        Some(pem) => load_ca(pem, &mut roots)?,
         None => {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
     }
-    let identity = client_identity.map(load_identity).transpose()?;
+    let identity = identity_bytes.as_deref().map(load_identity).transpose()?;
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|error| ClientError::Transport(error.to_string()))?
@@ -76,22 +84,39 @@ pub(crate) async fn connect(
     Ok(Box::new(tls))
 }
 
-/// Load one certificate-authority PEM file into `roots`.
+/// Read one PEM file off the runtime worker.
 ///
-/// The file a self-hosted daemon ships for its own certificate —
-/// each certificate in it that parses is added as trusted, an
-/// entry that does not parse is skipped, and a file from which
-/// none parses refuses.
+/// A stalled filesystem must not block the worker — or, on a
+/// current-thread runtime, everything else with it — so the read
+/// rides `spawn_blocking` and the exchange deadline can still expire
+/// while it waits.
 ///
 /// # Errors
 ///
-/// [`ClientError::Transport`] when the file cannot be read, holds
-/// no certificates, or none of them parse.
-fn load_ca(path: &Path, roots: &mut rustls::RootCertStore) -> Result<(), ClientError> {
-    let pem = std::fs::read(path).map_err(|error| {
-        ClientError::Transport(format!("the CA file could not be read: {error}"))
-    })?;
-    let mut cursor = pem.as_slice();
+/// [`ClientError::Transport`] when the read fails or the blocking
+/// task is lost; the diagnosis names what could not be read.
+async fn read_pem_file(path: &Path, what: &str) -> Result<Vec<u8>, ClientError> {
+    let path = path.to_path_buf();
+    let what = what.to_string();
+    tokio::task::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .map_err(|error| ClientError::Transport(format!("{what} could not be read: {error}")))?
+        .map_err(|error| ClientError::Transport(format!("{what} could not be read: {error}")))
+}
+
+/// Load one certificate-authority PEM into `roots`.
+///
+/// The bytes a self-hosted daemon ships for its own certificate —
+/// read off the worker before this parse — each certificate in them
+/// that parses is added as trusted, an entry that does not parse is
+/// skipped, and bytes from which none parses refuse.
+///
+/// # Errors
+///
+/// [`ClientError::Transport`] when the bytes hold no certificates,
+/// or none of them parse.
+fn load_ca(pem: &[u8], roots: &mut rustls::RootCertStore) -> Result<(), ClientError> {
+    let mut cursor = pem;
     let certificates = rustls_pemfile::certs(&mut cursor)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ClientError::Transport(format!("the CA file is not PEM: {error}")))?;
@@ -109,19 +134,20 @@ fn load_ca(path: &Path, roots: &mut rustls::RootCertStore) -> Result<(), ClientE
     Ok(())
 }
 
-/// Load one client-identity PEM file: its certificate chain and key.
+/// Load one client-identity PEM: its certificate chain and key.
 ///
-/// The file a mutual-TLS client presents — every certificate it
-/// carries is offered as the chain in file order, and the first
-/// private key found signs the handshake. The refusal contract
-/// mirrors [`load_ca`]'s, at the same fail-before-wire place.
+/// The bytes a mutual-TLS client presents — read off the worker
+/// before this parse — every certificate they carry is offered as the
+/// chain in file order, and the first private key found signs the
+/// handshake. The refusal contract mirrors [`load_ca`]'s, at the
+/// same fail-before-wire place.
 ///
 /// # Errors
 ///
-/// [`ClientError::Transport`] when the file cannot be read, is not
-/// PEM, holds no certificates, or holds no private key.
+/// [`ClientError::Transport`] when the bytes are not PEM, hold no
+/// certificates, or hold no private key.
 fn load_identity(
-    path: &Path,
+    pem: &[u8],
 ) -> Result<
     (
         Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -129,10 +155,7 @@ fn load_identity(
     ),
     ClientError,
 > {
-    let pem = std::fs::read(path).map_err(|error| {
-        ClientError::Transport(format!("the client identity could not be read: {error}"))
-    })?;
-    let mut cursor = pem.as_slice();
+    let mut cursor = pem;
     let certificates = rustls_pemfile::certs(&mut cursor)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -143,7 +166,7 @@ fn load_identity(
             "the client identity carried no certificates".into(),
         ));
     }
-    let mut cursor = pem.as_slice();
+    let mut cursor = pem;
     let key = rustls_pemfile::private_key(&mut cursor)
         .map_err(|error| {
             ClientError::Transport(format!("the client identity is not PEM: {error}"))

@@ -114,9 +114,12 @@ async fn spawn_tls_mock_with(responses: Vec<Vec<u8>>, client_roots_pem: Option<&
                 .collect::<Result<Vec<_>, _>>()
                 .expect("the client roots parse");
             roots.add_parsable_certificates(root_certs);
-            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                .build()
-                .expect("the client verifier builds");
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .build()
+            .expect("the client verifier builds");
             builder
                 .with_client_cert_verifier(verifier)
                 .with_single_cert(certificates, key)

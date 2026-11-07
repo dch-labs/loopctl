@@ -440,6 +440,22 @@ async fn spawn_mock_tcp_on(bind: &str, responses: Vec<Vec<u8>>) -> TcpMockDaemon
     }
 }
 
+/// A loopback port that reliably refuses connections.
+///
+/// Binds a listener, notes its port, then drops the listener — the
+/// address answers nothing afterward, a refusal the test controls
+/// rather than borrowing a well-known port any service on the
+/// machine might hold and stall instead of refusing.
+async fn a_refused_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the probe listener binds");
+    listener
+        .local_addr()
+        .expect("the probe address resolves")
+        .port()
+}
+
 #[tokio::test]
 async fn connect_performs_the_versioned_handshake() {
     let dir = client_test_dir();
@@ -1425,10 +1441,10 @@ async fn an_unspawnable_daemon_gives_up_after_the_bounded_window() {
     let rejection = DaemonClient::connect(options).await;
     let elapsed = started.elapsed();
     match rejection {
-        Err(ClientError::ConnectTimeout { window_ms }) => assert_eq!(
-            window_ms, 20,
-            "the window spans the delays between attempts — three tries, two \
-             10 ms delays, never an over-report"
+        Err(ClientError::ConnectTimeout { window_ms }) => assert!(
+            (20..=1000).contains(&window_ms),
+            "the reported span is what the window actually waited — two 10 ms delays \
+             delimit it, never a formula about it: {window_ms}"
         ),
         other => panic!("a daemon that never appears surfaces the timeout: {other:?}"),
     }
@@ -1797,7 +1813,8 @@ async fn the_event_stream_delivers_over_tcp_with_cursors() {
 
 #[tokio::test]
 async fn an_absent_remote_daemon_is_the_typed_absence() {
-    let rejection = DaemonClient::connect(ConnectOptions::tcp("127.0.0.1", 1, None)).await;
+    let port = a_refused_port().await;
+    let rejection = DaemonClient::connect(ConnectOptions::tcp("127.0.0.1", port, None)).await;
     assert!(
         matches!(rejection, Err(ClientError::SocketAbsent)),
         "a refused remote connection is the same typed absence the degrade path keys on: {rejection:?}"
@@ -1806,6 +1823,7 @@ async fn an_absent_remote_daemon_is_the_typed_absence() {
 
 #[tokio::test]
 async fn auto_spawn_never_runs_for_remote_endpoints() {
+    let port = a_refused_port().await;
     let spawns = Arc::new(AtomicUsize::new(0));
     let spawn_counter = Arc::clone(&spawns);
     let action: SpawnAction = Arc::new(move || {
@@ -1813,7 +1831,7 @@ async fn auto_spawn_never_runs_for_remote_endpoints() {
         Ok(())
     });
     let options =
-        ConnectOptions::tcp("127.0.0.1", 1, None).with_spawn(action, RetryWindow::default());
+        ConnectOptions::tcp("127.0.0.1", port, None).with_spawn(action, RetryWindow::default());
     let rejection = DaemonClient::connect(options).await;
     assert!(
         matches!(rejection, Err(ClientError::SocketAbsent)),
@@ -1877,10 +1895,17 @@ async fn a_stalled_peer_cannot_outlast_the_spawn_window() {
     .await
     .expect("the window closes even against a stalled peer")
     .expect_err("no handshake ever completes against a stalled peer");
-    assert!(
-        matches!(&rejection, ClientError::ConnectTimeout { .. }),
-        "a stalled peer inside the window surfaces the window's typed timeout: {rejection:?}"
-    );
+    match &rejection {
+        ClientError::ConnectTimeout { window_ms } => assert!(
+            (80..2000).contains(window_ms),
+            "the configured 80 ms deadline bounded the whole window — the first stalled \
+             attempt spent the aggregate budget, so the span names that deadline, not a \
+             longer timeout: {window_ms}"
+        ),
+        other => panic!(
+            "a stalled peer inside the window surfaces the window's typed timeout: {other:?}"
+        ),
+    }
     assert_eq!(
         spawns.load(Ordering::SeqCst),
         1,
@@ -2209,8 +2234,8 @@ async fn a_zero_attempt_window_spawns_then_times_out_with_no_span() {
             &rejection,
             Err(ClientError::ConnectTimeout { window_ms: 0 })
         ),
-        "zero attempts: the spawn ran, no retry followed, the window spanned nothing: \
-         {rejection:?}"
+        "zero attempts: the spawn ran, no retry followed, and nothing was awaited inside \
+         the window: {rejection:?}"
     );
     assert_eq!(
         spawns.load(Ordering::SeqCst),
@@ -2237,19 +2262,61 @@ async fn a_one_attempt_window_tries_once_and_spans_no_delay() {
         },
     );
     let rejection = DaemonClient::connect(options).await;
-    assert!(
-        matches!(
-            &rejection,
-            Err(ClientError::ConnectTimeout { window_ms: 0 })
+    match &rejection {
+        Err(ClientError::ConnectTimeout { window_ms }) => assert!(
+            *window_ms <= 100,
+            "one attempt with no delay: the span is at most the one absent-socket try, \
+             never a slept delay: {window_ms}"
         ),
-        "one attempt: no delay separates it from the spawn, so the span is zero: \
-         {rejection:?}"
-    );
+        other => panic!("the one-attempt window surfaces the timeout: {other:?}"),
+    }
     assert_eq!(
         spawns.load(Ordering::SeqCst),
         1,
         "the action ran once for the one connect"
     );
+}
+
+#[tokio::test]
+async fn a_one_attempt_window_completes_a_real_handshake() {
+    let dir = client_test_dir();
+    let socket = dir.path().join("one-shot.sock");
+    let server_socket = socket.clone();
+    let action: SpawnAction = Arc::new(move || {
+        let listener = UnixListener::bind(&server_socket).expect("the spawned socket binds");
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let request = read_one_request(&mut stream).await;
+                let response = if request.path == "/v1/hello" {
+                    hello_response("loopctl", 1, 1)
+                } else {
+                    json_response("200 OK", &serde_json::json!([]))
+                };
+                stream
+                    .write_all(&response)
+                    .await
+                    .expect("the answer writes");
+            }
+        });
+        Ok(())
+    });
+    let options = ConnectOptions::new(socket).with_spawn(
+        action,
+        RetryWindow {
+            attempts: 1,
+            delay: std::time::Duration::from_millis(1),
+        },
+    );
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("the window's single attempt completes the handshake");
+    client
+        .list_loops()
+        .await
+        .expect("the verb rides the one-attempt connection");
 }
 
 #[tokio::test]
@@ -2468,12 +2535,17 @@ async fn a_poisoned_stream_ends_and_a_fresh_connection_is_unaffected() {
     let dir = client_test_dir();
     let poisoned_feed = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
          id: 12\r\ndata: not-json\r\n\r\n";
+    let clean_feed = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
+        sse_frame(21, &run_started_event(21))
+    );
     let mock = spawn_mock(
         &dir,
         "poison.sock",
         vec![
             hello_response("loopctl", 1, 1),
             poisoned_feed.as_bytes().to_vec(),
+            clean_feed.into_bytes(),
         ],
     );
     let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
@@ -2498,6 +2570,19 @@ async fn a_poisoned_stream_ends_and_a_fresh_connection_is_unaffected() {
         after.is_none(),
         "a poisoned stream ends — the error never repeats: {after:?}"
     );
+    let mut reopened = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the original client opens a fresh subscription after the poison");
+    let redelivered = tokio::time::timeout(std::time::Duration::from_secs(5), reopened.next())
+        .await
+        .expect("the clean feed's event arrives")
+        .expect("the reopened stream is open")
+        .expect("the clean frame parses");
+    assert_eq!(
+        redelivered.cursor, 21,
+        "the same client recovers a fresh stream after a poisoned one: {redelivered:?}"
+    );
     let fresh = spawn_mock(&dir, "fresh.sock", vec![hello_response("loopctl", 1, 1)]);
     let client_two = DaemonClient::connect(ConnectOptions::new(fresh.socket()))
         .await
@@ -2508,5 +2593,209 @@ async fn a_poisoned_stream_ends_and_a_fresh_connection_is_unaffected() {
         "the client object reconnects cleanly after a poisoned stream"
     );
     fresh.stop();
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_connected_client_debugs_without_leaking_the_token() {
+    let mock = spawn_mock_tcp(vec![hello_response("loopctl", 1, 1)]).await;
+    let client = DaemonClient::connect(ConnectOptions::tcp(
+        "127.0.0.1",
+        mock.port,
+        Some("sekrit".to_string()),
+    ))
+    .await
+    .expect("the mock speaks the handshake over TCP");
+    let rendered = format!("{client:?}");
+    assert!(
+        !rendered.contains("sekrit"),
+        "the connected client's Debug carries its endpoint's redaction with it: {rendered}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_subtype_suffixed_media_type_refuses() {
+    let dir = client_test_dir();
+    let frame = format!("id: 5\r\ndata: {}\r\n\r\n", run_started_event(5));
+    let mock = spawn_mock(
+        &dir,
+        "subtype-sse.sock",
+        vec![
+            hello_response("loopctl", 1, 1),
+            sse_response("text/event-stream-json", &frame),
+        ],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let rejection = client.subscribe("watch-repos", None).await;
+    assert!(
+        matches!(&rejection, Err(ClientError::MalformedResponse(text))
+            if text.contains("not an event stream")),
+        "text/event-stream-json is a different media type, not a prefix match — the \
+         complete type is compared: {:?}",
+        rejection.err().map(|error| error.to_string())
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn an_undelimited_frame_flood_refuses_at_the_frame_bound() {
+    let dir = client_test_dir();
+    let sse = spawn_sse_mock(&dir);
+    let client = DaemonClient::connect(ConnectOptions::new(sse.daemon.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    // 4 MiB of data lines with no blank-line delimiter: the frame's
+    // retained size is the only bound that can see it — per-line
+    // bounds never trip, because every line is small.
+    let flood = format!("data: {}\r\n", "x".repeat(1024));
+    for _ in 0..(4 * 1024 + 8) {
+        sse.frames.send(flood.clone()).ok();
+    }
+    let mut stream = client.subscribe("watch-repos", None).await.expect("opens");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+        .await
+        .expect("the flood refuses at the bound")
+        .expect("the stream is open");
+    assert!(
+        matches!(&outcome, Err(ClientError::MalformedResponse(text))
+            if text.contains("exceeded the size bound")),
+        "an undelimited drip of data lines refuses at the frame bound rather than \
+         buffering without end: {outcome:?}"
+    );
+    sse.daemon.stop();
+}
+
+#[tokio::test]
+async fn a_cursor_that_does_not_advance_refuses_the_feed() {
+    let dir = client_test_dir();
+    let sse = spawn_sse_mock(&dir);
+    let client = DaemonClient::connect(ConnectOptions::new(sse.daemon.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let first = run_started_event(9).to_string();
+    let lower = run_started_event(1).to_string();
+    let repeat = run_started_event(9).to_string();
+    sse.frames
+        .send(format!("id: 9\r\ndata: {first}\r\n\r\n"))
+        .ok();
+    sse.frames
+        .send(format!("id: 8\r\ndata: {lower}\r\n\r\n"))
+        .ok();
+    sse.frames
+        .send(format!("id: 9\r\ndata: {repeat}\r\n\r\n"))
+        .ok();
+    let mut stream = client.subscribe("watch-repos", None).await.expect("opens");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first event arrives")
+        .expect("the stream is open")
+        .expect("the first frame parses");
+    assert_eq!(event.cursor, 9, "the advancing cursor delivers: {event:?}");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the regression arrives")
+        .expect("the stream is open");
+    assert!(
+        matches!(&outcome, Err(ClientError::MalformedResponse(text))
+            if text.contains("not strictly increasing")),
+        "a cursor at or below the last delivered one refuses — a resume from the last \
+         cursor would re-receive the event: {outcome:?}"
+    );
+    let after = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the refused stream settles");
+    assert!(after.is_none(), "the refusal poisons the stream: {after:?}");
+    sse.daemon.stop();
+}
+
+#[tokio::test]
+async fn a_stalled_error_body_on_subscription_answers_within_the_deadline() {
+    let dir = client_test_dir();
+    let head = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+                Content-Length: 500\r\nConnection: close\r\n\r\n{\"started\"";
+    let mock = spawn_mock(
+        &dir,
+        "stalled-error-subscription.sock",
+        vec![hello_response("loopctl", 1, 1), head.as_bytes().to_vec()],
+    );
+    let options =
+        ConnectOptions::new(mock.socket()).with_deadline(std::time::Duration::from_millis(150));
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("the mock speaks the handshake");
+    let rejection = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.subscribe("watch-repos", None),
+    )
+    .await
+    .expect("the stalled error body answers within the deadline, never an eternal await");
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Unauthorized { status: 401, .. })
+        ),
+        "the refused status surfaces even when its body stalls — the drain is bounded: {:?}",
+        rejection.err().map(|error| error.to_string())
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_stalled_error_body_on_a_verb_preserves_the_status() {
+    let dir = client_test_dir();
+    let head = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\
+                Content-Length: 500\r\nConnection: close\r\n\r\n{\"started\"";
+    let mock = spawn_mock(
+        &dir,
+        "stalled-error-verb.sock",
+        vec![hello_response("loopctl", 1, 1), head.as_bytes().to_vec()],
+    );
+    let options =
+        ConnectOptions::new(mock.socket()).with_deadline(std::time::Duration::from_millis(150));
+    let client = DaemonClient::connect(options)
+        .await
+        .expect("the mock speaks the handshake");
+    let rejection = tokio::time::timeout(std::time::Duration::from_secs(5), client.list_loops())
+        .await
+        .expect("the stalled error body answers within the deadline");
+    assert!(
+        matches!(
+            &rejection,
+            Err(ClientError::Unauthorized { status: 403, .. })
+        ),
+        "a 403 head whose body stalls answers its typed refusal — the status survives the \
+             stalled drain: {rejection:?}"
+    );
+    mock.stop();
+}
+
+#[tokio::test]
+async fn a_204_verb_answer_completes_without_waiting_for_a_close() {
+    let dir = client_test_dir();
+    let no_content = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+    let mock = spawn_mock(
+        &dir,
+        "no-content.sock",
+        vec![
+            hello_response("loopctl", 1, 1),
+            no_content.as_bytes().to_vec(),
+        ],
+    );
+    let client = DaemonClient::connect(ConnectOptions::new(mock.socket()))
+        .await
+        .expect("the mock speaks the handshake");
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.stop_run(uuid::Uuid::nil()),
+    )
+    .await
+    .expect("a bodyless 204 completes without waiting for the peer's close");
+    assert!(
+        stopped.is_ok(),
+        "the 204 answer is empty and successful: {stopped:?}"
+    );
     mock.stop();
 }

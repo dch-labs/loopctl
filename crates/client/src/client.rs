@@ -64,8 +64,10 @@ const DEFAULT_EXCHANGE_DEADLINE: Duration = Duration::from_secs(30);
 /// handshake, every verb, and the event stream behave identically
 /// across variants. Local access control for [`Endpoint::Socket`]
 /// is the filesystem's; the remote variants carry the bearer token
-/// a listening daemon expects.
-#[derive(Debug, Clone)]
+/// a listening daemon expects — a token no `Debug` render ever
+/// carries, so logging an endpoint, the options holding it, or a
+/// connected client cannot leak the credential.
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum Endpoint {
     /// The daemon's unix socket on the same machine.
@@ -103,7 +105,9 @@ pub enum Endpoint {
         /// that authenticates by other means — or refuses politely
         /// with the typed [`Unauthorized`](ClientError::Unauthorized).
         /// A token carrying CR, LF, or NUL is refused at the wire
-        /// rather than spliced into the request head.
+        /// rather than spliced into the request head, and a token
+        /// never renders through `Debug` — it formats as
+        /// `<redacted>` there.
         token: Option<String>,
     },
 
@@ -131,7 +135,8 @@ pub enum Endpoint {
         /// Sent as the `Authorization: Bearer` header on every
         /// request, inside the encrypted channel. A token carrying
         /// CR, LF, or NUL is refused at the wire rather than spliced
-        /// into the request head.
+        /// into the request head, and a token never renders through
+        /// `Debug` — it formats as `<redacted>` there.
         token: Option<String>,
 
         /// A PEM file of certificate authorities to verify the daemon with.
@@ -149,6 +154,36 @@ pub enum Endpoint {
         /// same single-file shape `ca_pem` takes.
         client_identity: Option<PathBuf>,
     },
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(unix)]
+            Self::Socket(path) => formatter.debug_tuple("Socket").field(path).finish(),
+            Self::Tcp { host, port, token } => formatter
+                .debug_struct("Tcp")
+                .field("host", host)
+                .field("port", port)
+                .field("token", &token.as_deref().map(|_| "<redacted>"))
+                .finish(),
+            #[cfg(feature = "tls")]
+            Self::Tls {
+                host,
+                port,
+                token,
+                ca_pem,
+                client_identity,
+            } => formatter
+                .debug_struct("Tls")
+                .field("host", host)
+                .field("port", port)
+                .field("token", &token.as_deref().map(|_| "<redacted>"))
+                .field("ca_pem", ca_pem)
+                .field("client_identity", client_identity)
+                .finish(),
+        }
+    }
 }
 
 impl Endpoint {
@@ -357,7 +392,10 @@ impl Endpoint {
 /// boundary the bearer token takes, at the same place. An `IPv6`
 /// literal rides bracketed, the authority form RFC 9110 reserves
 /// for it — `::1` addresses `[::1]:{port}`, never the ambiguous
-/// unbracketed join.
+/// unbracketed join — and a scoped literal (`fe80::1%eth0`) rides
+/// its zone identifier stripped for the same reason: the authority
+/// grammar carries no zone, while the connection still dials the
+/// scoped host the endpoint named.
 ///
 /// # Errors
 ///
@@ -378,6 +416,11 @@ fn remote_authority(host: &str, port: u16) -> Result<String, ClientError> {
         .is_ok_and(|address| address.is_ipv6())
     {
         return Ok(format!("[{host}]:{port}"));
+    }
+    if let Some((address, _zone)) = host.split_once('%')
+        && address.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        return Ok(format!("[{address}]:{port}"));
     }
     Ok(format!("{host}:{port}"))
 }
@@ -433,14 +476,18 @@ pub struct ConnectOptions {
     /// Applies only under [`SpawnPolicy::Spawn`].
     pub retry: RetryWindow,
 
-    /// The bound on any single exchange.
+    /// The bound on any single exchange — and on the whole spawn
+    /// window.
     ///
     /// One deadline covers the handshake, each verb, and the
-    /// establishment of an event subscription — a peer that accepts
-    /// and stalls answers the typed transport refusal naming the
-    /// bound, never an eternal await. The subscription's body is
-    /// untouched: a quiet daemon may stream for as long as it keeps
-    /// the connection. Defaults to thirty seconds;
+    /// establishment of an event subscription — and the post-spawn
+    /// retry sequence spends from the same deadline as one aggregate
+    /// budget, attempts and delays together, so a peer that stalls
+    /// each handshake cannot stretch the window past it — a peer
+    /// that accepts and stalls answers the typed transport refusal
+    /// naming the bound, never an eternal await. The subscription's
+    /// body is untouched: a quiet daemon may stream for as long as
+    /// it keeps the connection. Defaults to thirty seconds;
     /// [`with_deadline`](Self::with_deadline) tunes it.
     pub deadline: Duration,
 }
@@ -525,10 +572,11 @@ impl ConnectOptions {
     /// Attach a spawn action and retry window, chaining.
     ///
     /// The action runs once per connect; the window bounds how long
-    /// the handshake retries after it — and every retry is itself
-    /// bounded by the exchange [`deadline`](Self::deadline), so a
-    /// peer that accepts and never answers cannot outlast the window
-    /// either.
+    /// the handshake retries after it, and the whole sequence —
+    /// every attempt and every delay together — spends from one
+    /// aggregate budget, the exchange [`deadline`](Self::deadline),
+    /// so a peer that accepts and never answers cannot outlast the
+    /// window either.
     #[must_use]
     pub fn with_spawn(mut self, action: SpawnAction, retry: RetryWindow) -> Self {
         self.spawn = SpawnPolicy::Spawn(action);
@@ -538,12 +586,13 @@ impl ConnectOptions {
 
     /// Bound every single exchange at `deadline`, chaining.
     ///
-    /// One bound covers the handshake, each verb, and the
-    /// establishment of an event subscription — a peer that accepts
-    /// and stalls answers the typed transport refusal naming the
-    /// bound, never an eternal await. The subscription's body is
-    /// untouched by design: a quiet daemon streams for as long as it
-    /// keeps the connection.
+    /// One bound covers the handshake, each verb, the establishment
+    /// of an event subscription, and — as one aggregate budget — the
+    /// whole post-spawn retry sequence: a peer that accepts and
+    /// stalls answers the typed transport refusal naming the bound,
+    /// never an eternal await. The subscription's body is untouched
+    /// by design: a quiet daemon streams for as long as it keeps the
+    /// connection.
     #[must_use]
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
@@ -574,7 +623,8 @@ pub enum SpawnPolicy {
     /// One action run, bounded retries, a typed timeout on failure —
     /// never an unbounded wait: transient handshake failures (a peer
     /// still warming, a partial early response) retry inside the
-    /// window beside absence, and every attempt answers within the
+    /// window beside absence, and the whole sequence — every attempt
+    /// and every delay — spends from one aggregate budget, the
     /// exchange deadline.
     Spawn(SpawnAction),
 }
@@ -592,9 +642,10 @@ impl std::fmt::Debug for SpawnPolicy {
 ///
 /// The wait spans the delays between attempts — the first attempt
 /// follows the spawn immediately, so `attempts` tries are separated
-/// by `attempts − 1` delays and the reported span counts exactly
-/// those; the default matches the family's bounded-retry guidance
-/// (~5 s).
+/// by `attempts − 1` delays — and the whole sequence spends from one
+/// aggregate budget, the exchange deadline, so a peer that stalls
+/// each handshake cannot stretch the window past it; the default
+/// matches the family's bounded-retry guidance (~5 s).
 #[derive(Debug, Clone, Copy)]
 pub struct RetryWindow {
     /// How many connect attempts the window spans.
@@ -684,10 +735,12 @@ impl DaemonClient {
     /// handshake failure, the shape a warming daemon takes — runs the
     /// spawn action and retries inside the window; a daemon that
     /// never appears surfaces as the window's typed timeout naming
-    /// what was tried. Refusals that retrying cannot heal (a foreign
-    /// family, a floor violation, a credential answer) surface
-    /// immediately. Every attempt answers within the exchange
-    /// [`deadline`](ConnectOptions::deadline).
+    /// the span actually waited. The whole sequence — every attempt
+    /// and every delay — spends from one aggregate budget, the
+    /// exchange [`deadline`](ConnectOptions::deadline), so a peer
+    /// that stalls each handshake cannot stretch the window past it.
+    /// Refusals that retrying cannot heal (a foreign family, a floor
+    /// violation, a credential answer) surface immediately.
     /// # Errors
     ///
     /// [`ClientError::SocketAbsent`] when spawning is off and no
@@ -696,7 +749,7 @@ impl DaemonClient {
     /// malformed-response, and the three handshake refusals
     /// (`NotADaemon`, family mismatch, floor violation) otherwise.
     pub async fn connect(options: ConnectOptions) -> Result<Self, ClientError> {
-        match Self::try_handshake(&options.endpoint, options.deadline).await {
+        match Self::try_handshake(&options.endpoint, options.deadline, options.deadline).await {
             Ok(Some(client)) => return Ok(client),
             Ok(None) => {}
             Err(error) => {
@@ -717,11 +770,41 @@ impl DaemonClient {
         action().map_err(|source| ClientError::SpawnFailed {
             detail: source.to_string(),
         })?;
+        Self::retry_window(&options).await
+    }
+
+    /// Run the post-spawn retry window under one aggregate budget.
+    ///
+    /// Every attempt and every delay spends from the same aggregate
+    /// budget — the exchange
+    /// [`deadline`](ConnectOptions::deadline) — so a peer that
+    /// stalls each handshake cannot stretch the window past one
+    /// deadline however many attempts remain. The window ends with
+    /// whichever runs out first, the attempts or the budget, and
+    /// answers the typed timeout naming the span actually waited;
+    /// [`handshake_should_retry`] still decides which failures
+    /// retry and which surface immediately.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::ConnectTimeout`] when the window closes
+    /// without a handshake; otherwise the deciding attempt's own
+    /// refusal.
+    async fn retry_window(options: &ConnectOptions) -> Result<Self, ClientError> {
+        let started = std::time::Instant::now();
         for attempt in 0..options.retry.attempts {
             if attempt > 0 {
-                tokio::time::sleep(options.retry.delay).await;
+                let remaining = remaining_budget(options.deadline, started);
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(options.retry.delay.min(remaining)).await;
             }
-            match Self::try_handshake(&options.endpoint, options.deadline).await {
+            let remaining = remaining_budget(options.deadline, started);
+            if remaining.is_zero() {
+                break;
+            }
+            match Self::try_handshake(&options.endpoint, remaining, options.deadline).await {
                 Ok(Some(client)) => return Ok(client),
                 Ok(None) => {}
                 Err(error) if handshake_should_retry(&error) => {}
@@ -729,14 +812,7 @@ impl DaemonClient {
             }
         }
         Err(ClientError::ConnectTimeout {
-            window_ms: u64::from(options.retry.attempts.saturating_sub(1)).saturating_mul(
-                options
-                    .retry
-                    .delay
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
+            window_ms: elapsed_ms(started),
         })
     }
 
@@ -769,6 +845,11 @@ impl DaemonClient {
     ///
     /// `Ok(None)` means the socket is absent right now — the caller
     /// decides whether that is terminal or a spawn-and-retry signal.
+    /// `budget` bounds the exchange this one attempt makes, while
+    /// `deadline` is the bound the constructed client keeps for
+    /// every later verb — the two differ only inside the spawn
+    /// window, where each attempt spends from a shared aggregate
+    /// budget rather than the full deadline.
     ///
     /// # Errors
     ///
@@ -776,6 +857,7 @@ impl DaemonClient {
     /// non-family or floor-violating peers through [`negotiate`].
     async fn try_handshake(
         endpoint: &Endpoint,
+        budget: Duration,
         deadline: Duration,
     ) -> Result<Option<Self>, ClientError> {
         let request = HttpRequest {
@@ -783,7 +865,7 @@ impl DaemonClient {
             path: "/v1/hello".to_string(),
             body: None,
         };
-        let response = match send(endpoint, deadline, request).await {
+        let response = match send(endpoint, budget, request).await {
             Ok(response) => response,
             Err(ClientError::SocketAbsent) => return Ok(None),
             Err(error) => return Err(error),
@@ -983,15 +1065,22 @@ impl LoopctlClient for DaemonClient {
                 return Err(ClientError::CursorExpired { since });
             }
             if !status_ok(status) {
-                let body = reader.drain_error_body().await;
+                let body =
+                    match crate::http::exchange_timeout(self.deadline, reader.drain_error_body()) {
+                        Ok(bounded) => bounded.await.unwrap_or_default(),
+                        Err(error) => return Err(error),
+                    };
                 return Err(map_api_error(status, &body));
             }
             let answered = reader
                 .content_type()
                 .map_or_else(|| "no content type".to_string(), ToOwned::to_owned);
             if !answered
-                .to_ascii_lowercase()
-                .starts_with("text/event-stream")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
             {
                 return Err(ClientError::MalformedResponse(format!(
                     "the event subscription answered {answered:?}, not an event stream"
@@ -1018,6 +1107,25 @@ fn handshake_should_retry(error: &ClientError) -> bool {
         ClientError::Api { status, .. } => *status >= 500,
         _ => false,
     }
+}
+
+/// The unspent share of one aggregate budget, zero once exhausted.
+///
+/// The spawn window's clock: attempts and delays spend from the same
+/// deadline, so the window cannot outlast it even when every
+/// attempt stalls for the budget's whole span.
+fn remaining_budget(deadline: Duration, started: std::time::Instant) -> Duration {
+    deadline
+        .checked_sub(started.elapsed())
+        .unwrap_or(Duration::ZERO)
+}
+
+/// A wall-clock span in whole milliseconds, saturating.
+///
+/// The honest unit for [`ClientError::ConnectTimeout`]: the span the
+/// window actually waited, never a formula about it.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Decode a JSON body into `T`.
@@ -1102,7 +1210,10 @@ fn percent_encoded(segment: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::ConnectOptions;
+    use super::Endpoint;
     use super::percent_encoded;
+    use super::remote_authority;
     use proptest::prelude::*;
 
     #[test]
@@ -1111,6 +1222,79 @@ mod tests {
             percent_encoded("\r\n x"),
             "%0D%0A%20x",
             "CR, LF, and space never ride the request line raw"
+        );
+    }
+
+    #[test]
+    fn authenticated_endpoints_debug_without_leaking_the_token() {
+        let tcp = Endpoint::tcp("daemon.example", 8787, Some("sekrit".to_string()));
+        let rendered = format!("{tcp:?}");
+        assert!(
+            !rendered.contains("sekrit"),
+            "the TCP endpoint's Debug never carries the token: {rendered}"
+        );
+        assert!(
+            rendered.contains("token: Some(\"<redacted>\")"),
+            "the token's presence renders redacted, not absent: {rendered}"
+        );
+        let options = ConnectOptions::tcp("daemon.example", 8787, Some("sekrit".to_string()));
+        let rendered = format!("{options:?}");
+        assert!(
+            !rendered.contains("sekrit"),
+            "the options' Debug carries the endpoint's redaction with it: {rendered}"
+        );
+        let tokenless = Endpoint::tcp("daemon.example", 8787, None);
+        let rendered = format!("{tokenless:?}");
+        assert!(
+            rendered.contains("token: None"),
+            "a tokenless endpoint renders its honest absence: {rendered}"
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn the_tls_endpoint_debugs_without_leaking_the_token() {
+        let tls = Endpoint::mtls(
+            "daemon.example",
+            8787,
+            Some("sekrit".to_string()),
+            Some("/etc/loopctl/ca.pem".into()),
+            "/etc/loopctl/client.pem",
+        );
+        let rendered = format!("{tls:?}");
+        assert!(
+            !rendered.contains("sekrit"),
+            "the TLS endpoint's Debug never carries the token: {rendered}"
+        );
+        assert!(
+            rendered.contains("token: Some(\"<redacted>\")"),
+            "the token's presence renders redacted, not absent: {rendered}"
+        );
+    }
+
+    #[test]
+    fn scoped_ipv6_hosts_address_their_zone_stripped_authority() {
+        assert_eq!(
+            remote_authority("fe80::1%eth0", 8787).ok().as_deref(),
+            Some("[fe80::1]:8787"),
+            "a scoped IPv6 literal rides bracketed with its zone stripped — the authority \
+             grammar carries no zone identifier"
+        );
+        assert_eq!(
+            remote_authority("::1", 8787).ok().as_deref(),
+            Some("[::1]:8787"),
+            "an unscoped literal keeps its plain bracketed form"
+        );
+        assert_eq!(
+            remote_authority("daemon.example", 8787).ok().as_deref(),
+            Some("daemon.example:8787"),
+            "a name never brackets"
+        );
+        assert_eq!(
+            remote_authority("host%zone", 8787).ok().as_deref(),
+            Some("host%zone:8787"),
+            "a percent sign alone does not make a scoped address — the prefix must parse \
+             as IPv6"
         );
     }
 

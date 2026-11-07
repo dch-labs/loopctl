@@ -59,6 +59,7 @@
 //! ```rust,no_run
 //! use loopctl_client::{ConnectOptions, DaemonClient, LoopctlClient as _};
 //!
+//! # #[cfg(unix)]
 //! # async fn demo() -> Result<(), loopctl_client::ClientError> {
 //! let client = DaemonClient::connect(ConnectOptions::new(
 //!     "/run/user/1000/loopctl/loopctl.sock",

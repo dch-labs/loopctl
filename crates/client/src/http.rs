@@ -499,7 +499,10 @@ impl ByteStream {
     /// Exactly one wire step runs per call, and the phase commits
     /// only after that step's bytes are fully consumed — a read that
     /// pends and is dropped mid-step loses nothing, because no
-    /// transition preceded it.
+    /// transition preceded it. A space or tab immediately before an
+    /// extension semicolon is tolerated — the grammar's optional
+    /// whitespace — while a padded size with no extension still
+    /// refuses: `1*HEXDIG` is the whole size token.
     /// # Errors
     ///
     /// Malformed chunk syntax (a size that is not one hex number —
@@ -521,7 +524,10 @@ impl ByteStream {
                 let size_line = self.take_raw_line().await?.ok_or_else(|| {
                     ClientError::MalformedResponse("chunked body ended early".into())
                 })?;
-                let size_text = size_line.split(';').next().unwrap_or_default();
+                let size_text = match size_line.split_once(';') {
+                    Some((size, _extensions)) => size.trim_end_matches([' ', '\t']),
+                    None => size_line.as_str(),
+                };
                 if size_text.is_empty() || !size_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                     return Err(ClientError::MalformedResponse(
                         "a chunk size was not one hex number".into(),
@@ -623,7 +629,9 @@ impl ByteStream {
     /// The status is already the answer; whatever the body contributes
     /// is diagnosis, so a body that overruns the bound or fails
     /// mid-read loses its tail rather than masking the status the
-    /// daemon did send.
+    /// daemon did send — and the drain returns the moment the bound
+    /// is full, never waiting on another read whose bytes could not
+    /// contribute to the diagnosis.
     pub(super) async fn drain_error_body(&mut self) -> Vec<u8> {
         let mut collected = Vec::new();
         loop {
@@ -639,7 +647,7 @@ impl ByteStream {
                 return collected;
             };
             collected.extend_from_slice(slice);
-            if take < more.len() {
+            if collected.len() == MAX_ERROR_BODY_BYTES || take < more.len() {
                 return collected;
             }
         }
@@ -766,10 +774,46 @@ pub(super) async fn open(
         let status = reader.read_head().await?;
         Ok((status, reader))
     };
-    match tokio::time::timeout(deadline, exchange).await {
+    let bounded = exchange_timeout(deadline, exchange)?;
+    match bounded.await {
         Ok(outcome) => outcome,
         Err(_) => Err(exchange_deadline(deadline)),
     }
+}
+
+/// Wrap one exchange in its deadline, typing a missing timer driver.
+///
+/// tokio's `timeout` panics on a runtime built without a timer
+/// driver — `enable_io` alone leaves none — so before arming the real
+/// bound a one-nanosecond probe runs: a runtime that cannot arm it
+/// answers the typed refusal instead of unwinding the process, while
+/// a runtime that can arms the real deadline unchanged.
+///
+/// # Errors
+///
+/// [`ClientError::Transport`] when the runtime carries no timer
+/// driver, so the deadline could never be enforced.
+pub(crate) fn exchange_timeout<F>(
+    deadline: Duration,
+    exchange: F,
+) -> Result<tokio::time::Timeout<F>, ClientError>
+where
+    F: Future,
+{
+    let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        futures::future::FutureExt::now_or_never(tokio::time::timeout(
+            Duration::from_nanos(1),
+            std::future::pending::<()>(),
+        ))
+    }));
+    if probe.is_err() {
+        return Err(ClientError::Transport(
+            "the runtime carries no timer driver — the exchange deadline needs one; build the \
+             runtime with `enable_time()`"
+                .into(),
+        ));
+    }
+    Ok(tokio::time::timeout(deadline, exchange))
 }
 
 /// The typed refusal a stalled exchange answers with.
@@ -827,7 +871,9 @@ async fn connect_stream(endpoint: &Endpoint) -> Result<Box<dyn Wire>, ClientErro
 /// The one-shot verb path: opens, writes, resolves the body framing,
 /// and buffers the whole body — the exchange bounded by `deadline`,
 /// and an error-status body drained best-effort under the error bound
-/// so its status survives a flood. The verb layer in
+/// and the exchange deadline, so its status survives a flooded body
+/// and a stalled one alike: a 401 or 403 head answers its typed
+/// refusal even when its body never completes. The verb layer in
 /// [`crate::client`] owns both decisions; this path only carries
 /// them.
 pub(super) fn send<'a>(
@@ -836,19 +882,21 @@ pub(super) fn send<'a>(
     request: HttpRequest,
 ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, ClientError>> + Send + 'a>> {
     Box::pin(async move {
-        let exchange = async {
-            let (status, mut reader) = open(endpoint, deadline, &request).await?;
-            let body = if status_ok(status) {
-                reader.read_to_body_end().await?
-            } else {
-                reader.drain_error_body().await
-            };
-            Ok(HttpResponse { status, body })
+        let (status, mut reader) = open(endpoint, deadline, &request).await?;
+        let body = if status_ok(status) {
+            let bounded = exchange_timeout(deadline, reader.read_to_body_end())?;
+            match bounded.await {
+                Ok(Ok(body)) => body,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(exchange_deadline(deadline)),
+            }
+        } else {
+            match exchange_timeout(deadline, reader.drain_error_body()) {
+                Ok(bounded) => bounded.await.unwrap_or_default(),
+                Err(error) => return Err(error),
+            }
         };
-        match tokio::time::timeout(deadline, exchange).await {
-            Ok(outcome) => outcome,
-            Err(_) => Err(exchange_deadline(deadline)),
-        }
+        Ok(HttpResponse { status, body })
     })
 }
 
@@ -896,7 +944,12 @@ fn content_length(value: &str) -> Result<usize, ClientError> {
 /// close-delimited. A `Content-Length` that is not one decimal
 /// number refuses — the same anti-smuggling stance as the
 /// conflicting-duplicate refusal, so the list form (`2, 3`) or a
-/// signed `+2` never degrades to close-delimited framing.
+/// signed `+2` never degrades to close-delimited framing. A `204`
+/// answer is bodyless whatever its headers claim — the status
+/// selects zero-length framing ahead of every other body-framing
+/// rule, so a peer that declares a length or a chunked coding over a
+/// bodyless status still answers an empty body without waiting for
+/// the close it will never send.
 ///
 /// # Errors
 ///
@@ -939,7 +992,9 @@ fn parse_head(head: &str) -> Result<(u16, Framing, Option<String>), ClientError>
             content_type = Some(value.to_string());
         }
     }
-    let framing = if chunked {
+    let framing = if status == 204 {
+        Framing::ContentLength(0)
+    } else if chunked {
         Framing::Chunked
     } else {
         declared_length.map_or(Framing::ToClose, Framing::ContentLength)
@@ -961,7 +1016,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_reader_reclaims_consumed_bytes_on_a_long_stream() {
-        let (mut writer, stream) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut writer, stream) = tokio::io::duplex(8 * 1024);
         let mut reader = ByteStream::new(stream);
         let round = vec![b'x'; 8 * 1024];
         for _ in 0..256 {
@@ -990,7 +1045,7 @@ mod tests {
         )
         .into_bytes();
         head.extend(std::iter::repeat_n(b' ', at_cap));
-        let (mut writer, stream) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut writer, stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             writer
                 .write_all(&head)
@@ -1013,7 +1068,7 @@ mod tests {
         )
         .into_bytes();
         head.extend(std::iter::repeat_n(b' ', past));
-        let (mut writer, stream) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut writer, stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             writer
                 .write_all(&head)
@@ -1065,7 +1120,7 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
                  {size_line}\r\n"
             );
-            let (mut writer, stream) = tokio::net::UnixStream::pair().expect("a socket pair");
+            let (mut writer, stream) = tokio::io::duplex(64 * 1024);
             tokio::spawn(async move {
                 writer
                     .write_all(wire.as_bytes())
@@ -1116,7 +1171,7 @@ mod tests {
                     HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
             .as_bytes()
             .to_vec();
-        let (mut writer, stream) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut writer, stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             writer
                 .write_all(&wire)
@@ -1147,7 +1202,7 @@ mod tests {
             wire.extend_from_slice(trailer_line.as_bytes());
         }
         wire.extend_from_slice(b"\r\n");
-        let (mut writer, stream) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut writer, stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             writer
                 .write_all(&wire)
@@ -1171,7 +1226,7 @@ mod tests {
                     4;ext=ignored\r\nbody\r\n0\r\n\r\n"
             .as_bytes()
             .to_vec();
-        let (mut writer, stream) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut writer, stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             writer
                 .write_all(&wire)
@@ -1187,11 +1242,103 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn whitespace_before_a_chunk_extension_is_tolerated() {
+        for size_line in ["4 ;ext=value", "4\t;ext=value"] {
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                 {size_line}\r\nbody\r\n0\r\n\r\n"
+            );
+            let (mut writer, stream) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                writer
+                    .write_all(wire.as_bytes())
+                    .await
+                    .expect("the spaced wire writes");
+            });
+            let mut reader = ByteStream::new(stream);
+            let _ = reader.read_head().await.expect("the head parses");
+            let body = reader.read_to_body_end().await;
+            assert!(
+                matches!(body.as_deref(), Ok(b"body")),
+                "a space or tab immediately before an extension semicolon is the grammar's \
+                 optional whitespace, never a padded size: {size_line:?} answered {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_204_answer_is_bodyless_whatever_the_head_claims() {
+        let declared = "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n";
+        let parsed = parse_head(declared);
+        assert!(
+            matches!(parsed, Ok((204, Framing::ContentLength(0), _))),
+            "a 204 selects zero-length framing first — a declared length cannot make a \
+             bodyless status wait for one: {parsed:?}"
+        );
+        let chunked = "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n";
+        let parsed = parse_head(chunked);
+        assert!(
+            matches!(parsed, Ok((204, Framing::ContentLength(0), _))),
+            "a chunked coding claimed over a 204 meets the same zero-length arm: {parsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_body_at_the_cap_returns_without_another_read() {
+        let mut wire = b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n".to_vec();
+        wire.extend(std::iter::repeat_n(b'x', MAX_ERROR_BODY_BYTES));
+        let (mut writer, stream) = tokio::io::duplex(8 * 1024);
+        tokio::spawn(async move {
+            writer
+                .write_all(&wire)
+                .await
+                .expect("the capped error body writes");
+            // The connection stays open after the cap-full body: the
+            // next read is exactly the wait the drain must not make.
+            std::future::pending::<()>().await;
+        });
+        let mut reader = ByteStream::new(stream);
+        let _ = reader.read_head().await.expect("the head parses");
+        let drained =
+            tokio::time::timeout(std::time::Duration::from_secs(2), reader.drain_error_body())
+                .await
+                .expect("the drain returns the moment the cap is full");
+        assert_eq!(
+            drained.len(),
+            MAX_ERROR_BODY_BYTES,
+            "a full cap of diagnosis rides along"
+        );
+    }
+
+    #[test]
+    fn a_runtime_without_a_timer_answers_the_typed_refusal() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("the io-only runtime builds");
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejection = runtime.block_on(async {
+            match exchange_timeout(Duration::from_millis(50), std::future::pending::<()>()) {
+                Ok(_) => panic!("an io-only runtime cannot arm the deadline it was asked for"),
+                Err(error) => error,
+            }
+        });
+        std::panic::set_hook(previous_hook);
+        assert!(
+            matches!(&rejection, ClientError::Transport(refusal)
+                if refusal.contains("timer driver")),
+            "a runtime without a timer driver answers the typed refusal, never a panic: \
+             {rejection:?}"
+        );
+    }
+
     /// Split `wire` at `splits` byte offsets into consecutive pieces.
     ///
-    /// The property tests' cutter: every split point becomes a write
-    /// boundary, so the reader is driven piece by piece exactly as a
-    /// segmenting transport would deliver it.
+    /// The property tests' cutter: every split point becomes a piece
+    /// boundary, and the paced wire below hands the reader one piece
+    /// per read — each split observed, never coalesced away.
     fn split_wire_into_pieces(wire: &[u8], splits: &[usize]) -> Vec<Vec<u8>> {
         let mut pieces = Vec::new();
         let mut rest = wire;
@@ -1209,22 +1356,80 @@ mod tests {
         pieces
     }
 
+    /// An in-memory wire that hands the reader one scripted piece per
+    /// read and goes pending between pieces.
+    ///
+    /// The split-point properties' carrier: unlike a socket — which
+    /// may coalesce pieces before the reader ever resumes — this wire
+    /// forces the reader to observe every split as its own read and a
+    /// pending poll between them, so a regression after a partial
+    /// status or chunk-size line becomes pending cannot pass behind
+    /// coalesced writes.
+    struct PacedWire {
+        /// The pieces still to deliver, in order.
+        pieces: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for PacedWire {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let wire = self.get_mut();
+            let Some(piece) = wire.pieces.front_mut() else {
+                return std::task::Poll::Pending;
+            };
+            let take = buf.remaining().min(piece.len());
+            let Some(delivered) = piece.get(..take).map(<[u8]>::to_vec) else {
+                return std::task::Poll::Pending;
+            };
+            buf.put_slice(&delivered);
+            if take == piece.len() {
+                wire.pieces.pop_front();
+            } else {
+                piece.drain(..take);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PacedWire {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the paced wire is read-only",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     /// Decode one wire — whole or split into `pieces` — through a
-    /// fresh reader, to its full body.
+    /// fresh paced reader, to its full body.
     fn decode_pieces(pieces: Vec<Vec<u8>>) -> Result<Vec<u8>, ClientError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("the property runtime builds");
-        runtime.block_on(async {
-            let (mut writer, stream) = tokio::net::UnixStream::pair().expect("a socket pair");
-            tokio::spawn(async move {
-                for piece in pieces {
-                    writer.write_all(&piece).await.expect("a piece writes");
-                }
-            });
-            let mut reader = ByteStream::new(stream);
-            let _ = reader.read_head().await?;
+        let wire = PacedWire {
+            pieces: pieces.into(),
+        };
+        let mut reader = ByteStream::new(wire);
+        futures::executor::block_on(async {
+            reader.read_head().await?;
             reader.read_to_body_end().await
         })
     }

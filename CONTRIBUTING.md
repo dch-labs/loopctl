@@ -22,11 +22,16 @@ code. Contributions that keep those properties are welcome.
 1. **One logical change per PR.** Features and refactors do not ride in
    the same diff.
 2. **`make ci` green before you push.** From the crate root; it runs
-   everything CI runs. One conditional gate sits outside it: changes
-   touching provider wire code should also pass `make conformance` (the
-   cassette-backed provider contract). The live `make e2e` gates need
-   real credentials and models — they are deliberate owner-side checks,
-   never expected of a contributor (full gate map: AGENTS.md §8).
+   every build, lint, and test leg CI runs on a Linux runner. CI's
+   `vector-e2e` job (real Qdrant/pgvector service containers) and
+   `check-darwin` job (a macOS runner compiling the test tree under
+   `--features fs_tools`) have no `make ci` legs — they need hardware
+   or services a contributor's machine cannot assume. One conditional
+   gate sits outside it: changes touching provider wire code should
+   also pass `make conformance` (the cassette-backed provider
+   contract). The live `make e2e` gates need real credentials and
+   models — they are deliberate owner-side checks, never expected of a
+   contributor (full gate map: AGENTS.md §8).
 3. **Changing public API?** Update `[Unreleased]` in `CHANGELOG.md` in
    the same PR — what changed, why, and the migration if it breaks.
    **Breaking changes additionally need a maintainer's go-ahead before

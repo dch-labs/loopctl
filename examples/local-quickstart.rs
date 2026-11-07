@@ -26,6 +26,10 @@ use loopctl::tool::{FnTool, ToolOutput, ToolRegistry};
 use serde_json::json;
 
 /// The async function backing the `now` tool.
+///
+/// Returns the current Unix seconds as the tool's text output — the
+/// example's only tool body, boxed the way the `FnTool` adapter
+/// wants: a future resolving to a `ToolOutput`, never a panic.
 fn now_fn(
     _input: serde_json::Value,
     _ctx: &loopctl::tool::ToolContext,

@@ -23,6 +23,14 @@ follow depending on severity.
 - loopctl is a **library**: it never reads credentials from disk beyond
   the documented environment variables each provider feature uses, and
   it makes no network calls unless you construct a provider client.
+- The `loopctl-client` companion adds an opt-in daemon transport: the
+  per-user unix socket, plain TCP to a remote daemon (the bearer token
+  crosses the wire in the clear — trusted networks only), or TLS behind
+  the `tls` feature, verified against a named CA file or the public
+  WebPKI roots with no fallback to an unverified connection. It reads
+  the endpoint's `ca_pem` and, for mutual-TLS endpoints, the
+  `client_identity` file from disk — and connects nowhere unless you
+  construct one.
 - Tool implementations run model-requested code by design — hosts are
   expected to gate execution (see the permission middleware and the
   tool-safety shield). Reports about a tool *doing what it was configured

@@ -5,6 +5,13 @@
 //! conversation before acting — enumerate options, restate the goal,
 //! check a plan against constraints — without changing anything about
 //! the loop itself.
+//!
+//! The tool emits no telemetry of its own. The engine's per-call
+//! counter (`loopctl.tools.calls`) records a dispatched Think call
+//! exactly once at the dispatch settle seam, and a hand-driven `call()`
+//! — a host invoking the tool directly, beneath the dispatch layer —
+//! settles no counter event at all; a host that drives the tool by hand
+//! observes those calls at its own seam.
 
 use serde_json::{Value, json};
 use std::future::Future;

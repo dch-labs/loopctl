@@ -457,6 +457,33 @@ async fn think_signal_removal_scenario(capture: &MetricCapture) {
     );
 }
 
+#[cfg(all(feature = "testing", feature = "builtin_tools"))]
+async fn direct_think_call_is_beneath_the_counter_scenario(capture: &MetricCapture) {
+    use loopctl::tool::ToolContext;
+    use loopctl::tool::builtin::ThinkTool;
+
+    let before = capture.events().len();
+    let output = ThinkTool::new()
+        .call(
+            json!({"thought": "a hand-driven thought"}),
+            &ToolContext::default(),
+        )
+        .await
+        .expect("the direct call is accepted");
+    assert_eq!(output.text_content(), "ok", "the ack is unchanged");
+    let delta: Vec<String> = capture.events()[before..].to_vec();
+    let counted: Vec<String> = delta
+        .iter()
+        .filter(|event| event.contains("metric=loopctl.tools.calls"))
+        .cloned()
+        .collect();
+    assert!(
+        counted.is_empty(),
+        "a direct call settles no engine counter event — the dispatch layer owns the \
+         count, and a hand-driven call is beneath it: {counted:?}"
+    );
+}
+
 /// A tool answering under the builtin `Think` wire name.
 ///
 /// The per-turn marks key on the tool's *name*, so a stand-in exercises the
@@ -630,4 +657,6 @@ async fn every_call_and_retrieve_settles_one_labeled_event() {
     store_internal_distinguishability_scenario(&capture);
     #[cfg(all(feature = "testing", feature = "builtin_tools"))]
     think_signal_removal_scenario(&capture).await;
+    #[cfg(all(feature = "testing", feature = "builtin_tools"))]
+    direct_think_call_is_beneath_the_counter_scenario(&capture).await;
 }

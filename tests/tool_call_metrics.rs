@@ -405,8 +405,10 @@ fn store_internal_distinguishability_scenario(capture: &MetricCapture) {
     );
 }
 
+/// A dispatched Think call settles exactly one engine counter event, with
+/// no removed self-report firing beside it.
 #[cfg(all(feature = "testing", feature = "builtin_tools"))]
-async fn deprecated_think_coexistence_scenario(capture: &MetricCapture) {
+async fn think_signal_removal_scenario(capture: &MetricCapture) {
     use loopctl::tool::builtin::ThinkTool;
 
     let before = capture.events().len();
@@ -447,14 +449,42 @@ async fn deprecated_think_coexistence_scenario(capture: &MetricCapture) {
     );
     let self_reported: Vec<String> = delta
         .iter()
-        .filter(|event| event.contains("metric=loopctl.think.calls"))
+        .filter(|event| event.contains("loopctl.think.calls"))
         .cloned()
         .collect();
-    assert_eq!(
-        self_reported.len(),
-        1,
-        "the deprecated self-report still fires — the v0.3.1 surface stays intact \
-         until its 0.Y.0 removal, and the two counters coexist"
+    assert!(
+        self_reported.is_empty(),
+        "the removed self-report never fires — the engine counter owns the count: \
+         {self_reported:?}"
+    );
+}
+
+/// A hand-driven Think call settles no counter event — the dispatch layer
+/// owns the count, and a call beneath it is the host's to observe.
+#[cfg(all(feature = "testing", feature = "builtin_tools"))]
+async fn direct_think_call_is_beneath_the_counter_scenario(capture: &MetricCapture) {
+    use loopctl::tool::ToolContext;
+    use loopctl::tool::builtin::ThinkTool;
+
+    let before = capture.events().len();
+    let output = ThinkTool::new()
+        .call(
+            json!({"thought": "a hand-driven thought"}),
+            &ToolContext::default(),
+        )
+        .await
+        .expect("the direct call is accepted");
+    assert_eq!(output.text_content(), "ok", "the ack is unchanged");
+    let delta: Vec<String> = capture.events()[before..].to_vec();
+    let counted: Vec<String> = delta
+        .iter()
+        .filter(|event| event.contains("metric=loopctl.tools.calls"))
+        .cloned()
+        .collect();
+    assert!(
+        counted.is_empty(),
+        "a direct call settles no engine counter event — the dispatch layer owns the \
+         count, and a hand-driven call is beneath it: {counted:?}"
     );
 }
 
@@ -630,5 +660,7 @@ async fn every_call_and_retrieve_settles_one_labeled_event() {
     #[cfg(all(feature = "testing", feature = "vector_memory"))]
     store_internal_distinguishability_scenario(&capture);
     #[cfg(all(feature = "testing", feature = "builtin_tools"))]
-    deprecated_think_coexistence_scenario(&capture).await;
+    think_signal_removal_scenario(&capture).await;
+    #[cfg(all(feature = "testing", feature = "builtin_tools"))]
+    direct_think_call_is_beneath_the_counter_scenario(&capture).await;
 }

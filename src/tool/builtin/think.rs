@@ -6,12 +6,12 @@
 //! check a plan against constraints — without changing anything about
 //! the loop itself.
 //!
-//! The tool still emits the deprecated `loopctl.think.calls` counter
-//! it shipped in v0.3.1: the engine-level `loopctl.tools.calls`
-//! counter already counts every Think call, making this one redundant
-//! double counting. It is kept (with this note as the deprecation
-//! notice) for the released metric-stream surface and will be removed
-//! in a `0.Y.0` window.
+//! The tool emits no telemetry of its own. The engine's per-call
+//! counter (`loopctl.tools.calls`) records a dispatched Think call
+//! exactly once at the dispatch settle seam, and a hand-driven `call()`
+//! — a host invoking the tool directly, beneath the dispatch layer —
+//! settles no counter event at all; a host that drives the tool by hand
+//! observes those calls at its own seam.
 
 use serde_json::{Value, json};
 use std::future::Future;
@@ -105,11 +105,6 @@ impl Tool for ThinkTool {
                     "Think requires a string `thought` field".to_string(),
                 ));
             }
-            tracing::debug!(
-                target: "loopctl::metrics",
-                metric = "loopctl.think.calls",
-                "think tool called (deprecated signal)"
-            );
             Ok(ToolOutput::text(ACKNOWLEDGEMENT))
         })
     }

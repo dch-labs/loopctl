@@ -85,6 +85,10 @@ fn catalog_answers_through_the_public_path() {
         "the catalog is pinned at its exact size — an entry silently vanishing fails here"
     );
     assert!(
+        lookup("loopctl.think.calls").is_none(),
+        "the removed Think counter stays removed — the count alone cannot say which row left"
+    );
+    assert!(
         lookup("loopctl.reasoning.blocks").is_some(),
         "reasoning surface is declared"
     );

@@ -405,6 +405,8 @@ fn store_internal_distinguishability_scenario(capture: &MetricCapture) {
     );
 }
 
+/// A dispatched Think call settles exactly one engine counter event, with
+/// no removed self-report firing beside it.
 #[cfg(all(feature = "testing", feature = "builtin_tools"))]
 async fn think_signal_removal_scenario(capture: &MetricCapture) {
     use loopctl::tool::builtin::ThinkTool;
@@ -457,6 +459,8 @@ async fn think_signal_removal_scenario(capture: &MetricCapture) {
     );
 }
 
+/// A hand-driven Think call settles no counter event — the dispatch layer
+/// owns the count, and a call beneath it is the host's to observe.
 #[cfg(all(feature = "testing", feature = "builtin_tools"))]
 async fn direct_think_call_is_beneath_the_counter_scenario(capture: &MetricCapture) {
     use loopctl::tool::ToolContext;

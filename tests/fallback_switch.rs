@@ -151,6 +151,35 @@ fn make_agent(client: ScriptedClient, manager: FallbackManager) -> BareLoop<Scri
     )
 }
 
+/// A clock the test advances by hand — the breaker's cooldown crosses
+/// only when the test moves it, never by wall time.
+#[derive(Debug)]
+struct SteppedClock {
+    current: Mutex<std::time::Instant>,
+}
+
+impl SteppedClock {
+    fn started() -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new(std::time::Instant::now()),
+        })
+    }
+
+    fn advance(&self, by: std::time::Duration) {
+        *self.current.lock().unwrap() += by;
+    }
+}
+
+impl loopctl::determinism::Clock for SteppedClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+
+    fn monotonic(&self) -> std::time::Instant {
+        *self.current.lock().unwrap()
+    }
+}
+
 #[tokio::test]
 async fn tripped_breaker_routes_subsequent_requests_to_fallback_model() {
     let manager = FallbackManager::new(1, 1);
@@ -707,15 +736,14 @@ async fn a_first_event_429_through_the_default_handler_retrips_and_reports() {
         recovery_timeout: std::time::Duration::from_millis(50),
         ..loopctl::fallback::FallbackConfig::default()
     };
-    let manager = FallbackManager::new_with_config(config);
+    let clock = SteppedClock::started();
+    let manager =
+        FallbackManager::new_with_config(config).with_clock(Arc::<SteppedClock>::clone(&clock));
     manager
         .set_original_model("primary-model".to_string())
         .unwrap();
     manager.set_fallback_model("fallback-model").unwrap();
 
-    // No `with_stream_handler`: the default passthrough handler's
-    // zero-retry config surfaces the 429 as the plain stream failure,
-    // where the escalation-armed sibling above hides the re-trip.
     let client = ScriptedClient::new(vec![
         Step::AuthFail,
         Step::Text("on fallback".into()),
@@ -732,7 +760,7 @@ async fn a_first_event_429_through_the_default_handler_retrips_and_reports() {
 
     assert!(agent.run("q", &RunConfig::default()).await.is_err());
     assert!(agent.run("q", &RunConfig::default()).await.is_ok());
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    clock.advance(std::time::Duration::from_millis(60));
     assert!(
         agent.run("q", &RunConfig::default()).await.is_err(),
         "the rate-limited probe fails the turn through the default handler"
@@ -1432,15 +1460,14 @@ async fn a_never_configured_manager_fails_closed_while_tripped() {
 
 #[tokio::test]
 async fn a_never_configured_manager_probes_the_client_model_after_cooldown() {
-    // The closing half of the fail-closed window: once the cooldown
-    // elapses the chain-less manager probes in `Recovering`, and its
-    // routed model is `None` — the request rides the client's own model.
+    let clock = SteppedClock::started();
     let manager = FallbackManager::new_with_config(loopctl::fallback::FallbackConfig {
         trip_threshold: 3,
         recovery_timeout: std::time::Duration::from_millis(50),
         recovery_successes_needed: 1,
         ..loopctl::fallback::FallbackConfig::default()
-    });
+    })
+    .with_clock(Arc::<SteppedClock>::clone(&clock));
     let client = ScriptedClient::new(vec![
         Step::AuthFail,
         Step::AuthFail,
@@ -1467,7 +1494,7 @@ async fn a_never_configured_manager_probes_the_client_model_after_cooldown() {
         "the dead window sends no request at all"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    clock.advance(std::time::Duration::from_millis(60));
 
     let probe = agent
         .run("q", &RunConfig::default())
@@ -1513,16 +1540,17 @@ async fn a_half_configured_manager_yields_to_the_host_override_in_primary() {
 
 #[tokio::test]
 async fn a_half_configured_manager_probes_with_the_host_override_while_recovering() {
-    // The `Recovering` cell of the same claim: one shared arm routes
-    // `None` in both states, so after the cooldown the probe request —
-    // like the `Primary`-state turn that tripped — rides the host
-    // override. Routing the probe to the chain head would redden this.
+    // Routing the recovery probe to the chain head reddens this pin —
+    // the `Recovering` cell must yield to the override exactly as the
+    // `Primary` cell does.
+    let clock = SteppedClock::started();
     let manager = FallbackManager::new_with_config(loopctl::fallback::FallbackConfig {
         trip_threshold: 1,
         recovery_timeout: std::time::Duration::from_millis(50),
         recovery_successes_needed: 1,
         ..loopctl::fallback::FallbackConfig::default()
-    });
+    })
+    .with_clock(Arc::<SteppedClock>::clone(&clock));
     manager.set_fallback_model("fallback-model").unwrap();
 
     let client = ScriptedClient::new(vec![Step::AuthFail, Step::Text("probe served".into())]);
@@ -1534,7 +1562,7 @@ async fn a_half_configured_manager_probes_with_the_host_override_while_recoverin
         agent.run("q", &RunConfig::default()).await.is_err(),
         "the threshold-1 breaker trips on the first failure"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    clock.advance(std::time::Duration::from_millis(60));
 
     agent
         .run("q", &RunConfig::default())

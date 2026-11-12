@@ -97,30 +97,283 @@ pub use verify::{CommandVerifier, NoopVerifier, Verifier, VerifyMiddleware, Veri
 /// Resolve `path` against `cwd` lexically, without touching the
 /// filesystem.
 ///
-/// `.` segments drop and `..` segments pop one segment; a write target
+/// The thin wrapper over [`lexical_path_styled`] selecting the
+/// target platform's style: a Unix build normalizes under POSIX rules
+/// with byte-for-byte the outputs it has always produced, a Windows
+/// build under drive/UNC rules — the memoizer's invalidation keys and
+/// the verifier's write targets normalize identically on both. `.`
+/// segments drop and `..` segments pop one segment; a write target
 /// that does not exist yet is fine — this is normalization, not
-/// canonicalization, because canonicalizing would fail exactly for the
-/// not-yet-written paths that verification and invalidation care about.
-/// The result always carries a leading `/`, so identical targets
-/// normalize to identical strings regardless of the cwd spelling they
-/// arrived under.
+/// canonicalization, because canonicalizing would fail exactly for
+/// the not-yet-written paths that verification and invalidation care
+/// about. The result carries the style's root, so identical targets
+/// normalize to identical strings regardless of the cwd spelling
+/// they arrived under.
 pub(crate) fn lexical_path(cwd: &str, path: &str) -> String {
-    let joined = if path.starts_with('/') || cwd.is_empty() {
-        path.to_string()
-    } else {
-        format!("{cwd}/{path}")
-    };
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in joined.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            other => segments.push(other),
+    lexical_path_styled(PATH_STYLE, cwd, path)
+}
+
+/// The lexical path style a spelling is normalized under.
+///
+/// The style picks the separator, the root rules, and the prefix
+/// handling. It is selected from the target platform by
+/// [`lexical_path`] and [`resolved_cwd`], and passed directly to
+/// [`lexical_path_styled`] by the unit pins that exercise the
+/// Windows semantics on Linux CI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathStyle {
+    /// POSIX: `/` separates; a leading `/` is the filesystem root.
+    ///
+    /// Production constructs this variant only on unix targets
+    /// (through [`PATH_STYLE`]); on a Windows host it exists for the
+    /// styled-core unit pins, which name it directly — hence the
+    /// targeted allow.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Unix,
+
+    /// Windows: `/` and `\\` both separate; drive prefixes, bare
+    /// rooted spellings, and UNC shares carry root semantics.
+    ///
+    /// Production constructs this variant only on Windows targets
+    /// (through [`PATH_STYLE`]); on a unix host it exists for the
+    /// styled-core unit pins, which name it directly to exercise the
+    /// Windows semantics from Linux CI — hence the targeted allow.
+    #[cfg_attr(unix, allow(dead_code))]
+    Windows,
+}
+
+impl PathStyle {
+    /// Whether `path` names an absolute location under this style.
+    ///
+    /// Unix: a leading `/`. Windows: an UNC share or a drive-absolute
+    /// spelling (`C:\…`) — a drive-relative `C:repo` and a bare rooted
+    /// `\tmp` are not absolute and join like any relative spelling,
+    /// the way `std::path::Path::is_absolute` models them on Windows
+    /// targets.
+    fn is_absolute_spelling(self, path: &str) -> bool {
+        match self {
+            PathStyle::Unix => path.starts_with('/'),
+            PathStyle::Windows => matches!(
+                parse_windows_root(path),
+                (WindowsRoot::Unc(_), _, _) | (WindowsRoot::Drive(_), _, false)
+            ),
         }
     }
-    format!("/{}", segments.join("/"))
+}
+
+/// The style the target platform normalizes under.
+///
+/// A unix target normalizes under POSIX rules and keeps the
+/// byte-for-byte outputs the crate has always produced.
+#[cfg(unix)]
+const PATH_STYLE: PathStyle = PathStyle::Unix;
+/// The style the target platform normalizes under.
+///
+/// A Windows target normalizes under drive/UNC rules — the
+/// semantics the Linux unit pins exercise by naming
+/// [`PathStyle::Windows`] directly.
+#[cfg(not(unix))]
+const PATH_STYLE: PathStyle = PathStyle::Windows;
+
+/// The canonical root a Windows spelling carries.
+///
+/// The root renders with the style's own separator shape: a drive
+/// keeps its colon, a share keeps its `\\server\share` text, and a
+/// bare root keeps its leading separator. [`parse_windows_root`]
+/// produces these; [`render_windows`] consumes them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WindowsRoot {
+    /// A drive root: `C:` — rendered `C:\` even with no segments.
+    ///
+    /// The letter is uppercased at parse time, so `c:\work` and
+    /// `C:/work` normalize to one root and therefore to one string.
+    Drive(char),
+
+    /// An UNC share root: `\\server\share`.
+    ///
+    /// The share is the root a relative path below it joins onto and
+    /// the ceiling a leading `..` clamps at — a scope above the
+    /// share is not this machine's to name.
+    Unc(String),
+
+    /// A bare root: a leading separator with no drive or share.
+    ///
+    /// Rendered `\` alone when no segments follow, `\segment`
+    /// when they do — a rooted spelling resolves against the base's
+    /// drive or share, and this is what it falls back to when the
+    /// base carries neither.
+    Root,
+
+    /// No prefix — the spelling is relative.
+    ///
+    /// Rendered as the bare segment join with no root text at all,
+    /// the way a relative base's own segments render.
+    Relative,
+}
+
+/// Whether the byte is one of the two Windows separators.
+///
+/// Windows accepts either spelling everywhere a separator appears,
+/// so every parse and split under [`PathStyle::Windows`] goes
+/// through this predicate — `C:/a\b` and `C:\a/b` are the same
+/// target before any segment work starts.
+fn is_windows_separator(byte: u8) -> bool {
+    byte == b'\\' || byte == b'/'
+}
+
+/// Parse a Windows spelling into its canonical root, the remainder
+/// below it (unsplit), and whether a drive prefix was drive-relative
+/// (`C:repo`) — the spelling that joins onto the base instead of
+/// replacing it.
+fn parse_windows_root(path: &str) -> (WindowsRoot, String, bool) {
+    let bytes = path.as_bytes();
+    let first = bytes.first().copied();
+    let second = bytes.get(1).copied();
+    if first.is_some_and(is_windows_separator) && second.is_some_and(is_windows_separator) {
+        let rest = path.get(2..).unwrap_or_default();
+        let mut parts = rest.splitn(3, ['\\', '/']);
+        let server = parts.next().unwrap_or_default();
+        let share = parts.next().unwrap_or_default();
+        let remainder = parts.next().unwrap_or_default();
+        if !server.is_empty() && !share.is_empty() {
+            return (
+                WindowsRoot::Unc(format!("\\\\{server}\\{share}")),
+                remainder.to_string(),
+                false,
+            );
+        }
+        return (WindowsRoot::Root, rest.to_string(), false);
+    }
+    if let (Some(letter), Some(b':')) = (first.filter(u8::is_ascii_alphabetic), second) {
+        let drive = char::from(letter).to_ascii_uppercase();
+        let after = path.get(2..).unwrap_or_default();
+        if after.starts_with('\\') || after.starts_with('/') {
+            let rest = after.get(1..).unwrap_or_default();
+            return (WindowsRoot::Drive(drive), rest.to_string(), false);
+        }
+        return (WindowsRoot::Drive(drive), after.to_string(), true);
+    }
+    if first.is_some_and(is_windows_separator) {
+        return (
+            WindowsRoot::Root,
+            path.get(1..).unwrap_or_default().to_string(),
+            false,
+        );
+    }
+    (WindowsRoot::Relative, path.to_string(), false)
+}
+
+/// Split on both Windows separators; empties are kept for the
+/// normalizer to drop.
+fn split_windows(path: &str) -> Vec<String> {
+    path.split(['\\', '/']).map(str::to_string).collect()
+}
+
+/// Drop empty and `.` segments, pop one segment per `..` — clamping
+/// at the root, where a leading `..` has nothing to pop.
+fn normalize_windows(segments: Vec<String>) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::new();
+    for segment in segments {
+        match segment.as_str() {
+            "" | "." => {}
+            ".." => {
+                normalized.pop();
+            }
+            other => normalized.push(other.to_string()),
+        }
+    }
+    normalized
+}
+
+/// The root a bare rooted spelling (`\\tmp`) resolves against: the
+/// base's drive or share when it carries one, the bare root
+/// otherwise.
+fn rooted_against(base_root: &WindowsRoot) -> WindowsRoot {
+    match base_root {
+        WindowsRoot::Drive(drive) => WindowsRoot::Drive(*drive),
+        WindowsRoot::Unc(share) => WindowsRoot::Unc(share.clone()),
+        WindowsRoot::Root | WindowsRoot::Relative => WindowsRoot::Root,
+    }
+}
+
+/// Render a canonical root and its normalized segments as one
+/// string.
+fn render_windows(root: &WindowsRoot, segments: &[String]) -> String {
+    let joined = segments.join("\\");
+    match root {
+        WindowsRoot::Relative => joined,
+        WindowsRoot::Root => format!("\\{joined}"),
+        WindowsRoot::Unc(share) if joined.is_empty() => share.clone(),
+        WindowsRoot::Unc(share) => format!("{share}\\{joined}"),
+        WindowsRoot::Drive(drive) => format!("{drive}:\\{joined}"),
+    }
+}
+
+/// Join `path` onto `cwd` lexically under `style`, without touching
+/// the filesystem.
+///
+/// The pure core behind [`lexical_path`]: the style picks the
+/// separator, the root rules, and the prefix handling, so the
+/// Windows semantics unit-test on Linux CI while the Unix branch
+/// keeps its byte-for-byte outputs. Under [`PathStyle::Windows`] a
+/// drive-absolute spelling replaces the base, a drive-relative
+/// `C:repo` joins onto the base when the base lives on the same
+/// drive and anchors at the drive root otherwise, a bare rooted
+/// `\\tmp` resolves against the base's drive or share, and both
+/// separators normalize to the style's own — the invariant the
+/// memoizer and the verifier need is that identical targets
+/// normalize to identical strings.
+fn lexical_path_styled(style: PathStyle, cwd: &str, path: &str) -> String {
+    match style {
+        PathStyle::Unix => {
+            let joined = if path.starts_with('/') || cwd.is_empty() {
+                path.to_string()
+            } else {
+                format!("{cwd}/{path}")
+            };
+            let mut segments: Vec<&str> = Vec::new();
+            for segment in joined.split('/') {
+                match segment {
+                    "" | "." => {}
+                    ".." => {
+                        segments.pop();
+                    }
+                    other => segments.push(other),
+                }
+            }
+            format!("/{}", segments.join("/"))
+        }
+        PathStyle::Windows => {
+            let (base_root, base_rest, _) = parse_windows_root(cwd);
+            let mut segments: Vec<String> = Vec::new();
+            let root = match parse_windows_root(path) {
+                (WindowsRoot::Unc(share), rest, _) => {
+                    segments = split_windows(&rest);
+                    WindowsRoot::Unc(share)
+                }
+                (WindowsRoot::Drive(drive), rest, drive_relative) => {
+                    if drive_relative
+                        && matches!(&base_root, WindowsRoot::Drive(base_drive) if *base_drive == drive)
+                    {
+                        segments = split_windows(&base_rest);
+                    }
+                    segments.extend(split_windows(&rest));
+                    WindowsRoot::Drive(drive)
+                }
+                (WindowsRoot::Root, rest, _) => {
+                    segments = split_windows(&rest);
+                    rooted_against(&base_root)
+                }
+                (WindowsRoot::Relative, rest, _) => {
+                    segments = split_windows(&base_rest);
+                    segments.extend(split_windows(&rest));
+                    base_root
+                }
+            };
+            let normalized = normalize_windows(segments);
+            render_windows(&root, &normalized)
+        }
+    }
 }
 
 /// Split a command into shell words, honoring single and double
@@ -182,10 +435,13 @@ pub(crate) fn shell_words(command: &str) -> Result<Vec<String>, String> {
 /// relative cwd would anchor to the filesystem root — the wrong
 /// directory for every check that follows. This joins a relative
 /// spelling onto the process cwd lexically (no `canonicalize`: the
-/// join target need not exist, and symlink identity is not part of any
-/// contract here); absolute spellings ride through unchanged.
+/// join target need not exist, and symlink identity is not part of
+/// any contract here); a spelling absolute under the target
+/// platform's rules rides through unchanged — a leading `/` on Unix;
+/// a drive-absolute `C:\…` or an UNC `\\srv\share` on Windows, where
+/// a drive-relative `C:repo` and a bare rooted `\\tmp` still join.
 pub(crate) fn resolved_cwd(cwd: &str) -> String {
-    if cwd.starts_with('/') {
+    if PATH_STYLE.is_absolute_spelling(cwd) {
         return cwd.to_string();
     }
     let process =
@@ -2027,6 +2283,137 @@ mod tests {
         assert_eq!(lexical_path("/repo", "src/./lib.rs"), "/repo/src/lib.rs");
         assert_eq!(lexical_path("", "relative.txt"), "/relative.txt");
         assert_eq!(lexical_path("/repo", ""), "/repo");
+    }
+
+    #[test]
+    fn windows_styled_drive_absolute_spellings_stay_put() {
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\Users\\u\\repo", "C:\\work"),
+            "C:\\work"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\Users\\u\\repo", "C:/work"),
+            "C:\\work",
+            "forward separators normalize to the style's own"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "/home/u/repo", "C:\\work"),
+            "C:\\work",
+            "a drive-absolute path replaces a unix-shaped base outright"
+        );
+    }
+
+    #[test]
+    fn windows_styled_drive_relative_joins_onto_the_same_drive() {
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\Users\\u\\repo", "C:repo"),
+            "C:\\Users\\u\\repo\\repo",
+            "a drive-relative spelling joins onto the same drive's base"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "D:\\elsewhere", "C:repo"),
+            "C:\\repo",
+            "a drive-relative spelling over a foreign base anchors at the \
+             drive root"
+        );
+    }
+
+    #[test]
+    fn windows_styled_unc_roots_are_preserved() {
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\work", "\\\\srv\\share\\x"),
+            "\\\\srv\\share\\x"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "\\\\srv\\share", "..\\y"),
+            "\\\\srv\\share\\y",
+            "a .. at the share root clamps inside the share, never above it"
+        );
+    }
+
+    #[test]
+    fn windows_styled_cross_separator_spellings_normalize_to_one_form() {
+        let via_back = lexical_path_styled(PathStyle::Windows, "C:\\work", "C:\\a\\b");
+        let via_forward = lexical_path_styled(PathStyle::Windows, "C:\\work", "C:/a/b");
+        let mixed = lexical_path_styled(PathStyle::Windows, "C:\\work", "C:/a\\b");
+        assert_eq!(via_back, via_forward);
+        assert_eq!(via_back, mixed);
+        assert_eq!(via_back, "C:\\a\\b");
+    }
+
+    #[test]
+    fn windows_styled_leading_dotdot_clamps_at_the_drive_root() {
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\work", "..\\..\\escape"),
+            "C:\\escape"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\work", "..\\..\\..\\..\\escape"),
+            "C:\\escape",
+            "the unix clamp invariant: leading .. at the root has nothing to pop"
+        );
+    }
+
+    #[test]
+    fn windows_styled_relative_spellings_join_the_base() {
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\work", "src\\main.rs"),
+            "C:\\work\\src\\main.rs"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\Users\\u\\repo", "."),
+            "C:\\Users\\u\\repo"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\Users\\u\\repo", "..\\shared"),
+            "C:\\Users\\u\\shared"
+        );
+    }
+
+    #[test]
+    fn windows_styled_rooted_spellings_resolve_against_the_base_root() {
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\Users\\u\\repo", "\\tmp"),
+            "C:\\tmp"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\Users\\u\\repo", "/tmp"),
+            "C:\\tmp",
+            "a bare rooted spelling resolves against the current drive's \
+             root, the way Windows resolves it"
+        );
+    }
+
+    #[test]
+    fn windows_styled_consumer_targets_agree_across_spellings() {
+        // The memoizer's invalidation keys and the verifier's write
+        // targets both compute lexical_path over the resolved base —
+        // one target, two spellings, one string.
+        let base = lexical_path_styled(PathStyle::Windows, "C:\\work", ".");
+        let back = lexical_path_styled(PathStyle::Windows, &base, "C:\\a\\b");
+        let forward = lexical_path_styled(PathStyle::Windows, &base, "C:/a/b");
+        assert_eq!(back, forward, "one target normalizes to one key");
+    }
+
+    #[test]
+    fn windows_styled_absolute_detection_matches_the_platform_rules() {
+        assert!(PathStyle::Windows.is_absolute_spelling("C:\\work"));
+        assert!(
+            PathStyle::Windows.is_absolute_spelling("c:/work"),
+            "the drive letter is case-insensitive"
+        );
+        assert!(PathStyle::Windows.is_absolute_spelling("\\\\srv\\share"));
+        assert!(
+            !PathStyle::Windows.is_absolute_spelling("C:repo"),
+            "drive-relative is not absolute — it joins"
+        );
+        assert!(
+            !PathStyle::Windows.is_absolute_spelling("\\tmp"),
+            "bare rooted is not absolute — it resolves against the base root"
+        );
+        assert!(!PathStyle::Windows.is_absolute_spelling("src\\main.rs"));
+        assert!(PathStyle::Unix.is_absolute_spelling("/work"));
+        assert!(!PathStyle::Unix.is_absolute_spelling("C:\\work"));
     }
 
     #[test]

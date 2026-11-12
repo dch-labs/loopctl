@@ -1,6 +1,9 @@
 //! Middleware that checks tool permissions before execution.
 
-use super::{ToolDispatchContext, ToolDispatchResult, ToolMiddleware, ToolPipeline, resolved_cwd};
+use super::{
+    CancelSignal, ToolDispatchContext, ToolDispatchResult, ToolMiddleware, ToolPipeline,
+    resolved_cwd,
+};
 use crate::tool::PermissionCheck;
 use crate::tool::permission::{GateDecision, GateRuleSource, GateVerdict};
 use std::future::Future;
@@ -22,7 +25,7 @@ pub type PermissionCheckFn = Arc<dyn Fn(&ToolDispatchContext) -> PermissionCheck
 /// when the permission check resolves to [`PermissionCheck::Ask`].
 ///
 /// The returned future may be dropped before it resolves: when the
-/// dispatch's [`CancelSignal`](crate::cancel::CancelSignal) fires while
+/// dispatch's [`CancelSignal`] fires while
 /// the answer is still pending, the middleware stops awaiting and denies
 /// with `cancelled while awaiting approval`, and no completion signal
 /// reaches the resolver side. Implementations should be
@@ -87,9 +90,11 @@ pub struct PermissionAsk {
     /// into one; carried per ask, resolved, so a host never has to
     /// capture the session's directory out-of-band and keep it in
     /// sync with the dispatches it is approving. The resolution is
-    /// Unix-shaped: absolute means a leading `/`, a Windows drive
-    /// spelling (`C:\work`) rides the join like a relative path, and
-    /// a process directory that cannot be read anchors at the root.
+    /// platform-aware: absolute under the target platform's rules — a
+    /// leading `/` on Unix; a drive-absolute `C:\work` or an UNC
+    /// `\\srv\share` on Windows, where a drive-relative `C:repo` and a
+    /// bare rooted `\tmp` still join — and a process directory that
+    /// cannot be read anchors at the root.
     pub cwd: String,
 }
 
@@ -197,7 +202,7 @@ pub trait PermissionAskResolver: Send + Sync {
 ///   allow and is denied on a refusal, which can carry the user's words
 ///   back to the model. Without a
 ///   resolver, `Ask` is denied (headless mode). The prompt races the
-///   dispatch's [`CancelSignal`](crate::cancel::CancelSignal), and a
+///   dispatch's [`CancelSignal`], and a
 ///   cancellation that already fired when the answer lands wins
 ///   deterministically — a cancelled run never executes the tool,
 ///   however the approval resolves.
@@ -509,73 +514,20 @@ impl ToolMiddleware for PermissionMiddleware {
                 if let Some(resolution) = resolution {
                     Box::pin(async move {
                         let cancel = Arc::clone(&ctx.cancel);
-                        let resolution = tokio::select! {
-                            resolution = resolution => resolution,
-                            () = cancel.notified() => {
-                                let record = Self::gate_record(
-                                        ctx,
-                                        GateVerdict::Cancelled,
-                                        source,
-                                        &rule_id,
-                                    )
-                                    .with_reason("cancelled while awaiting approval");
-                                return Self::deny(
+                        tokio::select! {
+                            resolution = resolution => {
+                                Self::resolve_answered(
                                     ctx,
-                                    "cancelled while awaiting approval",
-                                )
-                                .await
-                                .with_gate(record);
-                            }
-                        };
-                        let resolution = match resolution {
-                            PermissionResolution::DenyWithFeedback(feedback)
-                                if feedback.trim().is_empty() =>
-                            {
-                                PermissionResolution::DenyOnce
-                            }
-                            answered => answered,
-                        };
-                        match resolution {
-                            PermissionResolution::AllowOnce if !cancel.is_cancelled() => {
-                                let record = Self::gate_record(
-                                    ctx,
-                                    GateVerdict::AskAllowed,
-                                    GateRuleSource::AskResolver,
-                                    "ask",
-                                );
-                                next.dispatch(ctx).await.with_gate(record)
-                            }
-                            PermissionResolution::AllowOnce => {
-                                let record = Self::gate_record(
-                                    ctx,
-                                    GateVerdict::Cancelled,
+                                    resolution,
+                                    &cancel,
                                     source,
                                     &rule_id,
+                                    next,
                                 )
-                                .with_reason("cancelled while awaiting approval");
-                                Self::deny(ctx, "cancelled while awaiting approval")
-                                    .await
-                                    .with_gate(record)
+                                .await
                             }
-                            PermissionResolution::DenyOnce => {
-                                let record = Self::gate_record(
-                                    ctx,
-                                    GateVerdict::AskDenied,
-                                    GateRuleSource::AskResolver,
-                                    "ask",
-                                )
-                                .with_reason("denied by user");
-                                Self::deny(ctx, "denied by user").await.with_gate(record)
-                            }
-                            PermissionResolution::DenyWithFeedback(reason) => {
-                                let record = Self::gate_record(
-                                    ctx,
-                                    GateVerdict::AskDenied,
-                                    GateRuleSource::AskResolver,
-                                    "ask",
-                                )
-                                .with_reason(reason.clone());
-                                Self::deny(ctx, &reason).await.with_gate(record)
+                            () = cancel.notified() => {
+                                Self::cancelled_ask(ctx, source, &rule_id).await
                             }
                         }
                     })
@@ -601,6 +553,93 @@ impl ToolMiddleware for PermissionMiddleware {
 }
 
 impl PermissionMiddleware {
+    /// The denial text and gate-record reason a cancelled ask produces.
+    ///
+    /// Both cancellation paths render this one string, so a cancelled
+    /// ask reads identically wherever the cancellation landed — the
+    /// select losing to [`CancelSignal::notified`] or the post-answer
+    /// re-check finding the run already cancelled.
+    const CANCELLED_ASK_TEXT: &str = "cancelled while awaiting approval";
+
+    /// Resolve one answered ask into its dispatch outcome.
+    ///
+    /// The shared post-`select!` arm for whatever the resolver
+    /// returned. Blank feedback normalizes to
+    /// [`PermissionResolution::DenyOnce`] first — the normalization
+    /// never consults the cancel signal — and a cancellation that
+    /// fired while the answer was in flight outranks every resolution:
+    /// a denial landing after cancellation is the run's cancellation,
+    /// never a user verdict an observer could misread as intent. A
+    /// live answer proceeds to the verdict match unchanged.
+    async fn resolve_answered(
+        ctx: &mut ToolDispatchContext,
+        resolution: PermissionResolution,
+        cancel: &Arc<CancelSignal>,
+        source: GateRuleSource,
+        rule_id: &str,
+        next: &ToolPipeline,
+    ) -> ToolDispatchResult {
+        let resolution = match resolution {
+            PermissionResolution::DenyWithFeedback(feedback) if feedback.trim().is_empty() => {
+                PermissionResolution::DenyOnce
+            }
+            answered => answered,
+        };
+        if cancel.is_cancelled() {
+            return Self::cancelled_ask(ctx, source, rule_id).await;
+        }
+        match resolution {
+            PermissionResolution::AllowOnce => {
+                let record = Self::gate_record(
+                    ctx,
+                    GateVerdict::AskAllowed,
+                    GateRuleSource::AskResolver,
+                    "ask",
+                );
+                next.dispatch(ctx).await.with_gate(record)
+            }
+            PermissionResolution::DenyOnce => {
+                let record = Self::gate_record(
+                    ctx,
+                    GateVerdict::AskDenied,
+                    GateRuleSource::AskResolver,
+                    "ask",
+                )
+                .with_reason("denied by user");
+                Self::deny(ctx, "denied by user").await.with_gate(record)
+            }
+            PermissionResolution::DenyWithFeedback(reason) => {
+                let record = Self::gate_record(
+                    ctx,
+                    GateVerdict::AskDenied,
+                    GateRuleSource::AskResolver,
+                    "ask",
+                )
+                .with_reason(reason.clone());
+                Self::deny(ctx, &reason).await.with_gate(record)
+            }
+        }
+    }
+
+    /// The cancelled outcome for an ask, whichever path took it.
+    ///
+    /// One record-and-denial pair for both cancellation sites — the
+    /// `select!` losing to [`CancelSignal::notified`] and the
+    /// post-answer re-check — so the verdict, the reason, and the
+    /// model-facing text stay identical wherever the cancellation
+    /// landed.
+    async fn cancelled_ask(
+        ctx: &mut ToolDispatchContext,
+        source: GateRuleSource,
+        rule_id: &str,
+    ) -> ToolDispatchResult {
+        let record = Self::gate_record(ctx, GateVerdict::Cancelled, source, rule_id)
+            .with_reason(Self::CANCELLED_ASK_TEXT);
+        Self::deny(ctx, Self::CANCELLED_ASK_TEXT)
+            .await
+            .with_gate(record)
+    }
+
     /// Build a denied result with tracing.
     ///
     /// One shape for every denial site — an explicit `Deny`, an
@@ -631,7 +670,9 @@ mod tests {
     use super::*;
     use crate::cancel::CancelSignal;
     use crate::middleware::ToolPipeline;
-    use crate::tool::{PermissionCheck, ToolContext, ToolRegistry};
+    use crate::tool::{
+        PermissionCheck, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema,
+    };
     use std::sync::Mutex;
 
     #[tokio::test]
@@ -806,6 +847,100 @@ mod tests {
                 ..ToolContext::default()
             },
         }
+    }
+
+    /// A resolver that answers `AllowOnce` and then fires the cancel
+    /// signal.
+    ///
+    /// The approval-lands-then-run-dies ordering the post-answer
+    /// guard exists for: the answer exists, the run does not, and the
+    /// record must say cancellation — whichever `select!` branch
+    /// wins, the outcome converges on the cancelled denial.
+    struct AnswerThenCancel {
+        cancel: Arc<CancelSignal>,
+    }
+
+    impl PermissionAskResolver for AnswerThenCancel {
+        fn resolve<'a>(
+            &'a self,
+            _ask: &'a PermissionAsk,
+        ) -> Pin<Box<dyn Future<Output = PermissionResolution> + Send + 'a>> {
+            let cancel = Arc::clone(&self.cancel);
+            Box::pin(async move {
+                cancel.cancel();
+                PermissionResolution::AllowOnce
+            })
+        }
+    }
+
+    /// A tool that records being dispatched and answers one fixed line.
+    ///
+    /// The live-allow pin's oracle: the flag flips only when the
+    /// dispatch reached the tool, so the pins assert both that a
+    /// cancelled answer never dispatched and that a live allow did.
+    struct DispatchProbe {
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Tool for DispatchProbe {
+        fn name(&self) -> &'static str {
+            "dispatch_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "A tool that records being dispatched"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: self.name().into(),
+                description: self.description().into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(ToolOutput::text("probe ran")) })
+        }
+    }
+
+    /// The harness for the direct `resolve_answered` pins.
+    ///
+    /// Returns the dispatch context, the signal, the probe's ran
+    /// flag, and a pipeline whose core carries the probe —
+    /// everything a direct call needs, with the context's tool name
+    /// already pointing at the probe so a live allow really
+    /// dispatches.
+    fn answered_helper_harness(
+        cancelled: bool,
+    ) -> (
+        ToolDispatchContext,
+        Arc<CancelSignal>,
+        Arc<std::sync::atomic::AtomicBool>,
+        ToolPipeline,
+    ) {
+        let cancel = Arc::new(CancelSignal::new());
+        if cancelled {
+            cancel.cancel();
+        }
+        let mut ctx = typed_seam_ctx();
+        ctx.cancel = Arc::clone(&cancel);
+        ctx.tool_name = "dispatch_probe".into();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry = ToolRegistry::new();
+        registry.register(DispatchProbe {
+            ran: Arc::clone(&ran),
+        });
+        let pipeline = ToolPipeline::builder()
+            .with_core(Arc::new(registry))
+            .build()
+            .expect("a bare core assembles");
+        (ctx, cancel, ran, pipeline)
     }
 
     #[tokio::test]
@@ -1089,15 +1224,61 @@ mod tests {
 
     #[tokio::test]
     async fn a_typed_approval_landing_after_cancellation_still_denies() {
-        let resolver = Arc::new(CapturingResolver {
-            answer: PermissionResolution::AllowOnce,
-            seen: Arc::new(Mutex::new(None)),
-        });
+        let cancel = Arc::new(CancelSignal::new());
         let permission = PermissionMiddleware::from_context()
             .with_check(|_| PermissionCheck::Ask {
                 prompt: "approve the deploy?".into(),
             })
-            .with_ask_resolver_typed(resolver);
+            .with_ask_resolver_typed(Arc::new(AnswerThenCancel {
+                cancel: Arc::clone(&cancel),
+            }));
+        let pipeline = Arc::new(
+            ToolPipeline::builder()
+                .with_core(Arc::new(ToolRegistry::new()))
+                .with_middleware(permission)
+                .build()
+                .expect("a core plus one middleware assembles"),
+        );
+        let mut ctx = typed_seam_ctx();
+        ctx.cancel = Arc::clone(&cancel);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), pipeline.invoke(ctx))
+            .await
+            .expect("the answered-then-cancelled prompt resolves immediately");
+
+        assert!(
+            result.is_error,
+            "an approval after cancellation denies the call"
+        );
+        assert!(
+            matches!(&result.gate, Some(record) if matches!(record.verdict, GateVerdict::Cancelled)
+                && record.reason.as_deref() == Some("cancelled while awaiting approval")),
+            "the approval landing after cancellation records the cancellation, \
+             never an allowance — the tool was never reached"
+        );
+        match &result.output {
+            crate::message::ToolContent::Text(text) => assert!(
+                text.contains("cancelled while awaiting approval"),
+                "the model reads the cancellation, not the approval: {text}"
+            ),
+            crate::message::ToolContent::Multipart(parts) => {
+                panic!("expected a text denial, got {} parts", parts.len())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_feedback_denial_under_cancellation_records_the_cancellation() {
+        let permission = PermissionMiddleware::from_context()
+            .with_check(|_| PermissionCheck::Ask {
+                prompt: "approve the deploy?".into(),
+            })
+            .with_ask_resolver_typed(Arc::new(CapturingResolver {
+                answer: PermissionResolution::DenyWithFeedback(
+                    "not tonight, that is a prod deploy".into(),
+                ),
+                seen: Arc::new(Mutex::new(None)),
+            }));
         let pipeline = Arc::new(
             ToolPipeline::builder()
                 .with_core(Arc::new(ToolRegistry::new()))
@@ -1112,24 +1293,213 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(1), pipeline.invoke(ctx))
             .await
-            .expect("the already-cancelled signal resolves the select immediately");
+            .expect("the pre-cancelled signal resolves the select immediately");
 
-        assert!(result.is_error, "a cancelled run must not execute the tool");
+        assert!(result.is_error, "a cancelled run denies the call");
         assert!(
             matches!(&result.gate, Some(record) if matches!(record.verdict, GateVerdict::Cancelled)
                 && record.reason.as_deref() == Some("cancelled while awaiting approval")),
-            "the both-ready race resolves to Cancelled, so the typed allow never \
-             passed the gate and the tool was never reached"
+            "a denial landing after cancellation records the cancellation — \
+             the record must not read as the user's verdict: {result:?}"
         );
         match &result.output {
-            crate::message::ToolContent::Text(text) => assert!(
-                text.contains("cancelled while awaiting approval"),
-                "cancellation wins the both-ready race deterministically: {text}"
-            ),
+            crate::message::ToolContent::Text(text) => {
+                assert!(
+                    text.contains("cancelled while awaiting approval"),
+                    "the model reads the cancellation: {text}"
+                );
+                assert!(
+                    !text.contains("prod deploy"),
+                    "the resolver's words never reach the model after \
+                     cancellation: {text}"
+                );
+            }
             crate::message::ToolContent::Multipart(parts) => {
                 panic!("expected a text denial, got {} parts", parts.len())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_deny_once_answer_under_cancellation_records_the_cancellation() {
+        let permission = PermissionMiddleware::from_context()
+            .with_check(|_| PermissionCheck::Ask {
+                prompt: "approve the deploy?".into(),
+            })
+            .with_ask_resolver_typed(Arc::new(CapturingResolver {
+                answer: PermissionResolution::DenyOnce,
+                seen: Arc::new(Mutex::new(None)),
+            }));
+        let pipeline = Arc::new(
+            ToolPipeline::builder()
+                .with_core(Arc::new(ToolRegistry::new()))
+                .with_middleware(permission)
+                .build()
+                .expect("a core plus one middleware assembles"),
+        );
+        let cancel = Arc::new(CancelSignal::new());
+        cancel.cancel();
+        let mut ctx = typed_seam_ctx();
+        ctx.cancel = Arc::clone(&cancel);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), pipeline.invoke(ctx))
+            .await
+            .expect("the pre-cancelled signal resolves the select immediately");
+
+        assert!(
+            matches!(&result.gate, Some(record) if matches!(record.verdict, GateVerdict::Cancelled)
+                && record.reason.as_deref() == Some("cancelled while awaiting approval")),
+            "a DenyOnce landing after cancellation records the cancellation, \
+             never an AskDenied a reader would take for the user's answer: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_false_answer_under_cancellation_records_the_cancellation() {
+        let deny: AskResolverFn = Arc::new(|_prompt: &str, _tool: &str| {
+            Box::pin(std::future::ready(false)) as Pin<Box<dyn Future<Output = bool> + Send>>
+        });
+        let permission = PermissionMiddleware::from_context()
+            .with_check(|_| PermissionCheck::Ask {
+                prompt: "approve the deploy?".into(),
+            })
+            .with_ask_resolver(deny);
+        let pipeline = Arc::new(
+            ToolPipeline::builder()
+                .with_core(Arc::new(ToolRegistry::new()))
+                .with_middleware(permission)
+                .build()
+                .expect("a core plus one middleware assembles"),
+        );
+        let cancel = Arc::new(CancelSignal::new());
+        cancel.cancel();
+        let mut ctx = typed_seam_ctx();
+        ctx.cancel = Arc::clone(&cancel);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), pipeline.invoke(ctx))
+            .await
+            .expect("the pre-cancelled signal resolves the select immediately");
+
+        assert!(
+            matches!(&result.gate, Some(record) if matches!(record.verdict, GateVerdict::Cancelled)
+                && record.reason.as_deref() == Some("cancelled while awaiting approval")),
+            "the legacy adapter rides the same cancellation arm — a boolean \
+             refusal after cancellation records the cancellation: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_post_answer_guard_cancels_a_cancelled_allow_in_the_helper() {
+        let (mut ctx, cancel, ran, pipeline) = answered_helper_harness(true);
+
+        let result = PermissionMiddleware::resolve_answered(
+            &mut ctx,
+            PermissionResolution::AllowOnce,
+            &cancel,
+            GateRuleSource::Middleware,
+            "gate",
+            &pipeline,
+        )
+        .await;
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a cancelled allow never dispatches the tool"
+        );
+        assert!(
+            matches!(&result.gate, Some(record) if matches!(record.verdict, GateVerdict::Cancelled)
+                && record.reason.as_deref() == Some("cancelled while awaiting approval")),
+            "the guard turns the cancelled allow into the cancelled denial: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_post_answer_guard_cancels_a_cancelled_feedback_denial_in_the_helper() {
+        let (mut ctx, cancel, ran, pipeline) = answered_helper_harness(true);
+
+        let result = PermissionMiddleware::resolve_answered(
+            &mut ctx,
+            PermissionResolution::DenyWithFeedback("not tonight, prod deploy".into()),
+            &cancel,
+            GateRuleSource::AskResolver,
+            "ask",
+            &pipeline,
+        )
+        .await;
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the tool is not dispatched on any cancelled answer"
+        );
+        assert!(
+            matches!(&result.gate, Some(record) if matches!(record.verdict, GateVerdict::Cancelled)
+                && record.reason.as_deref() == Some("cancelled while awaiting approval")),
+            "the cancelled feedback denial records the cancellation, not the \
+             user's words: {result:?}"
+        );
+        match &result.output {
+            crate::message::ToolContent::Text(text) => {
+                assert!(
+                    !text.contains("prod deploy"),
+                    "the feedback never renders after cancellation: {text}"
+                );
+            }
+            crate::message::ToolContent::Multipart(parts) => {
+                panic!("expected a text denial, got {} parts", parts.len())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_post_answer_guard_cancels_a_cancelled_plain_denial_in_the_helper() {
+        let (mut ctx, cancel, ran, pipeline) = answered_helper_harness(true);
+
+        let result = PermissionMiddleware::resolve_answered(
+            &mut ctx,
+            PermissionResolution::DenyOnce,
+            &cancel,
+            GateRuleSource::AskResolver,
+            "ask",
+            &pipeline,
+        )
+        .await;
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the tool is not dispatched on any cancelled answer"
+        );
+        assert!(
+            matches!(&result.gate, Some(record) if matches!(record.verdict, GateVerdict::Cancelled)
+                && record.reason.as_deref() == Some("cancelled while awaiting approval")),
+            "the cancelled DenyOnce records the cancellation, not an AskDenied: \
+             {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_allow_answer_dispatches_through_the_helper() {
+        let (mut ctx, cancel, ran, pipeline) = answered_helper_harness(false);
+
+        let result = PermissionMiddleware::resolve_answered(
+            &mut ctx,
+            PermissionResolution::AllowOnce,
+            &cancel,
+            GateRuleSource::AskResolver,
+            "ask",
+            &pipeline,
+        )
+        .await;
+
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a live allow dispatches the tool"
+        );
+        assert!(!result.is_error, "the probe answered");
+        assert!(
+            matches!(&result.gate, Some(record) if matches!(record.verdict, GateVerdict::AskAllowed)
+                && record.reason.is_none()),
+            "the live allow records AskAllowed with no denial reason: {result:?}"
+        );
     }
 
     #[tokio::test]

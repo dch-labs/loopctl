@@ -94,7 +94,13 @@ pub struct PermissionAsk {
     /// leading `/` on Unix; a drive-absolute `C:\work` or an UNC
     /// `\\srv\share` on Windows, where a drive-relative `C:repo` and a
     /// bare rooted `\tmp` still join — and a process directory that
-    /// cannot be read anchors at the root.
+    /// cannot be read anchors at the root. A drive-relative Windows
+    /// spelling (`C:repo`) joins onto the process working directory
+    /// when the drive is the process's current one and anchors at the
+    /// drive root otherwise, while the OS executes it against the
+    /// drive's saved per-drive directory — a host whose approval
+    /// scopes must match execution exactly passes absolute or
+    /// plain-relative cwds.
     pub cwd: String,
 }
 

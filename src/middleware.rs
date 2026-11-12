@@ -221,6 +221,44 @@ fn is_windows_separator(byte: u8) -> bool {
     byte == b'\\' || byte == b'/'
 }
 
+/// Recognize the verbatim UNC prefix — `\\?\UNC\server\share` — in
+/// the spelling after its two leading separators.
+///
+/// Returns the complete device-indicator-and-server-and-share text
+/// as the canonical root and the remainder below the share, so a
+/// root-relative `..` clamps at the share rather than at a boundary
+/// the ordinary UNC parse would misread. The indicator is
+/// case-insensitive (Windows device names are) and canonicalizes to
+/// uppercase with backslash separators, keeping one target one
+/// string. `None` for every other spelling, including an incomplete
+/// `\\?\UNC\server` with no share.
+fn parse_verbatim_unc(rest: &str) -> Option<(String, String)> {
+    let after_question = rest.strip_prefix('?')?;
+    let after_indicator = after_question.strip_prefix(['\\', '/'])?;
+    if !after_indicator
+        .get(..3)
+        .is_some_and(|head| head.eq_ignore_ascii_case("UNC"))
+    {
+        return None;
+    }
+    let after_unc = after_indicator.get(3..).unwrap_or_default();
+    if !after_unc.starts_with('\\') && !after_unc.starts_with('/') {
+        return None;
+    }
+    let tail = after_unc.get(1..).unwrap_or_default();
+    let mut parts = tail.splitn(3, ['\\', '/']);
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    let remainder = parts.next().unwrap_or_default();
+    if server.is_empty() || share.is_empty() {
+        return None;
+    }
+    Some((
+        format!("\\\\?\\UNC\\{server}\\{share}"),
+        remainder.to_string(),
+    ))
+}
+
 /// Parse a Windows spelling into its canonical root, the remainder
 /// below it (unsplit), and whether a drive prefix was drive-relative
 /// (`C:repo`) — the spelling that joins onto the base instead of
@@ -231,6 +269,9 @@ fn parse_windows_root(path: &str) -> (WindowsRoot, String, bool) {
     let second = bytes.get(1).copied();
     if first.is_some_and(is_windows_separator) && second.is_some_and(is_windows_separator) {
         let rest = path.get(2..).unwrap_or_default();
+        if let Some((prefix, remainder)) = parse_verbatim_unc(rest) {
+            return (WindowsRoot::Unc(prefix), remainder, false);
+        }
         let mut parts = rest.splitn(3, ['\\', '/']);
         let server = parts.next().unwrap_or_default();
         let share = parts.next().unwrap_or_default();
@@ -440,6 +481,13 @@ pub(crate) fn shell_words(command: &str) -> Result<Vec<String>, String> {
 /// platform's rules rides through unchanged — a leading `/` on Unix;
 /// a drive-absolute `C:\…` or an UNC `\\srv\share` on Windows, where
 /// a drive-relative `C:repo` and a bare rooted `\\tmp` still join.
+/// One Windows caveat a host whose approval scopes must match
+/// execution exactly should know: the OS resolves a drive-relative
+/// spelling against the drive's saved per-drive current directory,
+/// which a process that has switched drives may hold elsewhere — the
+/// join is exact when the drive is the process's current one and a
+/// best-effort anchor at the drive root otherwise, so such hosts
+/// pass absolute or plain-relative cwds.
 pub(crate) fn resolved_cwd(cwd: &str) -> String {
     if PATH_STYLE.is_absolute_spelling(cwd) {
         return cwd.to_string();
@@ -2264,25 +2312,43 @@ mod tests {
 
     #[test]
     fn lexical_path_joins_drops_and_clamps() {
-        assert_eq!(lexical_path("/repo", "src/lib.rs"), "/repo/src/lib.rs");
+        // The POSIX-shaped assertions pin the Unix-styled core
+        // directly, so they hold on every host — the platform wrapper
+        // would pick Windows rules on a Windows build.
         assert_eq!(
-            lexical_path("/repo", "/etc/absolute.conf"),
+            lexical_path_styled(PathStyle::Unix, "/repo", "src/lib.rs"),
+            "/repo/src/lib.rs"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Unix, "/repo", "/etc/absolute.conf"),
             "/etc/absolute.conf"
         );
         assert_eq!(
-            lexical_path("/repo/a", "../shared/x.md"),
+            lexical_path_styled(PathStyle::Unix, "/repo/a", "../shared/x.md"),
             "/repo/shared/x.md"
         );
-        assert_eq!(lexical_path("/repo/a", "../../shared/x.md"), "/shared/x.md");
         assert_eq!(
-            lexical_path("/repo", "../../../../escape"),
+            lexical_path_styled(PathStyle::Unix, "/repo/a", "../../shared/x.md"),
+            "/shared/x.md"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Unix, "/repo", "../../../../escape"),
             "/escape",
             ".. past the root clamps at the root"
         );
-        assert_eq!(lexical_path("/repo/", "src/lib.rs"), "/repo/src/lib.rs");
-        assert_eq!(lexical_path("/repo", "src/./lib.rs"), "/repo/src/lib.rs");
-        assert_eq!(lexical_path("", "relative.txt"), "/relative.txt");
-        assert_eq!(lexical_path("/repo", ""), "/repo");
+        assert_eq!(
+            lexical_path_styled(PathStyle::Unix, "/repo/", "src/lib.rs"),
+            "/repo/src/lib.rs"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Unix, "/repo", "src/./lib.rs"),
+            "/repo/src/lib.rs"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Unix, "", "relative.txt"),
+            "/relative.txt"
+        );
+        assert_eq!(lexical_path_styled(PathStyle::Unix, "/repo", ""), "/repo");
     }
 
     #[test]
@@ -2328,6 +2394,48 @@ mod tests {
             lexical_path_styled(PathStyle::Windows, "\\\\srv\\share", "..\\y"),
             "\\\\srv\\share\\y",
             "a .. at the share root clamps inside the share, never above it"
+        );
+    }
+
+    #[test]
+    fn windows_styled_verbatim_unc_roots_are_preserved_with_the_full_prefix() {
+        assert_eq!(
+            lexical_path_styled(
+                PathStyle::Windows,
+                "C:\\work",
+                "\\\\?\\UNC\\server\\share\\x"
+            ),
+            "\\\\?\\UNC\\server\\share\\x"
+        );
+        assert_eq!(
+            lexical_path_styled(
+                PathStyle::Windows,
+                "C:\\work",
+                "\\\\?\\UNC\\server\\share\\..\\y"
+            ),
+            "\\\\?\\UNC\\server\\share\\y",
+            "a .. below the verbatim share clamps at the share, not at a \
+             misparsed prefix boundary"
+        );
+        assert_eq!(
+            lexical_path_styled(
+                PathStyle::Windows,
+                "C:\\work",
+                "\\\\?\\UNC\\server\\..\\share\\x"
+            ),
+            "\\\\?\\UNC\\server\\..\\share\\x",
+            "the prefix rides verbatim whatever it holds — a prefix-position \
+             .. is a spelling Windows rejects, never one to normalize into \
+             a different target"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "C:\\work", "//?/unc/server/share/x"),
+            "\\\\?\\UNC\\server\\share\\x",
+            "separator and indicator-case spellings normalize to one form"
+        );
+        assert_eq!(
+            lexical_path_styled(PathStyle::Windows, "\\\\?\\UNC\\server\\share", "."),
+            "\\\\?\\UNC\\server\\share"
         );
     }
 
@@ -2418,7 +2526,12 @@ mod tests {
 
     #[test]
     fn resolved_cwd_passes_absolute_spellings_through_unchanged() {
+        // An absolute spelling under the target platform's own rules
+        // rides through; each host asserts with its native shape.
+        #[cfg(unix)]
         assert_eq!(resolved_cwd("/repo"), "/repo");
+        #[cfg(not(unix))]
+        assert_eq!(resolved_cwd("C:\\repo"), "C:\\repo");
     }
 
     #[test]
@@ -2427,14 +2540,19 @@ mod tests {
         // cwd must observe one directory while sibling tests chdir.
         let _guard = crate::TEST_CWD_LOCK.blocking_lock();
         let process = std::env::current_dir().expect("the test process has a working directory");
+        let separator = if cfg!(windows) { '\\' } else { '/' };
+        let mut base = process.display().to_string();
+        if base.ends_with(separator) {
+            base.truncate(base.len().saturating_sub(separator.len_utf8()));
+        }
         assert_eq!(
             resolved_cwd("sub/dir"),
-            format!("{}/sub/dir", process.display()),
+            format!("{base}{separator}sub{separator}dir"),
             "a relative spelling is joined onto the process working directory"
         );
         assert_eq!(
             resolved_cwd("."),
-            process.display().to_string(),
+            base,
             "the placeholder default resolves to the process working directory itself"
         );
     }

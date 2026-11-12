@@ -80,8 +80,11 @@ pub use memoize::{MemoizingMiddleware, NoopPathExtractor, PathExtractor, WritePa
 pub use crate::tool::permission::{GateDecision, GateRuleSource, GateVerdict};
 pub use output_limit::OutputLimitMiddleware;
 pub use permission::AskResolverFn;
+pub use permission::PermissionAsk;
+pub use permission::PermissionAskResolver;
 pub use permission::PermissionCheckFn;
 pub use permission::PermissionMiddleware;
+pub use permission::PermissionResolution;
 #[cfg(feature = "redaction")]
 pub use redaction::{RedactingMiddleware, SecretPattern, SecretPatternSet};
 #[cfg(feature = "tool_shield")]
@@ -273,12 +276,18 @@ pub struct ToolDispatchContext {
 ///
 /// # Ordering Conventions
 ///
-/// The typical registration order is:
+/// The typical registration order for a hand-built pipeline is:
 ///
 /// 1. [`PermissionMiddleware`] — deny before any work is done
 /// 2. [`TimeoutMiddleware`] — wrap execution in a deadline
 /// 3. [`UnknownToolMiddleware`] — intercept "not found" errors
 /// 4. (innermost) [`ToolCallMiddleware`] — the actual `Tool::call()`
+///
+/// No shipped preset installs a permission layer — permission gating
+/// is opt-in — so this order is what a host composing its own pipeline
+/// holds to; the preset stacks are [`OutputLimitMiddleware`] →
+/// [`VerifyMiddleware`] → [`MemoizingMiddleware`] (see
+/// [`presets`](crate::presets)).
 ///
 /// Post-processing middlewares (e.g. output limiting) follow the same
 /// rule: the first-registered middleware post-processes last, so an
@@ -2018,5 +2027,28 @@ mod tests {
         assert_eq!(lexical_path("/repo", "src/./lib.rs"), "/repo/src/lib.rs");
         assert_eq!(lexical_path("", "relative.txt"), "/relative.txt");
         assert_eq!(lexical_path("/repo", ""), "/repo");
+    }
+
+    #[test]
+    fn resolved_cwd_passes_absolute_spellings_through_unchanged() {
+        assert_eq!(resolved_cwd("/repo"), "/repo");
+    }
+
+    #[test]
+    fn resolved_cwd_joins_relative_spellings_onto_the_process_cwd() {
+        // Holds the chdir-discipline lock: both reads of the process
+        // cwd must observe one directory while sibling tests chdir.
+        let _guard = crate::TEST_CWD_LOCK.blocking_lock();
+        let process = std::env::current_dir().expect("the test process has a working directory");
+        assert_eq!(
+            resolved_cwd("sub/dir"),
+            format!("{}/sub/dir", process.display()),
+            "a relative spelling is joined onto the process working directory"
+        );
+        assert_eq!(
+            resolved_cwd("."),
+            process.display().to_string(),
+            "the placeholder default resolves to the process working directory itself"
+        );
     }
 }

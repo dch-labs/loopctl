@@ -190,11 +190,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// request to.
     ///
     /// While the breaker is closed this is the manager's primary
-    /// (`None` only when the manager is unconfigured, which leaves the
+    /// (`None` when the manager is unconfigured, which leaves the
     /// request on the client's own model or the host's override,
-    /// byte-identical to a loop without fallback). While tripped this
+    /// byte-identical to a loop without fallback — and also when a
+    /// half-configured manager carries a chain but no primary: in
+    /// `Primary` and `Recovering` such a manager yields to the client
+    /// or host model the same way, while still owning routing while
+    /// tripped). While tripped this
     /// is the active fallback model; during recovery, the primary. With
-    /// a configured manager the resolution is exclusive: outbound
+    /// a primary configured the resolution is exclusive: outbound
     /// requests, breaker bookkeeping, recovery probes, and observer
     /// contexts all derive from this one value, overriding any
     /// host-provided per-request model. Note the corollary: a manager

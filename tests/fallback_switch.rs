@@ -681,6 +681,92 @@ async fn transient_probe_failure_retrips_to_the_fallback_model() {
 }
 
 #[tokio::test]
+#[cfg(feature = "streaming")]
+async fn a_first_event_429_through_the_default_handler_retrips_and_reports() {
+    use loopctl::observer::{FallbackContext, LoopObserver};
+    use std::sync::Mutex as StdMutex;
+
+    struct FallbackRecorder {
+        events: Arc<StdMutex<Vec<(String, String)>>>,
+    }
+
+    impl LoopObserver for FallbackRecorder {
+        fn name(&self) -> &'static str {
+            "fallback-recorder"
+        }
+        fn on_fallback(&self, ctx: &FallbackContext) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((ctx.from.clone(), ctx.to.clone()));
+        }
+    }
+
+    let config = loopctl::fallback::FallbackConfig {
+        trip_threshold: 1,
+        recovery_timeout: std::time::Duration::from_millis(50),
+        ..loopctl::fallback::FallbackConfig::default()
+    };
+    let manager = FallbackManager::new_with_config(config);
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
+
+    // No `with_stream_handler`: the default passthrough handler's
+    // zero-retry config surfaces the 429 as the plain stream failure,
+    // where the escalation-armed sibling above hides the re-trip.
+    let client = ScriptedClient::new(vec![
+        Step::AuthFail,
+        Step::Text("on fallback".into()),
+        Step::RateLimit,
+        Step::Text("on fallback again".into()),
+    ]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+
+    let retrips = Arc::new(StdMutex::new(Vec::new()));
+    agent.register_observer(Arc::new(FallbackRecorder {
+        events: Arc::clone(&retrips),
+    }));
+
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(
+        agent.run("q", &RunConfig::default()).await.is_err(),
+        "the rate-limited probe fails the turn through the default handler"
+    );
+    assert!(
+        agent.run("q", &RunConfig::default()).await.is_ok(),
+        "the re-tripped breaker serves the fallback model again"
+    );
+
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![
+            Some("primary-model".to_string()),
+            Some("fallback-model".to_string()),
+            Some("primary-model".to_string()),
+            Some("fallback-model".to_string()),
+        ],
+        "trip → fallback → probe (primary, 429) → re-trip to fallback"
+    );
+    let retrips = retrips.lock().unwrap().clone();
+    assert_eq!(
+        retrips,
+        vec![
+            ("primary-model".to_string(), "fallback-model".to_string()),
+            ("primary-model".to_string(), "fallback-model".to_string()),
+        ],
+        "both trip entries report: the initial trip and the 429 re-trip \
+         off the recovering probe (a plain stream failure through the \
+         passthrough handler, not a RateLimit escalation)"
+    );
+}
+
+#[tokio::test]
 async fn tripped_empty_chain_fails_the_turn_instead_of_serving_the_primary() {
     let config = loopctl::fallback::FallbackConfig {
         trip_threshold: 1,
@@ -1303,5 +1389,167 @@ async fn an_options_less_client_fails_loud_when_the_breaker_reroutes() {
         err.to_string()
             .contains("does not support per-request model overrides"),
         "the error names the missing capability: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_never_configured_manager_fails_closed_while_tripped() {
+    // The default managers carry a breaker with no chain and the
+    // default threshold of three: after three consecutive failed turns
+    // the dead window opens — runs answer FallbackExhausted and no
+    // request is sent — until the cooldown admits the probe.
+    let client = ScriptedClient::new(vec![
+        Step::AuthFail,
+        Step::AuthFail,
+        Step::AuthFail,
+        Step::Text("never reached".into()),
+    ]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = BareLoop::new(
+        Arc::new(client),
+        ToolRegistry::new(),
+        SessionConfig::default(),
+    );
+
+    for failure in 1..=3 {
+        assert!(
+            agent.run("q", &RunConfig::default()).await.is_err(),
+            "failure {failure} of the default threshold is served by the client model"
+        );
+    }
+    let fourth = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        matches!(fourth, Err(loopctl::error::LoopError::FallbackExhausted)),
+        "the tripped default manager fails closed instead of serving the \
+         client model again: {fourth:?}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "the dead window sends no request at all"
+    );
+}
+
+#[tokio::test]
+async fn a_never_configured_manager_probes_the_client_model_after_cooldown() {
+    // The closing half of the fail-closed window: once the cooldown
+    // elapses the chain-less manager probes in `Recovering`, and its
+    // routed model is `None` — the request rides the client's own model.
+    let manager = FallbackManager::new_with_config(loopctl::fallback::FallbackConfig {
+        trip_threshold: 3,
+        recovery_timeout: std::time::Duration::from_millis(50),
+        recovery_successes_needed: 1,
+        ..loopctl::fallback::FallbackConfig::default()
+    });
+    let client = ScriptedClient::new(vec![
+        Step::AuthFail,
+        Step::AuthFail,
+        Step::AuthFail,
+        Step::Text("probe served".into()),
+    ]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+
+    for failure in 1..=3 {
+        assert!(
+            agent.run("q", &RunConfig::default()).await.is_err(),
+            "failure {failure} of the threshold is served by the client model"
+        );
+    }
+    let tripped = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        matches!(tripped, Err(loopctl::error::LoopError::FallbackExhausted)),
+        "the tripped chain-less manager fails closed: {tripped:?}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "the dead window sends no request at all"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+    let probe = agent
+        .run("q", &RunConfig::default())
+        .await
+        .expect("after the cooldown the chain-less manager probes");
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![None, None, None, None],
+        "every request this manager lets through — the recovery probe \
+         included — carries no override: the client's own model serves"
+    );
+    assert_eq!(probe.output.as_deref(), Some("probe served"));
+}
+
+#[tokio::test]
+async fn a_half_configured_manager_yields_to_the_host_override_in_primary() {
+    // A chain without a primary is a legal public state: while the
+    // breaker is closed the manager routes None, so the host's
+    // per-request override serves — the exclusivity a manager with a
+    // primary configured would claim does not hold in this state.
+    let manager = FallbackManager::new(1, 1);
+    manager.set_fallback_model("fallback-model").unwrap();
+
+    let client = ScriptedClient::new(vec![Step::Text("served".into())]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+    agent.set_request_options(loopctl::structured::RequestOptions::new().with_model("host-model"));
+
+    agent
+        .run("q", &RunConfig::default())
+        .await
+        .expect("the run completes on the host override");
+
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![Some("host-model".to_string())],
+        "a half-configured manager (chain, no primary) yields to the host \
+         override while the breaker is closed"
+    );
+}
+
+#[tokio::test]
+async fn a_half_configured_manager_probes_with_the_host_override_while_recovering() {
+    // The `Recovering` cell of the same claim: one shared arm routes
+    // `None` in both states, so after the cooldown the probe request —
+    // like the `Primary`-state turn that tripped — rides the host
+    // override. Routing the probe to the chain head would redden this.
+    let manager = FallbackManager::new_with_config(loopctl::fallback::FallbackConfig {
+        trip_threshold: 1,
+        recovery_timeout: std::time::Duration::from_millis(50),
+        recovery_successes_needed: 1,
+        ..loopctl::fallback::FallbackConfig::default()
+    });
+    manager.set_fallback_model("fallback-model").unwrap();
+
+    let client = ScriptedClient::new(vec![Step::AuthFail, Step::Text("probe served".into())]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+    agent.set_request_options(loopctl::structured::RequestOptions::new().with_model("host-model"));
+
+    assert!(
+        agent.run("q", &RunConfig::default()).await.is_err(),
+        "the threshold-1 breaker trips on the first failure"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+    agent
+        .run("q", &RunConfig::default())
+        .await
+        .expect("after the cooldown the probe serves");
+
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![
+            Some("host-model".to_string()),
+            Some("host-model".to_string())
+        ],
+        "the tripping turn (`Primary`) and the post-cooldown probe \
+         (`Recovering`) both ride the host override — neither names the \
+         chain the manager carries"
     );
 }

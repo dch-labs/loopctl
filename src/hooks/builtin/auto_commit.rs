@@ -1003,14 +1003,6 @@ mod tests {
         }
     }
 
-    /// Serializes tests that change the process working directory.
-    ///
-    /// `set_current_dir` is process-global and the test harness runs
-    /// tests on parallel threads, so two cwd-changing tests would run
-    /// each other's git commands in the wrong repository. All harness
-    /// tests hold this lock across their chdir window.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn stage_files_empty_list_does_not_stage_unrelated_changes() {
         use std::fs;
@@ -1071,7 +1063,7 @@ mod tests {
 
         fs::write(&sentinel, "v2-uncommitted\n").expect("wrote sentinel v2");
 
-        let _cwd_guard = CWD_LOCK.lock().unwrap();
+        let _cwd_guard = crate::TEST_CWD_LOCK.blocking_lock();
         let prev_dir = std::env::current_dir().expect("cwd readable");
         std::env::set_current_dir(&repo_dir).expect("cd into repo");
         let result = GitExecutor::stage_files(&[]);
@@ -1105,8 +1097,8 @@ mod tests {
     /// Shared scaffolding for the harness tests that need a real
     /// repository: initializes the repo, sets a test identity, commits
     /// `tool_output.txt` at `v1`, then rewrites it to `v2-uncommitted`.
-    /// The caller holds [`CWD_LOCK`] across its chdir window and drops
-    /// the returned [`RepoGuard`] to clean up.
+    /// The caller holds [`crate::TEST_CWD_LOCK`] across its chdir window
+    /// and drops the returned [`RepoGuard`] to clean up.
     fn repo_with_uncommitted_sentinel(tag: &str) -> (std::path::PathBuf, RepoGuard) {
         use std::fs;
         use std::process::Command;
@@ -1170,7 +1162,7 @@ mod tests {
             ..AutoCommitConfig::default()
         };
         let session_id = "11111111-2222-3333-4444-555555555555";
-        let _cwd_guard = CWD_LOCK.lock().unwrap();
+        let _cwd_guard = crate::TEST_CWD_LOCK.blocking_lock();
         let prev_dir = std::env::current_dir().expect("cwd readable");
         std::env::set_current_dir(&repo_dir).expect("cd into repo");
         let result = GitExecutor::auto_commit_with_files(
@@ -1260,7 +1252,7 @@ mod tests {
         hook.on_post_tool_use(&post_ctx("Write"));
         hook.on_post_tool_use(&post_ctx("Edit"));
 
-        let _cwd_guard = CWD_LOCK.lock().unwrap();
+        let _cwd_guard = crate::TEST_CWD_LOCK.blocking_lock();
         let prev_dir = std::env::current_dir().expect("cwd readable");
         std::env::set_current_dir(&repo_dir).expect("cd into repo");
         hook.on_run_end(&RunEndContext {

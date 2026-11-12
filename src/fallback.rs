@@ -431,9 +431,13 @@ struct BreakerState {
 
     /// Original model name, before any fallback was activated.
     ///
-    /// Captured when the manager first trips so the recovering state
-    /// knows which model to resume to. `None` until the circuit breaker
-    /// has switched away from the primary at least once.
+    /// Set by [`for_model`](FallbackManager::for_model)'s constructor or
+    /// [`set_original_model`](FallbackManager::set_original_model) — a
+    /// host, or the engine's model switch — never captured
+    /// automatically on trip, so a manager built with a chain but no
+    /// primary stays `None` here. `None` also leaves `Primary`'s
+    /// routing and `Recovering`'s probe with no model of their own to
+    /// serve.
     original_model: Option<String>,
 
     /// Ordered list of fallback models with their per-model failure
@@ -1584,6 +1588,11 @@ impl FallbackManager {
     ///   before attempting recovery (typically from
     ///   [`FallbackConfig::recovery_timeout`]).
     ///
+    /// The engine always passes its manager's
+    /// `config().recovery_timeout`, so for engine-driven loops that
+    /// knob is the one truth; a direct caller owns the value it hands
+    /// in, and nothing else consults the config on this path.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -1681,9 +1690,10 @@ impl FallbackManager {
     ///
     /// Unguarded: callable from any state (the engine calls it only
     /// from `Fallback`). Called from `Primary`, the breaker sits in
-    /// `Recovering` where transient failures reset the streak instead of
-    /// counting toward a trip — it cannot trip again until the recovery
-    /// successes close it.
+    /// `Recovering` where transient failures reset the success streak
+    /// but still count toward `trip_threshold` — reach it and the
+    /// breaker re-trips to `Fallback` (pinned by
+    /// `transient_failures_during_recovery_retrip_after_the_threshold`).
     ///
     /// # Example
     ///
@@ -2220,6 +2230,66 @@ mod tests {
         );
         assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
         assert_eq!(mgr.active_model().unwrap().as_deref(), Some("fb-1"));
+    }
+
+    #[test]
+    fn a_zero_recovery_threshold_closes_on_the_first_success() {
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 1,
+                recovery_successes_needed: 0,
+                max_fail_count: 2,
+                ..FallbackConfig::default()
+            });
+        mgr.add_fallback_model("fb-1").unwrap();
+        assert!(mgr.record_failure(FailureKind::Transient).unwrap());
+        mgr.transition_to_recovering().unwrap();
+        assert_eq!(
+            mgr.state().unwrap(),
+            FallbackState::Recovering,
+            "zero closes on the first success, not on entering the probe state"
+        );
+        mgr.record_success().unwrap();
+        assert_eq!(
+            mgr.state().unwrap(),
+            FallbackState::Primary,
+            "recovery_successes_needed 0 closes on the first success — the documented boundary"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_retrip_reports_no_trip_where_a_transient_one_does() {
+        // The observer gate reads record_failure's return: a RateLimit
+        // failure during the Recovering probe re-trips the breaker but
+        // reports no trip — no on_fallback fires for that re-entry —
+        // where a transient re-trip at the threshold reports one.
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 1,
+                recovery_successes_needed: 1,
+                max_fail_count: 2,
+                ..FallbackConfig::default()
+            });
+        mgr.add_fallback_model("fb-1").unwrap();
+        assert!(mgr.record_failure(FailureKind::Transient).unwrap());
+        mgr.transition_to_recovering().unwrap();
+
+        assert!(
+            !mgr.record_failure(FailureKind::RateLimit).unwrap(),
+            "the RateLimit re-trip transitions but reports no trip — no \
+             on_fallback fires for the re-entry"
+        );
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
+
+        mgr.transition_to_recovering().unwrap();
+        assert!(
+            mgr.record_failure(FailureKind::Transient).unwrap(),
+            "the transient re-trip at the threshold reports a trip — the \
+             contrast the observer gate turns into an event"
+        );
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
     }
 
     #[test]

@@ -32,7 +32,7 @@ loopctl = { path = "../..", version = "=0.5.0", default-features = false, featur
 proptest = "1"
 tempfile = "3"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [[test]]
 name = "client_tls"

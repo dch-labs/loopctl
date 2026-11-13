@@ -155,7 +155,8 @@ impl PathStyle {
             PathStyle::Unix => path.starts_with('/'),
             PathStyle::Windows => matches!(
                 parse_windows_root(path),
-                (WindowsRoot::Unc(_), _, _) | (WindowsRoot::Drive(_), _, false)
+                (WindowsRoot::Unc(_) | WindowsRoot::VerbatimUnc(_), _, _)
+                    | (WindowsRoot::Drive(_), _, false)
             ),
         }
     }
@@ -196,6 +197,15 @@ enum WindowsRoot {
     /// share is not this machine's to name.
     Unc(String),
 
+    /// A verbatim UNC root: `\\?\UNC\server\share`.
+    ///
+    /// The canonicalized device prefix with its server and share;
+    /// everything below the share rides as the caller wrote it —
+    /// Windows hands a verbatim path to the filesystem nearly
+    /// untranslated, so a lexical resolver that rewrote `..` or `/`
+    /// below the share would name a different target.
+    VerbatimUnc(String),
+
     /// A bare root: a leading separator with no drive or share.
     ///
     /// Rendered `\` alone when no segments follow, `\segment`
@@ -224,12 +234,14 @@ fn is_windows_separator(byte: u8) -> bool {
 /// Recognize the verbatim UNC prefix — `\\?\UNC\server\share` — in
 /// the spelling after its two leading separators.
 ///
-/// Returns the complete device-indicator-and-server-and-share text
-/// as the canonical root and the remainder below the share, so a
-/// root-relative `..` clamps at the share rather than at a boundary
-/// the ordinary UNC parse would misread. The indicator is
-/// case-insensitive (Windows device names are) and canonicalizes to
-/// uppercase with backslash separators, keeping one target one
+/// Returns the canonicalized prefix text as the root and the raw
+/// remainder below the share, which the caller preserves verbatim:
+/// Windows passes a `\\?` spelling to the filesystem nearly
+/// untranslated, so `..` and `/` in that remainder are the caller's
+/// bytes, not segments to resolve — rewriting them would name a
+/// different target. The indicator is case-insensitive (Windows
+/// device names are) and the prefix canonicalizes to an uppercase
+/// indicator with backslash separators, keeping one target one
 /// string. `None` for every other spelling, including an incomplete
 /// `\\?\UNC\server` with no share.
 fn parse_verbatim_unc(rest: &str) -> Option<(String, String)> {
@@ -270,7 +282,7 @@ fn parse_windows_root(path: &str) -> (WindowsRoot, String, bool) {
     if first.is_some_and(is_windows_separator) && second.is_some_and(is_windows_separator) {
         let rest = path.get(2..).unwrap_or_default();
         if let Some((prefix, remainder)) = parse_verbatim_unc(rest) {
-            return (WindowsRoot::Unc(prefix), remainder, false);
+            return (WindowsRoot::VerbatimUnc(prefix), remainder, false);
         }
         let mut parts = rest.splitn(3, ['\\', '/']);
         let server = parts.next().unwrap_or_default();
@@ -333,6 +345,7 @@ fn rooted_against(base_root: &WindowsRoot) -> WindowsRoot {
     match base_root {
         WindowsRoot::Drive(drive) => WindowsRoot::Drive(*drive),
         WindowsRoot::Unc(share) => WindowsRoot::Unc(share.clone()),
+        WindowsRoot::VerbatimUnc(prefix) => WindowsRoot::VerbatimUnc(prefix.clone()),
         WindowsRoot::Root | WindowsRoot::Relative => WindowsRoot::Root,
     }
 }
@@ -346,6 +359,8 @@ fn render_windows(root: &WindowsRoot, segments: &[String]) -> String {
         WindowsRoot::Root => format!("\\{joined}"),
         WindowsRoot::Unc(share) if joined.is_empty() => share.clone(),
         WindowsRoot::Unc(share) => format!("{share}\\{joined}"),
+        WindowsRoot::VerbatimUnc(prefix) if joined.is_empty() => prefix.clone(),
+        WindowsRoot::VerbatimUnc(prefix) => format!("{prefix}\\{joined}"),
         WindowsRoot::Drive(drive) => format!("{drive}:\\{joined}"),
     }
 }
@@ -361,9 +376,10 @@ fn render_windows(root: &WindowsRoot, segments: &[String]) -> String {
 /// `C:repo` joins onto the base when the base lives on the same
 /// drive and anchors at the drive root otherwise, a bare rooted
 /// `\\tmp` resolves against the base's drive or share, and both
-/// separators normalize to the style's own — the invariant the
-/// memoizer and the verifier need is that identical targets
-/// normalize to identical strings.
+/// separators normalize to the style's own — except under a
+/// verbatim UNC prefix, where the below-share suffix rides as
+/// written. The invariant the memoizer and the verifier need is
+/// that identical targets normalize to identical strings.
 fn lexical_path_styled(style: PathStyle, cwd: &str, path: &str) -> String {
     match style {
         PathStyle::Unix => {
@@ -388,6 +404,13 @@ fn lexical_path_styled(style: PathStyle, cwd: &str, path: &str) -> String {
             let (base_root, base_rest, _) = parse_windows_root(cwd);
             let mut segments: Vec<String> = Vec::new();
             let root = match parse_windows_root(path) {
+                (WindowsRoot::VerbatimUnc(prefix), rest, _) => {
+                    return if rest.is_empty() {
+                        prefix
+                    } else {
+                        format!("{prefix}\\{rest}")
+                    };
+                }
                 (WindowsRoot::Unc(share), rest, _) => {
                     segments = split_windows(&rest);
                     WindowsRoot::Unc(share)
@@ -2312,9 +2335,7 @@ mod tests {
 
     #[test]
     fn lexical_path_joins_drops_and_clamps() {
-        // The POSIX-shaped assertions pin the Unix-styled core
-        // directly, so they hold on every host — the platform wrapper
-        // would pick Windows rules on a Windows build.
+        // Calls the Unix core directly so the assertions hold on every host.
         assert_eq!(
             lexical_path_styled(PathStyle::Unix, "/repo", "src/lib.rs"),
             "/repo/src/lib.rs"
@@ -2413,9 +2434,10 @@ mod tests {
                 "C:\\work",
                 "\\\\?\\UNC\\server\\share\\..\\y"
             ),
-            "\\\\?\\UNC\\server\\share\\y",
-            "a .. below the verbatim share clamps at the share, not at a \
-             misparsed prefix boundary"
+            "\\\\?\\UNC\\server\\share\\..\\y",
+            "the suffix below the share rides verbatim — the OS does no \
+             normalization under the device prefix, and neither does the \
+             resolver"
         );
         assert_eq!(
             lexical_path_styled(
@@ -2540,19 +2562,15 @@ mod tests {
         // cwd must observe one directory while sibling tests chdir.
         let _guard = crate::TEST_CWD_LOCK.blocking_lock();
         let process = std::env::current_dir().expect("the test process has a working directory");
-        let separator = if cfg!(windows) { '\\' } else { '/' };
-        let mut base = process.display().to_string();
-        if base.ends_with(separator) {
-            base.truncate(base.len().saturating_sub(separator.len_utf8()));
-        }
+        let expected_subdir = process.join("sub").join("dir");
         assert_eq!(
             resolved_cwd("sub/dir"),
-            format!("{base}{separator}sub{separator}dir"),
+            expected_subdir.display().to_string(),
             "a relative spelling is joined onto the process working directory"
         );
         assert_eq!(
             resolved_cwd("."),
-            base,
+            process.display().to_string(),
             "the placeholder default resolves to the process working directory itself"
         );
     }

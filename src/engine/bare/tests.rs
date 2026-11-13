@@ -6293,6 +6293,71 @@ async fn gate_decision_timestamps_come_from_the_clock_seam() {
     );
 }
 
+#[tokio::test]
+async fn a_typed_ask_on_the_engine_path_carries_an_absolute_cwd() {
+    use crate::middleware::ToolPipeline;
+    use crate::middleware::permission::{
+        PermissionAsk, PermissionAskResolver, PermissionMiddleware, PermissionResolution,
+    };
+    use crate::tool::PermissionCheck;
+
+    /// A resolver that records the ask's working directory and allows once.
+    struct CwdCapturingResolver {
+        seen: Arc<Mutex<Option<String>>>,
+    }
+
+    impl PermissionAskResolver for CwdCapturingResolver {
+        fn resolve<'a>(
+            &'a self,
+            ask: &'a PermissionAsk,
+        ) -> Pin<Box<dyn Future<Output = PermissionResolution> + Send + 'a>> {
+            let cwd = ask.cwd.clone();
+            let seen = Arc::clone(&self.seen);
+            Box::pin(async move {
+                if let Ok(mut guard) = seen.lock() {
+                    *guard = Some(cwd);
+                }
+                PermissionResolution::AllowOnce
+            })
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(None::<String>));
+    // Held across run + assert: sibling chdir tests take this same lock.
+    let _cwd_guard = crate::TEST_CWD_LOCK.lock().await;
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "done");
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    agent
+        .set_pipeline(
+            ToolPipeline::builder().with_middleware(
+                PermissionMiddleware::from_context()
+                    .with_check(|_| PermissionCheck::Ask {
+                        prompt: "approve the echo?".into(),
+                    })
+                    .with_ask_resolver_typed(Arc::new(CwdCapturingResolver {
+                        seen: Arc::clone(&seen),
+                    })),
+            ),
+        )
+        .expect("an asking gate over the registered tools assembles");
+    agent.run("hi", &RunConfig::default()).await.unwrap();
+
+    let cwd = crate::error::recover_guard(seen.lock())
+        .take()
+        .expect("the resolver saw exactly one ask");
+    let process_cwd = std::env::current_dir().expect("the test process has a working directory");
+    assert_eq!(
+        cwd,
+        process_cwd.to_string_lossy(),
+        "the engine builds dispatch contexts with the default \".\" cwd — the ask \
+         must carry it resolved against the process working directory, not the \
+         placeholder verbatim"
+    );
+}
+
 /// Assert the engine's session and run ids against a fresh same-seed oracle.
 fn ids_match_oracle<C: crate::api::ApiClient>(agent: &BareLoop<C>, seed: u64, scenario: &str) {
     let oracle = crate::determinism::SeededIdGen::new(seed);

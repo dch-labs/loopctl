@@ -137,9 +137,18 @@ pub struct LoopManagers {
     /// [`reset_all`](Self::reset_all) to reinitialise mid-session.
     ///
     /// The default manager carries no fallback chain: it counts and
-    /// trips, but with no chain the routed model is unchanged — a loop
-    /// without [`set_fallback_models`](crate::fallback) serves the
-    /// client's model throughout, whatever the breaker believes.
+    /// trips, and with no chain a tripped breaker fails closed — while
+    /// tripped, turns answer
+    /// [`FallbackExhausted`](crate::error::LoopError::FallbackExhausted)
+    /// rather than serve a model the breaker just watched fail, until
+    /// the recovery timeout elapses and `Recovering` probes the
+    /// client's own model. A loop that never configures fallback sees
+    /// that fail-closed window after `trip_threshold` consecutive
+    /// failed turns (pinned by
+    /// `a_never_configured_manager_fails_closed_while_tripped` for the
+    /// window's opening and
+    /// `a_never_configured_manager_probes_the_client_model_after_cooldown`
+    /// for its closing probe).
     fallback: FallbackManager,
 
     /// Loop and convergence detection orchestrator.

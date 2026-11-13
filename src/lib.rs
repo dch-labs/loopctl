@@ -137,6 +137,22 @@ pub mod __private {
 #[cfg(feature = "derive")]
 pub use loopctl_derive::Tool;
 
+/// Serializes the crate's own tests that read or change the process
+/// working directory.
+///
+/// `current_dir` and `set_current_dir` are process-global while the
+/// harness runs tests on parallel threads, so a test that chdirs into
+/// a fixture repository (the auto-commit harness) and a test that
+/// resolves a dispatch cwd against the process directory (the
+/// typed-ask engine pin) can interleave — one observing the other's
+/// temporary directory. Tests hold this lock across their whole
+/// observing window: the chdir and its restore, or the dispatch and
+/// its assertion. The lock is a tokio mutex so an async test can hold
+/// it across an `await`, while a sync test takes it with
+/// [`tokio::sync::Mutex::blocking_lock`].
+#[cfg(test)]
+pub(crate) static TEST_CWD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub mod api;
 pub mod ask;
 pub mod attachment;

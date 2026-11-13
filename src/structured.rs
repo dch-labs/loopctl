@@ -495,7 +495,12 @@ impl RequestOptions {
     /// concurrent loops over one shared client cannot cross-wire their
     /// models. An empty or whitespace-only name is ignored (the override
     /// stays unset) — a nameless model override is never what a caller
-    /// means, and the providers reject it on the wire anyway.
+    /// means, and the providers reject it on the wire anyway. One
+    /// exception outranks the override: a fallback manager that resolves
+    /// a model this turn (a primary while the breaker is closed or
+    /// probing, an active fallback while tripped) replaces it before
+    /// the request is built — the engine's fallback routing, pinned in
+    /// `tests/fallback_switch.rs`.
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         let model = model.into();

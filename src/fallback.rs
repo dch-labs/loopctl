@@ -42,9 +42,11 @@
 //! assert!(!mgr.is_using_fallback().unwrap());
 //! ```
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+use crate::determinism::{Clock, SystemClock};
 
 /// Circuit breaker state for LLM model fallback.
 ///
@@ -431,9 +433,13 @@ struct BreakerState {
 
     /// Original model name, before any fallback was activated.
     ///
-    /// Captured when the manager first trips so the recovering state
-    /// knows which model to resume to. `None` until the circuit breaker
-    /// has switched away from the primary at least once.
+    /// Set by [`for_model`](FallbackManager::for_model)'s constructor or
+    /// [`set_original_model`](FallbackManager::set_original_model) — a
+    /// host, or the engine's model switch — never captured
+    /// automatically on trip, so a manager built with a chain but no
+    /// primary stays `None` here. `None` also leaves `Primary`'s
+    /// routing and `Recovering`'s probe with no model of their own to
+    /// serve.
     original_model: Option<String>,
 
     /// Ordered list of fallback models with their per-model failure
@@ -508,6 +514,17 @@ pub struct FallbackManager {
     /// Immutable config ([`config`](Self::config)) stays outside the
     /// lock.
     state: Mutex<BreakerState>,
+
+    /// The clock seam for the breaker's own time reads.
+    ///
+    /// [`fallback_switched_at`](Self::fallback_switched_at) stamps
+    /// through [`Clock::monotonic`] and the cooldown compares through
+    /// [`Clock::elapsed_since`], so a pinned clock freezes the dead
+    /// window: a frozen clock reports a zero elapsed forever, and no
+    /// run crosses the cooldown until the host (or test) moves the
+    /// clock. Defaults to [`SystemClock`], the live reads, so an
+    /// unpinned manager behaves exactly as it always has.
+    clock: Arc<dyn Clock>,
 }
 
 impl FallbackManager {
@@ -560,6 +577,7 @@ impl FallbackManager {
                 ..FallbackConfig::default()
             },
             state: Mutex::new(BreakerState::default()),
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -615,6 +633,53 @@ impl FallbackManager {
         &self.config
     }
 
+    /// Install the clock seam (builder-style).
+    ///
+    /// The breaker stamps its fallback switch through
+    /// [`Clock::monotonic`] and compares its cooldown through
+    /// [`Clock::elapsed_since`], so pinning the clock pins the whole
+    /// dead-window shape: a frozen clock never crosses the cooldown,
+    /// and a clock a test advances crosses it exactly when the test
+    /// moves it — no wall-clock sleeps, no scheduling races. Install
+    /// before driving runs; the cooldown is read only through this
+    /// seam.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::determinism::{Clock, FixedClock};
+    /// use loopctl::fallback::FallbackManager;
+    /// use std::sync::Arc;
+    /// use std::time::SystemTime;
+    ///
+    /// let clock: Arc<dyn Clock> = Arc::new(FixedClock::new(SystemTime::UNIX_EPOCH));
+    /// let mgr = FallbackManager::new(3, 2).with_clock(clock.clone());
+    /// assert!(Arc::ptr_eq(mgr.clock(), &clock));
+    /// ```
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Set the clock seam.
+    ///
+    /// Non-consuming variant of [`with_clock`](Self::with_clock).
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
+    /// Borrow the clock seam.
+    ///
+    /// Always configured — the default is
+    /// [`SystemClock`], the live
+    /// reads, so an unpinned manager's cooldown advances in real time
+    /// exactly as it always has.
+    #[must_use]
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
     /// Create a new manager directly from a [`FallbackConfig`].
     ///
     /// The config-driven counterpart of [`new`](Self::new): build the
@@ -634,6 +699,7 @@ impl FallbackManager {
         Self {
             config,
             state: Mutex::new(BreakerState::default()),
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -1439,7 +1505,7 @@ impl FallbackManager {
                         threshold = self.config.trip_threshold,
                         "Fallback threshold reached"
                     );
-                    Self::transition_to_fallback_impl(&mut state);
+                    Self::transition_to_fallback_impl(&mut state, &self.clock);
                     true
                 } else {
                     false
@@ -1460,7 +1526,7 @@ impl FallbackManager {
                     warn!(
                         "Primary model rate-limited during recovery test, re-tripping to fallback"
                     );
-                    Self::transition_to_fallback_impl(&mut state);
+                    Self::transition_to_fallback_impl(&mut state, &self.clock);
                     false
                 }
                 FailureKind::Transient => {
@@ -1471,7 +1537,7 @@ impl FallbackManager {
                             consecutive_failures = state.consecutive_failures,
                             "Primary model still failing transiently during recovery; re-tripping to fallback"
                         );
-                        Self::transition_to_fallback_impl(&mut state);
+                        Self::transition_to_fallback_impl(&mut state, &self.clock);
                         true
                     } else {
                         warn!(
@@ -1584,6 +1650,11 @@ impl FallbackManager {
     ///   before attempting recovery (typically from
     ///   [`FallbackConfig::recovery_timeout`]).
     ///
+    /// The engine always passes its manager's
+    /// `config().recovery_timeout`, so for engine-driven loops that
+    /// knob is the one truth; a direct caller owns the value it hands
+    /// in, and nothing else consults the config on this path.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -1605,6 +1676,7 @@ impl FallbackManager {
         Ok(Self::should_try_resume_primary_impl(
             &state,
             min_fallback_duration,
+            &self.clock,
         ))
     }
 
@@ -1614,13 +1686,14 @@ impl FallbackManager {
     fn should_try_resume_primary_impl(
         state: &BreakerState,
         min_fallback_duration: Duration,
+        clock: &Arc<dyn Clock>,
     ) -> bool {
         if state.state != FallbackState::Fallback {
             return false;
         }
         state
             .fallback_switched_at
-            .is_some_and(|switched_at| switched_at.elapsed() >= min_fallback_duration)
+            .is_some_and(|switched_at| clock.elapsed_since(switched_at) >= min_fallback_duration)
     }
 
     /// Transition to using fallback model (circuit open).
@@ -1649,7 +1722,7 @@ impl FallbackManager {
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
     pub fn transition_to_fallback(&self) -> Result<(), crate::error::LoopError> {
         let mut state = self.lock_state()?;
-        Self::transition_to_fallback_impl(&mut state);
+        Self::transition_to_fallback_impl(&mut state, &self.clock);
 
         Ok(())
     }
@@ -1660,10 +1733,10 @@ impl FallbackManager {
     /// Called from the `record_*` methods so the trip runs while their
     /// guard is held, making the read-decide-transition atomic with
     /// respect to other callers.
-    fn transition_to_fallback_impl(state: &mut BreakerState) {
+    fn transition_to_fallback_impl(state: &mut BreakerState, clock: &Arc<dyn Clock>) {
         state.state = FallbackState::Fallback;
         state.fallback_activated = true;
-        state.fallback_switched_at = Some(Instant::now());
+        state.fallback_switched_at = Some(clock.monotonic());
         state.primary_success_count = 0;
         state.consecutive_failures = 0;
         info!("Circuit breaker: transitioned to Fallback state");
@@ -1681,9 +1754,10 @@ impl FallbackManager {
     ///
     /// Unguarded: callable from any state (the engine calls it only
     /// from `Fallback`). Called from `Primary`, the breaker sits in
-    /// `Recovering` where transient failures reset the streak instead of
-    /// counting toward a trip — it cannot trip again until the recovery
-    /// successes close it.
+    /// `Recovering` where transient failures reset the success streak
+    /// but still count toward `trip_threshold` — reach it and the
+    /// breaker re-trips to `Fallback` (pinned by
+    /// `transient_failures_during_recovery_retrip_after_the_threshold`).
     ///
     /// # Example
     ///
@@ -2220,6 +2294,118 @@ mod tests {
         );
         assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
         assert_eq!(mgr.active_model().unwrap().as_deref(), Some("fb-1"));
+    }
+
+    #[test]
+    fn a_zero_recovery_threshold_closes_on_the_first_success() {
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 1,
+                recovery_successes_needed: 0,
+                max_fail_count: 2,
+                ..FallbackConfig::default()
+            });
+        mgr.add_fallback_model("fb-1").unwrap();
+        assert!(mgr.record_failure(FailureKind::Transient).unwrap());
+        mgr.transition_to_recovering().unwrap();
+        assert_eq!(
+            mgr.state().unwrap(),
+            FallbackState::Recovering,
+            "zero closes on the first success, not on entering the probe state"
+        );
+        mgr.record_success().unwrap();
+        assert_eq!(
+            mgr.state().unwrap(),
+            FallbackState::Primary,
+            "recovery_successes_needed 0 closes on the first success — the documented boundary"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_retrip_reports_no_trip_where_a_transient_one_does() {
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 1,
+                recovery_successes_needed: 1,
+                max_fail_count: 2,
+                ..FallbackConfig::default()
+            });
+        mgr.add_fallback_model("fb-1").unwrap();
+        assert!(mgr.record_failure(FailureKind::Transient).unwrap());
+        mgr.transition_to_recovering().unwrap();
+
+        assert!(
+            !mgr.record_failure(FailureKind::RateLimit).unwrap(),
+            "the RateLimit re-trip transitions but reports no trip — no \
+             on_fallback fires for the re-entry"
+        );
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
+
+        mgr.transition_to_recovering().unwrap();
+        assert!(
+            mgr.record_failure(FailureKind::Transient).unwrap(),
+            "the transient re-trip at the threshold reports a trip — the \
+             contrast the observer gate turns into an event"
+        );
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
+    }
+
+    #[test]
+    fn the_clock_seam_installs_through_both_builders() {
+        let clock: Arc<dyn Clock> = Arc::new(crate::determinism::FixedClock::new(
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        let mgr = FallbackManager::new(1, 1).with_clock(Arc::clone(&clock));
+        assert!(
+            Arc::ptr_eq(mgr.clock(), &clock),
+            "with_clock installs the seam the accessor returns"
+        );
+
+        let swapped: Arc<dyn Clock> = Arc::new(crate::determinism::FixedClock::new(
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        let mut configured = FallbackManager::new_with_config(FallbackConfig::default());
+        configured.set_clock(Arc::clone(&swapped));
+        assert!(
+            Arc::ptr_eq(configured.clock(), &swapped),
+            "set_clock swaps the seam on an existing manager"
+        );
+    }
+
+    #[test]
+    fn switched_at_stamps_through_the_seam_and_a_frozen_clock_holds_the_dead_window() {
+        let clock: Arc<dyn Clock> = Arc::new(crate::determinism::FixedClock::new(
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        let mgr = FallbackManager::new(1, 1).with_clock(Arc::clone(&clock));
+        mgr.transition_to_fallback().unwrap();
+
+        assert_eq!(
+            mgr.fallback_switched_at().unwrap(),
+            Some(clock.monotonic()),
+            "the switch stamp reads the seam's monotonic half"
+        );
+        assert!(
+            !mgr.should_try_resume_primary(Duration::from_millis(50))
+                .unwrap(),
+            "a frozen clock reports a zero elapsed forever — the dead window \
+             holds no matter how long the test runs"
+        );
+    }
+
+    #[test]
+    fn the_default_seam_keeps_live_time_behavior() {
+        let mgr = FallbackManager::new(1, 1);
+        mgr.transition_to_fallback().unwrap();
+        assert!(mgr.fallback_switched_at().unwrap().is_some());
+        assert!(
+            !mgr.should_try_resume_primary(Duration::from_secs(3600))
+                .unwrap(),
+            "the unpinned manager reads live time — an hour's cooldown has \
+             not elapsed microseconds after the trip"
+        );
     }
 
     #[test]

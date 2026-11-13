@@ -89,7 +89,7 @@ async fn spawn_tls_mock_with(responses: Vec<Vec<u8>>, client_roots_pem: Option<&
     let certified =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("the cert mints");
     let cert_pem = certified.cert.pem();
-    let key_pem = certified.key_pair.serialize_pem();
+    let key_pem = certified.signing_key.serialize_pem();
     let ca_pem = dir.path().join("ca.pem");
     std::fs::write(&ca_pem, &cert_pem).expect("the CA file writes");
 
@@ -481,7 +481,8 @@ async fn the_mtls_endpoint_presents_its_identity_and_verbs() {
         Some(minted.cert.pem().as_bytes()),
     )
     .await;
-    let (_holder, identity) = identity_file(&minted.cert.pem(), &minted.key_pair.serialize_pem());
+    let (_holder, identity) =
+        identity_file(&minted.cert.pem(), &minted.signing_key.serialize_pem());
     let options = ConnectOptions::mtls(
         "localhost",
         mock.port,
@@ -565,7 +566,7 @@ async fn an_identity_file_with_no_certificates_is_a_typed_transport_refusal() {
     let mock = spawn_tls_mock(vec![hello_response("loopctl", 1, 1)]).await;
     let key_only = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("a key pair mints");
-    let (_holder, identity) = identity_file("", &key_only.key_pair.serialize_pem());
+    let (_holder, identity) = identity_file("", &key_only.signing_key.serialize_pem());
     let rejection = DaemonClient::connect(ConnectOptions::mtls(
         "localhost",
         mock.port,
@@ -646,7 +647,7 @@ async fn a_wrong_client_identity_refuses_rather_than_connecting() {
     let stranger = rcgen::generate_simple_self_signed(vec!["loopctl-client".to_string()])
         .expect("the stranger client certificate mints");
     let (_holder, identity) =
-        identity_file(&stranger.cert.pem(), &stranger.key_pair.serialize_pem());
+        identity_file(&stranger.cert.pem(), &stranger.signing_key.serialize_pem());
     let rejection = DaemonClient::connect(ConnectOptions::mtls(
         "localhost",
         mock.port,
@@ -706,7 +707,7 @@ async fn spawn_tls_mock_paced(answers: Vec<Vec<Vec<u8>>>) -> TlsMock {
     let certified =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("the cert mints");
     let cert_pem = certified.cert.pem();
-    let key_pem = certified.key_pair.serialize_pem();
+    let key_pem = certified.signing_key.serialize_pem();
     let ca_pem = dir.path().join("ca.pem");
     std::fs::write(&ca_pem, &cert_pem).expect("the CA file writes");
     let mut cert_bytes = cert_pem.as_bytes();

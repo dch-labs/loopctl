@@ -57,11 +57,13 @@ pub enum BudgetDimension {
     /// Accrued only while the gate carries a price table: each
     /// turn-serving usage report is priced through the table at
     /// [`observe_cost`](BudgetGate::observe_cost), so a provider that
-    /// reports no usage — or a model the table does not price — spends
-    /// nothing against this line, never a guess. The dimension's
-    /// `u64` unit is micro-dollars, the same
-    /// dimension-specific-unit pattern wall-clock uses with
-    /// milliseconds.
+    /// reports no usage spends nothing against this line, never a
+    /// guess. A model the table does not price spends nothing too —
+    /// and once a `usd` limit is configured, one such report refuses
+    /// the run's next request, because a spend the table cannot price
+    /// is a spend the line cannot certify. The dimension's `u64` unit
+    /// is micro-dollars, the same dimension-specific-unit pattern
+    /// wall-clock uses with milliseconds.
     Usd,
 }
 
@@ -109,8 +111,10 @@ pub struct BudgetLimits {
 
     /// The hard ceiling on estimated spend, in US dollars.
     ///
-    /// Accrues from table-priced usage reports only (see
-    /// [`BudgetDimension::Usd`]; the soft line is a fraction of this
+    /// Accrues from table-priced usage reports only — see
+    /// [`BudgetDimension::Usd`]: a reported usage on a model the
+    /// table does not price refuses the next request rather than
+    /// accrue a guessed zero. The soft line is a fraction of this
     /// value, and the value compares in micro-dollars internally. A
     /// negative or NaN value set directly on this field reads as zero
     /// micro-dollars — a zero budget, refusing the run's first
@@ -398,6 +402,18 @@ struct GateState {
     /// The table-priced sum of every reported usage report's estimate,
     /// saturating; zero forever when no table is installed.
     spent_usd_micro: u64,
+
+    /// Whether the run reported usage on a model the table does not
+    /// price while a `usd` line is configured.
+    ///
+    /// A latch, not a counter: one unpriced report leaves the line's
+    /// total uncertifiable for the rest of the run, so
+    /// [`pre_request`](BudgetGate::pre_request) refuses from the next
+    /// check on regardless of the priced spend — spend the table
+    /// cannot price is spend the line cannot certify, and the gate
+    /// refuses rather than read the unknown as zero. `begin` clears
+    /// it with the run's other state.
+    unpriced_usd: bool,
 }
 
 impl BudgetGate {
@@ -424,8 +440,10 @@ impl BudgetGate {
     /// nothing accrues, nothing warns, nothing refuses, because cost
     /// without a price source is a guess and the gate does not guess.
     /// Installing a table arms the line from the next
-    /// [`observe_cost`](Self::observe_cost) on; the usual source is the
-    /// crate's vendored
+    /// [`observe_cost`](Self::observe_cost) on: reports the table
+    /// prices accrue, and a reported usage on a model the table does
+    /// not price latches a refusal rather than accrue a guessed zero.
+    /// The usual source is the crate's vendored
     /// [`PriceTable::curated()`](crate::pricing::PriceTable::curated),
     /// optionally layered with host override files.
     #[must_use]
@@ -496,14 +514,32 @@ impl BudgetGate {
     /// The cost-capture twin of [`observe_usage`](Self::observe_usage):
     /// the report is priced through the installed table at capture
     /// time — the same estimate the event ledger stamps — and the
-    /// micro-dollar total accrues. A model the table does not price
-    /// accrues nothing (the no-guess contract), `None` usage accrues
-    /// nothing, and a gate without a table ignores the call entirely.
+    /// micro-dollar total accrues. `None` usage accrues nothing, and a
+    /// gate without a table ignores the call entirely. A model the
+    /// table does not price accrues nothing — never a guess — and when
+    /// a `usd` limit is configured it also latches a refusal: the next
+    /// [`pre_request`](Self::pre_request) refuses over the Usd line,
+    /// because spend the table cannot price is spend the line cannot
+    /// certify, and reading it as zero would let unpriced usage spend
+    /// past the budget unchecked.
     pub fn observe_cost(&self, model: &str, usage: Option<&crate::stream::Usage>) {
         let (Some(table), Some(usage)) = (&self.prices, usage) else {
             return;
         };
         let Some(cost) = table.cost(model, *usage) else {
+            if self.config.limits.usd.is_some()
+                && let Ok(mut state) = self.state.lock()
+                && !state.unpriced_usd
+            {
+                state.unpriced_usd = true;
+                tracing::warn!(
+                    target: "loopctl::metrics",
+                    model,
+                    "the price table does not price this model — the armed \
+                     usd budget line refuses the next request rather than \
+                     read the spend as zero"
+                );
+            }
             return;
         };
         if let Ok(mut state) = self.state.lock() {
@@ -644,7 +680,9 @@ impl BudgetGate {
         if let Some(limit) = self.config.limits.usd {
             let limit_micro = crate::pricing::micro_usd(limit);
             let spent_usd = state.spent_usd_micro;
-            if spent_usd >= limit_micro {
+            // An unpriced report refuses even under the numeric line:
+            // the run's total is uncertifiable, not small.
+            if spent_usd >= limit_micro || state.unpriced_usd {
                 latch_warn(
                     &mut state.warned,
                     &mut warns,
@@ -1104,24 +1142,105 @@ mod tests {
     }
 
     #[test]
-    fn unpriced_models_and_unreported_usage_accrue_nothing() {
+    fn unreported_usage_accrues_nothing() {
         let limits = BudgetLimits {
             usd: Some(0.000_005),
             ..BudgetLimits::new()
         };
         let gate = BudgetGate::new(limits).with_price_table(fresh_gpt_table());
         gate.begin();
-        let report = crate::stream::Usage::new(1_000_000, 1_000_000);
         for _ in 0..10 {
-            gate.observe_cost("my-fine-tune-9000", Some(&report));
             gate.observe_cost("gpt-4o", None);
         }
         let (warns, hard) = gate.pre_request(Duration::ZERO);
         assert!(
             warns.is_empty() && hard.is_none(),
-            "a model the table does not price spends nothing and an \
-             unreported request spends nothing — one priced gpt-4o report of \
-             this size would cross the 5µ line instantly: {warns:?} {hard:?}"
+            "a report that never arrived prices nothing — an unreported \
+             request spends nothing against the line: {warns:?} {hard:?}"
+        );
+    }
+
+    #[test]
+    fn unpriced_usage_refuses_an_armed_usd_line_even_under_the_limit() {
+        // The bypass the usd line must not have: a model the table does
+        // not price accrues nothing, and nothing reads as "under
+        // budget" forever — unpriced usage could spend past a
+        // configured cost line unchecked (a family delisted from the
+        // listing a table refresh regenerates from, a fine-tune, a
+        // private deployment). One unpriced report latches a refusal:
+        // the next check refuses over the Usd line with the priced
+        // spend and the configured limit, however far under the number
+        // that spend sits, because the run's total is uncertifiable —
+        // not small.
+        let limits = BudgetLimits {
+            usd: Some(0.01),
+            ..BudgetLimits::new()
+        };
+        let gate = BudgetGate::new(limits).with_price_table(fresh_gpt_table());
+        gate.begin();
+        let priced = crate::stream::Usage::new(50, 25);
+        let unpriced = crate::stream::Usage::new(1_000_000, 1_000_000);
+        gate.observe_cost("gpt-4o", Some(&priced));
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        assert!(
+            warns.is_empty() && hard.is_none(),
+            "375µ of the 10_000µ line — the priced report alone crosses \
+             nothing: {warns:?} {hard:?}"
+        );
+        gate.observe_cost("stepfun/step-3.5-flash", Some(&unpriced));
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        let crossing = hard.expect("one unpriced report refuses the next request");
+        assert_eq!(crossing.dimension, BudgetDimension::Usd);
+        assert_eq!(
+            crossing.spent, 375,
+            "the priced accrual — the honest number the gate has"
+        );
+        assert_eq!(crossing.limit, 10_000);
+        assert_eq!(
+            warns.len(),
+            1,
+            "the refusal latches the Usd warn beside it: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn unpriced_usage_without_a_usd_line_accrues_nothing() {
+        // No configured line, nothing to bypass: an unpriced report is
+        // merely unpriced — it prices nothing and refuses nothing.
+        let gate = BudgetGate::new(BudgetLimits::new()).with_price_table(fresh_gpt_table());
+        gate.begin();
+        let report = crate::stream::Usage::new(1_000_000, 1_000_000);
+        for _ in 0..10 {
+            gate.observe_cost("my-fine-tune-9000", Some(&report));
+        }
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        assert!(
+            warns.is_empty() && hard.is_none(),
+            "without a usd limit there is no line to certify: {warns:?} \
+             {hard:?}"
+        );
+    }
+
+    #[test]
+    fn begin_clears_the_unpriced_usd_latch() {
+        let limits = BudgetLimits {
+            usd: Some(0.01),
+            ..BudgetLimits::new()
+        };
+        let gate = BudgetGate::new(limits).with_price_table(fresh_gpt_table());
+        gate.begin();
+        let report = crate::stream::Usage::new(1_000_000, 1_000_000);
+        gate.observe_cost("my-fine-tune-9000", Some(&report));
+        assert!(
+            gate.pre_request(Duration::ZERO).1.is_some(),
+            "the unpriced report refuses this run's next request"
+        );
+        gate.begin();
+        let (warns, hard) = gate.pre_request(Duration::ZERO);
+        assert!(
+            warns.is_empty() && hard.is_none(),
+            "the next run starts certifiable — the latch died with the \
+             run's other state: {warns:?} {hard:?}"
         );
     }
 

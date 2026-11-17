@@ -595,7 +595,7 @@ async fn output_schema_carried_through_accessor() {
     let carried = plain.output_schema().expect("outputSchema carried through");
     assert_eq!(
         carried.get("type").and_then(Value::as_str),
-        Some("string"),
+        Some("object"),
         "outputSchema carried verbatim: {carried}"
     );
     // The annotated tool declares no outputSchema → None.
@@ -640,9 +640,17 @@ fn plain_tool() -> RmcpTool {
         serde_json::Value::Array(vec![serde_json::Value::String("q".to_string())]),
     );
     let mut output_schema = serde_json::Map::new();
+    // Spec-shaped (SEP-2106): an outputSchema's root type is "object" —
+    // rmcp 3.11 strips non-object roots from `tools/list` for peers on
+    // older protocol versions, and the MCP schema versions pin the same
+    // shape, so the carriage fixture declares an object-rooted schema.
     output_schema.insert(
         "type".to_string(),
-        serde_json::Value::String("string".to_string()),
+        serde_json::Value::String("object".to_string()),
+    );
+    output_schema.insert(
+        "properties".to_string(),
+        serde_json::json!({"answer": {"type": "string"}}),
     );
     RmcpTool::new("plain", "an unannotated tool", schema)
         .with_raw_output_schema(std::sync::Arc::new(output_schema))
@@ -1127,12 +1135,17 @@ async fn invalid_content_keeps_the_server_text_lane_beside_the_verdict() {
 
 #[tokio::test]
 async fn an_oversized_violation_stays_under_the_bound() {
+    // Spec-shaped (SEP-2106): `structuredContent` is an object, so the
+    // flood rides inside one property that violates its declared string
+    // type — rmcp 3.11 strips non-object structuredContent from the wire
+    // for peers on older protocol versions, and the violation must still
+    // reach the bound with the huge instance embedded in the verdict.
     let flood: Vec<String> = (0..200)
         .map(|i| format!("payload-{i:05}-xxxxxxxxxxxxxxxx"))
         .collect();
     let (client, _server) = connect_in_process(StructuredServer::new(
-        json!({"type": "object"}),
-        serde_json::Value::Array(flood.into_iter().map(serde_json::Value::String).collect()),
+        shaped_output_schema(),
+        json!({"city": flood}),
     ))
     .await;
     let provider = McpToolProvider::connect(client, None)
@@ -1147,7 +1160,10 @@ async fn an_oversized_violation_stays_under_the_bound() {
         .call(json!({}), &ToolContext::default())
         .await
         .expect("call ok");
-    assert!(out.is_error, "an array against an object schema is invalid");
+    assert!(
+        out.is_error,
+        "a string-typed property given an array is invalid"
+    );
     assert!(
         out.text_content().len() < 5 * 1024,
         "the verdict and the bounded payload together stay under the anti-flood \

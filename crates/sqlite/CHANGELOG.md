@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- **`rusqlite` 0.41 → 0.42 — a dependency bump that is semver-breaking for one exposed type, so consumers move with it** — the requirement moved (`rusqlite = "0.42"`, `bundled` as before) with no code change: the store compiles and its whole suite passes unchanged on 0.42. The one consumer-visible seam: `SqliteMemoryError::Sqlite` carries `rusqlite::Error` verbatim (the `#[from]` variant the constructors' errors ride), so a host that also depends on `rusqlite` directly must move to 0.42 alongside — a 0.41 dependency beside this crate resolves two `rusqlite` copies and the variant's payload stops unifying with the host's own error type. Nothing in-repo coordinates against the crate (the `loopctl-vector` companion and every example are rusqlite-free), so the move is consumer-side only. **Migration:** consumers matching `SqliteMemoryError::Sqlite(e)` or converting from `rusqlite::Error` bump their own `rusqlite` dependency to `0.42`; consumers who never name `rusqlite` themselves are unaffected — the `bundled` SQLite build rides along.
+
 ## [0.4.0] - 2026-10-10
 
 ### Added

@@ -659,12 +659,8 @@ impl ContextCompactor for RollingCompactor {
                 .collect();
             *recover_guard(self.state.lock()) = RollingState {
                 ledger: carried_ledger.or_else(|| {
-                    ledger_index.map(|index| {
-                        messages
-                            .get(index)
-                            .map(Message::text_content)
-                            .unwrap_or_default()
-                    })
+                    ledger_index
+                        .map(|index| messages.get(index).map_or_default(Message::text_content))
                 }),
                 micro_summaries: summaries,
             };

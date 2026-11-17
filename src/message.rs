@@ -287,14 +287,21 @@ impl Message {
     /// Scans the message's parts for tool-call parts and maps each to a
     /// `(id, name, input)` tuple. Returns an empty vector when the message
     /// contains no tool calls.
+    ///
+    /// The tuple deliberately carries dispatch bookkeeping only — it
+    /// cannot carry the part's [`signature`](MessagePart::ToolCall.signature),
+    /// so a caller rebuilding assistant parts from this view would drop
+    /// the reasoning continuity token. Every in-crate consumer reads it
+    /// for correlation alone and moves whole [`Message`] objects through
+    /// history; keep it that way, or extend the view before rebuilding.
     #[must_use]
     pub fn tool_call_parts(&self) -> Vec<(&str, &str, &serde_json::Value)> {
         self.parts
             .iter()
             .filter_map(|part| match part {
-                MessagePart::ToolCall { id, name, input } => {
-                    Some((id.as_str(), name.as_str(), input))
-                }
+                MessagePart::ToolCall {
+                    id, name, input, ..
+                } => Some((id.as_str(), name.as_str(), input)),
                 _ => None,
             })
             .collect()
@@ -480,6 +487,20 @@ pub enum MessagePart {
         /// Structure depends on the tool's input schema. May be
         /// any JSON value (`Object`, `Array`, `String`, etc.).
         input: Value,
+
+        /// The provider's signature over the call's reasoning, when the
+        /// dialect attaches one to the call part itself.
+        ///
+        /// Gemini documents `thoughtSignature` as metadata that can
+        /// ride any part — a function-call part carrying one is the
+        /// continuity token for reasoning across a tool turn, so it is
+        /// captured here and returned verbatim on the call part of the
+        /// next **Gemini** request; every other dialect drops it at
+        /// request-build time, its wire having no carrier for it
+        /// (pinned per dialect). `None` for every dialect that signs
+        /// nothing and for unsigned calls; never synthesized.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
 
     /// The model's reasoning trace for an assistant turn.
@@ -632,6 +653,55 @@ impl MessagePart {
             id: id.into(),
             name: name.into(),
             input,
+            signature: None,
+        }
+    }
+
+    /// Create a tool-call part carrying the provider's reasoning
+    /// signature.
+    ///
+    /// The same shape as [`MessagePart::tool_call`] with the continuity
+    /// token a reasoning model attached to the call itself — Gemini's
+    /// `thoughtSignature` riding a function-call part. The signature is
+    /// replayed verbatim on the call part of the next request and never
+    /// synthesized; `None` says the call was unsigned, which is every
+    /// other dialect's shape.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The unique tool invocation identifier.
+    /// * `name` - The name of the tool being invoked.
+    /// * `input` - The JSON input provided by the model.
+    /// * `signature` - The provider's signature over the call's
+    ///   reasoning, when the dialect attaches one.
+    ///
+    /// # Returns
+    ///
+    /// A [`MessagePart::ToolCall`] variant carrying the signature.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::message::{MessagePart};
+    /// let part = MessagePart::tool_call_with_signature(
+    ///     "tool_abc",
+    ///     "read_file",
+    ///     serde_json::json!({"path": "/tmp/test.txt"}),
+    ///     Some("c2ln".to_string()),
+    /// );
+    /// assert!(part.is_tool_call());
+    /// ```
+    pub fn tool_call_with_signature(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: Value,
+        signature: Option<String>,
+    ) -> Self {
+        Self::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input,
+            signature,
         }
     }
 

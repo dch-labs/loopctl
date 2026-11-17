@@ -311,8 +311,7 @@ impl<C: ApiClient> BareLoop<C> {
         };
         let elapsed = self
             .budget_run_started
-            .map(|started| self.managers.clock().elapsed_since(started))
-            .unwrap_or_default();
+            .map_or_default(|started| self.managers.clock().elapsed_since(started));
         let (warns, crossing) = gate.pre_request(elapsed);
         for warn in warns {
             self.managers

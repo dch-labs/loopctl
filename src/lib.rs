@@ -110,6 +110,7 @@
         clippy::expect_used,
         clippy::panic,
         clippy::indexing_slicing,
+        clippy::assert_is_empty,
         clippy::missing_panics_doc,
         clippy::missing_errors_doc,
         clippy::unnecessary_wraps,

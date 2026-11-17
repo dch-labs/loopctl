@@ -817,8 +817,7 @@ impl DetectionManager {
                 pattern_description: status
                     .repeated_operations
                     .first()
-                    .map(|op| format!("{}({})", op.tool, op.primary_param))
-                    .unwrap_or_default(),
+                    .map_or_default(|op| format!("{}({})", op.tool, op.primary_param)),
             })
         } else {
             let mut guard = self
@@ -1101,8 +1100,7 @@ impl DetectionManager {
                 pattern_description: status
                     .repeated_operations
                     .first()
-                    .map(|op| format!("{}({})", op.tool, op.primary_param))
-                    .unwrap_or_default(),
+                    .map_or_default(|op| format!("{}({})", op.tool, op.primary_param)),
             };
         }
         DetectedPattern::NoPattern
@@ -1391,8 +1389,7 @@ impl DetectionManager {
                 pattern_description: loop_status
                     .repeated_operations
                     .first()
-                    .map(|op| format!("{}({})", op.tool, op.primary_param))
-                    .unwrap_or_default(),
+                    .map_or_default(|op| format!("{}({})", op.tool, op.primary_param)),
             });
         }
         self.check_convergence_pattern()

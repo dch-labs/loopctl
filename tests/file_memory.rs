@@ -534,7 +534,7 @@ async fn an_unrecoverable_append_failure_marks_the_store_unusable() {
     let second = store
         .store(MemoryEntry::new(MemoryCategory::Fact, "second"))
         .await;
-    let message = second.err().map(|e| e.to_string()).unwrap_or_default();
+    let message = second.err().map_or_default(|e| e.to_string());
     assert!(
         message.contains("unusable"),
         "when even the truncation fails, later appends are rejected until \
@@ -1772,10 +1772,7 @@ async fn a_rewrite_refuses_to_replace_a_final_symlink() {
     let store = FileMemoryStore::new(&head);
 
     let flush_result = store.flush();
-    let message = flush_result
-        .err()
-        .map(|error| error.to_string())
-        .unwrap_or_default();
+    let message = flush_result.err().map_or_default(|error| error.to_string());
     assert!(
         message.contains("refusing to replace the link"),
         "the rewrite must refuse to rename over a final-component \
@@ -1986,10 +1983,7 @@ async fn a_foreign_infinite_relevance_line_fails_the_open() {
     std::fs::write(&path, spliced.as_bytes()).unwrap();
 
     let result = FileMemoryStore::open(&path);
-    let message = result
-        .err()
-        .map(|error| error.to_string())
-        .unwrap_or_default();
+    let message = result.err().map_or_default(|error| error.to_string());
     assert!(
         message.contains("non-finite relevance") || message.contains("out of range"),
         "a valid-JSON number that overflows f32 must never reach the \

@@ -696,11 +696,7 @@ impl LoopMachine {
         self.turns_taken = self.turns_taken.saturating_add(1);
 
         if tool_calls.is_empty() {
-            let final_text = self
-                .pending
-                .last()
-                .map(Message::text_content)
-                .unwrap_or_default();
+            let final_text = self.pending.last().map_or_default(Message::text_content);
             let outcome = MachineOutcome::Completed { final_text };
             self.state = MachineState::Terminal(outcome);
             return;

@@ -831,8 +831,7 @@ fn tighten_in_place(schema: &mut serde_json::Value) {
     let property_keys: Vec<String> = obj
         .get("properties")
         .and_then(serde_json::Value::as_object)
-        .map(|props| props.keys().cloned().collect())
-        .unwrap_or_default();
+        .map_or_default(|props| props.keys().cloned().collect());
     let mut required: Vec<serde_json::Value> = obj
         .get("required")
         .and_then(serde_json::Value::as_array)

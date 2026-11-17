@@ -2320,8 +2320,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("### Key facts")
                 && summary_text.contains("src/api.rs uses reqwest"),
@@ -2347,8 +2346,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("Second prose answer, still no headings."),
             "the raw text of the final response rides the summary message: {summary_text}"
@@ -2370,8 +2368,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("### Key facts\n- ### Key facts"),
             "the unparsed whole text rides as the single key-facts entry: {summary_text}"
@@ -2562,8 +2559,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("### Key facts")
                 && summary_text.contains("src/api.rs uses reqwest"),
@@ -2629,8 +2625,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("[1, 2, 3]"),
             "the model's non-string content rides the summary message instead of vanishing \
@@ -2673,8 +2668,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("### Decisions")
                 && summary_text.contains("the unwired model answer rides whole"),
@@ -2711,8 +2705,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("### Decisions")
                 && summary_text.contains("a fact outside the action template"),
@@ -3132,8 +3125,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("settled deployment on Docker")
                 && summary_text.contains("must finish before Friday"),
@@ -3168,8 +3160,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert!(
             summary_text.contains("### Key facts")
                 && summary_text.contains("src/api.rs uses reqwest"),
@@ -3196,8 +3187,7 @@ mod tests {
         let summary_text = outcome
             .messages
             .first()
-            .map(Message::text_content)
-            .unwrap_or_default();
+            .map_or_default(Message::text_content);
         assert_eq!(
             summary_text,
             format!("## Conversation summary (compacted)\n\n{EMPTY_SUMMARY_STUB}"),

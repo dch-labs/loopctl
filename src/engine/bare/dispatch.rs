@@ -565,11 +565,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// react, rather than panicking.
     fn missing_result(tc: Option<&ToolCall>) -> ToolDispatchResult {
         ToolDispatchResult {
-            tool_call_id: tc.map(|c| c.id.clone()).unwrap_or_default(),
+            tool_call_id: tc.map_or_default(|c| c.id.clone()),
             output: ToolContent::Text("dispatch produced no result".to_string()),
             is_error: true,
             duration: Duration::ZERO,
-            resolved_tool_name: tc.map(|c| c.tool.clone()).unwrap_or_default(),
+            resolved_tool_name: tc.map_or_default(|c| c.tool.clone()),
             display_hint: None,
             retention: None,
             gate: None,

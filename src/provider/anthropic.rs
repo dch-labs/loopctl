@@ -2214,7 +2214,13 @@ fn anthropic_thinking_budget(effort: crate::structured::ThinkingEffort) -> Optio
 /// demands the original block — signature or redacted payload intact —
 /// ahead of `tool_use` on continuation requests, so a signed or
 /// redacted part is returned exactly as it arrived rather than
-/// rendered as plain text.
+/// rendered as plain text. The wire block is a one-of pair (`thinking`
+/// or `redacted_thinking`), so a part somehow carrying both payloads —
+/// a state no Anthropic response builds, reachable only from a foreign
+/// history — answers with the redacted block and drops the signature:
+/// the withheld form is the one a continuation cannot reconstruct from
+/// its own text, and a part this shape is already foreign to the
+/// dialect (pinned by `a_both_payload_part_answers_with_the_redacted_block`).
 fn native_thinking_block(text: &str, signature: Option<&str>, redacted: Option<&str>) -> Value {
     if let Some(data) = redacted {
         serde_json::json!({ "type": "redacted_thinking", "data": data })
@@ -2283,7 +2289,9 @@ pub(super) fn convert_message(
                     "text": format!("<thinking>\n{tail}\n</thinking>"),
                 }));
             }
-            MessagePart::ToolCall { id, name, input } => {
+            MessagePart::ToolCall {
+                id, name, input, ..
+            } => {
                 tool_calls.push(serde_json::json!({
                     "type": "tool_use",
                     "id": id,
@@ -2694,6 +2702,7 @@ impl StreamEmitter {
                         id,
                         name,
                         input: Value::Null,
+                        signature: None,
                     }),
                 }));
                 self.current_tool_index = Some(index);
@@ -3095,6 +3104,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "Bash".to_string(),
                         input: serde_json::json!({"command": "ls"}),
+                        signature: None,
                     },
                 ],
             )],
@@ -3659,6 +3669,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "search".to_string(),
                     input: serde_json::json!({"q": "rust"}),
+                    signature: None,
                 },
             ],
         )];
@@ -3680,6 +3691,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_both_payload_part_answers_with_the_redacted_block() {
+        let block = native_thinking_block("hm", Some("sig"), Some("opaque"));
+        assert_eq!(
+            block["type"], "redacted_thinking",
+            "the wire block is a one-of pair, so the withheld form wins"
+        );
+        assert_eq!(block["data"], "opaque");
+        assert!(
+            block.get("signature").is_none(),
+            "no signature rides a redacted block — the foreign state answers one way, \
+             pinned rather than silent"
+        );
+    }
+
+    #[test]
+    fn a_signed_thinking_part_stays_off_the_wire_when_effort_is_none() {
+        let history = Message::new(
+            crate::message::Role::Assistant,
+            vec![crate::message::MessagePart::Thinking {
+                text: "hm".into(),
+                signature: Some("sig".into()),
+                redacted: None,
+            }],
+        );
+        let body = convert_message(&history, false, None);
+        let blocks = body["content"].as_array().unwrap();
+        assert!(
+            blocks.is_empty(),
+            "effort None with replay off drops the signed part — thinking is not \
+             enabled, so nothing native can ride and no text was asked for: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn a_signed_thinking_part_replays_as_text_without_its_signature_at_effort_none() {
+        let history = Message::new(
+            crate::message::Role::Assistant,
+            vec![crate::message::MessagePart::Thinking {
+                text: "hm".into(),
+                signature: Some("sig".into()),
+                redacted: None,
+            }],
+        );
+        let body = convert_message(&history, true, None);
+        let blocks = body["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "one text block: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(
+            blocks[0]["text"].as_str().unwrap().contains("hm"),
+            "the reasoning text rides inside the replay marker"
+        );
+        assert!(
+            !blocks[0]["text"].as_str().unwrap().contains("sig"),
+            "the signature never rides a text replay"
+        );
+    }
+
+    #[test]
+    fn a_call_signature_never_rides_the_anthropic_wire() {
+        let history = Message::new(
+            crate::message::Role::Assistant,
+            vec![crate::message::MessagePart::tool_call_with_signature(
+                "t1",
+                "echo",
+                serde_json::json!({}),
+                Some("sig-fc".into()),
+            )],
+        );
+        let body = convert_message(&history, false, None);
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("sig-fc") && !rendered.contains("thoughtSignature"),
+            "this wire has no carrier for a call signature — the token drops at \
+             request-build, booked on no lane: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn redacted_thinking_blocks_ride_continuations_verbatim() {
         let history = vec![Message::new(
@@ -3694,6 +3783,7 @@ mod tests {
                     id: "call_2".to_string(),
                     name: "search".to_string(),
                     input: serde_json::json!({"q": "rust"}),
+                    signature: None,
                 },
             ],
         )];
@@ -3729,6 +3819,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "search".to_string(),
                     input: serde_json::json!({"q": "rust"}),
+                    signature: None,
                 },
             ],
         )];
@@ -3762,6 +3853,7 @@ mod tests {
                     id: "call_2".to_string(),
                     name: "search".to_string(),
                     input: serde_json::json!({"q": "rust"}),
+                    signature: None,
                 },
             ],
         )];
@@ -3845,6 +3937,7 @@ mod tests {
                     id: "call_3".to_string(),
                     name: "search".to_string(),
                     input: serde_json::json!({"q": "rust"}),
+                    signature: None,
                 },
             ],
         )];
@@ -4051,6 +4144,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "echo".into(),
                     input: serde_json::json!({"msg": "hi"}),
+                    signature: None,
                 }],
             ),
         ];
@@ -4339,6 +4433,7 @@ mod tests {
                         id: "call_1".into(),
                         name: "search".into(),
                         input: serde_json::json!({"q": "rust"}),
+                        signature: None,
                     },
                 ],
             ),
@@ -5176,7 +5271,9 @@ mod tests {
         let response = AnthropicClient::build_response(&raw);
         assert_eq!(response.message.parts.len(), 1);
         match &response.message.parts[0] {
-            MessagePart::ToolCall { id, name, input } => {
+            MessagePart::ToolCall {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_1");
                 assert_eq!(name, "search");
                 assert_eq!(input, &serde_json::json!({"q": "rust"}));

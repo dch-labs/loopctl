@@ -1244,8 +1244,7 @@ impl fmt::Display for StreamOutcome {
                 };
                 let retry = detail
                     .retry_after
-                    .map(|d| format!(" (retry after {d:?})"))
-                    .unwrap_or_default();
+                    .map_or_default(|d| format!(" (retry after {d:?})"));
                 let partial = if *has_partial_data {
                     " (partial data)"
                 } else {

@@ -114,11 +114,7 @@ impl SafetyShieldMiddleware {
             tool_name: ctx.tool_name.clone(),
             input: ctx.input.clone(),
             turn: ctx.turn_number,
-            recent_calls: self
-                .recent
-                .lock()
-                .map(|log| log.clone())
-                .unwrap_or_default(),
+            recent_calls: self.recent.lock().map_or_default(|log| log.clone()),
         }
     }
 }

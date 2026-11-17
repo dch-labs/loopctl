@@ -1444,6 +1444,16 @@ struct ConverseStreamEmitter {
     ///
     /// [`MessageDelta`]: crate::stream::MessageDelta
     usage: Option<crate::stream::Usage>,
+
+    /// Content-block indices with a slot already opened by a
+    /// `contentBlockStart` or a synthesized reasoning lane.
+    ///
+    /// A reasoning delta arriving for an index not listed here opens the
+    /// thinking lane itself (a `PartStart` with no part), so a stream that
+    /// omits the block start still captures its reasoning; indices listed
+    /// here keep the slot their opener built. A `contentBlockStop` removes
+    /// its index, mirroring the accumulator closing the first matching slot.
+    open_blocks: Vec<usize>,
 }
 
 impl ConverseStreamEmitter {
@@ -1455,7 +1465,10 @@ impl ConverseStreamEmitter {
     /// terminal [`MessageDelta`]+[`MessageStop`] pair. Once that pair
     /// is out, every further chunk is ignored — a desynced stream must
     /// not append parts to a message the consumer has already been
-    /// told is complete.
+    /// told is complete. A reasoning delta for an index whose block
+    /// never opened still captures: it opens the thinking lane itself,
+    /// so a stream that omits the `contentBlockStart` loses no
+    /// signature or redacted payload.
     ///
     /// [`MessageDelta`]: crate::stream::MessageDelta
     /// [`MessageStop`]: crate::stream::MessageStop
@@ -1503,10 +1516,31 @@ impl ConverseStreamEmitter {
                 index,
                 part,
             }));
+            self.open_blocks.push(index);
             return out;
         }
         if let Some(delta) = chunk.get("contentBlockDelta") {
             let index = block_index(delta);
+            let reasoning_text = delta
+                .pointer("/delta/reasoningContent/text")
+                .and_then(serde_json::Value::as_str);
+            let reasoning_signature = delta
+                .pointer("/delta/reasoningContent/signature")
+                .and_then(serde_json::Value::as_str);
+            let reasoning_redacted = delta
+                .pointer("/delta/reasoningContent/redactedContent")
+                .and_then(serde_json::Value::as_str);
+            if (reasoning_text.is_some()
+                || reasoning_signature.is_some()
+                || reasoning_redacted.is_some())
+                && !self.open_blocks.contains(&index)
+            {
+                self.open_blocks.push(index);
+                out.push(StreamEvent::PartStart(crate::stream::PartStart {
+                    index,
+                    part: None,
+                }));
+            }
             if let Some(text) = delta
                 .pointer("/delta/text")
                 .and_then(serde_json::Value::as_str)
@@ -1524,10 +1558,7 @@ impl ConverseStreamEmitter {
                     },
                 }));
             }
-            if let Some(reasoning) = delta
-                .pointer("/delta/reasoningContent/text")
-                .and_then(serde_json::Value::as_str)
-            {
+            if let Some(reasoning) = reasoning_text {
                 out.push(StreamEvent::IndexedDelta(crate::stream::IndexedDelta {
                     index,
                     delta: crate::stream::DeltaPart::Thinking {
@@ -1537,10 +1568,7 @@ impl ConverseStreamEmitter {
                     },
                 }));
             }
-            if let Some(signature) = delta
-                .pointer("/delta/reasoningContent/signature")
-                .and_then(serde_json::Value::as_str)
-            {
+            if let Some(signature) = reasoning_signature {
                 out.push(StreamEvent::IndexedDelta(crate::stream::IndexedDelta {
                     index,
                     delta: crate::stream::DeltaPart::Thinking {
@@ -1550,10 +1578,7 @@ impl ConverseStreamEmitter {
                     },
                 }));
             }
-            if let Some(redacted) = delta
-                .pointer("/delta/reasoningContent/redactedContent")
-                .and_then(serde_json::Value::as_str)
-            {
+            if let Some(redacted) = reasoning_redacted {
                 out.push(StreamEvent::IndexedDelta(crate::stream::IndexedDelta {
                     index,
                     delta: crate::stream::DeltaPart::Thinking {
@@ -1566,9 +1591,11 @@ impl ConverseStreamEmitter {
             return out;
         }
         if let Some(stop) = chunk.get("contentBlockStop") {
-            out.push(StreamEvent::PartStop {
-                index: Some(block_index(stop)),
-            });
+            let index = block_index(stop);
+            if let Some(pos) = self.open_blocks.iter().position(|open| *open == index) {
+                self.open_blocks.remove(pos);
+            }
+            out.push(StreamEvent::PartStop { index: Some(index) });
             return out;
         }
         if let Some(reason) = chunk
@@ -3470,10 +3497,6 @@ mod tests {
         let mut emitter = ConverseStreamEmitter::default();
         let events: Vec<StreamEvent> = [
             serde_json::json!({"messageStart": {"role": "assistant"}}),
-            serde_json::json!({"contentBlockStart": {
-                "contentBlockIndex": 0,
-                "start": {"reasoningContent": {"reasoningText": {"text": ""}}}
-            }}),
             serde_json::json!({"contentBlockDelta": {
                 "contentBlockIndex": 0,
                 "delta": {"reasoningContent": {"text": "pondering"}}

@@ -228,8 +228,7 @@ impl JobStore {
     pub(crate) fn list(&self) -> Vec<BackgroundJob> {
         self.table
             .lock()
-            .map(|table| table.values().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|table| table.values().cloned().collect())
     }
 
     /// Remove every terminal job from the table.

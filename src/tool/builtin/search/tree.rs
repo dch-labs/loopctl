@@ -616,8 +616,7 @@ mod tests {
                 entry
                     .path
                     .strip_prefix("/repo")
-                    .map(|rel| rel.to_string_lossy().into_owned())
-                    .unwrap_or_default()
+                    .map_or_default(|rel| rel.to_string_lossy().into_owned())
             })
             .collect();
         // `*` is the walker's char-wise wildcard and crosses `/`, so a

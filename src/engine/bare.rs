@@ -2939,8 +2939,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.machine
                 .full_history()
                 .last()
-                .map(Self::message_input)
-                .unwrap_or_default()
+                .map_or_default(Self::message_input)
         }
     }
 

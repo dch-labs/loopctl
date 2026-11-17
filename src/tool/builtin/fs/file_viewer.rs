@@ -500,8 +500,7 @@ fn parse_input(input: &Value) -> Result<ParsedInput<'_>, ToolError> {
     let output_format = input
         .get("output_format")
         .and_then(Value::as_str)
-        .map(OutputFormat::from_str)
-        .unwrap_or_default();
+        .map_or_default(OutputFormat::from_str);
 
     Ok(ParsedInput {
         file_path,

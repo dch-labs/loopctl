@@ -202,15 +202,20 @@ pub(super) fn replay_reasoning_tail(text: &str) -> String {
 /// as nothing). Counted one
 /// event per block per request, so the ratio between the actions is the
 /// ratio of reasoning the model can see to reasoning it cannot. Called by
-/// the three dialects that decide the question over their own history at
-/// all — OpenAI, Anthropic, and Gemini, the last answering `skipped`
-/// always, having no reasoning channel to replay into. The Bedrock
-/// converter is a split case: its Converse converter drops a Thinking
-/// part outright and books nothing, while its Messages-shaped request
-/// folds the history through the Anthropic converter above and books it
-/// there. So on a Bedrock build the two rows answer for whichever shape
-/// the request took, not for the client as a whole.
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+/// the four dialects that decide the question over their own history at
+/// all — OpenAI, Anthropic, Gemini, and Bedrock Converse. Gemini echoes a
+/// signed thought part natively and skips an unsigned one; Bedrock
+/// Converse echoes a signed or redacted `reasoningContent` block natively
+/// and books unsigned thinking `skipped`, while Bedrock's Messages-shaped
+/// request folds the history through the Anthropic converter above and
+/// books it there. So on a Bedrock build the two rows answer for
+/// whichever shape the request took, not for the client as a whole.
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
 pub(super) fn record_reasoning_block(action: &'static str) {
     tracing::debug!(
         target: "loopctl::metrics",
@@ -229,7 +234,12 @@ pub(super) fn record_reasoning_block(action: &'static str) {
 /// context the model sees. The counter makes that configuration visible
 /// without block-level tracing. One event per block, alongside the
 /// [`record_reasoning_block`] event that names the same block `skipped`.
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "bedrock"
+))]
 pub(super) fn record_reasoning_skip() {
     tracing::debug!(
         target: "loopctl::metrics",

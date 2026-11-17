@@ -2,7 +2,7 @@
 name = "derive-consumer-fixture"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 publish = false
 
 [workspace]

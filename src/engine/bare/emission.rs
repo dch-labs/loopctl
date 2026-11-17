@@ -780,8 +780,7 @@ impl<C: ApiClient> BareLoop<C> {
             session_id: self.session.id,
             model: self.client.model(),
             working_directory: std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+                .map_or_default(|p| p.to_string_lossy().into_owned()),
         };
         executor.notify_run_start(&ctx);
     }

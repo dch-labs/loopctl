@@ -2,7 +2,7 @@
 name = "loopctl-derive"
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 description = "Derive macro for the loopctl Tool trait"
 repository = "https://github.com/dch-labs/loopctl"

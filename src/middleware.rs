@@ -527,7 +527,7 @@ pub(crate) fn resolved_cwd(cwd: &str) -> String {
 /// which can name the offending interpreter in its diagnostic, and the
 /// extractor simply unwraps to the payload it wants to scan.
 pub(crate) fn is_wrapped_shell(tokens: &[String]) -> bool {
-    let first = tokens.first().map(String::as_str).unwrap_or_default();
+    let first = tokens.first().map_or_default(String::as_str);
     let shell_like =
         first == "sh" || first == "bash" || first.ends_with("sh") || first.ends_with("shell");
     shell_like && tokens.get(1).map(String::as_str) == Some("-c")

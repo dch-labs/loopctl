@@ -11,7 +11,7 @@ keywords = ["agent", "framework", "llm", "loop"]
 categories = ["api-bindings", "development-tools"]
 exclude = ["tests/cassettes/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
 readme = "README.md"
-rust-version = "1.98"
+rust-version = "1.100"
 
 [workspace]
 members = ["crates/derive", "crates/sqlite", "crates/hnsw", "crates/client", "crates/otel", "crates/langfuse"]

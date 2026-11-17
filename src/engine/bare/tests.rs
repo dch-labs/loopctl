@@ -13978,6 +13978,84 @@ mod budget_gate_tests {
         );
     }
 
+    /// The task-named pin: a cost budget cannot be spent past by a
+    /// model the table does not price. A run on `stepfun/step-3.5-flash`
+    /// against a table pricing only `gpt-4o`, under a $0.0011 line: the
+    /// first turn completes (its usage prices nothing, never a guess)
+    /// and latches a refusal, so the second request is refused with the
+    /// priced spend — zero — against the configured limit.
+    #[tokio::test]
+    async fn unpriced_model_usage_refuses_under_a_cost_budget() {
+        let client = crate::testing::MockApiClient::new("stepfun/step-3.5-flash")
+            .with_responses(budget_script(2));
+        let collector = std::sync::Arc::new(BudgetCollector {
+            warns: Mutex::new(Vec::new()),
+            decisions: Mutex::new(Vec::new()),
+        });
+        let registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let mut agent = BareLoop::new_with_managers(
+            std::sync::Arc::new(client.clone()),
+            registry,
+            make_config(),
+            LoopManagers::new(),
+        );
+        agent.register_observer(
+            std::sync::Arc::clone(&collector) as std::sync::Arc<dyn LoopObserver>
+        );
+        let mut agent = agent.with_budget_gate(
+            crate::budget::BudgetGate::new(crate::budget::BudgetLimits {
+                usd: Some(0.0011),
+                ..crate::budget::BudgetLimits::new()
+            })
+            .with_price_table(std::sync::Arc::new(
+                crate::pricing::PriceTable::from_json(
+                    r#"{ "table_version": "engine-pin", "pricing_updated": "2999-01-01",
+                        "models": { "gpt-4o": { "input_per_mtok": 2.5,
+                                                "output_per_mtok": 10.0 } } }"#,
+                )
+                .expect("valid pin table"),
+            )),
+        );
+        let error = agent
+            .run("start", &make_run_config())
+            .await
+            .expect_err("the second request is refused over the unpriced first turn");
+        match error {
+            crate::error::LoopError::BudgetExhausted {
+                dimension,
+                spent,
+                limit,
+            } => {
+                assert_eq!(dimension, crate::budget::BudgetDimension::Usd);
+                assert_eq!(
+                    spent, 0,
+                    "the unpriced turn accrued nothing — never a guess"
+                );
+                assert_eq!(limit, 1100);
+            }
+            other => panic!("expected BudgetExhausted over usd, got {other:?}"),
+        }
+        assert_eq!(
+            client.with_options_calls(),
+            1,
+            "the unpriced turn completed; the second request was refused \
+             before it was sent"
+        );
+        let decisions = collector.decisions.lock().unwrap().clone();
+        let deny = decisions
+            .iter()
+            .find(|decision| decision.rule_id == "budget.hard")
+            .expect("the refusal mints a budget.hard record");
+        assert!(
+            deny.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("0 of 1100")),
+            "the record's reason carries the numbers: {:?}",
+            deny.reason
+        );
+    }
+
     /// The nested-loop tool for the independence pin below.
     ///
     /// Parks a second `BareLoop` behind a tokio mutex and runs it to

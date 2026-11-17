@@ -120,14 +120,15 @@ fn parse_body(body: &str) -> Value {
     serde_json::from_str(body).expect("the recorded body parses as JSON")
 }
 
-/// A Gemini non-streaming response carrying one thought part with a
-/// signature and one function call, as the first turn of a tool loop.
-fn gemini_tool_turn() -> Value {
+/// A Gemini non-streaming response carrying one thought part signed
+/// with `signature` and one function call, as the first turn of a tool
+/// loop.
+fn gemini_tool_turn(signature: &str) -> Value {
     json!({
         "candidates": [{
             "content": {
                 "parts": [
-                    {"text": "pondering", "thought": true, "thoughtSignature": "sig-1"},
+                    {"text": "pondering", "thought": true, "thoughtSignature": signature},
                     {"functionCall": {"name": "echo_sig", "args": {}}}
                 ]
             },
@@ -179,7 +180,7 @@ async fn a_signed_thought_part_rides_the_next_gemini_request_through_a_redacting
             when.method("POST").body_includes("please echo");
             then.status(200)
                 .header("content-type", "application/json")
-                .body(gemini_tool_turn().to_string());
+                .body(gemini_tool_turn(&echo_token()).to_string());
         })
         .await;
 
@@ -215,29 +216,45 @@ async fn a_signed_thought_part_rides_the_next_gemini_request_through_a_redacting
     let export = String::from_utf8_lossy(&bytes);
     let followup_body = parse_body(&nth_recorded_request_body(&export, 1));
 
-    let carried = followup_body
-        .pointer("/contents")
-        .and_then(Value::as_array)
-        .expect("the follow-up carries contents")
-        .iter()
-        .flat_map(|message| {
-            message
-                .pointer("/parts")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-        })
-        .any(|part| {
-            part.get("thoughtSignature").and_then(Value::as_str) == Some("sig-1")
-                && part.get("thought") == Some(&json!(true))
-        });
+    let parts_of = |body: &Value| -> Vec<Value> {
+        body.pointer("/contents")
+            .and_then(Value::as_array)
+            .expect("the follow-up carries contents")
+            .iter()
+            .flat_map(|message| {
+                message
+                    .pointer("/parts")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    let token = echo_token();
+    let followup_parts = parts_of(&followup_body);
+    let carried = followup_parts.iter().any(|part| {
+        part.get("thoughtSignature").and_then(Value::as_str) == Some(token.as_str())
+            && part.get("thought") == Some(&json!(true))
+    });
     assert!(
         carried,
-        "the signed thought part rides the follow-up request verbatim: {followup_body}"
+        "the signed thought part rides the follow-up request with the exact \
+         token the tool echoed: {followup_body}"
+    );
+    let response_part = followup_parts
+        .iter()
+        .find(|part| part.get("functionResponse").is_some())
+        .expect("the follow-up carries the tool result as a functionResponse part");
+    let rendered = response_part.to_string();
+    assert!(
+        rendered.contains("[REDACTED:"),
+        "the tool-output echo of the same bytes was scrubbed where it rode the \
+         output lane: {rendered}"
     );
     assert!(
-        nth_recorded_request_body(&export, 1).contains("[REDACTED:"),
-        "the tool-output echo of the same bytes was scrubbed where it rode the output lane"
+        !rendered.contains(token.as_str()),
+        "the scrubbed output lane must not carry the raw token — the marker \
+         replaces it, byte for byte: {rendered}"
     );
 
     opening.delete_async().await;

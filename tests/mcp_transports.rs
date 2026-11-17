@@ -29,31 +29,37 @@ use loopctl::stream::handler::StreamRetryConfig;
 
 /// Path to the loopctl-shipped stdio example server binary.
 ///
-/// Resolved by probing candidate locations, because the test binary's own
-/// location is not a stable anchor: newer cargo runs test binaries from
-/// `target/<profile>/build/<pkg>/<hash>/out/`, where walking two levels up
-/// from `current_exe()` lands inside the build tree, not the profile
-/// directory. Candidates, in order: `<CARGO_TARGET_DIR>/<profile>` and
-/// `<CARGO_MANIFEST_DIR>/target/<profile>` (both debug and release), then
-/// the legacy `deps/`-derived profile directory. The first candidate
-/// holding the example wins; with none present the first cargo-provided
-/// path is returned so the spawn error names a real location.
+/// Resolved against the current invocation's build profile, because the
+/// test binary's own location is not a stable anchor — newer cargo runs
+/// test binaries from `target/<profile>/build/<pkg>/<hash>/out/`, where
+/// walking two levels up from `current_exe()` lands inside the build
+/// tree, not the profile directory — and existence must never pick the
+/// profile: a stale artifact from a previous `--release` run must not
+/// stand in for the debug build this invocation expects (or the
+/// reverse). The profile is read from this test binary's own
+/// `debug_assertions`, so candidates stay anchored to the invocation:
+/// `<CARGO_TARGET_DIR>/<profile>`, then
+/// `<CARGO_MANIFEST_DIR>/target/<profile>`, then the legacy
+/// `deps/`-derived profile directory. The first candidate holding the
+/// example wins; with none present the first cargo-provided path is
+/// returned so the spawn error names a real location.
 fn stdio_server_bin() -> String {
     let name = if cfg!(windows) {
         "mcp-stdio-server.exe"
     } else {
         "mcp-stdio-server"
     };
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
-        let target = std::path::PathBuf::from(target);
-        candidates.push(target.join("debug"));
-        candidates.push(target.join("release"));
+        candidates.push(std::path::PathBuf::from(target).join(profile));
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let target = std::path::Path::new(&manifest).join("target");
-        candidates.push(target.join("debug"));
-        candidates.push(target.join("release"));
+        candidates.push(std::path::Path::new(&manifest).join("target").join(profile));
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(profile_dir) = exe.parent().and_then(|deps| deps.parent())

@@ -238,7 +238,7 @@ impl ToolStats {
         saturating_add(&self.total_duration_ns, ns);
         self.max_duration_ns.fetch_max(ns, Ordering::Relaxed);
         self.ewma_success
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
                 Some(update_ewma(prev, true))
             })
             .ok();
@@ -257,7 +257,7 @@ impl ToolStats {
         saturating_add(&self.total_duration_ns, ns);
         self.max_duration_ns.fetch_max(ns, Ordering::Relaxed);
         self.ewma_success
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
                 Some(update_ewma(prev, false))
             })
             .ok();
@@ -377,7 +377,7 @@ fn update_ewma(prev: u64, is_success: bool) -> u64 {
 /// Atomic fetch-add wraps on overflow; the compare-exchange loop
 /// keeps monotone counters monotone at the type's ceiling.
 fn saturating_add(cell: &AtomicU64, value: u64) {
-    cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+    cell.try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
         prev.checked_add(value).or(Some(u64::MAX))
     })
     .ok();

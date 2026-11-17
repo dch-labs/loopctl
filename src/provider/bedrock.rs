@@ -1066,11 +1066,7 @@ impl AwsEventStreamDecoder {
             self.buf.drain(..total_len);
             return DecodeStep::Skipped;
         }
-        let headers = self
-            .buf
-            .get(12..headers_end)
-            .map(parse_headers)
-            .unwrap_or_default();
+        let headers = self.buf.get(12..headers_end).map_or_default(parse_headers);
         let payload_end = total_len.saturating_sub(4); // trailing CRC
         let payload = self
             .buf
@@ -1082,18 +1078,15 @@ impl AwsEventStreamDecoder {
             event_type: headers
                 .iter()
                 .find(|(k, _)| k == ":event-type")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default(),
+                .map_or_default(|(_, v)| v.clone()),
             exception_type: headers
                 .iter()
                 .find(|(k, _)| k == ":exception-type")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default(),
+                .map_or_default(|(_, v)| v.clone()),
             message_type: headers
                 .iter()
                 .find(|(k, _)| k == ":message-type")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default(),
+                .map_or_default(|(_, v)| v.clone()),
             request_id: frame_request_id(&headers),
             payload,
         })
@@ -1276,8 +1269,26 @@ fn converse_body(request: &StreamRequest, max_tokens: u32) -> serde_json::Value 
 /// Content becomes typed blocks: text parts map to `{"text": …}`,
 /// tool-call parts to `{"toolUse": {toolUseId, name, input}}`, and
 /// tool results to `{"toolResult": …}` blocks riding a user message —
-/// Converse has no separate tool role. Image parts are not supported
-/// on this path, matching the sibling providers.
+/// Converse has no separate tool role. A `Thinking` part carrying a
+/// signature or a redacted payload rides back as a `reasoningContent`
+/// block in the block union the AWS API reference defines
+/// (`ReasoningContentBlock`): the signed case as
+/// `{"reasoningText": {"text": …, "signature": …}}` — the reference's
+/// own instruction for multi-turn continuity is to pass the text and
+/// its signature back unmodified — and the withheld case as
+/// `{"redactedContent": …}`, each booked `native`, because a signed
+/// block is the continuity token a reasoning model needs returned on
+/// the next request. Unsigned thinking is dropped and booked as
+/// `skipped`, a text-only reasoning block being a shape Converse
+/// rejects on input. A part carrying both a signature and a redacted
+/// payload emits both members in one block rather than halving the
+/// state silently: the block is a one-member union, so such a part is
+/// already out-of-contract, and the provider refusing it loudly beats
+/// a writer that invents which half was real. (The *delta* type the
+/// stream emitter reads is flat — `text`/`signature`/`redactedContent`
+/// — but that flatness belongs to `ReasoningContentBlockDelta`, not to
+/// the block; the two must not be confused.) Image parts are not
+/// supported on this path, matching the sibling providers.
 fn converse_message(message: &crate::message::Message) -> serde_json::Value {
     let role = if message.role == crate::message::Role::Assistant {
         "assistant"
@@ -1290,7 +1301,9 @@ fn converse_message(message: &crate::message::Message) -> serde_json::Value {
             crate::message::MessagePart::Text { text } => {
                 content.push(serde_json::json!({ "text": text }));
             }
-            crate::message::MessagePart::ToolCall { id, name, input } => {
+            crate::message::MessagePart::ToolCall {
+                id, name, input, ..
+            } => {
                 content.push(serde_json::json!({
                     "toolUse": {"toolUseId": id, "name": name, "input": input}
                 }));
@@ -1309,8 +1322,35 @@ fn converse_message(message: &crate::message::Message) -> serde_json::Value {
                     }
                 }));
             }
-            crate::message::MessagePart::Thinking { .. }
-            | crate::message::MessagePart::Image { .. } => {}
+            crate::message::MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                if signature.is_some() || redacted.is_some() {
+                    super::record_reasoning_block("native");
+                    let mut reasoning = serde_json::Map::new();
+                    if let Some(signature) = signature {
+                        reasoning.insert(
+                            "reasoningText".to_string(),
+                            serde_json::json!({"text": text, "signature": signature}),
+                        );
+                    }
+                    if let Some(payload) = redacted {
+                        reasoning.insert(
+                            "redactedContent".to_string(),
+                            serde_json::Value::String(payload.clone()),
+                        );
+                    }
+                    content.push(serde_json::json!({
+                        "reasoningContent": serde_json::Value::Object(reasoning)
+                    }));
+                } else {
+                    super::record_reasoning_block("skipped");
+                    super::record_reasoning_skip();
+                }
+            }
+            crate::message::MessagePart::Image { .. } => {}
         }
     }
     serde_json::json!({"role": role, "content": content})
@@ -1452,6 +1492,7 @@ impl ConverseStreamEmitter {
                         .unwrap_or_default()
                         .to_string(),
                     input: serde_json::Value::Null,
+                    signature: None,
                 })
             } else if start.pointer("/start/reasoningContent").is_some() {
                 None
@@ -1493,6 +1534,32 @@ impl ConverseStreamEmitter {
                         text: reasoning.to_string(),
                         signature: None,
                         redacted: None,
+                    },
+                }));
+            }
+            if let Some(signature) = delta
+                .pointer("/delta/reasoningContent/signature")
+                .and_then(serde_json::Value::as_str)
+            {
+                out.push(StreamEvent::IndexedDelta(crate::stream::IndexedDelta {
+                    index,
+                    delta: crate::stream::DeltaPart::Thinking {
+                        text: String::new(),
+                        signature: Some(signature.to_string()),
+                        redacted: None,
+                    },
+                }));
+            }
+            if let Some(redacted) = delta
+                .pointer("/delta/reasoningContent/redactedContent")
+                .and_then(serde_json::Value::as_str)
+            {
+                out.push(StreamEvent::IndexedDelta(crate::stream::IndexedDelta {
+                    index,
+                    delta: crate::stream::DeltaPart::Thinking {
+                        text: String::new(),
+                        signature: None,
+                        redacted: Some(redacted.to_string()),
                     },
                 }));
             }
@@ -2168,6 +2235,29 @@ fn bedrock_non_streaming_response(
     if let Some(content) = json.get("content").and_then(serde_json::Value::as_array) {
         let mut parts = Vec::new();
         for block in content {
+            if block.get("type").and_then(serde_json::Value::as_str) == Some("thinking") {
+                let text = block
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let signature = block.get("signature").and_then(serde_json::Value::as_str);
+                if !text.is_empty() || signature.is_some() {
+                    parts.push(crate::message::MessagePart::Thinking {
+                        text: text.to_string(),
+                        signature: signature.map(str::to_string),
+                        redacted: None,
+                    });
+                }
+            }
+            if block.get("type").and_then(serde_json::Value::as_str) == Some("redacted_thinking")
+                && let Some(data) = block.get("data").and_then(serde_json::Value::as_str)
+            {
+                parts.push(crate::message::MessagePart::Thinking {
+                    text: String::new(),
+                    signature: None,
+                    redacted: Some(data.to_string()),
+                });
+            }
             if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
                 parts.push(crate::message::MessagePart::text(text));
             }
@@ -2181,6 +2271,7 @@ fn bedrock_non_streaming_response(
                         .unwrap_or_default()
                         .to_string(),
                     input,
+                    signature: None,
                 });
             }
         }
@@ -2217,6 +2308,26 @@ fn bedrock_non_streaming_response(
     {
         let mut parts = Vec::new();
         for block in output {
+            if let Some(reasoning) = block.get("reasoningContent") {
+                let reasoning_text = reasoning.get("reasoningText");
+                let text = reasoning_text
+                    .and_then(|rt| rt.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let signature = reasoning_text
+                    .and_then(|rt| rt.get("signature"))
+                    .and_then(serde_json::Value::as_str);
+                let redacted = reasoning
+                    .get("redactedContent")
+                    .and_then(serde_json::Value::as_str);
+                if !text.is_empty() || signature.is_some() || redacted.is_some() {
+                    parts.push(crate::message::MessagePart::Thinking {
+                        text: text.to_string(),
+                        signature: signature.map(str::to_string),
+                        redacted: redacted.map(str::to_string),
+                    });
+                }
+            }
             if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
                 parts.push(crate::message::MessagePart::text(text));
             }
@@ -2233,6 +2344,7 @@ fn bedrock_non_streaming_response(
                         .unwrap_or_default()
                         .to_string(),
                     input: tool.get("input").cloned().unwrap_or(serde_json::json!({})),
+                    signature: None,
                 });
             }
         }
@@ -3350,6 +3462,483 @@ mod tests {
         assert!(
             acc.build().text_content().is_empty(),
             "reasoning does not leak into the visible message text"
+        );
+    }
+
+    #[test]
+    fn converse_stream_signature_delta_latches_onto_the_reasoning_block() {
+        let mut emitter = ConverseStreamEmitter::default();
+        let events: Vec<StreamEvent> = [
+            serde_json::json!({"messageStart": {"role": "assistant"}}),
+            serde_json::json!({"contentBlockStart": {
+                "contentBlockIndex": 0,
+                "start": {"reasoningContent": {"reasoningText": {"text": ""}}}
+            }}),
+            serde_json::json!({"contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"text": "pondering"}}
+            }}),
+            serde_json::json!({"contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"signature": "c2ln"}}
+            }}),
+            serde_json::json!({"contentBlockStop": {"contentBlockIndex": 0}}),
+        ]
+        .iter()
+        .flat_map(|chunk| emitter.process_chunk(chunk))
+        .collect();
+
+        assert!(
+            events.iter().any(|e| matches!(e,
+                StreamEvent::IndexedDelta(d) if matches!(&d.delta,
+                    crate::stream::DeltaPart::Thinking { signature: Some(sig), .. } if sig == "c2ln"))),
+            "the signature delta rides the thinking lane: {events:?}"
+        );
+
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        let thinking = built
+            .parts
+            .iter()
+            .find(|p| matches!(p, MessagePart::Thinking { .. }))
+            .expect("the reasoning block builds a Thinking part");
+        match thinking {
+            MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                assert_eq!(text, "pondering");
+                assert_eq!(signature.as_deref(), Some("c2ln"));
+                assert!(redacted.is_none());
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converse_stream_redacted_content_rides_the_thinking_lane() {
+        let mut emitter = ConverseStreamEmitter::default();
+        let events: Vec<StreamEvent> = [
+            serde_json::json!({"messageStart": {"role": "assistant"}}),
+            serde_json::json!({"contentBlockStart": {
+                "contentBlockIndex": 0,
+                "start": {"reasoningContent": {"reasoningText": {"text": ""}}}
+            }}),
+            serde_json::json!({"contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"redactedContent": "b3BhcXVl"}}
+            }}),
+            serde_json::json!({"contentBlockStop": {"contentBlockIndex": 0}}),
+        ]
+        .iter()
+        .flat_map(|chunk| emitter.process_chunk(chunk))
+        .collect();
+
+        assert!(
+            events.iter().any(|e| matches!(e,
+                StreamEvent::IndexedDelta(d) if matches!(&d.delta,
+                    crate::stream::DeltaPart::Thinking { redacted: Some(payload), text, .. }
+                        if payload == "b3BhcXVl" && text.is_empty()))),
+            "a redactedContent delta rides the thinking lane with empty text: {events:?}"
+        );
+    }
+
+    #[test]
+    fn converse_response_captures_reasoning_blocks_with_signatures() {
+        let json = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        // The documented block shape (ReasoningContentBlock in
+                        // the AWS API reference): reasoningText {text, signature}
+                        // or redactedContent — no flat text/signature members.
+                        {"reasoningContent": {"reasoningText": {"text": "pondering", "signature": "c2ln"}}},
+                        {"reasoningContent": {"redactedContent": "b3BhcXVl"}},
+                        {"text": "the answer"}
+                    ]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 2}
+        });
+        let response = bedrock_non_streaming_response(&json, "m").unwrap();
+        let parts = &response.message.parts;
+        assert_eq!(parts.len(), 3, "two reasoning blocks and one text block");
+        match &parts[0] {
+            MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                assert_eq!(text, "pondering");
+                assert_eq!(signature.as_deref(), Some("c2ln"));
+                assert!(redacted.is_none());
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        match &parts[1] {
+            MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                assert_eq!(text, "");
+                assert!(signature.is_none());
+                assert_eq!(redacted.as_deref(), Some("b3BhcXVl"));
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        assert!(matches!(&parts[2], MessagePart::Text { text } if text == "the answer"));
+    }
+
+    #[test]
+    fn invoke_response_captures_thinking_blocks_with_signatures() {
+        let json = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "hm", "signature": "c2ln"},
+                {"type": "redacted_thinking", "data": "b3BhcXVl"},
+                {"type": "text", "text": "the answer"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let response = bedrock_non_streaming_response(&json, "m").unwrap();
+        let parts = &response.message.parts;
+        assert_eq!(parts.len(), 3, "thinking, redacted, and text blocks");
+        match &parts[0] {
+            MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                assert_eq!(text, "hm");
+                assert_eq!(signature.as_deref(), Some("c2ln"));
+                assert!(redacted.is_none());
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        match &parts[1] {
+            MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                assert_eq!(text, "");
+                assert!(signature.is_none());
+                assert_eq!(redacted.as_deref(), Some("b3BhcXVl"));
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        assert!(matches!(&parts[2], MessagePart::Text { text } if text == "the answer"));
+    }
+
+    #[test]
+    fn signed_thinking_parts_ride_converse_requests_natively() {
+        let request = StreamRequest {
+            messages: vec![Message::new(
+                crate::message::Role::Assistant,
+                vec![
+                    MessagePart::Thinking {
+                        text: "pondering".into(),
+                        signature: Some("c2ln".into()),
+                        redacted: None,
+                    },
+                    MessagePart::tool_call("t1", "echo", serde_json::json!({"a": 1})),
+                ],
+            )],
+            system: None,
+            tools: None,
+        };
+        let body = converse_body(&request, BUDGET);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "the signed block and the tool call: {blocks:?}"
+        );
+        assert_eq!(
+            blocks[0]["reasoningContent"]["reasoningText"]["text"], "pondering",
+            "the reasoning text rides verbatim inside the block union's reasoningText member"
+        );
+        assert_eq!(
+            blocks[0]["reasoningContent"]["reasoningText"]["signature"], "c2ln",
+            "the signature rides verbatim beside its text, as the AWS reference instructs"
+        );
+    }
+
+    #[test]
+    fn redacted_thinking_parts_ride_converse_requests_verbatim() {
+        let request = StreamRequest {
+            messages: vec![Message::new(
+                crate::message::Role::Assistant,
+                vec![MessagePart::Thinking {
+                    text: String::new(),
+                    signature: None,
+                    redacted: Some("b3BhcXVl".into()),
+                }],
+            )],
+            system: None,
+            tools: None,
+        };
+        let body = converse_body(&request, BUDGET);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "the redacted block alone: {blocks:?}");
+        assert_eq!(blocks[0]["reasoningContent"]["redactedContent"], "b3BhcXVl");
+        assert!(
+            blocks[0]["reasoningContent"].get("reasoningText").is_none(),
+            "a redacted block is the union's other member alone, with no reasoningText"
+        );
+    }
+
+    #[test]
+    fn converse_stream_text_after_the_signature_continues_the_same_block() {
+        let mut emitter = ConverseStreamEmitter::default();
+        let events: Vec<StreamEvent> = [
+            serde_json::json!({"contentBlockStart": {
+                "contentBlockIndex": 0,
+                "start": {"reasoningContent": {"reasoningText": {"text": ""}}}
+            }}),
+            serde_json::json!({"contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"text": "first "}}
+            }}),
+            serde_json::json!({"contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"signature": "c2ln"}}
+            }}),
+            serde_json::json!({"contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"text": "second"}}
+            }}),
+            serde_json::json!({"contentBlockStop": {"contentBlockIndex": 0}}),
+        ]
+        .iter()
+        .flat_map(|chunk| emitter.process_chunk(chunk))
+        .collect();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        match acc.build().parts.first() {
+            Some(crate::message::MessagePart::Thinking {
+                text, signature, ..
+            }) => {
+                assert_eq!(
+                    text, "first second",
+                    "deltas after the signature continue the block"
+                );
+                assert_eq!(signature.as_deref(), Some("c2ln"));
+            }
+            other => panic!("expected one merged Thinking part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_converse_block_stopped_before_any_delta_builds_nothing() {
+        let mut emitter = ConverseStreamEmitter::default();
+        let events = emitter.process_chunk(&serde_json::json!({
+            "contentBlockStop": {"contentBlockIndex": 0}
+        }));
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        assert!(
+            acc.build().parts.is_empty(),
+            "a stop before any delta is an empty lane — nothing builds: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_doubled_block_start_at_one_index_feeds_the_first_slot_only() {
+        let mut emitter = ConverseStreamEmitter::default();
+        let events: Vec<StreamEvent> = [
+            serde_json::json!({"contentBlockStart": {
+                "contentBlockIndex": 0,
+                "start": {"reasoningContent": {"reasoningText": {"text": ""}}}
+            }}),
+            serde_json::json!({"contentBlockStart": {
+                "contentBlockIndex": 0,
+                "start": {"reasoningContent": {"reasoningText": {"text": ""}}}
+            }}),
+            serde_json::json!({"contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"text": "only"}}
+            }}),
+            serde_json::json!({"contentBlockStop": {"contentBlockIndex": 0}}),
+        ]
+        .iter()
+        .flat_map(|chunk| emitter.process_chunk(chunk))
+        .collect();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        assert_eq!(
+            built.parts.len(),
+            1,
+            "deltas land in the first slot at the index; the duplicate open never \
+             receives anything and builds nothing: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_converse_block_carrying_both_members_reads_both_payloads() {
+        let json = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {
+                            "reasoningText": {"text": "hm", "signature": "c2ln"},
+                            "redactedContent": "b3BhcXVl"
+                        }}
+                    ]
+                }
+            },
+            "stopReason": "end_turn"
+        });
+        let response = bedrock_non_streaming_response(&json, "m").unwrap();
+        match response.message.parts.first() {
+            Some(crate::message::MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            }) => {
+                assert_eq!(text, "hm");
+                assert_eq!(signature.as_deref(), Some("c2ln"));
+                assert_eq!(redacted.as_deref(), Some("b3BhcXVl"));
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_part_with_both_payloads_carries_both_on_converse_rather_than_halving() {
+        let request = StreamRequest {
+            messages: vec![Message::new(
+                crate::message::Role::Assistant,
+                vec![MessagePart::Thinking {
+                    text: "pondering".into(),
+                    signature: Some("c2ln".into()),
+                    redacted: Some("b3BhcXVl".into()),
+                }],
+            )],
+            system: None,
+            tools: None,
+        };
+        let body = converse_body(&request, BUDGET);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "one reasoning block carries the state: {blocks:?}"
+        );
+        let reasoning = &blocks[0]["reasoningContent"];
+        assert_eq!(reasoning["reasoningText"]["text"], "pondering");
+        assert_eq!(reasoning["reasoningText"]["signature"], "c2ln");
+        assert_eq!(
+            reasoning["redactedContent"], "b3BhcXVl",
+            "both payloads ride in their member shapes — the block is a one-member \
+             union, so the provider refuses the out-of-contract shape loudly instead \
+             of the writer silently inventing which half was real: {reasoning}"
+        );
+    }
+
+    #[test]
+    fn unsigned_thinking_is_dropped_from_converse_bodies() {
+        let request = StreamRequest {
+            messages: vec![Message::new(
+                crate::message::Role::Assistant,
+                vec![
+                    MessagePart::Thinking {
+                        text: "pondering".into(),
+                        signature: None,
+                        redacted: None,
+                    },
+                    MessagePart::text("the answer"),
+                ],
+            )],
+            system: None,
+            tools: None,
+        };
+        let body = converse_body(&request, BUDGET);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "unsigned thinking must not ride — a text-only reasoning block is a \
+             shape Converse rejects on input: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["text"], "the answer");
+    }
+
+    #[test]
+    fn a_call_signature_never_rides_the_converse_wire() {
+        let request = StreamRequest {
+            messages: vec![Message::new(
+                crate::message::Role::Assistant,
+                vec![MessagePart::tool_call_with_signature(
+                    "t1",
+                    "echo",
+                    serde_json::json!({"a": 1}),
+                    Some("sig-fc".into()),
+                )],
+            )],
+            system: None,
+            tools: None,
+        };
+        let body = converse_body(&request, BUDGET);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "the tool call rides alone: {blocks:?}");
+        assert_eq!(blocks[0]["toolUse"]["toolUseId"], "t1");
+        assert_eq!(blocks[0]["toolUse"]["name"], "echo");
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("sig-fc") && !rendered.contains("thoughtSignature"),
+            "this wire has no carrier for a call signature — the token drops at \
+             request-build, booked on no lane: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_call_signature_never_rides_the_invoke_wire() {
+        // The Messages-shaped path folds history through the Anthropic
+        // converter, whose own pin covers that wire; this one closes the
+        // per-dialect claim for the Bedrock client's second shape.
+        let request = StreamRequest {
+            messages: vec![Message::new(
+                crate::message::Role::Assistant,
+                vec![MessagePart::tool_call_with_signature(
+                    "t1",
+                    "echo",
+                    serde_json::json!({"a": 1}),
+                    Some("sig-fc".into()),
+                )],
+            )],
+            system: None,
+            tools: None,
+        };
+        let body = anthropic_body(&request, BUDGET);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the tool_use block rides alone: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["id"], "t1");
+        assert_eq!(blocks[0]["name"], "echo");
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("sig-fc") && !rendered.contains("thoughtSignature"),
+            "the invoke shape has no carrier for a call signature either — the \
+             drop is pinned per outbound shape, not inferred from the shared \
+             converter: {rendered}"
         );
     }
 

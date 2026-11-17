@@ -232,7 +232,7 @@ site. The only obligations: an honest bump (never a break in a patch)
 and a CHANGELOG migration note. `#[deprecated]` is not a gate and not a
 ritual.
 
-**MSRV is 1.98** (`Cargo.toml` `rust-version`; `.clippy.toml` mirrors
+**MSRV is 1.100** (`Cargo.toml` `rust-version`; `.clippy.toml` mirrors
 it). MSRV rises only in minors. CI runs on the **pinned** toolchain, not
 floating stable — a toolchain roll must not flip a lint verdict mid-PR.
 Widening the matrix is a deliberate act: add the job, then the rule.

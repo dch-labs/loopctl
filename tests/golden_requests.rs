@@ -471,6 +471,16 @@ fn shared_conversation() -> StreamRequest {
 /// 404 — the body is already on the wire by then, the recording holds
 /// it, and the client's error is expected and discarded.
 async fn golden_wire_body<C: ApiClient>(scenario: &str, build_client: impl FnOnce(&str) -> C) {
+    golden_wire_body_with_request(scenario, build_client, shared_conversation()).await;
+}
+
+/// The [`golden_wire_body`] shape over a caller-owned request, for
+/// scenarios whose history is the thing under test.
+async fn golden_wire_body_with_request<C: ApiClient>(
+    scenario: &str,
+    build_client: impl FnOnce(&str) -> C,
+    request: StreamRequest,
+) {
     let server = httpmock::MockServer::start_async().await;
     let recording = server
         .record_async(|rule| {
@@ -480,7 +490,6 @@ async fn golden_wire_body<C: ApiClient>(scenario: &str, build_client: impl FnOnc
         })
         .await;
     let client = build_client(&server.base_url());
-    let request = shared_conversation();
     let mut stream = client.stream_messages(&request);
     // Drain to completion: the 404 arrives as an error event, and only
     // the request the client built matters here.
@@ -1025,6 +1034,52 @@ async fn gemini_wire_body_is_golden() {
             .build()
             .expect("the gemini client builds")
     })
+    .await;
+}
+
+#[tokio::test]
+#[cfg(feature = "gemini")]
+async fn a_signed_thought_part_on_the_gemini_wire_is_golden() {
+    let request = StreamRequest::new(vec![
+        Message::user("Check the weather in Paris with the weather tool."),
+        Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "pondering the request".into(),
+                    signature: Some("golden-signature".into()),
+                    redacted: None,
+                },
+                MessagePart::tool_call_with_signature(
+                    "call_gold_weather",
+                    "get_weather",
+                    json!({"city": "Paris"}),
+                    Some("golden-call-signature".into()),
+                ),
+            ],
+        ),
+        Message::new(
+            Role::User,
+            vec![MessagePart::tool_result(
+                "call_gold_weather",
+                "get_weather",
+                "18 degrees, clear sky",
+                false,
+            )],
+        ),
+    ]);
+    golden_wire_body_with_request(
+        "gemini_wire_reasoning",
+        |base| {
+            loopctl::provider::GeminiClient::builder()
+                .with_api_key("golden-key")
+                .with_base_url(format!("{base}/v1beta"))
+                .with_model("golden-model")
+                .build()
+                .expect("the gemini client builds")
+        },
+        request,
+    )
     .await;
 }
 

@@ -347,8 +347,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for CaptureLayer {
             .0
             .iter()
             .find(|(key, _)| key == "message")
-            .map(|(_, value)| value.clone())
-            .unwrap_or_default();
+            .map_or_default(|(_, value)| value.clone());
         let meta = event.metadata();
         self.0
             .events

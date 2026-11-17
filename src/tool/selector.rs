@@ -1395,8 +1395,7 @@ mod async_tests {
                         .table
                         .iter()
                         .find(|(known, _)| known == text)
-                        .map(|(_, vector)| vector.clone())
-                        .unwrap_or_default();
+                        .map_or_default(|(_, vector)| vector.clone());
                     Ok(Embedding::new(vector))
                 })
             }

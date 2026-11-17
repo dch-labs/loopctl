@@ -336,10 +336,15 @@ impl GeminiClient {
     /// present (Gemini 3 assigns a unique id per call; older versions omit
     /// it, in which case the id defaults to an empty string) and its `args`
     /// normalized by [`normalize_function_args`] (absent or `null` becomes
-    /// an empty object). Parts flagged
-    /// `thought: true` are skipped — reasoning is stream-only in this crate,
-    /// so their summaries are dropped rather than surfaced as visible text,
-    /// matching what the streaming accumulator's text lane yields. A single
+    /// an empty object). Parts flagged `thought: true` become
+    /// [`MessagePart::Thinking`] parts carrying their text and, when the
+    /// response holds one, their `thoughtSignature` verbatim — the same
+    /// parts the streaming path routes to the thinking lane, so the two
+    /// transports yield identical reasoning for parts carrying no
+    /// `functionCall` (a thought part carrying neither text nor a
+    /// signature yields nothing; the streaming arm dispatches a
+    /// call-carrying part before its text lane, so a mixed part's text
+    /// rides this transport only). A single
     /// part may hold both `text` and `functionCall`, in which case it yields
     /// two parts. Maps `candidates[0].finishReason` to a [`StreamStopReason`]
     /// using the same mapping the streaming emitter applies: `"MAX_TOKENS"` →
@@ -358,14 +363,41 @@ impl GeminiClient {
                     .get("thought")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if !is_thought && let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                    parts.push(MessagePart::text(text));
+                let part_signature = part.get("thoughtSignature").and_then(Value::as_str);
+                if is_thought {
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                    let signature = part_signature.filter(|_| part.get("functionCall").is_none());
+                    if !text.is_empty() || signature.is_some() {
+                        parts.push(MessagePart::Thinking {
+                            text: text.to_string(),
+                            signature: signature.map(str::to_string),
+                            redacted: None,
+                        });
+                    }
+                } else {
+                    let text = part.get("text").and_then(|t| t.as_str());
+                    let signature = part_signature.filter(|_| part.get("functionCall").is_none());
+                    if let Some(signature) = signature {
+                        parts.push(MessagePart::Thinking {
+                            text: String::new(),
+                            signature: Some(signature.to_string()),
+                            redacted: None,
+                        });
+                    }
+                    if let Some(text) = text {
+                        parts.push(MessagePart::text(text));
+                    }
                 }
                 if let Some(fc) = part.get("functionCall") {
                     let id = fc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let input = normalize_function_args(fc);
-                    parts.push(MessagePart::tool_call(id, name, input));
+                    parts.push(MessagePart::tool_call_with_signature(
+                        id,
+                        name,
+                        input,
+                        part_signature.map(str::to_string),
+                    ));
                 }
             }
         }
@@ -1074,20 +1106,44 @@ fn convert_message(m: &Message) -> Value {
 
 /// Convert a single [`MessagePart`] into a Gemini part JSON object.
 ///
-/// Returns `None` for image parts (not yet supported for Gemini) and for
-/// `Thinking` parts, which Gemini has no channel to replay — each dropped
-/// block is booked as `skipped` on the reasoning rows, not left unsaid.
+/// Returns `None` for image parts (not yet supported for Gemini). A
+/// `Thinking` part carrying a signature rides back in Gemini's own
+/// thought shape — the text, `thought: true`, and the `thoughtSignature`
+/// verbatim — booked as `native`, because a signed summary is the
+/// continuity token a reasoning model needs returned on the next request.
+/// Unsigned thinking is dropped and booked as `skipped` on the reasoning
+/// rows, not left unsaid, and so is a part whose only fidelity payload is
+/// a redacted blob — this dialect carries no wire shape for one. A part
+/// carrying both a signature and a redacted payload — a state no Gemini
+/// response builds, reachable only from a foreign history — answers with
+/// the signature and drops the redacted blob, booked `native` for what
+/// rode: the token this dialect can return is the signature, and a part
+/// this shape is already foreign to it (pinned by
+/// `a_both_payload_part_answers_with_its_signature_on_gemini`).
 fn convert_part(p: &MessagePart) -> Option<Value> {
     match p {
         MessagePart::Text { text } => Some(serde_json::json!({"text": text})),
-        MessagePart::ToolCall { id, name, input } => {
+        MessagePart::ToolCall {
+            id,
+            name,
+            input,
+            signature,
+        } => {
             let mut fc = serde_json::Map::new();
             fc.insert("name".to_string(), serde_json::Value::String(name.clone()));
             fc.insert("args".to_string(), input.clone());
             if !id.is_empty() {
                 fc.insert("id".to_string(), serde_json::Value::String(id.clone()));
             }
-            Some(serde_json::json!({"functionCall": fc}))
+            let mut block = serde_json::Map::new();
+            block.insert("functionCall".to_string(), serde_json::Value::Object(fc));
+            if let Some(signature) = signature {
+                block.insert(
+                    "thoughtSignature".to_string(),
+                    serde_json::Value::String(signature.clone()),
+                );
+            }
+            Some(serde_json::Value::Object(block))
         }
         MessagePart::ToolResult {
             call_id,
@@ -1105,6 +1161,18 @@ fn convert_part(p: &MessagePart) -> Option<Value> {
                 serde_json::json!({"result": output.to_string()}),
             );
             Some(serde_json::json!({"functionResponse": fr}))
+        }
+        MessagePart::Thinking {
+            text,
+            signature: Some(signature),
+            ..
+        } => {
+            super::record_reasoning_block("native");
+            Some(serde_json::json!({
+                "text": text,
+                "thought": true,
+                "thoughtSignature": signature,
+            }))
         }
         MessagePart::Thinking { .. } => {
             super::record_reasoning_block("skipped");
@@ -1330,7 +1398,12 @@ impl StreamEmitter {
     /// for the terminal stop signal. Events accumulate in the internal queue
     /// until [`drain`](Self::drain) is called. A chunk carrying a top-level
     /// `/error` object produces no events — it records the terminal error
-    /// that [`finish`](Self::finish) surfaces.
+    /// that [`finish`](Self::finish) surfaces. A parts payload arriving
+    /// after the `finishReason` is dropped whole: a re-emitting proxy
+    /// speaking past the provider's terminal signal would open lanes
+    /// nothing after the terminal closes, so its content — a signature
+    /// included — would vanish at build with no signal; the stream ends
+    /// where the provider said it ended.
     fn process_chunk(&mut self, json: &Value) {
         if json.get("error").is_some() {
             self.record_error(json);
@@ -1348,7 +1421,9 @@ impl StreamEmitter {
         }
 
         self.note_usage(json);
-        self.extract_parts_with_tools(json);
+        if matches!(self.terminal, TerminalStage::Pending) {
+            self.extract_parts_with_tools(json);
+        }
         self.extract_finish_reason(json);
     }
 
@@ -1452,6 +1527,19 @@ impl StreamEmitter {
     /// previous lane first when switching — at most one content lane is
     /// ever open, so a lane left open behind a switch could share its
     /// part index with a later tool call and make closing ambiguous.
+    /// The thinking lane is bounded by the signals that terminate a
+    /// logical thought, symmetric with how the text lane treats the
+    /// same wire: a signature-bearing delta closes its part (the
+    /// signature is Google's documented terminator, delivered on the
+    /// last delta of a thought), a second thought part *within one
+    /// chunk's* `parts[]` array opens a new part (the assembled response
+    /// lists each as its own part), and a lane switch closes whatever is
+    /// open — while unsigned thought fragments arriving across chunks
+    /// concatenate into the open part, exactly as consecutive text
+    /// fragments across chunks concatenate into one text part. A split
+    /// on every chunk boundary would shatter a single thought the model
+    /// streamed incrementally, replaying a truncated fragment under a
+    /// signature computed over the whole summary.
     fn extract_parts_with_tools(&mut self, json: &Value) {
         let Some(parts) = json
             .pointer("/candidates/0/content/parts")
@@ -1460,30 +1548,35 @@ impl StreamEmitter {
             return;
         };
 
+        let mut thought_in_chunk = false;
         for part in parts {
             if part.get("functionCall").is_some() {
                 self.handle_function_call(part);
                 continue;
             }
 
-            let Some(text) = part.get("text").and_then(Value::as_str) else {
-                continue;
-            };
-
-            if text.is_empty() {
-                continue;
-            }
-
+            let text = part.get("text").and_then(Value::as_str);
+            let signature = part.get("thoughtSignature").and_then(Value::as_str);
             let is_thought = part
                 .get("thought")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
             if is_thought {
+                let text = text.unwrap_or("");
+                if text.is_empty() && signature.is_none() {
+                    continue;
+                }
                 if matches!(self.text, PartLane::Open) {
                     self.text = PartLane::Closed;
                     self.push(StreamEvent::PartStop {
                         index: Some(TEXT_PART_INDEX),
+                    });
+                }
+                if matches!(self.thinking, PartLane::Open) && thought_in_chunk {
+                    self.thinking = PartLane::Closed;
+                    self.push(StreamEvent::PartStop {
+                        index: Some(THINKING_PART_INDEX),
                     });
                 }
                 if matches!(self.thinking, PartLane::Closed) {
@@ -1497,11 +1590,56 @@ impl StreamEmitter {
                     index: THINKING_PART_INDEX,
                     delta: DeltaPart::Thinking {
                         text: text.to_string(),
-                        signature: None,
+                        signature: signature.map(str::to_string),
                         redacted: None,
                     },
                 }));
+                if signature.is_some() {
+                    self.thinking = PartLane::Closed;
+                    self.push(StreamEvent::PartStop {
+                        index: Some(THINKING_PART_INDEX),
+                    });
+                }
+                thought_in_chunk = true;
             } else {
+                thought_in_chunk = false;
+                if let Some(signature) = signature {
+                    if matches!(self.text, PartLane::Open) {
+                        self.text = PartLane::Closed;
+                        self.push(StreamEvent::PartStop {
+                            index: Some(TEXT_PART_INDEX),
+                        });
+                    }
+                    if matches!(self.thinking, PartLane::Open) {
+                        self.thinking = PartLane::Closed;
+                        self.push(StreamEvent::PartStop {
+                            index: Some(THINKING_PART_INDEX),
+                        });
+                    }
+                    self.thinking = PartLane::Open;
+                    self.push(StreamEvent::PartStart(PartStart {
+                        index: THINKING_PART_INDEX,
+                        part: None,
+                    }));
+                    self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: THINKING_PART_INDEX,
+                        delta: DeltaPart::Thinking {
+                            text: String::new(),
+                            signature: Some(signature.to_string()),
+                            redacted: None,
+                        },
+                    }));
+                    self.thinking = PartLane::Closed;
+                    self.push(StreamEvent::PartStop {
+                        index: Some(THINKING_PART_INDEX),
+                    });
+                }
+                let Some(text) = text else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
                 if matches!(self.thinking, PartLane::Open) {
                     self.thinking = PartLane::Closed;
                     self.push(StreamEvent::PartStop {
@@ -1532,7 +1670,11 @@ impl StreamEmitter {
     /// at their original position relative to text/thought parts. Each call
     /// gets its own incrementing index, and its `args` are normalized by
     /// [`normalize_function_args`] — the `PartStart` input and the emitted
-    /// `InputJson` delta both carry the normalized object.
+    /// `InputJson` delta both carry the normalized object. A
+    /// `thoughtSignature` riding the part is latched onto the emitted
+    /// `ToolCall` — Google documents the signature as metadata that can
+    /// attach to any part, and the function-call part is the documented
+    /// carrier for reasoning continuity across a tool turn.
     fn handle_function_call(&mut self, part: &Value) {
         let Some(func_call) = part.get("functionCall") else {
             return;
@@ -1547,6 +1689,10 @@ impl StreamEmitter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let signature = part
+            .get("thoughtSignature")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let args = normalize_function_args(func_call);
         let args_str = serde_json::to_string(&args).unwrap_or_default();
 
@@ -1572,6 +1718,7 @@ impl StreamEmitter {
                 id,
                 name,
                 input: args,
+                signature,
             }),
         }));
         self.push(StreamEvent::IndexedDelta(IndexedDelta {
@@ -1732,6 +1879,108 @@ mod tests {
     }
 
     #[test]
+    fn an_error_after_an_open_lane_keeps_the_closed_signed_part_and_drops_the_rest() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "settled", "thought": true, "thoughtSignature": "sig-1"}]}
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "unfinished ", "thought": true}]}
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "error": {"code": 503, "message": "overloaded"}
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
+            "an errored stream never reaches its terminal pair — truncation, \
+             not synthetic completion: {events:?}"
+        );
+        match built.parts.first() {
+            Some(MessagePart::Thinking {
+                text, signature, ..
+            }) => {
+                assert_eq!(text, "settled");
+                assert_eq!(
+                    signature.as_deref(),
+                    Some("sig-1"),
+                    "the closed signed part survives the truncation"
+                );
+            }
+            other => panic!("expected the settled signed part, got {other:?}"),
+        }
+        assert_eq!(
+            built.parts.len(),
+            1,
+            "the open unsigned fragment drops with the truncation — no synthetic close"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_signed_lane_drops_at_build() {
+        let mut acc = crate::stream::StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: None,
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::Thinking {
+                text: String::new(),
+                signature: Some("sig-lost".to_string()),
+                redacted: None,
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::MessageStop).unwrap();
+        assert!(
+            acc.build().parts.is_empty(),
+            "a lane never closed is dropped however it was filled — build flushes \
+             completed parts only, and MessageStop closes nothing"
+        );
+    }
+
+    #[test]
+    fn parts_after_the_finish_reason_are_dropped_whole() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "final"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 7}
+        }));
+        em.drain();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "late"},
+                    {"thoughtSignature": "sig-late"}
+                ]}
+            }]
+        }));
+        let late = em.drain();
+        assert!(
+            late.is_empty(),
+            "a parts payload after the terminal signal opens lanes nothing \
+             would close — its signature would vanish at build with no signal, \
+             so the chunk is dropped whole: {late:?}"
+        );
+    }
+
+    #[test]
     fn gemini_terminal_stage_starts_pending() {
         let em = StreamEmitter::default();
         assert!(
@@ -1806,6 +2055,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 input: serde_json::json!({"msg": "hi"}),
+                signature: None,
             }],
         )];
         let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
@@ -2260,6 +2510,946 @@ mod tests {
                 })
             )),
             "thought:true part must not produce a Text delta"
+        );
+    }
+
+    #[test]
+    fn emitter_thought_signature_rides_the_thinking_lane() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "step 1",
+                        "thought": true,
+                        "thoughtSignature": "c2lnbmF0dXJl"
+                    }]
+                }
+            }]
+        }));
+        let events = em.drain();
+        let delta = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::IndexedDelta(d) => Some(d.clone()),
+                _ => None,
+            })
+            .expect("expected at least one IndexedDelta");
+        match delta.delta {
+            DeltaPart::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                assert_eq!(text, "step 1");
+                assert_eq!(signature.as_deref(), Some("c2lnbmF0dXJl"));
+                assert!(redacted.is_none());
+            }
+            other => panic!("expected a Thinking delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_signature_only_thought_part_still_opens_the_lane() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "thought": true,
+                        "thoughtSignature": "c2lnbmF0dXJl"
+                    }]
+                }
+            }]
+        }));
+        let events = em.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStart(p) if p.index == THINKING_PART_INDEX)),
+            "a signature-only thought part must open the thinking lane"
+        );
+        let delta = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::IndexedDelta(d) => Some(d.clone()),
+                _ => None,
+            })
+            .expect("expected a Thinking delta for the signature");
+        match delta.delta {
+            DeltaPart::Thinking {
+                text, signature, ..
+            } => {
+                assert_eq!(text, "");
+                assert_eq!(signature.as_deref(), Some("c2lnbmF0dXJl"));
+            }
+            other => panic!("expected a Thinking delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_unsigned_thought_part_yields_nothing() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "thought": true }]
+                }
+            }]
+        }));
+        let events = em.drain();
+        assert!(
+            events.is_empty(),
+            "a thought part carrying neither text nor a signature must yield no events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn build_response_captures_thought_parts_with_their_signatures() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "pondering", "thought": true, "thoughtSignature": "c2ln" },
+                        { "text": "the answer" },
+                        { "thought": true, "thoughtSignature": "c2lnMg==" }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        let parts = &response.message.parts;
+        assert_eq!(parts.len(), 3, "two thought parts and one text part");
+        match &parts[0] {
+            MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                assert_eq!(text, "pondering");
+                assert_eq!(signature.as_deref(), Some("c2ln"));
+                assert!(redacted.is_none());
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        assert!(matches!(&parts[1], MessagePart::Text { text } if text == "the answer"));
+        match &parts[2] {
+            MessagePart::Thinking {
+                text, signature, ..
+            } => {
+                assert_eq!(text, "");
+                assert_eq!(signature.as_deref(), Some("c2lnMg=="));
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_skips_an_empty_unsigned_thought_part() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "thought": true },
+                        { "text": "the answer" }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 1);
+        assert!(
+            matches!(&response.message.parts[0], MessagePart::Text { text } if text == "the answer")
+        );
+    }
+
+    #[test]
+    fn signed_thinking_parts_ride_gemini_requests_natively() {
+        let msgs = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "step 1".into(),
+                    signature: Some("c2lnbmF0dXJl".into()),
+                    redacted: None,
+                },
+                MessagePart::ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"msg": "hi"}),
+                    signature: None,
+                },
+            ],
+        )];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(
+            parts.len(),
+            2,
+            "the signed part and the tool call: {parts:?}"
+        );
+        assert_eq!(parts[0]["text"], "step 1");
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["thoughtSignature"], "c2lnbmF0dXJl");
+    }
+
+    #[test]
+    fn unsigned_thinking_parts_stay_skipped_on_the_gemini_wire() {
+        let msgs = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "step 1".into(),
+                    signature: None,
+                    redacted: None,
+                },
+                MessagePart::text("the answer"),
+            ],
+        )];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "unsigned thinking must not ride: {parts:?}");
+        assert_eq!(parts[0]["text"], "the answer");
+        assert!(
+            parts[0].get("thoughtSignature").is_none(),
+            "no signature may be synthesized for an unsigned part"
+        );
+    }
+
+    #[test]
+    fn a_function_call_part_signature_latches_onto_the_call() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {"name": "echo", "args": {}},
+                        "thoughtSignature": "sig-fc"
+                    }]
+                }
+            }]
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        match built.parts.first().expect("the call builds a part") {
+            MessagePart::ToolCall {
+                name, signature, ..
+            } => {
+                assert_eq!(name, "echo");
+                assert_eq!(
+                    signature.as_deref(),
+                    Some("sig-fc"),
+                    "the signature riding the call part is the continuity token and must survive the turn"
+                );
+            }
+            other => panic!("expected a ToolCall part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adjacent_thought_parts_across_chunks_stay_separate_signed_parts() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "alpha", "thought": true, "thoughtSignature": "sig-1"}]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "beta", "thought": true, "thoughtSignature": "sig-2"}]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        let shapes: Vec<(String, Option<String>)> = built
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::Thinking {
+                    text, signature, ..
+                } => Some((text.clone(), signature.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                ("alpha".to_string(), Some("sig-1".to_string())),
+                ("beta".to_string(), Some("sig-2".to_string())),
+            ],
+            "each thought part keeps its own signature — a merged lane destroys the earlier token: {events:?}"
+        );
+    }
+
+    #[test]
+    fn cross_chunk_unsigned_fragments_accumulate_into_one_signed_part() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "alpha ", "thought": true}]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "beta", "thought": true, "thoughtSignature": "sig-final"}]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        let shapes: Vec<(String, Option<String>)> = built
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::Thinking {
+                    text, signature, ..
+                } => Some((text.clone(), signature.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![("alpha beta".to_string(), Some("sig-final".to_string()))],
+            "a thought streamed as fragments across chunks rebuilds as one complete part \
+             carrying the signature computed over the whole summary — a split on the chunk \
+             boundary would replay a truncated fragment under that signature: {events:?}"
+        );
+    }
+
+    proptest::proptest! {
+        /// Every signature delivered on a generated wire — on a thought
+        /// delta, a signature-only part, or a function call — appears
+        /// exactly once among the built parts, whatever the fragmenting
+        /// and interleaving around it: no loss, no duplication, order of
+        /// first delivery preserved.
+        #[test]
+        fn generated_gemini_wires_conserve_every_signature(
+            plan in proptest::collection::vec(
+                proptest::collection::vec(0..6usize, 0..=4),
+                1..=6
+            ),
+        ) {
+            let kinds = [
+                "unsigned-thought",
+                "signed-thought",
+                "sig-only",
+                "text",
+                "call",
+                "signed-call",
+            ];
+            let mut delivered: Vec<(usize, String)> = Vec::new();
+            let mut chunks: Vec<serde_json::Value> = Vec::new();
+            let mut counter = 0usize;
+            for step in &plan {
+                let mut parts = Vec::new();
+                for kind_index in step {
+                    counter = counter.saturating_add(1);
+                    let sig = format!("sig-{counter}");
+                    let kind = kinds
+                        .get(kind_index.checked_rem(kinds.len()).unwrap_or(0))
+                        .copied()
+                        .unwrap_or("unsigned-thought");
+                    match kind {
+                        "unsigned-thought" => parts.push(serde_json::json!({"text": format!("t{counter}"), "thought": true})),
+                        "signed-thought" => {
+                            parts.push(serde_json::json!({"text": format!("t{counter}"), "thought": true, "thoughtSignature": sig}));
+                            delivered.push((counter, sig));
+                        }
+                        "sig-only" => {
+                            parts.push(serde_json::json!({"thoughtSignature": sig}));
+                            delivered.push((counter, sig));
+                        }
+                        "text" => parts.push(serde_json::json!({"text": format!("t{counter}")})),
+                        "call" => parts.push(serde_json::json!({"functionCall": {"name": format!("c{counter}"), "args": {}}})),
+                        _ => {
+                            parts.push(serde_json::json!({"functionCall": {"name": format!("c{counter}"), "args": {}}, "thoughtSignature": sig}));
+                            delivered.push((counter, sig));
+                        }
+                    }
+                }
+                chunks.push(serde_json::json!({"candidates": [{"content": {"parts": parts}}]}));
+            }
+            chunks.push(serde_json::json!({"candidates": [{"finishReason": "STOP"}]}));
+
+            let mut em = StreamEmitter::default();
+            em.started = true;
+            let mut events: Vec<StreamEvent> = Vec::new();
+            for chunk in &chunks {
+                em.process_chunk(chunk);
+                events.extend(em.drain());
+            }
+            let mut acc = crate::stream::StreamAccumulator::new();
+            for ev in &events {
+                acc.process(ev).unwrap();
+            }
+            let built: Vec<(usize, String)> = acc
+                .build()
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    MessagePart::Thinking { signature, .. } | MessagePart::ToolCall { signature, .. } => {
+                        signature.as_ref().and_then(|sig| {
+                            sig.strip_prefix("sig-")
+                                .and_then(|n| n.parse::<usize>().ok())
+                                .map(|n| (n, sig.clone()))
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut expected = delivered;
+            expected.sort_by_key(|(n, _)| *n);
+            let mut actual = built;
+            actual.sort_by_key(|(n, _)| *n);
+            proptest::prop_assert_eq!(
+                actual,
+                expected,
+                "every delivered signature survives exactly once, in delivery order"
+            );
+        }
+    }
+
+    #[test]
+    fn a_signature_only_part_does_not_merge_with_a_following_thought_part() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thoughtSignature": "sig-a"},
+                        {"text": "t", "thought": true, "thoughtSignature": "sig-b"}
+                    ]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let shapes: Vec<(String, Option<String>)> = acc
+            .build()
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::Thinking {
+                    text, signature, ..
+                } => Some((text.clone(), signature.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                (String::new(), Some("sig-a".to_string())),
+                ("t".to_string(), Some("sig-b".to_string())),
+            ],
+            "the signature-only part closes at its delta, so the following \
+             thought opens a fresh slot — a merge would let the second \
+             signature overwrite the first with no signal: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_signature_only_part_splits_the_text_around_it() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "a"},
+                        {"thoughtSignature": "s"},
+                        {"text": "b"}
+                    ]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        let rendered: Vec<String> = built
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::Text { text } => Some(format!("text:{text}")),
+                MessagePart::Thinking {
+                    text, signature, ..
+                } => Some(format!(
+                    "thought:{text}?{}",
+                    signature.as_deref().unwrap_or_default()
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "text:a".to_string(),
+                "thought:?s".to_string(),
+                "text:b".to_string(),
+            ],
+            "the boundary closes the open text lane, so text around it stays \
+             in its own parts — the assembled response keeps all three: {events:?}"
+        );
+    }
+
+    #[test]
+    fn both_transports_capture_a_thought_call_signature_once_on_the_call() {
+        let parts = serde_json::json!([{
+            "text": "hm",
+            "thought": true,
+            "thoughtSignature": "sig-fc",
+            "functionCall": {"name": "echo", "args": {}}
+        }]);
+        let streamed = {
+            let mut em = StreamEmitter::default();
+            em.started = true;
+            em.process_chunk(&serde_json::json!({
+                "candidates": [{"content": {"parts": parts}}]
+            }));
+            em.process_chunk(&serde_json::json!({
+                "candidates": [{"finishReason": "STOP"}]
+            }));
+            let events = em.drain();
+            let mut acc = crate::stream::StreamAccumulator::new();
+            for ev in &events {
+                acc.process(ev).unwrap();
+            }
+            acc.build()
+        };
+        let plain = GeminiClient::build_response(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": parts},
+                "finishReason": "STOP"
+            }]
+        }));
+        // The signature agreement is what this shape owns: both transports
+        // capture it exactly once, on the call. (The mixed part's *text*
+        // diverges — the streaming arm dispatches a call-carrying part
+        // before its text lane, a drop outside this pin's scope.)
+        let signatures = |msg: &crate::message::Message| -> Vec<(&'static str, String)> {
+            msg.parts
+                .iter()
+                .filter_map(|p| match p {
+                    MessagePart::Thinking { signature, .. } => signature
+                        .as_deref()
+                        .map(|sig| ("thinking", sig.to_string())),
+                    MessagePart::ToolCall { signature, .. } => {
+                        signature.as_deref().map(|sig| ("call", sig.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            signatures(&streamed),
+            vec![("call", "sig-fc".to_string())],
+            "streaming captures the signature once, on the call"
+        );
+        assert_eq!(
+            signatures(&plain.message),
+            vec![("call", "sig-fc".to_string())],
+            "non-streaming captures the signature once, on the call — the \
+             never-twice rule holds on both transports for this shape"
+        );
+    }
+
+    #[test]
+    fn two_signed_thought_parts_in_one_chunk_stay_separate_parts() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "alpha", "thought": true, "thoughtSignature": "sig-1"},
+                        {"text": "beta", "thought": true, "thoughtSignature": "sig-2"}
+                    ]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        let shapes: Vec<(String, Option<String>)> = built
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::Thinking {
+                    text, signature, ..
+                } => Some((text.clone(), signature.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                ("alpha".to_string(), Some("sig-1".to_string())),
+                ("beta".to_string(), Some("sig-2".to_string())),
+            ],
+            "two thought parts inside one chunk's parts array are two logical parts, \
+             matching the assembled response the non-streaming reader sees: {events:?}"
+        );
+    }
+
+    #[test]
+    fn build_response_captures_a_bare_signature_part() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thoughtSignature": "sig-bare"},
+                        {"text": "the answer"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        let parts = &response.message.parts;
+        assert_eq!(
+            parts.len(),
+            2,
+            "the signature part then the text part: {parts:?}"
+        );
+        match &parts[0] {
+            MessagePart::Thinking {
+                text, signature, ..
+            } => {
+                assert_eq!(text, "");
+                assert_eq!(
+                    signature.as_deref(),
+                    Some("sig-bare"),
+                    "a signature part carrying neither text nor a call is captured, \
+                     symmetric with the streaming arm"
+                );
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        assert!(matches!(&parts[1], MessagePart::Text { text } if text == "the answer"));
+    }
+
+    #[test]
+    fn a_signature_on_a_final_text_part_rides_as_a_signature_only_thinking_part() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "the answer", "thoughtSignature": "sig-final"}]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        assert_eq!(
+            built.parts.len(),
+            2,
+            "the signature part then the text part"
+        );
+        match &built.parts[0] {
+            MessagePart::Thinking {
+                text, signature, ..
+            } => {
+                assert_eq!(text, "");
+                assert_eq!(signature.as_deref(), Some("sig-final"));
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        assert!(matches!(&built.parts[1], MessagePart::Text { text } if text == "the answer"));
+    }
+
+    #[test]
+    fn build_response_captures_a_signature_on_the_function_call_part() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "echo", "args": {}}, "thoughtSignature": "sig-fc"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        match response
+            .message
+            .parts
+            .first()
+            .expect("the call builds a part")
+        {
+            MessagePart::ToolCall {
+                name, signature, ..
+            } => {
+                assert_eq!(name, "echo");
+                assert_eq!(signature.as_deref(), Some("sig-fc"));
+            }
+            other => panic!("expected a ToolCall part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_carries_a_final_part_signature_as_a_thinking_part() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "the answer", "thoughtSignature": "sig-final"}]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        let parts = &response.message.parts;
+        assert_eq!(
+            parts.len(),
+            2,
+            "the signature part then the text part: {parts:?}"
+        );
+        match &parts[0] {
+            MessagePart::Thinking {
+                text, signature, ..
+            } => {
+                assert_eq!(text, "");
+                assert_eq!(signature.as_deref(), Some("sig-final"));
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        assert!(matches!(&parts[1], MessagePart::Text { text } if text == "the answer"));
+    }
+
+    #[test]
+    fn a_signature_on_a_part_holding_text_and_a_call_rides_the_call_once() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "calling now",
+                        "functionCall": {"name": "echo", "args": {}},
+                        "thoughtSignature": "sig-fc"
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        let parts = &response.message.parts;
+        assert_eq!(
+            parts.len(),
+            2,
+            "the text and the call, with no duplicate signature part: {parts:?}"
+        );
+        assert!(matches!(&parts[0], MessagePart::Text { text } if text == "calling now"));
+        match &parts[1] {
+            MessagePart::ToolCall { signature, .. } => {
+                assert_eq!(signature.as_deref(), Some("sig-fc"));
+            }
+            other => panic!("expected a ToolCall part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_signature_on_a_thought_part_with_a_call_rides_the_call_once() {
+        // Out-of-contract wire (Google documents no `thought: true` on a
+        // function-call part), but the capture rule is total: the call is
+        // the signature's carrier when one rides the part, so the thinking
+        // half stays unsigned rather than duplicating the token.
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "hm",
+                        "thought": true,
+                        "thoughtSignature": "sig-fc",
+                        "functionCall": {"name": "echo", "args": {}}
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        let parts = &response.message.parts;
+        assert_eq!(parts.len(), 2, "the thinking text and the call: {parts:?}");
+        match &parts[0] {
+            MessagePart::Thinking {
+                text, signature, ..
+            } => {
+                assert_eq!(text, "hm");
+                assert!(
+                    signature.is_none(),
+                    "the signature rides the call alone, never twice"
+                );
+            }
+            other => panic!("expected a Thinking part, got {other:?}"),
+        }
+        match &parts[1] {
+            MessagePart::ToolCall { signature, .. } => {
+                assert_eq!(signature.as_deref(), Some("sig-fc"));
+            }
+            other => panic!("expected a ToolCall part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_text_signed_thinking_part_rides_with_its_empty_text() {
+        let msgs = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: String::new(),
+                signature: Some("sig-1".into()),
+                redacted: None,
+            }],
+        )];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "the signature-only part rides: {parts:?}");
+        assert_eq!(parts[0]["text"], "", "the empty text rides verbatim");
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["thoughtSignature"], "sig-1");
+    }
+
+    #[test]
+    fn two_signed_calls_in_one_response_each_keep_their_own_signature() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "first", "args": {}}, "thoughtSignature": "sig-1"},
+                        {"functionCall": {"name": "second", "args": {}}, "thoughtSignature": "sig-2"}
+                    ]
+                }
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let shapes: Vec<(String, Option<String>)> = acc
+            .build()
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::ToolCall {
+                    name, signature, ..
+                } => Some((name.clone(), signature.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                ("first".to_string(), Some("sig-1".to_string())),
+                ("second".to_string(), Some("sig-2".to_string())),
+            ],
+            "each signed call keeps its own token — the per-index latch must not \
+             share one signature across slots: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_both_payload_part_answers_with_its_signature_on_gemini() {
+        let msgs = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: "pondering".into(),
+                signature: Some("sig-1".into()),
+                redacted: Some("b3BhcXVl".into()),
+            }],
+        )];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "one thought part rides: {parts:?}");
+        assert_eq!(parts[0]["thoughtSignature"], "sig-1");
+        assert_eq!(parts[0]["thought"], true);
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.get("redacted").is_none() && p.get("redactedContent").is_none()),
+            "no redacted shape exists on this wire — the drop is the pinned rule, \
+             not a silent accident"
+        );
+    }
+
+    #[test]
+    fn a_signed_call_rides_its_signature_beside_the_function_call() {
+        let msgs = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call_with_signature(
+                "call_1",
+                "echo",
+                serde_json::json!({"msg": "hi"}),
+                Some("sig-fc".into()),
+            )],
+        )];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "one call part: {parts:?}");
+        assert_eq!(parts[0]["functionCall"]["name"], "echo");
+        assert_eq!(
+            parts[0]["thoughtSignature"], "sig-fc",
+            "the signature rides beside the call, the shape it arrived in"
         );
     }
 
@@ -2728,6 +3918,83 @@ mod tests {
             matches!(err, ApiError::RateLimit { .. }),
             "a 503/UNAVAILABLE chunk is the SSE form of an overloaded status \
              and must classify as RateLimit"
+        );
+    }
+
+    #[test]
+    fn an_error_chunk_abandons_the_open_thought_lane_and_errors_at_finish() {
+        // Poison mid-transition on the fidelity lane: a signed thought
+        // part closed by its own terminator is history the accumulator
+        // holds, but the unsigned fragment after it leaves the lane
+        // open — no PartStop ever closes it, nothing builds from it,
+        // and finish answers the error rather than letting the partial
+        // turn masquerade as a complete one.
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "alpha", "thought": true, "thoughtSignature": "sig-1"},
+                    {"text": "beta ", "thought": true}
+                ]}
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "error": {"code": 500, "message": "internal error", "status": "INTERNAL"}
+        }));
+        assert!(
+            em.error_recorded(),
+            "the error chunk must be recorded over the open lane"
+        );
+        let events = em.drain();
+        let thinking_stops = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    StreamEvent::PartStop {
+                        index: Some(THINKING_PART_INDEX)
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            thinking_stops, 1,
+            "only the signature terminator's PartStop exists — the lane the error \
+             landed on is never closed: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
+            "no clean MessageStop may ride alongside the failure: {events:?}"
+        );
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        let built = acc.build();
+        match built.parts.as_slice() {
+            [
+                MessagePart::Thinking {
+                    text, signature, ..
+                },
+            ] => {
+                assert_eq!(text, "alpha");
+                assert_eq!(
+                    signature.as_deref(),
+                    Some("sig-1"),
+                    "the closed, signed part survives as history the handler can salvage"
+                );
+            }
+            other => panic!(
+                "exactly the closed signed part builds — the abandoned fragment \
+                 yields nothing: {other:?}"
+            ),
+        }
+        let err = em
+            .finish()
+            .expect_err("finish must surface the recorded error");
+        assert!(
+            err.to_string().contains("INTERNAL"),
+            "the terminal error must name the provider's status: {err}"
         );
     }
 
@@ -3382,7 +4649,9 @@ mod tests {
         let response = GeminiClient::build_response(&raw);
         assert_eq!(response.message.parts.len(), 1);
         match &response.message.parts[0] {
-            MessagePart::ToolCall { id, name, input } => {
+            MessagePart::ToolCall {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "");
                 assert_eq!(name, "search");
                 assert_eq!(input, &serde_json::json!({"q": "rust"}));

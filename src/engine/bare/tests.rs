@@ -4380,6 +4380,7 @@ async fn a_tool_carrying_length_cut_is_an_ordinary_tool_turn_not_a_salvage() {
                 id: "call_cut".into(),
                 name: "echo".into(),
                 input: serde_json::Value::Null,
+                signature: None,
             }),
         }),
         StreamEvent::IndexedDelta(IndexedDelta {
@@ -9559,6 +9560,7 @@ async fn test_text_streamer_ignores_non_text_deltas() {
                 id: "call_1".into(),
                 name: "echo".into(),
                 input: Value::Null,
+                signature: None,
             }),
         }),
         StreamEvent::IndexedDelta(IndexedDelta {
@@ -9766,6 +9768,7 @@ async fn test_on_text_delta_ignores_non_text_deltas() {
                 id: "call_1".into(),
                 name: "echo".into(),
                 input: Value::Null,
+                signature: None,
             }),
         }),
         StreamEvent::IndexedDelta(IndexedDelta {
@@ -14710,16 +14713,12 @@ fn wire_request_matches(
         "request {} carries the exact prompt the overhead counts",
         index.saturating_add(1)
     );
-    let advertised: Vec<String> = request
-        .tools
-        .as_ref()
-        .map(|tools| {
-            tools
-                .iter()
-                .map(|schema| serde_json::to_string(schema).unwrap_or_default())
-                .collect()
-        })
-        .unwrap_or_default();
+    let advertised: Vec<String> = request.tools.as_ref().map_or_default(|tools| {
+        tools
+            .iter()
+            .map(|schema| serde_json::to_string(schema).unwrap_or_default())
+            .collect()
+    });
     assert_eq!(
         advertised,
         vec![expected_schema.to_string()],
@@ -14775,8 +14774,7 @@ async fn wire_parity_under() {
     );
     let mut at_rest: Vec<Message> = captured
         .last()
-        .map(|request| request.messages.clone())
-        .unwrap_or_default();
+        .map_or_default(|request| request.messages.clone());
     at_rest.push(final_response);
     let expected_system = HeuristicTokenCounter.count(&[Message::user(system_prompt.to_string())]);
     let expected_tools = HeuristicTokenCounter.count(&[Message::user(
@@ -15366,8 +15364,7 @@ fn surface_names(request: &crate::api::StreamRequest) -> Vec<String> {
     request
         .tools
         .as_ref()
-        .map(|tools| tools.iter().map(|schema| schema.tool.clone()).collect())
-        .unwrap_or_default()
+        .map_or_default(|tools| tools.iter().map(|schema| schema.tool.clone()).collect())
 }
 
 #[cfg(feature = "streaming")]

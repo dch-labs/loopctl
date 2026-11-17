@@ -200,8 +200,7 @@ async fn dispatch_sets_a_per_session_path_under_the_override_base() {
     );
     let file_name = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().into_owned());
     assert!(
         file_name.starts_with("loopctl-") && file_name.contains(&session_id),
         "the subdir is named after the session: got {file_name}, session {session_id}"
@@ -520,13 +519,11 @@ async fn random_lifecycle_sequences_never_leak_session_dirs() {
         }
         drop(loop_);
 
-        let leftovers: Vec<String> = std::fs::read_dir(&base)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let leftovers: Vec<String> = std::fs::read_dir(&base).map_or_default(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        });
         assert!(
             leftovers.is_empty(),
             "iter {iter}: session dirs outlived their loops: {leftovers:?} \

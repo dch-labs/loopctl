@@ -103,6 +103,63 @@ fn text_of(result: &loopctl::tool::ToolDispatchResult) -> String {
 }
 
 #[tokio::test]
+async fn signature_shaped_tokens_scrub_in_tool_output() {
+    // The counterfactual that makes the seam boundary mean something: the
+    // same bytes that ride a Thinking part's `signature` field are dense
+    // high-entropy material, and in tool output the heuristic eats them —
+    // the field survives on the lane only because the lane is structured
+    // state no dispatch pipeline traverses, never because the heuristic
+    // spares it. The survival half is pinned where it can fail — end to
+    // end, the next provider request still carrying the signature
+    // verbatim through a redacting pipeline — in the reasoning round-trip
+    // suite; a locally constructed part matched against itself would pin
+    // nothing.
+    // Assembled from pieces so the contiguous token never appears in
+    // source, matching the discipline the AWS fixture below carries.
+    let signature = [
+        "x7Kp9", "QmZ2vB", "n4RtY6", "wLc8Jh", "1DfG3S", "aE5uIo", "P0zXq",
+    ]
+    .concat();
+    let result = redact(ToolContent::from_string(format!(
+        "the tool echoed {signature}"
+    )))
+    .await;
+    let text = text_of(&result);
+    assert!(
+        !text.contains(signature.as_str()),
+        "in tool output the echo must mask — its entropy is exactly what the heuristic hunts: {text}"
+    );
+    assert!(
+        text.contains("[REDACTED:"),
+        "the echo is replaced, not merely deleted: {text}"
+    );
+}
+
+#[tokio::test]
+async fn signature_shaped_echoes_pass_only_when_the_entropy_heuristic_is_on() {
+    // The scrub of a dense signature-shaped echo is heuristic-conditional:
+    // with the lane off, the same bytes pass untouched — the boundary the
+    // module's docs state, pinned in both directions.
+    let signature = [
+        "x7Kp9", "QmZ2vB", "n4RtY6", "wLc8Jh", "1DfG3S", "aE5uIo", "P0zXq",
+    ]
+    .concat();
+    let patterns = SecretPatternSet::default_common().with_entropy_heuristic(false);
+    let result = redact_with(
+        ToolContent::from_string(format!("the tool echoed {signature}")),
+        patterns,
+        None,
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(
+        text.contains(signature.as_str()),
+        "with the heuristic off the echo passes — the scrub was always \
+         heuristic-conditional, never intrinsic to the bytes: {text}"
+    );
+}
+
+#[tokio::test]
 async fn bearer_header_is_redacted() {
     let result = redact(ToolContent::from_string(
         "curl -H 'Authorization: Bearer abcdef-1234-5678' https://api.example.com",

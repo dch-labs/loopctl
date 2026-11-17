@@ -1239,6 +1239,16 @@ struct OpenPart {
     /// [`MessagePart::ToolCall`]. Empty for text slots.
     tool_name: String,
 
+    /// The latched reasoning signature for a tool-call slot.
+    ///
+    /// Latched from the [`PartStart::part`](crate::stream::PartStart::part)
+    /// when the opening part is a [`MessagePart::ToolCall`] carrying a
+    /// signature — a dialect that attaches its reasoning continuity
+    /// token to the call itself (Gemini's `thoughtSignature` riding a
+    /// function-call part) — and carried onto the built part so the
+    /// token survives the turn. `None` for every other slot.
+    tool_signature: Option<String>,
+
     /// Raw JSON arguments string for a tool-call slot.
     ///
     /// Grown fragment by fragment by [`DeltaPart::InputJson`] and
@@ -1369,9 +1379,16 @@ impl StreamAccumulator {
                     kind,
                     ..Default::default()
                 };
-                if let Some(MessagePart::ToolCall { id, name, .. }) = &part_start.part {
+                if let Some(MessagePart::ToolCall {
+                    id,
+                    name,
+                    signature,
+                    ..
+                }) = &part_start.part
+                {
                     slot.tool_id.clone_from(id);
                     slot.tool_name.clone_from(name);
+                    slot.tool_signature.clone_from(signature);
                 }
                 self.open.push(slot);
                 Ok(())
@@ -1453,7 +1470,12 @@ impl StreamAccumulator {
                                 StreamError::InvalidToolInputJson(e, slot.tool_input.clone())
                             })?
                         };
-                        Some(MessagePart::tool_call(slot.tool_id, slot.tool_name, input))
+                        Some(MessagePart::tool_call_with_signature(
+                            slot.tool_id,
+                            slot.tool_name,
+                            input,
+                            slot.tool_signature,
+                        ))
                     }
                     _ => None,
                 };
@@ -1663,6 +1685,74 @@ mod tests {
         assert_eq!(msg.role, crate::message::Role::Assistant);
         assert_eq!(msg.parts.len(), 1);
         assert_eq!(msg.parts[0].as_text(), Some("Hello world"));
+    }
+
+    proptest::proptest! {
+        /// The thinking slot's merge laws, for any delta order: text is
+        /// append-only in arrival order, and the signature/redacted
+        /// payloads equal the last `Some` delivered (or `None` when none
+        /// was). The overwrite is the law — pinned as such, so a change
+        /// to either law reddens this property, not a user's run.
+        #[test]
+        fn generated_thinking_delta_orders_hold_the_merge_laws(
+            deltas in proptest::collection::vec(
+                (proptest::option::of(proptest::string::string_regex("[a-c]{1,3}").unwrap()),
+                 proptest::option::of(proptest::string::string_regex("[xy]{1,2}").unwrap()),
+                 proptest::option::of(proptest::string::string_regex("[mn]{1,2}").unwrap())),
+                1..=12
+            ),
+        ) {
+            let mut acc = StreamAccumulator::new();
+            acc.process(&StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: None,
+            }))
+            .unwrap();
+            let mut expected_text = String::new();
+            let mut expected_signature: Option<String> = None;
+            let mut expected_redacted: Option<String> = None;
+            for (text, signature, redacted) in &deltas {
+                acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+                    index: 1,
+                    delta: DeltaPart::Thinking {
+                        text: text.clone().unwrap_or_default(),
+                        signature: signature.clone(),
+                        redacted: redacted.clone(),
+                    },
+                }))
+                .unwrap();
+                expected_text.push_str(text.as_deref().unwrap_or(""));
+                if let Some(sig) = signature {
+                    expected_signature = Some(sig.clone());
+                }
+                if let Some(payload) = redacted {
+                    expected_redacted = Some(payload.clone());
+                }
+            }
+            acc.process(&StreamEvent::PartStop { index: Some(1) })
+                .unwrap();
+            let built = acc.build();
+            let anything_accumulated = !expected_text.is_empty()
+                || expected_signature.is_some()
+                || expected_redacted.is_some();
+            if anything_accumulated {
+                match built.parts.first().expect("a fed slot flushes on close") {
+                    crate::message::MessagePart::Thinking { text, signature, redacted } => {
+                        proptest::prop_assert_eq!(text, &expected_text);
+                        proptest::prop_assert_eq!(signature, &expected_signature);
+                        proptest::prop_assert_eq!(redacted, &expected_redacted);
+                    }
+                    other => {
+                        proptest::prop_assert!(false, "expected a Thinking part, got {other:?}");
+                    }
+                }
+            } else {
+                proptest::prop_assert!(
+                    built.parts.is_empty(),
+                    "an all-empty delta sequence is an empty lane — nothing builds"
+                );
+            }
+        }
     }
 
     #[test]

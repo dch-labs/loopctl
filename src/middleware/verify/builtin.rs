@@ -172,7 +172,7 @@ impl CommandVerifier {
             return pass();
         }
         if is_wrapped_shell(&tokens) {
-            let shell = tokens.first().map(String::as_str).unwrap_or_default();
+            let shell = tokens.first().map_or_default(String::as_str);
             if !self.allowed_shells.iter().any(|allowed| allowed == shell) {
                 tracing::debug!(class = "shell-not-allowed", "command verification failed");
                 return fail(&format!(

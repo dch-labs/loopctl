@@ -179,7 +179,6 @@ impl HookExecutor {
     ///
     /// Runs the synchronous check and wraps the result in a `Pin<Box<Future>>`
     /// for use in async contexts without spawning a separate task.
-    #[must_use]
     pub fn check_pre_tool_use_async(
         &self,
         ctx: &PreToolUseContext,
@@ -225,7 +224,6 @@ impl HookExecutor {
     ///
     /// Runs the synchronous check and wraps the result in a `Pin<Box<Future>>`
     /// for use in async contexts without spawning a separate task.
-    #[must_use]
     pub fn check_pre_compact_async(
         &self,
         ctx: &PreCompactContext,
@@ -251,7 +249,6 @@ impl HookExecutor {
     ///
     /// Runs all post-tool-use hooks synchronously and wraps completion
     /// in a `Pin<Box<Future>>` for async compatibility.
-    #[must_use]
     pub fn notify_post_tool_use_async(
         &self,
         ctx: &PostToolUseContext,
@@ -324,7 +321,6 @@ impl HookExecutor {
     ///
     /// Runs all post-compact hooks synchronously and wraps completion
     /// in a `Pin<Box<Future>>` for async compatibility.
-    #[must_use]
     pub fn notify_post_compact_async(
         &self,
         ctx: &PostCompactContext,
@@ -337,7 +333,6 @@ impl HookExecutor {
     ///
     /// Runs all run-start hooks synchronously and wraps completion
     /// in a `Pin<Box<Future>>` for async compatibility.
-    #[must_use]
     pub fn notify_run_start_async(
         &self,
         ctx: &RunStartContext,
@@ -350,7 +345,6 @@ impl HookExecutor {
     ///
     /// Runs all run-end hooks synchronously and wraps completion
     /// in a `Pin<Box<Future>>` for async compatibility.
-    #[must_use]
     pub fn notify_run_end_async(
         &self,
         ctx: &RunEndContext,

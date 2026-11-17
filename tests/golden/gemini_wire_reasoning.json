@@ -1,0 +1,46 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Check the weather in Paris with the weather tool."
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "parts": [
+        {
+          "text": "pondering the request",
+          "thought": true,
+          "thoughtSignature": "golden-signature"
+        },
+        {
+          "functionCall": {
+            "args": {
+              "city": "Paris"
+            },
+            "id": "call_gold_weather",
+            "name": "get_weather"
+          },
+          "thoughtSignature": "golden-call-signature"
+        }
+      ],
+      "role": "model"
+    },
+    {
+      "parts": [
+        {
+          "functionResponse": {
+            "id": "call_gold_weather",
+            "name": "get_weather",
+            "response": {
+              "result": "18 degrees, clear sky"
+            }
+          }
+        }
+      ],
+      "role": "user"
+    }
+  ]
+}

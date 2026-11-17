@@ -1072,13 +1072,11 @@ mod tests {
                                 let tool = point
                                     .attributes()
                                     .find(|kv| kv.key.as_str() == "tool")
-                                    .map(|kv| kv.value.as_str().into_owned())
-                                    .unwrap_or_default();
+                                    .map_or_default(|kv| kv.value.as_str().into_owned());
                                 let outcome = point
                                     .attributes()
                                     .find(|kv| kv.key.as_str() == "outcome")
-                                    .map(|kv| kv.value.as_str().into_owned())
-                                    .unwrap_or_default();
+                                    .map_or_default(|kv| kv.value.as_str().into_owned());
                                 points.push((tool, outcome, point.value()));
                             }
                         }
@@ -1366,8 +1364,7 @@ mod tests {
                                 let tool = point
                                     .attributes()
                                     .find(|kv| kv.key.as_str() == "tool")
-                                    .map(|kv| kv.value.as_str().into_owned())
-                                    .unwrap_or_default();
+                                    .map_or_default(|kv| kv.value.as_str().into_owned());
                                 points.push((tool, point.value()));
                             }
                         }

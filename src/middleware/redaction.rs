@@ -20,6 +20,21 @@
 //! [`SecretPatternSet::scrub`] states the exact rule, and
 //! [`SecretPatternSet::with_entropy_heuristic`] toggles the lane.
 //!
+//! The thinking lane never routes through the scrubber: a reasoning
+//! block's fidelity material — the provider signature and redacted
+//! payload of a [`MessagePart::Thinking`](crate::message::MessagePart)
+//! — is structured state on the conversation part, not text in a tool
+//! result, and [`ToolContent`] carries no
+//! message parts, so no dispatch pipeline can hand the lane to the
+//! patterns. That is the skip list in force: a signature-shaped token
+//! *would* mask (its entropy is exactly what the heuristic hunts), so the
+//! guarantee lives in the seam — a tool that echoes signature material in
+//! its output has that echo scrubbed like any high-entropy token, by
+//! design, while the conversation's own fidelity fields ride untouched
+//! and replay verbatim (pinned end-to-end by the reasoning round-trip
+//! suite). A host that scrubs rendered thinking text for logs holds its
+//! own copy — the part's fields are not that text.
+//!
 //! # Example
 //!
 //! ```rust,ignore

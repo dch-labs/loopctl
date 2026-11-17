@@ -165,7 +165,14 @@ pub struct OpenAiClient {
     /// `GLM` round-trips natively; `DeepSeek` documents the input lane
     /// only as a Beta prefix-completion feature (`prefix: true` on the
     /// last assistant message), so the field reaches it best-effort,
-    /// not as a guaranteed round-trip.
+    /// not as a guaranteed round-trip. The dialect's fidelity is
+    /// text-only: a thinking part's `signature` and `redacted`
+    /// payloads are other dialects' continuity tokens and never ride
+    /// this wire (only the text does), and o-series models on the
+    /// Chat Completions wire surface reasoning as usage token counts
+    /// alone — no content, no item ids, nothing to capture or replay;
+    /// the reasoning-item ids and encrypted reasoning of the Responses
+    /// API belong to a wire this client does not speak.
     replay_reasoning: bool,
 
     /// The cached context-window probe answer for the current model.
@@ -1727,7 +1734,9 @@ fn convert_message(m: &Message, replay_reasoning: bool) -> Vec<Value> {
                 super::record_reasoning_block("as_text");
                 reasoning_parts.push(super::replay_reasoning_tail(text));
             }
-            MessagePart::ToolCall { id, name, input } => {
+            MessagePart::ToolCall {
+                id, name, input, ..
+            } => {
                 tool_calls.push(serde_json::json!({
                     "id": id,
                     "type": "function",
@@ -2605,6 +2614,7 @@ impl StreamEmitter {
                         .and_then(|f| f.name.clone())
                         .unwrap_or_default(),
                     input: Value::Null,
+                    signature: None,
                 }),
             }));
             self.open_tool_count = self.open_tool_count.saturating_add(1);
@@ -3054,6 +3064,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 input: serde_json::json!({"message": "hi"}),
+                signature: None,
             }],
         );
         let v = convert_message(&m, false).remove(0);
@@ -3115,6 +3126,97 @@ mod tests {
         assert_eq!(vs[0]["tool_call_id"], "call_1");
         assert_eq!(vs[1]["role"], "tool");
         assert_eq!(vs[1]["tool_call_id"], "call_2");
+    }
+
+    #[test]
+    fn replayed_reasoning_rides_the_reasoning_content_field() {
+        let m = Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "step 1".into(),
+                    signature: Some("c2ln".into()),
+                    redacted: None,
+                },
+                MessagePart::text("the answer"),
+            ],
+        );
+        let vs = convert_message(&m, true);
+        assert_eq!(vs.len(), 1, "one assistant message carries the parts");
+        assert_eq!(
+            vs[0]["reasoning_content"], "step 1",
+            "replay joins the thinking text into the field"
+        );
+        assert_eq!(vs[0]["content"], "the answer");
+    }
+
+    #[test]
+    fn a_call_signature_never_rides_the_openai_wire() {
+        let m = Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call_with_signature(
+                "call_1",
+                "echo",
+                serde_json::json!({"msg": "hi"}),
+                Some("sig-fc".into()),
+            )],
+        );
+        for replay in [false, true] {
+            let vs = convert_message(&m, replay);
+            let rendered = vs[0].to_string();
+            assert!(
+                !rendered.contains("sig-fc"),
+                "this wire has no carrier for a call signature, whatever the replay \
+                 setting: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_stays_off_the_wire_when_replay_is_disabled() {
+        let m = Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "step 1".into(),
+                    signature: Some("c2ln".into()),
+                    redacted: None,
+                },
+                MessagePart::text("the answer"),
+            ],
+        );
+        let vs = convert_message(&m, false);
+        assert_eq!(vs.len(), 1);
+        assert!(
+            vs[0].get("reasoning_content").is_none(),
+            "replay off must leave the wire byte-identical to a client that never saw reasoning"
+        );
+        assert_eq!(vs[0]["content"], "the answer");
+    }
+
+    #[test]
+    fn an_o_series_usage_only_response_yields_no_thinking_parts() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {"content": "visible answer"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "completion_tokens_details": {"reasoning_tokens": 15}
+            }
+        });
+        let response = OpenAiClient::build_response(&raw).expect("a well-formed body parses");
+        assert!(
+            !response
+                .message
+                .parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::Thinking { .. })),
+            "o-series reasoning arrives as usage token counts alone — there is no \
+             content to preserve, and none may be invented"
+        );
     }
 
     #[test]
@@ -4513,7 +4615,9 @@ mod tests {
         let response = OpenAiClient::build_response(&raw).unwrap();
         assert_eq!(response.message.parts.len(), 1);
         match &response.message.parts[0] {
-            MessagePart::ToolCall { id, name, input } => {
+            MessagePart::ToolCall {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "search");
                 assert_eq!(input, &serde_json::json!({"q": "x"}));

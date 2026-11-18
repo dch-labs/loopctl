@@ -154,7 +154,7 @@ println!("Completed in {} turns", result.turn_count());
 
 ```toml
 [dev-dependencies]
-loopctl = { version = "0.5", features = ["testing"] }
+loopctl = { version = "0.6", features = ["testing"] }
 ```
 
 ```rust,no_run

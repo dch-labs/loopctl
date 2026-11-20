@@ -327,13 +327,13 @@
       "output_per_mtok": 3.94
     },
     "beam-1-0-501b-a23b": {
-      "cache_read_per_mtok": 0.04,
-      "input_per_mtok": 0.3,
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.25,
       "output_per_mtok": 1
     },
     "beam-1.0-501b-a23b": {
-      "cache_read_per_mtok": 0.04,
-      "input_per_mtok": 0.3,
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.25,
       "output_per_mtok": 1
     },
     "bytedance-seed/seed-2-0-lite": {
@@ -656,9 +656,9 @@
       "output_per_mtok": 1.2
     },
     "deepseek-v4-1-flash-1017": {
-      "cache_read_per_mtok": 0.01,
-      "input_per_mtok": 0.036,
-      "output_per_mtok": 0.5
+      "cache_read_per_mtok": 0.003,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
     },
     "deepseek-v4-flash": {
       "cache_read_per_mtok": 0.018,
@@ -666,9 +666,9 @@
       "output_per_mtok": 0.18
     },
     "deepseek-v4-flash-0731": {
-      "cache_read_per_mtok": 0.015,
-      "input_per_mtok": 0.06,
-      "output_per_mtok": 0.18
+      "cache_read_per_mtok": 0.035,
+      "input_per_mtok": 0.062,
+      "output_per_mtok": 0.3
     },
     "deepseek-v4-flash-vision-exp": {
       "cache_read_per_mtok": 0.014,
@@ -691,9 +691,9 @@
       "output_per_mtok": 1.2
     },
     "deepseek-v4.1-flash-1017": {
-      "cache_read_per_mtok": 0.01,
-      "input_per_mtok": 0.036,
-      "output_per_mtok": 0.5
+      "cache_read_per_mtok": 0.003,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
     },
     "deepseek/deepseek-chat": {
       "input_per_mtok": 0.2574,
@@ -750,9 +750,9 @@
       "output_per_mtok": 1.2
     },
     "deepseek/deepseek-v4-1-flash-1017": {
-      "cache_read_per_mtok": 0.01,
-      "input_per_mtok": 0.036,
-      "output_per_mtok": 0.5
+      "cache_read_per_mtok": 0.003,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
     },
     "deepseek/deepseek-v4-flash": {
       "cache_read_per_mtok": 0.018,
@@ -760,9 +760,9 @@
       "output_per_mtok": 0.18
     },
     "deepseek/deepseek-v4-flash-0731": {
-      "cache_read_per_mtok": 0.015,
-      "input_per_mtok": 0.06,
-      "output_per_mtok": 0.18
+      "cache_read_per_mtok": 0.035,
+      "input_per_mtok": 0.062,
+      "output_per_mtok": 0.3
     },
     "deepseek/deepseek-v4-flash-vision-exp": {
       "cache_read_per_mtok": 0.014,
@@ -785,9 +785,9 @@
       "output_per_mtok": 1.2
     },
     "deepseek/deepseek-v4.1-flash-1017": {
-      "cache_read_per_mtok": 0.01,
-      "input_per_mtok": 0.036,
-      "output_per_mtok": 0.5
+      "cache_read_per_mtok": 0.003,
+      "input_per_mtok": 0.15,
+      "output_per_mtok": 0.6
     },
     "devstral-2512": {
       "cache_read_per_mtok": 0.04,
@@ -1066,6 +1066,12 @@
       "input_per_mtok": 1.5,
       "output_per_mtok": 7.5
     },
+    "gemini-4-neon": {
+      "cache_read_per_mtok": 0.15,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
     "gemini-nano-banana-2-1": {
       "input_per_mtok": 1.5,
       "output_per_mtok": 7.5
@@ -1099,9 +1105,8 @@
       "output_per_mtok": 0.15
     },
     "gemma-3-27b-it": {
-      "cache_read_per_mtok": 0.04,
       "input_per_mtok": 0.08,
-      "output_per_mtok": 0.45
+      "output_per_mtok": 0.16
     },
     "gemma-3-4b-it": {
       "input_per_mtok": 0.05,
@@ -1195,14 +1200,14 @@
       "output_per_mtok": 3.2
     },
     "glm-5-1": {
-      "cache_read_per_mtok": 0.26,
-      "input_per_mtok": 1.4,
-      "output_per_mtok": 4.4
+      "cache_read_per_mtok": 0.6,
+      "input_per_mtok": 1.19,
+      "output_per_mtok": 3.74
     },
     "glm-5-2": {
-      "cache_read_per_mtok": 0.006,
-      "input_per_mtok": 0.007,
-      "output_per_mtok": 6.8
+      "cache_read_per_mtok": 0.14,
+      "input_per_mtok": 0.62,
+      "output_per_mtok": 2.42
     },
     "glm-5-3": {
       "cache_read_per_mtok": 0.0689,
@@ -1235,14 +1240,14 @@
       "output_per_mtok": 4
     },
     "glm-5.1": {
-      "cache_read_per_mtok": 0.26,
-      "input_per_mtok": 1.4,
-      "output_per_mtok": 4.4
+      "cache_read_per_mtok": 0.6,
+      "input_per_mtok": 1.19,
+      "output_per_mtok": 3.74
     },
     "glm-5.2": {
-      "cache_read_per_mtok": 0.006,
-      "input_per_mtok": 0.007,
-      "output_per_mtok": 6.8
+      "cache_read_per_mtok": 0.14,
+      "input_per_mtok": 0.62,
+      "output_per_mtok": 2.42
     },
     "glm-5.3": {
       "cache_read_per_mtok": 0.0689,
@@ -1502,6 +1507,12 @@
       "input_per_mtok": 1.5,
       "output_per_mtok": 7.5
     },
+    "google/gemini-4-neon": {
+      "cache_read_per_mtok": 0.15,
+      "cache_write_per_mtok": 0.083333,
+      "input_per_mtok": 3,
+      "output_per_mtok": 15
+    },
     "google/gemini-nano-banana-2-1": {
       "input_per_mtok": 1.5,
       "output_per_mtok": 7.5
@@ -1535,9 +1546,8 @@
       "output_per_mtok": 0.15
     },
     "google/gemma-3-27b-it": {
-      "cache_read_per_mtok": 0.04,
       "input_per_mtok": 0.08,
-      "output_per_mtok": 0.45
+      "output_per_mtok": 0.16
     },
     "google/gemma-3-4b-it": {
       "input_per_mtok": 0.05,
@@ -2270,9 +2280,9 @@
       "output_per_mtok": 3.41
     },
     "kimi-k2-7-code": {
-      "cache_read_per_mtok": 0.17,
-      "input_per_mtok": 0.7,
-      "output_per_mtok": 3.75
+      "cache_read_per_mtok": 0.16,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 3.5
     },
     "kimi-k2-thinking": {
       "cache_read_per_mtok": 0.15,
@@ -2290,9 +2300,9 @@
       "output_per_mtok": 3.41
     },
     "kimi-k2.7-code": {
-      "cache_read_per_mtok": 0.17,
-      "input_per_mtok": 0.7,
-      "output_per_mtok": 3.75
+      "cache_read_per_mtok": 0.16,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 3.5
     },
     "kimi-k3": {
       "cache_read_per_mtok": 0.182,
@@ -2300,14 +2310,14 @@
       "output_per_mtok": 16
     },
     "kimi-k3-1-pro": {
-      "cache_read_per_mtok": 0.2,
-      "input_per_mtok": 0.2403,
-      "output_per_mtok": 8.4023
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.253,
+      "output_per_mtok": 8.8
     },
     "kimi-k3.1-pro": {
-      "cache_read_per_mtok": 0.2,
-      "input_per_mtok": 0.2403,
-      "output_per_mtok": 8.4023
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.253,
+      "output_per_mtok": 8.8
     },
     "kt/midm-k-3-0-pro": {
       "cache_read_per_mtok": 0.04,
@@ -3000,9 +3010,9 @@
       "output_per_mtok": 3.41
     },
     "moonshotai/kimi-k2-7-code": {
-      "cache_read_per_mtok": 0.17,
-      "input_per_mtok": 0.7,
-      "output_per_mtok": 3.75
+      "cache_read_per_mtok": 0.16,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 3.5
     },
     "moonshotai/kimi-k2-thinking": {
       "cache_read_per_mtok": 0.15,
@@ -3020,9 +3030,9 @@
       "output_per_mtok": 3.41
     },
     "moonshotai/kimi-k2.7-code": {
-      "cache_read_per_mtok": 0.17,
-      "input_per_mtok": 0.7,
-      "output_per_mtok": 3.75
+      "cache_read_per_mtok": 0.16,
+      "input_per_mtok": 0.6,
+      "output_per_mtok": 3.5
     },
     "moonshotai/kimi-k3": {
       "cache_read_per_mtok": 0.182,
@@ -3030,14 +3040,14 @@
       "output_per_mtok": 16
     },
     "moonshotai/kimi-k3-1-pro": {
-      "cache_read_per_mtok": 0.2,
-      "input_per_mtok": 0.2403,
-      "output_per_mtok": 8.4023
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.253,
+      "output_per_mtok": 8.8
     },
     "moonshotai/kimi-k3.1-pro": {
-      "cache_read_per_mtok": 0.2,
-      "input_per_mtok": 0.2403,
-      "output_per_mtok": 8.4023
+      "cache_read_per_mtok": 0.18,
+      "input_per_mtok": 0.253,
+      "output_per_mtok": 8.8
     },
     "morph-v3-fast": {
       "input_per_mtok": 0.8,
@@ -4009,8 +4019,8 @@
       "output_per_mtok": 2.08
     },
     "qwen/qwen3-5-27b": {
-      "input_per_mtok": 0.3,
-      "output_per_mtok": 2.4
+      "input_per_mtok": 0.195,
+      "output_per_mtok": 1.56
     },
     "qwen/qwen3-5-35b-a3b": {
       "cache_read_per_mtok": 0.05,
@@ -4151,8 +4161,8 @@
       "output_per_mtok": 2.08
     },
     "qwen/qwen3.5-27b": {
-      "input_per_mtok": 0.3,
-      "output_per_mtok": 2.4
+      "input_per_mtok": 0.195,
+      "output_per_mtok": 1.56
     },
     "qwen/qwen3.5-35b-a3b": {
       "cache_read_per_mtok": 0.05,
@@ -4296,8 +4306,8 @@
       "output_per_mtok": 2.08
     },
     "qwen3-5-27b": {
-      "input_per_mtok": 0.3,
-      "output_per_mtok": 2.4
+      "input_per_mtok": 0.195,
+      "output_per_mtok": 1.56
     },
     "qwen3-5-35b-a3b": {
       "cache_read_per_mtok": 0.05,
@@ -4438,8 +4448,8 @@
       "output_per_mtok": 2.08
     },
     "qwen3.5-27b": {
-      "input_per_mtok": 0.3,
-      "output_per_mtok": 2.4
+      "input_per_mtok": 0.195,
+      "output_per_mtok": 1.56
     },
     "qwen3.5-35b-a3b": {
       "cache_read_per_mtok": 0.05,
@@ -4543,13 +4553,13 @@
       "output_per_mtok": 4.275
     },
     "reflection/beam-1-0-501b-a23b": {
-      "cache_read_per_mtok": 0.04,
-      "input_per_mtok": 0.3,
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.25,
       "output_per_mtok": 1
     },
     "reflection/beam-1.0-501b-a23b": {
-      "cache_read_per_mtok": 0.04,
-      "input_per_mtok": 0.3,
+      "cache_read_per_mtok": 0.05,
+      "input_per_mtok": 0.25,
       "output_per_mtok": 1
     },
     "reka-edge": {
@@ -5083,14 +5093,14 @@
       "output_per_mtok": 3.2
     },
     "z-ai/glm-5-1": {
-      "cache_read_per_mtok": 0.26,
-      "input_per_mtok": 1.4,
-      "output_per_mtok": 4.4
+      "cache_read_per_mtok": 0.6,
+      "input_per_mtok": 1.19,
+      "output_per_mtok": 3.74
     },
     "z-ai/glm-5-2": {
-      "cache_read_per_mtok": 0.006,
-      "input_per_mtok": 0.007,
-      "output_per_mtok": 6.8
+      "cache_read_per_mtok": 0.14,
+      "input_per_mtok": 0.62,
+      "output_per_mtok": 2.42
     },
     "z-ai/glm-5-3": {
       "cache_read_per_mtok": 0.0689,
@@ -5123,14 +5133,14 @@
       "output_per_mtok": 4
     },
     "z-ai/glm-5.1": {
-      "cache_read_per_mtok": 0.26,
-      "input_per_mtok": 1.4,
-      "output_per_mtok": 4.4
+      "cache_read_per_mtok": 0.6,
+      "input_per_mtok": 1.19,
+      "output_per_mtok": 3.74
     },
     "z-ai/glm-5.2": {
-      "cache_read_per_mtok": 0.006,
-      "input_per_mtok": 0.007,
-      "output_per_mtok": 6.8
+      "cache_read_per_mtok": 0.14,
+      "input_per_mtok": 0.62,
+      "output_per_mtok": 2.42
     },
     "z-ai/glm-5.3": {
       "cache_read_per_mtok": 0.0689,
@@ -5163,6 +5173,6 @@
       "output_per_mtok": 4
     }
   },
-  "pricing_updated": "2026-11-18",
-  "table_version": "openrouter-2026-11-18"
+  "pricing_updated": "2026-11-19",
+  "table_version": "openrouter-2026-11-19"
 }

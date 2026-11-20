@@ -567,6 +567,32 @@ impl<C: ApiClient> BareLoop<C> {
         );
     }
 
+    /// Fire [`on_repetition_detected`](crate::observer::LoopObserver::on_repetition_detected)
+    /// for one repetition-guard verdict.
+    ///
+    /// The observability half of a degenerate-generation abort: the
+    /// turn fails with the paired typed error, and this event carries
+    /// the verdict's numbers — the repeating window's byte length, the
+    /// consecutive-copy threshold, and how many bytes of assistant text
+    /// arrived before the abort — so hosts log the loop without
+    /// pattern-matching error text.
+    pub(super) fn notify_repetition_detected(
+        &self,
+        period_bytes: usize,
+        repeats: usize,
+        partial_text_bytes: u64,
+    ) {
+        let turn = self.session.current_run().map_or(0, Run::turn_count);
+        self.managers.observers().on_repetition_detected(
+            &crate::observer::RepetitionDetectedContext {
+                turn,
+                period_bytes: u64::try_from(period_bytes).unwrap_or(u64::MAX),
+                repeats: u64::try_from(repeats).unwrap_or(u64::MAX),
+                partial_text_bytes,
+            },
+        );
+    }
+
     /// Fire [`on_attempt_reset`](crate::observer::LoopObserver::on_attempt_reset)
     /// for the retried stream attempt the engine is entering.
     ///

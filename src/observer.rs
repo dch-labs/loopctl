@@ -24,6 +24,7 @@
 //! - [`CompactionFailedContext`] — compaction pass failed
 //! - [`FallbackContext`] — model fallback event
 //! - [`TransportFallbackContext`] — non-streaming transport fallback event
+//! - [`RepetitionDetectedContext`] — repetition-guard abort event
 //! - [`ModelSwitchedContext`] — runtime model hot-swap event
 //! - [`ToolSurfaceContext`] — runtime tool-surface change between turns
 //! - [`LoopDetectedContext`] — loop detection event
@@ -55,9 +56,10 @@ pub use context::{
     AttemptResetContext, BudgetWarnContext, CompactedContext, CompactionFailedContext,
     ContextFigureInfo, ConvergenceDetectedContext, FallbackContext, FigureSource,
     GateDecisionContext, LoopDetectedContext, ModelSwitchedContext, PreCompactionContext,
-    ResponseContext, RunEndContext, RunStartContext, StreamContext, StreamFailureContext,
-    TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext,
-    ToolPreContext, ToolSurfaceContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
+    RepetitionDetectedContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
+    StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
+    ToolPostContext, ToolPreContext, ToolSurfaceContext, TransportFallbackContext, TurnEndContext,
+    TurnStartContext,
 };
 pub use hub::{EventHub, LoopEvent, ObservedEvent};
 
@@ -408,6 +410,16 @@ pub trait LoopObserver: Send + Sync {
     /// [`on_turn_end`](Self::on_turn_end).
     fn on_transport_fallback(&self, _ctx: &TransportFallbackContext) {}
 
+    /// Called when the repetition guard aborted a degenerate generation.
+    ///
+    /// Fired by the engine when the stream repetition guard aborts a
+    /// model call whose assistant text fell into a verbatim repetition
+    /// loop. The turn fails with
+    /// [`RepetitionDetected`](crate::error::LoopError::RepetitionDetected);
+    /// the event carries the verdict's numbers. Retrying is host
+    /// policy, not engine policy.
+    fn on_repetition_detected(&self, _ctx: &RepetitionDetectedContext) {}
+
     /// Called when the model is hot-swapped at runtime.
     ///
     /// Fired by [`BareLoop::switch_model`](crate::engine::BareLoop::switch_model)
@@ -729,6 +741,16 @@ impl ObserverHost {
     /// once per fallback-served turn, before that turn's `on_turn_end`.
     pub fn on_transport_fallback(&self, ctx: &TransportFallbackContext) {
         self.dispatch(|obs| obs.on_transport_fallback(ctx));
+    }
+
+    /// Dispatch [`LoopObserver::on_repetition_detected`] to all observers.
+    ///
+    /// Fired when the repetition guard aborts a degenerate generation
+    /// loop, carrying the verdict's numbers; the turn fails with the
+    /// paired [`RepetitionDetected`](crate::error::LoopError::RepetitionDetected)
+    /// error. Iterates registered observers in registration order.
+    pub fn on_repetition_detected(&self, ctx: &RepetitionDetectedContext) {
+        self.dispatch(|obs| obs.on_repetition_detected(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_model_switched`] to all observers.

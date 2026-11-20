@@ -390,6 +390,9 @@ impl<C: ApiClient> BareLoop<C> {
         };
         match result {
             Ok(response) => {
+                if let Err(error) = self.guard_completed_response(&response.message) {
+                    return Err(self.record_turn_failure(turn, error));
+                }
                 self.record_turn_success(turn, response.usage.as_ref())?;
                 Ok(TurnServing {
                     message: response.message,
@@ -458,16 +461,40 @@ impl<C: ApiClient> BareLoop<C> {
         let mut accumulator = StreamAccumulator::new();
         let mut stop_reason = StreamStopReason::EndTurn;
         let mut attempt = 1usize;
+        let mut partial_text_bytes: u64 = 0;
 
         while let Some(result) = stream.next().await {
-            match result.map_err(Self::map_handler_error)? {
+            let item = match result {
+                Ok(item) => item,
+                Err(error) => {
+                    if let StreamHandlerError::StreamFailed(
+                        crate::stream::handler::StreamOutcome::RepetitionDetected {
+                            period_bytes,
+                            repeats,
+                            ..
+                        },
+                    ) = &error
+                    {
+                        self.notify_repetition_detected(
+                            *period_bytes,
+                            *repeats,
+                            partial_text_bytes,
+                        );
+                    }
+                    return Err(Self::map_handler_error(error));
+                }
+            };
+            match item {
                 HandlerEvent::Stream(ev) => {
-                    self.dispatch_stream_event(&ev, &mut accumulator, &mut stop_reason)?;
+                    let dispatched =
+                        self.dispatch_stream_event(&ev, &mut accumulator, &mut stop_reason)?;
+                    partial_text_bytes = partial_text_bytes.saturating_add(dispatched);
                 }
                 HandlerEvent::AttemptReset => {
                     accumulator = StreamAccumulator::new();
                     stop_reason = StreamStopReason::EndTurn;
                     attempt = attempt.saturating_add(1);
+                    partial_text_bytes = 0;
                     self.notify_attempt_reset(attempt);
                 }
                 HandlerEvent::Fallback {
@@ -496,7 +523,9 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Dispatch one stream event: fire per-delta observer callbacks
     /// (`on_text_delta`, `on_thinking_delta`) and the `text_streamer`, extract
-    /// the stop reason, then fold the event into the accumulator.
+    /// the stop reason, then fold the event into the accumulator. Returns
+    /// the text and thinking bytes the event carried — the repetition
+    /// guard's partial-text accounting.
     ///
     /// # Errors
     ///
@@ -507,10 +536,12 @@ impl<C: ApiClient> BareLoop<C> {
         event: &StreamEvent,
         accumulator: &mut StreamAccumulator,
         stop_reason: &mut StreamStopReason,
-    ) -> Result<(), LoopError> {
+    ) -> Result<u64, LoopError> {
+        let mut dispatched_bytes: usize = 0;
         if let StreamEvent::IndexedDelta(d) = event
             && let crate::stream::DeltaPart::Text { text } = &d.delta
         {
+            dispatched_bytes = dispatched_bytes.saturating_add(text.len());
             if let Some(streamer) = &self.text_streamer {
                 streamer(text.as_str());
             }
@@ -522,6 +553,7 @@ impl<C: ApiClient> BareLoop<C> {
         if let StreamEvent::IndexedDelta(d) = event
             && let crate::stream::DeltaPart::Thinking { text, .. } = &d.delta
         {
+            dispatched_bytes = dispatched_bytes.saturating_add(text.len());
             self.managers
                 .observers()
                 .on_thinking_delta(&ThinkingDeltaContext {
@@ -536,7 +568,8 @@ impl<C: ApiClient> BareLoop<C> {
         }
         accumulator
             .process(event)
-            .map_err(|e| LoopError::Api(format!("stream accumulation error: {e}")))
+            .map_err(|e| LoopError::Api(format!("stream accumulation error: {e}")))?;
+        Ok(u64::try_from(dispatched_bytes).unwrap_or(u64::MAX))
     }
     /// Consult the detection manager and, if a pattern forced a hard stop,
     /// return the error for the driver loop to act on.
@@ -610,9 +643,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// Map a [`StreamHandlerError`] to a [`LoopError`].
     ///
     /// Preserves cancellation semantics —
-    /// [`StreamHandlerError::Cancelled`] maps to [`LoopError::Cancelled`].
-    /// All other variants map to [`LoopError::Api`] with a descriptive
-    /// message.
+    /// [`StreamHandlerError::Cancelled`] maps to [`LoopError::Cancelled`]
+    /// and the repetition guard's verdict maps to the typed
+    /// [`LoopError::RepetitionDetected`]. All other variants map to
+    /// [`LoopError::Api`] with a descriptive message.
     #[cfg(feature = "streaming")]
     pub(super) fn map_handler_error(error: StreamHandlerError) -> LoopError {
         match error {
@@ -623,6 +657,16 @@ impl<C: ApiClient> BareLoop<C> {
             StreamHandlerError::InitFailed(outcome) => {
                 LoopError::Api(format!("stream failed before completing: {outcome}"))
             }
+            StreamHandlerError::StreamFailed(
+                crate::stream::handler::StreamOutcome::RepetitionDetected {
+                    period_bytes,
+                    repeats,
+                    ..
+                },
+            ) => LoopError::RepetitionDetected {
+                period_bytes: u64::try_from(period_bytes).unwrap_or(u64::MAX),
+                repeats: u64::try_from(repeats).unwrap_or(u64::MAX),
+            },
             StreamHandlerError::StreamFailed(outcome) => {
                 LoopError::Api(format!("stream failed: {outcome}"))
             }
@@ -640,6 +684,49 @@ impl<C: ApiClient> BareLoop<C> {
                 retry_after,
             },
         }
+    }
+
+    /// Run the repetition guard over a completed non-streaming response.
+    ///
+    /// The non-streaming turn's share of the guard, always compiled:
+    /// the completed assistant text (both lanes concatenated) runs
+    /// through the same detector the streaming paths carry in the
+    /// [`StreamHandler`](crate::stream::handler::StreamHandler),
+    /// before the turn is recorded or committed — so a degenerate
+    /// completion fails the turn with the typed
+    /// [`LoopError::RepetitionDetected`] and fires
+    /// [`on_repetition_detected`](crate::observer::LoopObserver::on_repetition_detected)
+    /// exactly like a degenerate stream, in every build including the
+    /// crate's default no-features shape where
+    /// [`TurnMode::NonStreaming`](crate::engine::TurnMode::NonStreaming)
+    /// is the only turn path. The managers' effective configuration
+    /// (an installed handler's knobs adopted at install time, or the
+    /// [`LoopManagers`](crate::managers::LoopManagers) knob) is the
+    /// single source; a disarmed guard returns `Ok` without
+    /// inspecting the message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::RepetitionDetected`] when the completed
+    /// text carries a verbatim repetition loop.
+    fn guard_completed_response(&self, message: &Message) -> Result<(), LoopError> {
+        let config = self.managers.repetition_guard();
+        if !config.enabled {
+            return Ok(());
+        }
+        let text = crate::stream::repetition::concat_lane_text(message);
+        if let Some(hit) = crate::stream::repetition::detect_repetition(text.as_bytes(), config) {
+            self.notify_repetition_detected(
+                hit.period_bytes,
+                hit.repeats,
+                u64::try_from(text.len()).unwrap_or(u64::MAX),
+            );
+            return Err(LoopError::RepetitionDetected {
+                period_bytes: u64::try_from(hit.period_bytes).unwrap_or(u64::MAX),
+                repeats: u64::try_from(hit.repeats).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(())
     }
 }
 

@@ -3536,27 +3536,43 @@ impl<C: ApiClient> BareLoop<C> {
     /// provider cannot report: the response ended at the output limit
     /// carrying no visible text — what a context with no generation
     /// room looks like from the wire, and indistinguishable on it from
-    /// an output cap too small for the answer. The truncated message is
-    /// never recorded; the history is compacted toward the salvage
-    /// target and the turn re-issued. The attempt's real usage rides
-    /// the failed-turn event that pairs its turn-start — the request
-    /// succeeded and its spend was real — while the turn's record and
-    /// the run's totals stay the salvaged retry's figures. A second
-    /// truncation on the same turn, an unshrinkable history, or a
-    /// declined compaction step fails the run with
-    /// [`LoopError::ContextExceeded`] carrying the machine's figure
-    /// floored just above the window rather than measured: the wire
-    /// cannot tell an over-full context from a too-small output cap,
-    /// so the salvage always names the reading its remedy acts on —
-    /// the same deliberate floor as [`Self::overflow_salvage`].
+    /// an output cap too small for the answer. Which reading rules
+    /// depends on ground truth: with a usage anchor armed, the
+    /// machine's own context figure decides — the natural trigger
+    /// compacts and retries exactly when the anchored figure actually
+    /// crossed the threshold or emergency line, and a figure below
+    /// both refutes the over-full reading, failing the run with
+    /// [`LoopError::LengthCutNoOutput`] and the real figures (no
+    /// compaction, no fabricated window-plus-one). In the engine's
+    /// own flow the refuted arm is the one a served turn reaches —
+    /// the pre-request deferral compacts before serving whenever the
+    /// figure crosses a line — so the compacting arm is the safety
+    /// net, not the expectation. Without an anchor — a backend that
+    /// reports no usage — the wire signal is all there is, and the
+    /// salvage keeps its legacy shape: force the emergency figure,
+    /// compact, retry.
+    ///
+    /// The truncated message is never recorded; on the compacting arm
+    /// the history is compacted toward the salvage target and the turn
+    /// re-issued. The attempt's real usage rides the failed-turn event
+    /// that pairs its turn-start — the request succeeded and its spend
+    /// was real — while the turn's record and the run's totals stay
+    /// the salvaged retry's figures. A second truncation on the same
+    /// turn, an unshrinkable history, or a declined compaction step
+    /// fails the run with [`LoopError::ContextExceeded`] carrying the
+    /// machine's figure floored just above the window: on those arms
+    /// the over-full reading is either spent or unverifiable, and the
+    /// salvage names the reading its remedy acts on — the same
+    /// deliberate floor as [`Self::overflow_salvage`].
     ///
     /// # Errors
     ///
     /// Returns [`LoopError::ContextExceeded`] when the retry was
     /// already spent on this turn or the history cannot be compacted —
-    /// both mean the conversation does not fit even reduced; `Ok(())`
-    /// when the compaction pass was armed and the turn will be
-    /// re-issued by the next machine step.
+    /// both mean the conversation does not fit even reduced;
+    /// [`LoopError::LengthCutNoOutput`] when a usage anchor refutes
+    /// the over-full reading; `Ok(())` when the compaction pass was
+    /// armed and the turn will be re-issued by the next machine step.
     fn truncation_salvage(
         &mut self,
         turn: usize,
@@ -3568,6 +3584,7 @@ impl<C: ApiClient> BareLoop<C> {
         }
         self.truncation_retry = Some(turn);
         let shrinkable = self.machine.full_history().len() > 1;
+        let anchored = self.anchor.is_some();
         if shrinkable {
             let truncated_payload = self
                 .count_context(&self.machine.full_history())
@@ -3583,8 +3600,10 @@ impl<C: ApiClient> BareLoop<C> {
                 turn,
                 target,
             );
-            self.machine
-                .set_context_tokens(self.effective_context_window().saturating_add(1));
+            if !anchored {
+                self.machine
+                    .set_context_tokens(self.effective_context_window().saturating_add(1));
+            }
         }
         let compacted = shrinkable
             && matches!(
@@ -3602,9 +3621,42 @@ impl<C: ApiClient> BareLoop<C> {
             );
             self.anchor = None;
             Ok(())
+        } else if shrinkable && anchored {
+            Err(self.length_cut_with_room_exhausted(turn, turn_start, usage))
         } else {
             Err(self.length_cut_exhausted(turn, turn_start, usage))
         }
+    }
+
+    /// The terminal failure for a length cut the anchored figure
+    /// refutes.
+    ///
+    /// The honest counterpart of [`length_cut_exhausted`](Self::length_cut_exhausted):
+    /// a usage anchor measured the conversation well inside the
+    /// window, so the empty truncated completion was not an over-full
+    /// context and the reported `used` is the real anchored figure —
+    /// never floored. Pairs the turn's start with its failed turn-end,
+    /// carrying the truncated attempt's real usage.
+    fn length_cut_with_room_exhausted(
+        &mut self,
+        turn: usize,
+        turn_start: Instant,
+        usage: &TurnUsage,
+    ) -> LoopError {
+        let limit = self.effective_context_window();
+        let exhausted = LoopError::LengthCutNoOutput {
+            used: self.machine.context_tokens(),
+            limit,
+        };
+        let failed = exhausted.to_string();
+        self.notify_failed_turn(
+            turn,
+            &failed,
+            turn_start,
+            usage,
+            StreamStopReason::MaxTokens,
+        );
+        exhausted
     }
 
     /// The terminal failure and paired turn-end for a length cut the

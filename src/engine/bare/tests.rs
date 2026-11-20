@@ -77,6 +77,8 @@ struct MockClient {
     model_name: Arc<std::sync::Mutex<String>>,
 
     reports_usage: bool,
+
+    fixed_usage: Option<Usage>,
 }
 
 impl MockClient {
@@ -85,6 +87,7 @@ impl MockClient {
             responses: Arc::new(Mutex::new(Vec::new())),
             model_name: Arc::new(std::sync::Mutex::new(model.to_string())),
             reports_usage: true,
+            fixed_usage: None,
         }
     }
 
@@ -96,10 +99,24 @@ impl MockClient {
         self
     }
 
+    /// Serve one fixed usage report on every scripted response.
+    ///
+    /// The usage-anchoring fixtures stage a provider-grade input figure
+    /// (the anchored estimate's ground truth) independent of the small
+    /// scripted texts.
+    #[cfg(feature = "streaming")]
+    fn with_fixed_usage(mut self, usage: Usage) -> Self {
+        self.fixed_usage = Some(usage);
+        self
+    }
+
     /// The usage a scripted response carries, honoring
     /// [`without_usage`](Self::without_usage).
     fn staged_usage(&self, input: u32, output: u32) -> Option<Usage> {
-        self.reports_usage.then(|| Usage::new(input, output))
+        if !self.reports_usage {
+            return None;
+        }
+        Some(self.fixed_usage.unwrap_or(Usage::new(input, output)))
     }
 
     fn add_text_response(&self, text: &str) {
@@ -136,6 +153,26 @@ impl MockClient {
     #[cfg(feature = "streaming")]
     fn add_events(&self, events: Vec<StreamEvent>) {
         crate::error::recover_guard(self.responses.lock()).push(events);
+    }
+
+    /// Bulk varied answer text of at least `min_bytes` bytes.
+    ///
+    /// Compaction, telemetry, and clock fixtures need a large model
+    /// answer; uniform filler (`"x".repeat`) is itself a verbatim
+    /// repetition loop to the stream repetition guard, so bulk fixtures
+    /// stream this numbered-lines shape instead.
+    fn bulk_answer(min_bytes: usize) -> String {
+        let mut text = String::new();
+        let mut line = 0_usize;
+        while text.len() < min_bytes {
+            std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("bulk answer line {line:04} with varied content\n"),
+            )
+            .expect("writing to a String cannot fail");
+            line = line.saturating_add(1);
+        }
+        text
     }
 
     /// Queue a response that carries only reasoning and ends at the
@@ -1929,11 +1966,11 @@ async fn a_failing_turn_s_turn_end_carries_the_engine_s_context_estimate() {
 async fn session_retention_counts_prior_thinking_in_the_context_estimate() {
     let client = MockClient::new("test-model");
     client.add_thinking_tool_then_thinking_text(
-        &"first turn reasoning ".repeat(40),
+        &MockClient::bulk_answer(840),
         "call_1",
         "echo",
         &json!({"message": "hi"}),
-        &"second turn reasoning ".repeat(10),
+        &MockClient::bulk_answer(210),
         "all done",
     );
     let registry = ToolRegistry::new();
@@ -3467,6 +3504,447 @@ async fn a_length_cut_completion_compacts_and_retries_the_turn() {
     );
 }
 
+/// Records every repetition-guard verdict an engine run fires.
+#[cfg(feature = "streaming")]
+struct RepetitionRecorder {
+    /// One entry per `on_repetition_detected` event.
+    hits: Arc<Mutex<Vec<crate::observer::RepetitionDetectedContext>>>,
+}
+
+/// The malformed tool-call stanza the repetition incident's model looped
+/// on, as a shared fixture constant.
+#[cfg(any(feature = "streaming", feature = "testing"))]
+const REPEATED_STANZA: &str =
+    "<tool_call><function=Bash><parameter=command>true\n</parameter></function></tool_call>";
+
+#[cfg(feature = "streaming")]
+impl crate::observer::LoopObserver for RepetitionRecorder {
+    fn name(&self) -> &'static str {
+        "repetition-recorder"
+    }
+    fn on_repetition_detected(&self, ctx: &crate::observer::RepetitionDetectedContext) {
+        crate::error::recover_guard(self.hits.lock()).push(ctx.clone());
+    }
+}
+
+/// The malformed tool-call stanza from the repetition incident, one wire
+/// delta per copy.
+#[cfg(feature = "streaming")]
+fn degenerate_stream_events(copies: usize, usage: Option<Usage>) -> Vec<StreamEvent> {
+    let stanza = REPEATED_STANZA;
+    let mut events = vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_repeat".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(crate::message::MessagePart::text("")),
+        }),
+    ];
+    for _ in 0..copies {
+        events.push(StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: stanza.to_string(),
+            },
+        }));
+    }
+    events.push(StreamEvent::PartStop { index: None });
+    events.push(StreamEvent::MessageDelta(MessageDelta {
+        delta: MessageDeltaPayload {
+            stop_reason: Some("end_turn".to_string()),
+        },
+        usage,
+    }));
+    events.push(StreamEvent::MessageStop);
+    events
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_degenerate_repetition_stream_fails_typed_and_fires_the_observer() {
+    let scripted = MockClient::new("test-model");
+    scripted.add_events(degenerate_stream_events(5, None));
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let managers =
+        crate::managers::LoopManagers::new().with_observer(Arc::new(RepetitionRecorder {
+            hits: Arc::clone(&hits),
+        }));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let result = agent.run("drive it", &RunConfig::default()).await;
+    let stanza_len = REPEATED_STANZA.len();
+    match result {
+        Err(crate::error::LoopError::RepetitionDetected {
+            period_bytes,
+            repeats,
+        }) => {
+            assert_eq!(period_bytes, stanza_len as u64);
+            assert_eq!(repeats, 4);
+        }
+        other => panic!("expected a typed repetition abort, got: {other:?}"),
+    }
+    let hits = crate::error::recover_guard(hits.lock());
+    assert_eq!(hits.len(), 1, "exactly one observer event pairs the error");
+    assert_eq!(hits[0].period_bytes, stanza_len as u64);
+    assert_eq!(hits[0].repeats, 4);
+    assert_eq!(
+        hits[0].partial_text_bytes,
+        u64::try_from(3 * stanza_len).unwrap_or(u64::MAX),
+        "the three pre-abort deltas are the partial text the host keeps"
+    );
+    assert!(
+        !agent
+            .machine()
+            .full_history()
+            .iter()
+            .any(|message| message.text_content().contains("<tool_call>")),
+        "the degenerate message is never committed to the conversation"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_disarmed_repetition_guard_completes_the_degenerate_run() {
+    let scripted = MockClient::new("test-model");
+    scripted.add_events(degenerate_stream_events(5, None));
+    let handler = crate::stream::handler::StreamHandler::new().with_repetition_guard(
+        crate::stream::repetition::RepetitionGuardConfig {
+            enabled: false,
+            ..crate::stream::repetition::RepetitionGuardConfig::default()
+        },
+    );
+    let managers = crate::managers::LoopManagers::new().with_stream_handler(handler);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("a disarmed guard restores the legacy behavior");
+    assert_eq!(
+        run.output.as_deref(),
+        Some(REPEATED_STANZA.repeat(5).as_str()),
+        "the degenerate text completes and commits when the guard is off"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_degenerate_non_streaming_completion_fails_typed() {
+    let scripted = MockClient::new("test-model");
+    scripted.add_events(degenerate_stream_events(5, None));
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let managers =
+        crate::managers::LoopManagers::new().with_observer(Arc::new(RepetitionRecorder {
+            hits: Arc::clone(&hits),
+        }));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    agent.set_turn_mode(crate::engine::TurnMode::NonStreaming);
+    let result = agent.run("drive it", &RunConfig::default()).await;
+    assert!(
+        matches!(
+            result,
+            Err(crate::error::LoopError::RepetitionDetected { .. })
+        ),
+        "the completed-text guard covers the non-streaming dialect, got: {result:?}"
+    );
+    let hits = crate::error::recover_guard(hits.lock());
+    assert_eq!(hits.len(), 1, "exactly one observer event pairs the error");
+    assert_eq!(
+        hits[0].partial_text_bytes,
+        u64::try_from(5 * REPEATED_STANZA.len()).unwrap_or(u64::MAX),
+        "the non-streaming arm reports the rejected completion's full text — \
+         no delta observers fire on that path"
+    );
+}
+
+#[cfg(all(feature = "testing", not(feature = "streaming")))]
+#[tokio::test]
+async fn a_degenerate_non_streaming_completion_fails_without_the_streaming_feature() {
+    // The crate's default shape: no streaming feature, no stream
+    // handler, `TurnMode::NonStreaming` the only turn path — and the
+    // repetition guard still refuses a degenerate completion before it
+    // is recorded, through the managers' own knob.
+    let degenerate = REPEATED_STANZA.repeat(5);
+    let client = crate::testing::MockApiClient::new("test-model").with_responses(vec![
+        crate::testing::MockResponse {
+            text: degenerate.clone(),
+            tool_call: None,
+            stop_reason: "end_turn".to_string(),
+        },
+    ]);
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let result = agent.run("drive it", &RunConfig::default()).await;
+    assert!(
+        matches!(
+            result,
+            Err(crate::error::LoopError::RepetitionDetected { period_bytes, repeats })
+                if period_bytes == REPEATED_STANZA.len() as u64 && repeats == 4
+        ),
+        "the guard covers the no-features build, got: {result:?}"
+    );
+    assert!(
+        !agent
+            .machine()
+            .full_history()
+            .iter()
+            .any(|message| message.text_content().contains("<tool_call>")),
+        "the degenerate message is never committed to the conversation"
+    );
+}
+
+#[cfg(all(feature = "testing", not(feature = "streaming")))]
+#[tokio::test]
+async fn a_disarmed_managers_guard_lets_the_degenerate_completion_through() {
+    let degenerate = REPEATED_STANZA.repeat(5);
+    let client = crate::testing::MockApiClient::new("test-model").with_responses(vec![
+        crate::testing::MockResponse {
+            text: degenerate.clone(),
+            tool_call: None,
+            stop_reason: "end_turn".to_string(),
+        },
+    ]);
+    let managers = crate::managers::LoopManagers::new().with_repetition_guard(
+        crate::stream::repetition::RepetitionGuardConfig {
+            enabled: false,
+            ..crate::stream::repetition::RepetitionGuardConfig::default()
+        },
+    );
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("a disarmed managers guard restores the legacy behavior");
+    assert_eq!(
+        run.output.as_deref(),
+        Some(degenerate.as_str()),
+        "the degenerate text completes and commits when the guard is off"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn installing_a_stream_handler_adopts_its_repetition_guard() {
+    let disarmed = crate::managers::LoopManagers::new().with_stream_handler(
+        crate::stream::handler::StreamHandler::new().with_repetition_guard(
+            crate::stream::repetition::RepetitionGuardConfig {
+                enabled: false,
+                ..crate::stream::repetition::RepetitionGuardConfig::default()
+            },
+        ),
+    );
+    assert!(
+        !disarmed.repetition_guard().enabled,
+        "the managers adopt the installed handler's guard knobs"
+    );
+    assert!(
+        crate::managers::LoopManagers::new()
+            .repetition_guard()
+            .enabled,
+        "an empty managers bundle carries the armed default"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[test]
+fn setting_the_repetition_guard_after_install_restamps_the_handler() {
+    use crate::capabilities::StreamCapable;
+    let managers = crate::managers::LoopManagers::new()
+        .with_stream_handler(crate::stream::handler::StreamHandler::new())
+        .with_repetition_guard(crate::stream::repetition::RepetitionGuardConfig {
+            enabled: false,
+            ..crate::stream::repetition::RepetitionGuardConfig::default()
+        });
+    assert!(
+        !managers.repetition_guard().enabled,
+        "the non-streaming turn guard reads the last-set knobs"
+    );
+    assert!(
+        !managers.stream_handler().repetition_config().enabled,
+        "the installed handler enforces the same knobs the managers were last \
+         given — one configuration governs both turn paths whatever the order"
+    );
+}
+
+/// A counter that overestimates eight-fold, standing in for the
+/// tool-heavy transcripts whose retained content runs far above the
+/// wire payload the provider bills.
+#[cfg(feature = "streaming")]
+struct InflatingCounter;
+
+#[cfg(feature = "streaming")]
+impl crate::compact::TokenCounter for InflatingCounter {
+    fn count(&self, messages: &[crate::message::Message]) -> u64 {
+        crate::compact::HeuristicTokenCounter
+            .count(messages)
+            .saturating_mul(8)
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_anchored_length_cut_at_low_utilization_never_compacts() {
+    // The phantom-emergency regression: a usage-anchored figure at
+    // roughly a fifth of the window refutes the over-full reading of
+    // an empty truncated completion. The installed counter
+    // overestimates the retained transcript eight-fold — the
+    // tool-heavy ledger divergence of the incident — and the anchored
+    // figure still decides: no compaction, and the failure carries
+    // the real figures.
+    let scripted = MockClient::new("test-model").with_fixed_usage(Usage::new(48_000, 16_384));
+    scripted.add_text_response("first turn lands");
+    scripted.add_truncated_thinking("a thought that never becomes visible text ");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(
+            crate::compact::ContextManager::new(Arc::new(
+                crate::compact::TruncatingCompactor::new(),
+            ))
+            .with_token_counter(Arc::new(InflatingCounter)),
+        ));
+    let config = make_config()
+        .with_context_window(262_144)
+        .with_compact_threshold(95);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(10_000))
+            } else {
+                Message::assistant("a".repeat(10_000))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        managers,
+    );
+    let first = agent.run("seed the anchor", &RunConfig::default()).await;
+    assert!(
+        first.is_ok(),
+        "the anchor-seeding turn completes: {first:?}"
+    );
+    let result = agent
+        .run("rewrite your prior response", &RunConfig::default())
+        .await;
+    match result {
+        Err(crate::error::LoopError::LengthCutNoOutput { used, limit }) => {
+            assert_eq!(limit, 262_144, "the failure names the resolved window");
+            assert!(
+                (48_000..233_507).contains(&used),
+                "the failure carries the real anchored figure, not a fabricated one: {used}"
+            );
+        }
+        other => panic!("expected the honest length-cut failure, got: {other:?}"),
+    }
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "no compaction ran — the anchored figure refutes the over-full reading"
+    );
+    assert!(
+        agent.machine().context_tokens() < 262_144,
+        "the machine's figure stays the anchored one, never the forced window-plus-one"
+    );
+    let raw_estimate = agent.count_context(&agent.machine().full_history());
+    assert!(
+        raw_estimate >= agent.machine().context_tokens().saturating_mul(5),
+        "the regression shape holds: the counter's raw estimate ({raw_estimate}) runs at \
+         five times the anchored figure ({})",
+        agent.machine().context_tokens()
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_emergency_figure_compacts_before_serving_and_the_length_cut_reports_room() {
+    // The anchored figure decides by the natural trigger: a figure over
+    // the emergency line makes the machine compact before the turn is
+    // served. The turn that follows carries a fresh anchor from its own
+    // usage report and a post-compaction figure well inside the window,
+    // so its empty truncated completion is the output-budget reading —
+    // reported with the real figures, not force-compacted again.
+    let scripted = MockClient::new("test-model").with_fixed_usage(Usage::new(3_900, 100));
+    scripted.add_text_response("first turn lands");
+    scripted.add_truncated_thinking("truncated at the edge ");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new(),
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        managers,
+    );
+    let first = agent.run("seed the anchor", &RunConfig::default()).await;
+    assert!(
+        first.is_ok(),
+        "the anchor-seeding turn completes: {first:?}"
+    );
+    let result = agent
+        .run("rewrite your prior response", &RunConfig::default())
+        .await;
+    match result {
+        Err(crate::error::LoopError::LengthCutNoOutput { used, limit }) => {
+            assert_eq!(limit, 4_000, "the failure names the resolved window");
+            assert!(
+                used < 3_800,
+                "the post-compaction figure reports the room it actually has: {used}"
+            );
+        }
+        other => panic!("expected the honest length-cut failure, got: {other:?}"),
+    }
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the emergency line forced a real pass before the turn was served"
+    );
+}
+
 #[cfg(feature = "streaming")]
 #[tokio::test]
 async fn a_second_length_cut_completion_ends_the_run() {
@@ -3590,7 +4068,7 @@ async fn a_salvaged_length_cut_pairs_every_turn_start_with_a_turn_end() {
     // stays the salvaged retry's figures: the two surfaces are
     // deliberately different readings, pinned apart so neither drifts
     // onto the other by accident.
-    let scripted = MockClient::new("test-model");
+    let scripted = MockClient::new("test-model").without_usage();
     scripted.add_truncated_thinking("the answer is almost within reach, let me just ");
     scripted.add_events(recovered_turn_events("the recovered answer", 777, 66));
     let starts = Arc::new(Mutex::new(Vec::new()));
@@ -3656,13 +4134,13 @@ async fn a_salvaged_length_cut_pairs_every_turn_start_with_a_turn_end() {
 async fn a_length_cut_salvage_reports_the_truncated_attempt_s_usage_at_its_failed_turn_end() {
     // Salvage × usage-on: the truncated request succeeded and its
     // tokens were burned, so the failed turn-end carries the real
-    // figures — while the run's aggregate stays the salvaged retry's
-    // numbers alone. That split across surfaces is the contract: the
-    // observer sees every attempt's spend; `RunEndContext`, the turn
-    // records, and the ledger report only what was recorded.
+    // figures. The usage report also anchors the context estimate, so
+    // the honest length-cut reading rules: the run ends reporting the
+    // room the anchored figure measured, with no retry — the host's
+    // call to raise the output budget or re-run — and the failed end
+    // is the attempt's only surface.
     let scripted = MockClient::new("test-model");
     scripted.add_truncated_thinking("the answer is almost within reach, let me just ");
-    scripted.add_events(recovered_turn_events("the recovered answer", 777, 66));
     let reported = Arc::new(Mutex::new(Vec::new()));
     let capture = Arc::new(UsageDetailCapture::new());
     let managers = crate::managers::LoopManagers::new()
@@ -3694,27 +4172,21 @@ async fn a_length_cut_salvage_reports_the_truncated_attempt_s_usage_at_its_faile
         ToolRegistry::new(),
         managers,
     );
-    let run = agent
-        .run("drive it", &RunConfig::default())
-        .await
-        .expect("the salvage completes on the retry");
+    let run = agent.run("drive it", &RunConfig::default()).await;
+    match run {
+        Err(crate::error::LoopError::LengthCutNoOutput { .. }) => {}
+        other => panic!("expected the honest length-cut failure, got: {other:?}"),
+    }
     assert_eq!(
         *crate::error::recover_guard(reported.lock()),
-        vec![(0, false, 10, 20), (0, true, 777, 66)],
-        "the failed end carries the attempt's real spend (10/20), and only \
-         the salvaged retry arrives as success"
+        vec![(0, false, 10, 20)],
+        "the failed end carries the attempt's real spend (10/20) — the request \
+         succeeded and its tokens were burned"
     );
     assert_eq!(
-        (run.turns[0].input_tokens, run.turns[0].output_tokens),
-        (777, 66),
-        "the recorded turn is the salvaged retry's, not the dropped attempt's"
-    );
-    let totals = *crate::error::recover_guard(capture.run_end.lock());
-    assert_eq!(
-        totals,
-        Some((777, 66, 0, 0, 0)),
-        "RunEndContext totals stay the recorded turn's figures — the failed \
-         salvage attempt never enters the run's sums"
+        *crate::error::recover_guard(capture.run_end.lock()),
+        Some((0, 0, 0, 0, 0)),
+        "the run-end totals are zeroed — the attempt never entered the run's sums"
     );
 }
 
@@ -3778,7 +4250,9 @@ async fn a_length_cut_on_the_non_streaming_path_compacts_and_retries_the_turn() 
     // `create_message`, and the retry completes the run. Without the
     // salvage the empty completion would end the run as-is — the
     // retry's text and the compaction count below are what make this
-    // pin non-vacuous.
+    // pin non-vacuous. The mock reports no usage: with an anchor the
+    // honest reading would refuse instead (the usage-on pin lives on
+    // the streaming side).
     use crate::testing::{MockApiClient, MockResponse};
 
     let seeded: Vec<Message> = (0..12)
@@ -3793,18 +4267,20 @@ async fn a_length_cut_on_the_non_streaming_path_compacts_and_retries_the_turn() 
     let compactions = Arc::new(Mutex::new(0usize));
     let starts = Arc::new(Mutex::new(Vec::new()));
     let ends = Arc::new(Mutex::new(Vec::new()));
-    let client = MockApiClient::new("test-model").with_responses(vec![
-        MockResponse {
-            text: String::new(),
-            tool_call: None,
-            stop_reason: "max_tokens".to_string(),
-        },
-        MockResponse {
-            text: "recovered".to_string(),
-            tool_call: None,
-            stop_reason: "end_turn".to_string(),
-        },
-    ]);
+    let client = MockApiClient::new("test-model")
+        .without_usage()
+        .with_responses(vec![
+            MockResponse {
+                text: String::new(),
+                tool_call: None,
+                stop_reason: "max_tokens".to_string(),
+            },
+            MockResponse {
+                text: "recovered".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            },
+        ]);
     let managers = crate::managers::LoopManagers::new()
         .with_observer(Arc::new(NonStreamPairRecorder {
             starts: Arc::clone(&starts),
@@ -3874,7 +4350,7 @@ async fn a_third_length_cut_on_one_turn_ends_the_run() {
     // exactly one failed end, and that end reports the truncated
     // attempt's real spend — the request succeeded; the zeros of a
     // silent drop would be a lie about burned tokens.
-    let scripted = MockClient::new("test-model");
+    let scripted = MockClient::new("test-model").without_usage();
     scripted.add_truncated_thinking("first truncated thought ");
     scripted.add_truncated_thinking("second truncated thought ");
     scripted.add_truncated_thinking("third thought the run never reaches ");
@@ -3931,8 +4407,9 @@ async fn a_third_length_cut_on_one_turn_ends_the_run() {
     );
     assert_eq!(
         *crate::error::recover_guard(reported.lock()),
-        vec![(0, false, 10, 20), (0, false, 10, 20)],
-        "both attempts close as failed turns carrying their real spend"
+        vec![(0, false, 0, 0), (0, false, 0, 0)],
+        "both attempts close as failed turns; the usage-less mock reports zeros — \
+         the spend-carrying pin lives on the usage-on salvage side"
     );
 }
 
@@ -5887,7 +6364,7 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
     let client = MockClient::new("test-model");
     // Drive enough tokens to trip a low threshold, then finish; the second
     // run guarantees the trip even if the first stays under the line.
-    client.add_text_response(&"x".repeat(2_000));
+    client.add_text_response(&MockClient::bulk_answer(2_000));
     client.add_text_response("done");
     client.add_text_response("done again");
     let durations = Arc::new(Mutex::new(Vec::new()));
@@ -5949,7 +6426,7 @@ fn compaction_scenario_client() -> MockClient {
         "call_1",
         "echo",
         &json!({"message": "hi"}),
-        &"x".repeat(2_000),
+        &MockClient::bulk_answer(2_000),
     );
     client.add_text_response("done");
     client
@@ -6450,7 +6927,7 @@ async fn cancellation_mid_tool_ids_match_the_oracle() {
 /// history.
 async fn compaction_turn_ids_match_the_oracle() {
     let client = MockClient::new("test-model");
-    client.add_text_response(&"x".repeat(2_000));
+    client.add_text_response(&MockClient::bulk_answer(2_000));
     client.add_text_response("done");
     client.add_text_response("done again");
     let counter = Arc::new(CompactionCounter {
@@ -6720,7 +7197,7 @@ async fn observer_sequence_multi_tool_turn() {
 #[tokio::test]
 async fn compaction_sees_pending_messages() {
     let client = MockClient::new("test-model");
-    client.add_text_response(&"x".repeat(200));
+    client.add_text_response(&MockClient::bulk_answer(200));
     client.add_text_response("done");
 
     let config = make_config()
@@ -7245,7 +7722,7 @@ fn set_token_counter_sets_fallback_and_count_context_prefers_manager() {
 #[tokio::test]
 async fn compaction_then_cancellation_leaves_history_compacted() {
     let client = MockClient::new("test-model").without_usage();
-    client.add_text_response(&"x".repeat(200));
+    client.add_text_response(&MockClient::bulk_answer(200));
     client.add_text_response("done");
     client.add_text_response("second done");
 
@@ -15154,7 +15631,7 @@ async fn attachments_ride_every_request_ahead_of_the_history() {
 #[tokio::test]
 async fn attachments_survive_a_compaction_pass_byte_equal() {
     let (client, requests) = WireCaptureClient::new();
-    client.push_final_turn("fat ", &"history payload ".repeat(240));
+    client.push_final_turn("fat ", &MockClient::bulk_answer(3_600));
     client.push_final_turn("lean ", "lean done");
     let compactions = Arc::new(Mutex::new(0usize));
     let managers = crate::managers::LoopManagers::new()
@@ -17709,7 +18186,7 @@ async fn a_post_compaction_request_is_legal_on_a_strict_provider() {
     // 400s the run dead. The seam coalesces, so the request is legal
     // and the run completes.
     let (client, requests, rejections) = StrictAssistantShapeClient::new();
-    client.push_tool_turn(&"history ballast ".repeat(2200), "grow_1");
+    client.push_tool_turn(&MockClient::bulk_answer(35_200), "grow_1");
     client.push_text_turn("after compaction");
     let registry = ToolRegistry::new();
     registry.register(EchoTool);
@@ -18550,7 +19027,7 @@ async fn compact_manual_refuses_a_pass_that_outgrew_the_history_split() {
     // installed, nothing staged, nothing demoted, no observer event,
     // the conversation exactly as it was.
     let client = MockClient::new("test-model");
-    let long_answer = "o".repeat(800);
+    let long_answer = MockClient::bulk_answer(800);
     client.add_text_response(&long_answer);
     let calls = Arc::new(Mutex::new(0usize));
     let compactions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -18804,7 +19281,7 @@ async fn compact_manual_keeps_the_cancel_signal_the_host_already_holds() {
     // sized so the pass genuinely shrinks it — a rewritten feed that
     // grew would be refused as a stall, as the growth pin proves.
     let client = MockClient::new("test-model");
-    let long_answer = "o".repeat(800);
+    let long_answer = MockClient::bulk_answer(800);
     client.add_text_response(&long_answer);
     client.add_text_response("two");
     let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
@@ -18836,7 +19313,7 @@ async fn compact_manual_notifies_observers_like_an_automatic_pass() {
     // ceremony — the same path the automatic pass takes. The history
     // is sized so the pass genuinely shrinks it.
     let client = MockClient::new("test-model");
-    let long_answer = "o".repeat(800);
+    let long_answer = MockClient::bulk_answer(800);
     client.add_text_response(&long_answer);
     let compactions = Arc::new(Mutex::new(0usize));
     let managers = crate::managers::LoopManagers::new()
@@ -18919,8 +19396,8 @@ impl Hook for CompactWitnessHook {
 #[cfg(feature = "hooks")]
 fn loop_with_compact_witness(aborting: bool) -> (BareLoop<MockClient>, Arc<CompactWitnessHook>) {
     let client = MockClient::new("test-model");
-    let long_one = "o".repeat(800);
-    let long_two = "t".repeat(800);
+    let long_one = MockClient::bulk_answer(800);
+    let long_two = MockClient::bulk_answer(1_600);
     client.add_text_response(&long_one);
     client.add_text_response(&long_two);
     let hook = CompactWitnessHook::new(aborting);

@@ -18,10 +18,10 @@ use super::LoopObserver;
 use super::context::{
     AttemptResetContext, BudgetWarnContext, CompactedContext, CompactionFailedContext,
     ConvergenceDetectedContext, FallbackContext, GateDecisionContext, LoopDetectedContext,
-    ModelSwitchedContext, PreCompactionContext, ResponseContext, RunEndContext, RunStartContext,
-    StreamContext, StreamFailureContext, TextDeltaContext, ThinkingDeltaContext,
-    ToolCallReceivedContext, ToolPostContext, ToolPreContext, TransportFallbackContext,
-    TurnEndContext, TurnStartContext,
+    ModelSwitchedContext, PreCompactionContext, RepetitionDetectedContext, ResponseContext,
+    RunEndContext, RunStartContext, StreamContext, StreamFailureContext, TextDeltaContext,
+    ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext, ToolPreContext,
+    TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 
 /// One observed lifecycle moment of a run, as forwarded by [`EventHub`].
@@ -150,6 +150,13 @@ pub enum LoopEvent {
     /// Fired when a streaming transport degrades to the non-streaming
     /// one.
     TransportFallback(TransportFallbackContext),
+
+    /// The repetition guard aborted a degenerate generation loop.
+    ///
+    /// Fired when one byte window of the assistant text repeated
+    /// verbatim enough consecutive times; the turn fails with the
+    /// paired typed error.
+    RepetitionDetected(RepetitionDetectedContext),
 
     /// The active model changed.
     ///
@@ -503,6 +510,16 @@ impl LoopObserver for EventHub {
         self.publish(LoopEvent::TransportFallback(ctx.clone()));
     }
 
+    /// Forwards
+    /// [`on_repetition_detected`](LoopObserver::on_repetition_detected)
+    /// as a [`RepetitionDetected`](LoopEvent::RepetitionDetected) event.
+    ///
+    /// Carries the repetition verdict's numbers; the turn's failure
+    /// rides the paired typed error, not this event.
+    fn on_repetition_detected(&self, ctx: &RepetitionDetectedContext) {
+        self.publish(LoopEvent::RepetitionDetected(ctx.clone()));
+    }
+
     /// Forwards [`on_model_switched`](LoopObserver::on_model_switched)
     /// as a [`ModelSwitched`](LoopEvent::ModelSwitched) event.
     ///
@@ -563,6 +580,7 @@ mod tests {
             LoopEvent::CompactionFailed(_) => "compaction_failed",
             LoopEvent::Fallback(_) => "fallback",
             LoopEvent::TransportFallback(_) => "transport_fallback",
+            LoopEvent::RepetitionDetected(_) => "repetition_detected",
             LoopEvent::ModelSwitched(_) => "model_switched",
             LoopEvent::LoopDetected(_) => "loop_detected",
             LoopEvent::ConvergenceDetected(_) => "convergence_detected",

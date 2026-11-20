@@ -82,6 +82,7 @@ use crate::observer::{ConvergenceDetectedContext, LoopDetectedContext};
 use crate::observer::{LoopObserver, ObserverHost};
 #[cfg(feature = "streaming")]
 use crate::stream::handler::StreamHandler;
+use crate::stream::repetition::RepetitionGuardConfig;
 #[cfg(feature = "tool_health")]
 use crate::tool::health::ToolHealthRegistry;
 
@@ -188,6 +189,18 @@ pub struct LoopManagers {
     #[cfg(feature = "streaming")]
     stream_handler: Option<StreamHandler>,
 
+    /// The repetition guard's configuration.
+    ///
+    /// The knobs the engine's non-streaming turn guard reads — armed
+    /// with conservative defaults, adopted from an installed
+    /// [`StreamHandler`] at
+    /// install time, or set directly through
+    /// [`with_repetition_guard`](Self::with_repetition_guard). Always
+    /// compiled: the guard it configures covers the crate's default
+    /// no-features build, where `TurnMode::NonStreaming` is the only
+    /// turn path.
+    repetition_guard: crate::stream::repetition::RepetitionGuardConfig,
+
     /// Optional hook executor for bidirectional lifecycle interception.
     ///
     /// When set, hooks can inspect and approve or reject actions before they
@@ -282,6 +295,7 @@ impl LoopManagers {
             context_manager: None,
             #[cfg(feature = "streaming")]
             stream_handler: None,
+            repetition_guard: crate::stream::repetition::RepetitionGuardConfig::default(),
             #[cfg(feature = "hooks")]
             hook_executor: None,
             #[cfg(feature = "tool_health")]
@@ -392,6 +406,12 @@ impl LoopManagers {
 
     /// Set the stream handler for resilient streaming (builder-style).
     ///
+    /// Installing a handler also adopts its repetition-guard
+    /// configuration as the managers' own — the engine's
+    /// non-streaming turn guard reads the same knobs the handler's
+    /// streaming abort enforces, so one configuration governs both
+    /// turn paths of a run.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -402,8 +422,58 @@ impl LoopManagers {
     #[must_use]
     #[cfg(feature = "streaming")]
     pub fn with_stream_handler(mut self, handler: StreamHandler) -> Self {
+        self.repetition_guard = handler.repetition_config().clone();
         self.stream_handler = Some(handler);
         self
+    }
+
+    /// Set the repetition guard's configuration (builder-style).
+    ///
+    /// The engine's always-compiled share of the guard: the
+    /// non-streaming turn path runs the detector over a completed
+    /// response before it is recorded, reading these knobs. The
+    /// streaming paths enforce the same guard inside the installed
+    /// [`StreamHandler`], whose
+    /// configuration this managers bundle adopts at install time;
+    /// setting these knobs after a handler is installed restamps the
+    /// handler's copy too, so the last write governs both turn paths
+    /// whatever the builder order. Build without a handler and this is
+    /// the guard's only home.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::managers::LoopManagers;
+    /// use loopctl::stream::repetition::RepetitionGuardConfig;
+    ///
+    /// let managers = LoopManagers::new().with_repetition_guard(
+    ///     RepetitionGuardConfig {
+    ///         enabled: false,
+    ///         ..RepetitionGuardConfig::default()
+    ///     },
+    /// );
+    /// assert!(!managers.repetition_guard().enabled);
+    /// ```
+    #[must_use]
+    pub fn with_repetition_guard(mut self, config: RepetitionGuardConfig) -> Self {
+        #[cfg(feature = "streaming")]
+        if let Some(handler) = self.stream_handler.as_mut() {
+            handler.set_repetition_guard(config.clone());
+        }
+        self.repetition_guard = config;
+        self
+    }
+
+    /// The repetition guard's configuration.
+    ///
+    /// The effective knobs for the engine's non-streaming turn guard —
+    /// the handler's own configuration when one was installed (adopted
+    /// at install time), otherwise whatever
+    /// [`with_repetition_guard`](Self::with_repetition_guard) set,
+    /// otherwise the armed conservative default.
+    #[must_use]
+    pub fn repetition_guard(&self) -> &RepetitionGuardConfig {
+        &self.repetition_guard
     }
 
     /// Set the hook executor for bidirectional lifecycle interception (builder-style).

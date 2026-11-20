@@ -554,6 +554,71 @@ pub enum LoopError {
         String,
     ),
 
+    /// The repetition guard aborted a degenerate generation loop.
+    ///
+    /// One byte window of the assistant text repeated verbatim for
+    /// enough consecutive times — the shape of a model stuck in a
+    /// repetition attractor, decoding cheaply toward the provider's
+    /// output cap. The stream ends at the abort with the partial text
+    /// delivered so far visible through the per-delta observers; the
+    /// paired [`on_repetition_detected`](crate::observer::LoopObserver::on_repetition_detected)
+    /// event carries the same verdict for observability. The abort
+    /// counts as a model failure for the fallback breaker — a model
+    /// that loops is an unhealthy model — so a configured fallback
+    /// model takes the next attempt. Recoverable by host policy: a
+    /// retry re-samples the generation (optionally with sampling
+    /// penalties or a tighter completion budget set on the client), and
+    /// the degenerate message was never committed to the conversation.
+    #[error("Repetition loop detected: {period_bytes}-byte window repeated {repeats} times")]
+    RepetitionDetected {
+        /// The repeating window's length, in bytes.
+        ///
+        /// The smallest qualifying period at detection time, bounded by
+        /// the guard's
+        /// [`min_period_bytes`](crate::stream::repetition::RepetitionGuardConfig::min_period_bytes).
+        period_bytes: u64,
+
+        /// The consecutive verbatim copies that triggered the abort.
+        ///
+        /// The verdict threshold
+        /// ([`min_repeats`](crate::stream::repetition::RepetitionGuardConfig::min_repeats)),
+        /// not a census of how far the loop ran.
+        repeats: u64,
+    },
+
+    /// The completion ended at the output limit with no visible text
+    /// while the anchored context figure showed room.
+    ///
+    /// The length-cut salvage's honest reading when ground truth
+    /// refutes the over-full one: a usage report anchored the context
+    /// figure well below the window, so an empty truncated completion
+    /// was not a context with no generation room — it was an output
+    /// budget too small for the answer (or a degenerate generation the
+    /// repetition guard did not catch). The run ends without
+    /// compacting: destroying history the window still comfortably
+    /// fits would trade real conversation for a wrong diagnosis.
+    /// Recoverable by host policy — raise the client's completion
+    /// budget (`max_tokens`) or retry the turn.
+    #[error(
+        "completion ended at the output limit with no visible text while the context \
+         had room: used {used} of {limit} tokens"
+    )]
+    LengthCutNoOutput {
+        /// The anchored context figure at the failure.
+        ///
+        /// The usage-anchored estimate of the conversation — the figure
+        /// the compaction trigger would have acted on — deliberately
+        /// not floored: it sits below `limit` by construction, and the
+        /// pair reports the utilization the engine actually measured.
+        used: u64,
+
+        /// The context window the figure was measured against.
+        ///
+        /// The run's resolved window (the disclosed or declared
+        /// denominator), for utilization reporting.
+        limit: u64,
+    },
+
     /// Configuration error (invalid settings, missing required
     /// fields).
     ///

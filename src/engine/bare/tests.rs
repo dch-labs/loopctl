@@ -4459,7 +4459,8 @@ async fn a_single_message_length_cut_with_measured_room_fails_honestly() {
     // a one-message conversation cannot compact, but its measured figure
     // (300 of 4,000) shows the window is nowhere near full, so the
     // honest length-cut failure reports the real figures instead of a
-    // floored over-full claim.
+    // floored over-full claim. Empty history makes run("go") supply the
+    // conversation's sole message — the single-message path itself.
     let scripted = MockClient::new("test-model");
     scripted.add_events(vec![
         StreamEvent::MessageStart(MessageStart {
@@ -4486,7 +4487,7 @@ async fn a_single_message_length_cut_with_measured_room_fails_honestly() {
         StreamEvent::MessageStop,
     ]);
     let mut agent = BareLoop::from_machine_with_managers(
-        crate::engine::core::LoopMachine::from_history(vec![Message::user("only".to_string())]),
+        crate::engine::core::LoopMachine::from_history(Vec::new()),
         make_config().with_context_window(4_000),
         Arc::new(scripted),
         ToolRegistry::new(),

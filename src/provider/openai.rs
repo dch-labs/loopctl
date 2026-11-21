@@ -3083,7 +3083,11 @@ impl StreamEmitter {
     /// here — it is deferred until the usage chunk arrives (when
     /// `stream_options.include_usage` is set) or flushed by
     /// [`finish`](Self::finish) at stream end, so the `MessageDelta` carries
-    /// both the stop reason and the usage in one event. Maps `"tool_calls"`
+    /// both the stop reason and the usage in one event. A reasoning suffix
+    /// held past open tool calls flushes after those slots close, and the
+    /// lanes it opened — thinking prefix, text suffix — close with them,
+    /// so no part reaches [`MessageStop`](StreamEvent::MessageStop) still
+    /// open. Maps `"tool_calls"`
     /// → [`ToolCall`](StreamStopReason::ToolCall), `"length"` →
     /// [`MaxTokens`](StreamStopReason::MaxTokens), and anything else via
     /// [`StreamStopReason::from_api_str`]. No-ops if already finished.
@@ -3105,12 +3109,7 @@ impl StreamEmitter {
         }
         if !self.reasoning_pending.is_empty() {
             self.flush_reasoning_pending();
-            if matches!(self.thinking, PartLane::Open) {
-                self.thinking = PartLane::Closed;
-                self.push(StreamEvent::PartStop {
-                    index: Some(THINKING_PART_INDEX),
-                });
-            }
+            self.close_content_lanes();
         }
 
         let stop_reason = match reason {
@@ -3709,6 +3708,48 @@ mod tests {
             thinking,
             vec!["abc</thi".to_string()],
             "the held suffix still reaches the thinking lane once the tool slot is closed"
+        );
+    }
+
+    #[test]
+    fn stream_held_suffix_with_a_complete_tag_releases_as_content_and_stops() {
+        // A suffix held past an open tool call can carry the COMPLETE
+        // boundary: the finish-time flush resolves it — prefix thinking,
+        // suffix content — and both lanes must close, or the text suffix
+        // never receives a PartStop and the accumulator drops the still-
+        // open part when the message builds.
+        let message = message_from_reasoning_chunks(&[
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_a","function":{"name":"run","arguments":"{\"a\": 1}"}}]},"finish_reason":null}]}"#,
+            &reasoning_chunk("abc</think>visible tail"),
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let calls: Vec<(String, Value)> = message
+            .tool_call_parts()
+            .into_iter()
+            .map(|(_id, tool, input)| (tool.to_string(), input.clone()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![("run".to_string(), serde_json::json!({"a": 1})),],
+            "the deferred flush leaves the open tool call whole"
+        );
+        let thinking: Vec<String> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec!["abc".to_string()],
+            "the pre-tag bytes stay thinking when the held bytes resolve the boundary"
+        );
+        assert_eq!(
+            message.text_content(),
+            "visible tail",
+            "the post-tag suffix keeps its lane open through to a PartStop and lands as content"
         );
     }
 

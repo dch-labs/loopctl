@@ -731,7 +731,7 @@ struct UsageAnchor {
     /// A usage anchor pairs one provider report with the wire prefix
     /// it described, and the pairing is model-scoped — another routed
     /// model counts its window on a different denominator. Read by
-    /// [`drop_anchor_from_another_model`](BareLoop::drop_anchor_from_another_model),
+    /// [`reset_foreign_model_estimates`](BareLoop::reset_foreign_model_estimates),
     /// which drops the anchor before a run for another model consumes
     /// it.
     model: String,
@@ -855,10 +855,11 @@ const CALIBRATION_MAX_BP: u64 = 4000;
 /// The engine predicts each request's input-token count (history plus
 /// overhead plus transients); when the provider reports the actual
 /// `input_tokens`, the prediction error feeds this rolling ratio,
-/// which later estimates multiply in. A model-fallback turn samples a
-/// possibly-different tokenizer than the request the prediction was
-/// armed for — accepted noise, bounded by the clamp and diluted by the
-/// smoothing, since fallback routing is transient by design. The ratio is stored in integer
+/// which later estimates multiply in. The ratio is model-scoped: each
+/// sample folds under the model that reported it, and a routed model
+/// change resets the ratio to identity under the new model's name —
+/// one model's tokenizer correction never estimates another's
+/// figures. The ratio is stored in integer
 /// thousandths — the same exact-integer discipline as the crate's
 /// ratio counters — clamped to
 /// `[CALIBRATION_MIN_BP, CALIBRATION_MAX_BP]` so an absurd report (a
@@ -894,6 +895,15 @@ struct EstimateCalibration {
     /// arrived — the honest signal for a backend that reports no
     /// usage.
     calibrated: bool,
+
+    /// The model whose reports folded the current ratio.
+    ///
+    /// Empty while no sample has arrived. A routed model change
+    /// resets the ratio to identity under the new model's name —
+    /// see [`reset_foreign_model_estimates`](BareLoop::reset_foreign_model_estimates)
+    /// — so one model's tokenizer correction never estimates
+    /// another's figures.
+    model: String,
 }
 
 impl EstimateCalibration {
@@ -907,6 +917,7 @@ impl EstimateCalibration {
             ratio_bp: CALIBRATION_IDENTITY_BP,
             prediction: None,
             calibrated: false,
+            model: String::new(),
         }
     }
 
@@ -1646,28 +1657,45 @@ impl<C: ApiClient> BareLoop<C> {
         )
     }
 
-    /// Drop a usage anchor whose model differs from the served model.
+    /// Reset the model-scoped estimates when the served model changed.
     ///
-    /// A usage anchor pairs one provider report with the wire prefix it
-    /// described, and the pairing is model-scoped: another routed model
-    /// counts its window on a different denominator, so an anchor left
-    /// by a breaker trip is stale in exactly the sense the anchor's
-    /// invalidation events describe. Runs before any figure can consume
-    /// the anchor — at the run prologue and ahead of each turn's
+    /// Both usage-fed estimates pair one model's reports with the wire
+    /// prefixes they described: the usage anchor pairs a provider input
+    /// figure with its request payload, and the calibration ratio folds
+    /// that model's report samples. Another routed model counts its
+    /// window on a different denominator, so estimates carried across a
+    /// breaker trip are stale in exactly the sense the invalidation
+    /// events describe — the anchor drops, the calibration resets to
+    /// identity under the new model's name, and a ratio that actually
+    /// moved re-syncs the manager's raw window through the same flow a
+    /// ratio move uses. Runs before any figure can consume either
+    /// estimate — at the run prologue and ahead of each turn's
     /// pre-request estimate — so a rejected attempt's spend still books
     /// into pricing (the gate's concern) while its measurement never
-    /// compacts another model's conversation.
+    /// shapes another model's figure. Same-model turns reset nothing.
     ///
     /// # Errors
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
     /// when the routed-model lookup cannot read the fallback state.
-    fn drop_anchor_from_another_model(&mut self) -> Result<(), LoopError> {
+    fn reset_foreign_model_estimates(&mut self) -> Result<(), LoopError> {
         let served = self.effective_request_model()?;
-        if let Some(anchor) = &self.anchor
-            && anchor.model != served
-        {
-            self.anchor = None;
+        let anchor_matches = self
+            .anchor
+            .as_ref()
+            .is_none_or(|anchor| anchor.model == served);
+        if self.calibration.model == served && anchor_matches {
+            return Ok(());
+        }
+        let ratio_before = self.calibration.ratio_bp;
+        self.calibration = {
+            let mut identity = EstimateCalibration::identity();
+            identity.model = served;
+            identity
+        };
+        self.anchor = None;
+        if ratio_before != CALIBRATION_IDENTITY_BP {
+            self.sync_manager_window(self.effective_context_window());
         }
         Ok(())
     }
@@ -2629,7 +2657,7 @@ impl<C: ApiClient> BareLoop<C> {
         {
             return Err(LoopError::FallbackExhausted);
         }
-        self.drop_anchor_from_another_model()?;
+        self.reset_foreign_model_estimates()?;
 
         // The steering drain: guidance accepted since the last
         // boundary joins the pending set ahead of this turn's
@@ -2725,7 +2753,7 @@ impl<C: ApiClient> BareLoop<C> {
             && text.trim().is_empty()
             && stream_stop == StreamStopReason::MaxTokens
         {
-            return self.truncation_salvage(turn, turn_start, &turn_usage, raw_payload);
+            return self.truncation_salvage(turn, turn_start, &turn_usage);
         }
 
         let pattern = if tool_calls.is_empty()
@@ -3137,6 +3165,11 @@ impl<C: ApiClient> BareLoop<C> {
             Role::User,
             slots.into_iter().flatten().collect(),
         )]);
+        let fallback = self.managers.fallback();
+        if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
+            fallback.transition_to_recovering()?;
+        }
+        self.reset_foreign_model_estimates()?;
         let prepared = self.prepare_turn(turn.saturating_add(1)).await;
         let estimate = self.context_figure(
             self.count_context(&self.machine.full_history())
@@ -3404,7 +3437,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     self.finalize(Some(&e)).await?;
                     return Err(e);
                 }
-                if let Err(e) = self.drop_anchor_from_another_model() {
+                if let Err(e) = self.reset_foreign_model_estimates() {
                     self.set_error_state(&e);
                     self.finalize(Some(&e)).await?;
                     return Err(e);
@@ -3602,12 +3635,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// depends on ground truth: when the attempt's own usage arms the
     /// anchor (a measurement this attempt took — a report-less attempt
     /// or a run whose window is disabled keeps the legacy shape), the
-    /// machine's context figure is re-derived through the same
-    /// [`context_figure`](Self::context_figure) routing that fed it
-    /// before the request, so the freshly armed anchor decides rather
-    /// than the pre-request estimate the attempt just outdated, and
-    /// the natural trigger decides before any retry limit is
-    /// consulted: a figure that crossed the threshold or emergency
+    /// figure is that report's input count itself — the number the
+    /// anchor armed from, with no projection through the pre-request
+    /// estimate — and the natural trigger decides before any retry
+    /// limit is consulted: a figure that crossed the threshold or emergency
     /// line compacts and retries exactly as before, while a figure
     /// below both refutes the over-full reading, failing the run with
     /// [`LoopError::LengthCutNoOutput`] and the real figures (no
@@ -3651,13 +3682,11 @@ impl<C: ApiClient> BareLoop<C> {
         turn: usize,
         turn_start: Instant,
         usage: &TurnUsage,
-        raw_payload: u64,
     ) -> Result<(), LoopError> {
         let anchored =
             self.anchor.is_some() && usage.input_tokens > 0 && self.effective_context_window() > 0;
         if anchored {
-            self.machine
-                .set_context_tokens(self.context_figure(raw_payload));
+            self.machine.set_context_tokens(usage.input_tokens);
             if !matches!(
                 self.machine.next_step(self.machine_policy()),
                 MachineStep::Compact { .. }

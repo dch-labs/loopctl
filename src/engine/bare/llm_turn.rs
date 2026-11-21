@@ -432,7 +432,7 @@ impl<C: ApiClient> BareLoop<C> {
                     self.guard_completed_response(&response.message, response.usage.as_ref())
                 {
                     self.observe_attempt_usage(response.usage.as_ref(), &served);
-                    return Err(self.record_turn_failure(turn, error));
+                    return Err(self.record_turn_failure(turn, error, &served));
                 }
                 self.record_turn_success(turn, response.usage.as_ref(), &served)?;
                 Ok(TurnServing {
@@ -442,7 +442,7 @@ impl<C: ApiClient> BareLoop<C> {
                     transport_fallback: false,
                 })
             }
-            Err(e) => Err(self.record_turn_failure(turn, e)),
+            Err(e) => Err(self.record_turn_failure(turn, e, &served)),
         }
     }
 
@@ -480,7 +480,7 @@ impl<C: ApiClient> BareLoop<C> {
                 {
                     self.observe_attempt_usage(Some(rejected), &served);
                 }
-                Err(self.record_turn_failure(turn, e))
+                Err(self.record_turn_failure(turn, e, &served))
             }
         }
     }

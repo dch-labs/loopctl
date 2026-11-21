@@ -672,6 +672,7 @@ impl<C: ApiClient> BareLoop<C> {
             && let Some(raw_payload) = armed_prediction
             && raw_payload > 0
         {
+            self.calibration.model = served.to_string();
             self.anchor = Some(UsageAnchor {
                 input_tokens: in_tok,
                 raw_payload,
@@ -699,16 +700,23 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`on_fallback`](crate::observer::LoopObserver::on_fallback). Always fires
     /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure)
     /// (except for the cancel short-circuit) and returns the original error.
+    /// The failure events name `served` — the model the failed request
+    /// actually carried — rather than a fresh routing resolution, which
+    /// can disagree with the request a host override names. The breaker's
+    /// own bookkeeping keeps its fallback-routing resolution.
     /// # Errors
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
-    pub(super) fn record_turn_failure(&mut self, turn: usize, e: LoopError) -> LoopError {
+    pub(super) fn record_turn_failure(
+        &mut self,
+        turn: usize,
+        e: LoopError,
+        served: &str,
+    ) -> LoopError {
         if matches!(e, LoopError::Cancelled) {
             return e;
         }
-        // A poisoned breaker while recording a failure is the more
-        // severe condition — surface it instead of the original error.
-        self.record_turn_failure_inner(turn, e)
+        self.record_turn_failure_inner(turn, e, served)
             .unwrap_or_else(|poison| poison)
     }
 
@@ -724,8 +732,8 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         e: LoopError,
+        served: &str,
     ) -> Result<LoopError, LoopError> {
-        let served = self.routed_or_client_model()?;
         let was_in_fallback =
             self.managers.fallback().state()? == crate::fallback::FallbackState::Fallback;
         let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
@@ -741,7 +749,7 @@ impl<C: ApiClient> BareLoop<C> {
         if tripped && let Some(to) = self.managers.fallback().fallback_model()? {
             tracing::warn!(from = %served, to = %to, "fallback manager tripped");
             self.managers.observers().on_fallback(&FallbackContext {
-                from: served.clone(),
+                from: served.to_string(),
                 to,
             });
         }
@@ -754,7 +762,7 @@ impl<C: ApiClient> BareLoop<C> {
             .observers()
             .on_stream_failure(&StreamFailureContext {
                 turn,
-                model: served,
+                model: served.to_string(),
                 error: e.clone(),
             });
 

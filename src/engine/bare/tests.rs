@@ -7732,6 +7732,31 @@ async fn session_and_run_id_sequences_match_a_fresh_oracle_per_scenario() {
     fallback_switch_ids_match_the_oracle().await;
 }
 
+// A controllable clock for the recovery test: real instants plus an
+// advanceable offset, so the recovery cooldown expires on demand instead
+// of sleeping in real time.
+#[derive(Debug)]
+struct AdvanceableClock {
+    /// The real instant the clock was constructed at.
+    base: Instant,
+    /// Extra milliseconds added on top of [`base`](Self::base) — the
+    /// test advances this past the cooldown to expire it.
+    offset_ms: std::sync::atomic::AtomicU64,
+}
+
+impl crate::determinism::Clock for AdvanceableClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+    fn monotonic(&self) -> Instant {
+        self.base
+            .checked_add(Duration::from_millis(
+                self.offset_ms.load(std::sync::atomic::Ordering::SeqCst),
+            ))
+            .expect("the test offset stays within Instant's range")
+    }
+}
+
 // A recovery cooldown elapsing across runs re-opens the next run on the
 // primary model — and the run prologue must transition to recovering
 // BEFORE the model-scoped estimates reset. The fallback turn's high report
@@ -7740,8 +7765,16 @@ async fn session_and_run_id_sequences_match_a_fresh_oracle_per_scenario() {
 // anchor and selects a phantom compaction for a conversation the primary
 // model measures well inside its window.
 struct RecoveryProbeClient {
+    /// Consumed by the first request only: its response errors, tripping
+    /// the breaker onto the fallback model.
     fail_next: std::sync::atomic::AtomicBool,
+
+    /// Consumed by the second request only: its response reports the high
+    /// fallback-model usage the stale-estimate scenario needs.
     high_next: std::sync::atomic::AtomicBool,
+
+    /// The effective model each request carried — failed attempts
+    /// included, so every run's routing is asserted from the same log.
     served: Arc<Mutex<Vec<String>>>,
 }
 
@@ -7869,11 +7902,17 @@ async fn a_recovery_cooldown_expiry_opens_the_next_run_on_primary_estimates() {
         served: Arc::new(Mutex::new(Vec::new())),
     });
     let compactions = Arc::new(Mutex::new(0usize));
-    let manager = FallbackManager::new(1, 2).with_config(crate::fallback::FallbackConfig {
-        recovery_timeout: Duration::from_millis(20),
-        trip_threshold: 1,
-        ..crate::fallback::FallbackConfig::default()
+    let clock = Arc::new(AdvanceableClock {
+        base: Instant::now(),
+        offset_ms: std::sync::atomic::AtomicU64::new(0),
     });
+    let manager = FallbackManager::new(1, 2)
+        .with_config(crate::fallback::FallbackConfig {
+            recovery_timeout: Duration::from_millis(20),
+            trip_threshold: 1,
+            ..crate::fallback::FallbackConfig::default()
+        })
+        .with_clock(Arc::clone(&clock) as Arc<dyn crate::determinism::Clock>);
     manager
         .set_original_model("primary-model".to_string())
         .expect("a fresh manager accepts its primary");
@@ -7934,7 +7973,9 @@ async fn a_recovery_cooldown_expiry_opens_the_next_run_on_primary_estimates() {
         agent.calibration.model, "fallback-model",
         "the calibration ratio folded under the fallback model"
     );
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    clock
+        .offset_ms
+        .store(30, std::sync::atomic::Ordering::SeqCst);
     let run3 = agent
         .run("three", &RunConfig::default())
         .await

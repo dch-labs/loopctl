@@ -1020,8 +1020,22 @@ impl<C: ApiClient> BareLoop<C> {
     /// and the first model call needs its prepared tools and a context
     /// estimate before [`next_step`](crate::engine::core::LoopMachine::next_step)
     /// can answer. Runs before each pass of [`drive_steps`](Self::drive_steps).
-    async fn arm_first_turn(&mut self) {
+    /// The fallback recovery check and the model-scoped estimate reset run
+    /// after the asynchronous preparation — a cooldown can elapse while it
+    /// awaits — so the opening figure is computed under the model that will
+    /// actually serve the turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
+    /// when the recovery checks cannot read the fallback state.
+    async fn arm_first_turn(&mut self) -> Result<(), LoopError> {
         let prepared = self.prepare_turn(0).await;
+        let fallback = self.managers.fallback();
+        if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
+            fallback.transition_to_recovering()?;
+        }
+        self.reset_foreign_model_estimates()?;
         let estimate = self.context_figure(
             self.count_context(&self.machine.full_history())
                 .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
@@ -1029,6 +1043,7 @@ impl<C: ApiClient> BareLoop<C> {
         );
         self.machine.set_context_tokens(estimate);
         self.prepared_turn = Some(prepared);
+        Ok(())
     }
 
     /// Arm the continuation turn a follow-up injected, at its true index.
@@ -3165,12 +3180,12 @@ impl<C: ApiClient> BareLoop<C> {
             Role::User,
             slots.into_iter().flatten().collect(),
         )]);
+        let prepared = self.prepare_turn(turn.saturating_add(1)).await;
         let fallback = self.managers.fallback();
         if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
             fallback.transition_to_recovering()?;
         }
         self.reset_foreign_model_estimates()?;
-        let prepared = self.prepare_turn(turn.saturating_add(1)).await;
         let estimate = self.context_figure(
             self.count_context(&self.machine.full_history())
                 .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
@@ -3437,16 +3452,11 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     self.finalize(Some(&e)).await?;
                     return Err(e);
                 }
-                let fallback = self.managers.fallback();
-                if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
-                    fallback.transition_to_recovering()?;
-                }
-                if let Err(e) = self.reset_foreign_model_estimates() {
+                if let Err(e) = self.arm_first_turn().await {
                     self.set_error_state(&e);
                     self.finalize(Some(&e)).await?;
                     return Err(e);
                 }
-                self.arm_first_turn().await;
                 if let Err(e) = self.drive_steps(run_config).await {
                     self.finalize(Some(&e)).await?;
                     return Err(e);
@@ -3636,13 +3646,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// carrying no visible text — what a context with no generation
     /// room looks like from the wire, and indistinguishable on it from
     /// an output cap too small for the answer. Which reading rules
-    /// depends on ground truth: when the attempt's own usage arms the
-    /// anchor (a measurement this attempt took — a report-less attempt
+    /// depends on ground truth: when the attempt reports usable input
+    /// tokens (a measurement this attempt took — a report-less attempt
     /// or a run whose window is disabled keeps the legacy shape), the
-    /// figure is that report's input count itself — the number the
-    /// anchor armed from, with no projection through the pre-request
-    /// estimate — and the natural trigger decides before any retry
-    /// limit is consulted: a figure that crossed the threshold or emergency
+    /// figure is that report's input count itself — no anchor and no
+    /// projection through the pre-request estimate — and the natural
+    /// trigger decides before any retry limit is consulted: a figure
+    /// that crossed the threshold or emergency
     /// line compacts and retries exactly as before, while a figure
     /// below both refutes the over-full reading, failing the run with
     /// [`LoopError::LengthCutNoOutput`] and the real figures (no
@@ -3687,9 +3697,8 @@ impl<C: ApiClient> BareLoop<C> {
         turn_start: Instant,
         usage: &TurnUsage,
     ) -> Result<(), LoopError> {
-        let anchored =
-            self.anchor.is_some() && usage.input_tokens > 0 && self.effective_context_window() > 0;
-        if anchored {
+        let measured = usage.input_tokens > 0 && self.effective_context_window() > 0;
+        if measured {
             self.machine.set_context_tokens(usage.input_tokens);
             if !matches!(
                 self.machine.next_step(self.machine_policy()),
@@ -3720,7 +3729,7 @@ impl<C: ApiClient> BareLoop<C> {
                 turn,
                 target,
             );
-            if !anchored {
+            if !measured {
                 self.machine
                     .set_context_tokens(self.effective_context_window().saturating_add(1));
             }

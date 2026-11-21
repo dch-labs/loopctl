@@ -7732,6 +7732,231 @@ async fn session_and_run_id_sequences_match_a_fresh_oracle_per_scenario() {
     fallback_switch_ids_match_the_oracle().await;
 }
 
+// A recovery cooldown elapsing across runs re-opens the next run on the
+// primary model — and the run prologue must transition to recovering
+// BEFORE the model-scoped estimates reset. The fallback turn's high report
+// (3,900 tokens in a 4,000 window) arms a fallback-model anchor; without
+// the ordering, the cooldown-expired run's opening figure reads that
+// anchor and selects a phantom compaction for a conversation the primary
+// model measures well inside its window.
+struct RecoveryProbeClient {
+    fail_next: std::sync::atomic::AtomicBool,
+    high_next: std::sync::atomic::AtomicBool,
+    served: Arc<Mutex<Vec<String>>>,
+}
+
+impl ApiClient for RecoveryProbeClient {
+    fn model(&self) -> String {
+        "primary-model".to_string()
+    }
+
+    fn base_url(&self) -> String {
+        "recovery-probe".to_string()
+    }
+
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
+    }
+
+    fn create_message(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.create_message_with_options(request, crate::structured::RequestOptions::default())
+    }
+
+    fn stream_messages_with_options(
+        &self,
+        _request: &crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        self.served
+            .lock()
+            .expect("served log")
+            .push(options.model.unwrap_or_else(|| self.model()));
+        let fail = self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if fail {
+            return Box::pin(futures::stream::iter(vec![Err(ApiError::api(
+                "tripping the breaker",
+            ))]));
+        }
+        let high = self
+            .high_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        let usage = if high {
+            Usage::new(3_900, 100)
+        } else {
+            Usage::new(300, 50)
+        };
+        Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_probe".into(),
+                    role: "assistant".into(),
+                    model: self.model(),
+                },
+            })),
+            Ok(StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::text("an answer")),
+            })),
+            Ok(StreamEvent::PartStop { index: None }),
+            Ok(StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".to_string()),
+                },
+                usage: Some(usage),
+            })),
+            Ok(StreamEvent::MessageStop),
+        ]))
+    }
+
+    fn create_message_with_options(
+        &self,
+        _request: &crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.served
+            .lock()
+            .expect("served log")
+            .push(options.model.unwrap_or_else(|| self.model()));
+        let fail = self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if fail {
+            return Box::pin(async { Err(ApiError::api("tripping the breaker")) });
+        }
+        let high = self
+            .high_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        let usage = if high {
+            Usage::new(3_900, 100)
+        } else {
+            Usage::new(300, 50)
+        };
+        Box::pin(async move {
+            Ok(crate::api::NonStreamingResponse {
+                message: crate::message::Message::assistant("an answer"),
+                stop_reason: crate::stream::StreamStopReason::EndTurn,
+                usage: Some(usage),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_recovery_cooldown_expiry_opens_the_next_run_on_primary_estimates() {
+    let client = Arc::new(RecoveryProbeClient {
+        fail_next: std::sync::atomic::AtomicBool::new(true),
+        high_next: std::sync::atomic::AtomicBool::new(true),
+        served: Arc::new(Mutex::new(Vec::new())),
+    });
+    let compactions = Arc::new(Mutex::new(0usize));
+    let manager = FallbackManager::new(1, 2).with_config(crate::fallback::FallbackConfig {
+        recovery_timeout: Duration::from_millis(20),
+        trip_threshold: 1,
+        ..crate::fallback::FallbackConfig::default()
+    });
+    manager
+        .set_original_model("primary-model".to_string())
+        .expect("a fresh manager accepts its primary");
+    manager
+        .set_fallback_model("fallback-model")
+        .expect("a fresh manager accepts its fallback");
+    let managers = crate::managers::LoopManagers::new()
+        .with_fallback(manager)
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..6)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::clone(&client),
+        ToolRegistry::new(),
+        managers,
+    );
+    let run1 = agent.run("one", &RunConfig::default()).await;
+    assert!(run1.is_err(), "the scripted failure fails the first run");
+    assert!(
+        agent.managers.fallback().is_using_fallback().unwrap(),
+        "the failure tripped the breaker onto the fallback model"
+    );
+    agent
+        .run("two", &RunConfig::default())
+        .await
+        .expect("the fallback-served run completes");
+    assert_eq!(
+        crate::error::recover_guard(client.served.lock()).last(),
+        Some(&"fallback-model".to_string()),
+        "run two served under the fallback model"
+    );
+    {
+        let anchor = agent
+            .anchor
+            .as_ref()
+            .expect("the fallback turn's usage armed the anchor");
+        assert_eq!(
+            anchor.model, "fallback-model",
+            "the anchor names the model that reported it"
+        );
+        assert_eq!(anchor.input_tokens, 3_900);
+    }
+    assert_eq!(
+        agent.calibration.model, "fallback-model",
+        "the calibration ratio folded under the fallback model"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let run3 = agent
+        .run("three", &RunConfig::default())
+        .await
+        .expect("the cooldown-expired run completes on the primary model");
+    assert_eq!(
+        crate::error::recover_guard(client.served.lock()).last(),
+        Some(&"primary-model".to_string()),
+        "run three served under the recovered primary model"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "the opening estimate reads primary-model calibration — no phantom \
+         compaction from the fallback anchor"
+    );
+    assert_eq!(
+        agent.calibration.model, "primary-model",
+        "the prologue reset the estimates under the served model"
+    );
+    assert_eq!(run3.turns.len(), 1);
+}
+
 #[tokio::test]
 async fn observer_sequence_multi_tool_turn() {
     let client = MockClient::new("test-model");

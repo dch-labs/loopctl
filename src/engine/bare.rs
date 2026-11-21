@@ -3437,6 +3437,10 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     self.finalize(Some(&e)).await?;
                     return Err(e);
                 }
+                let fallback = self.managers.fallback();
+                if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
+                    fallback.transition_to_recovering()?;
+                }
                 if let Err(e) = self.reset_foreign_model_estimates() {
                     self.set_error_state(&e);
                     self.finalize(Some(&e)).await?;

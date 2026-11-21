@@ -438,8 +438,7 @@ impl LoopManagers {
     #[must_use]
     #[cfg(feature = "streaming")]
     pub fn with_stream_handler(mut self, handler: StreamHandler) -> Self {
-        self.repetition_guard = handler.repetition_config().clone();
-        self.stream_handler = Some(handler);
+        self.set_stream_handler(handler);
         self
     }
 
@@ -453,8 +452,12 @@ impl LoopManagers {
     /// configuration this managers bundle adopts at install time;
     /// setting these knobs after a handler is installed restamps the
     /// handler's copy too, so the last write governs both turn paths
-    /// whatever the builder order. Build without a handler and this is
-    /// the guard's only home.
+    /// whatever the builder order. Build without a handler and the
+    /// knobs still govern the streaming path: the bundle's own
+    /// passthrough-shaped fallback handler — the one
+    /// [`stream_handler`](crate::capabilities::StreamCapable::stream_handler)
+    /// serves — is restamped by every call, so a disarmed or retuned
+    /// bundle never streams under the shared armed default.
     ///
     /// # Example
     ///

@@ -1036,10 +1036,9 @@ mod tests {
 
 #[test]
 fn repetition_and_length_cut_errors_are_recoverable() {
-    // Both describe an attempt whose remedy is another attempt:
-    // a resample for the loop, a larger budget for the cut. A
-    // measured no-progress stall stays permanent — the counter
-    // example the classifier's contract names.
+    // Both describe an attempt whose remedy is another attempt: a resample
+    // for the loop, a larger budget for the cut. A measured no-progress stall
+    // stays permanent — the counter example the classifier's contract names.
     let repetition = LoopError::RepetitionDetected {
         period_bytes: 84,
         repeats: 4,

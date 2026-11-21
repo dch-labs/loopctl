@@ -2867,13 +2867,22 @@ impl StreamEmitter {
     /// grow into the tag across a delta boundary. After the boundary has
     /// fired, every fragment is content — a pass-through server keeps
     /// streaming the post-thinking generation down the same field, and
-    /// a second close tag in that stream stays literal text.
+    /// a second close tag in that stream stays literal text. While a
+    /// tool call holds the thinking lane's wire index, the whole
+    /// fragment holds instead: emitting would open the thinking lane at
+    /// an index the accumulator routes to the open tool slot, and the
+    /// lane-closure stop would close that slot. The hold releases at
+    /// finish, after the tool slots have closed and the flush resolves
+    /// the boundary over the held bytes.
     fn process_reasoning_fragment(&mut self, fragment: &str) {
         if matches!(self.reasoning_boundary, ReasoningBoundary::Crossed) {
             self.emit_text_fragment(fragment);
             return;
         }
         self.reasoning_pending.push_str(fragment);
+        if self.seen_tool_indices.contains(&THINKING_PART_INDEX) {
+            return;
+        }
         let Some(index) = self.reasoning_pending.find(THINK_CLOSE_TAG) else {
             let held = held_tag_prefix_len(&self.reasoning_pending);
             let split = self.reasoning_pending.len().saturating_sub(held);
@@ -2966,11 +2975,25 @@ impl StreamEmitter {
     /// The stream ended before the pending suffix resolved into (or
     /// ruled out) a tag: the bytes are reasoning under the
     /// no-close-tag rule, so they emit into the thinking lane before
-    /// the lanes close. After the boundary has fired the buffer is
-    /// empty by construction, and an empty fragment is dropped — the
-    /// flush is a no-op there.
+    /// the lanes close. A suffix held past open tool calls may carry a
+    /// complete tag — the boundary resolves here over the held bytes,
+    /// splitting prefix thinking from suffix content exactly as the
+    /// live scan would have. After the boundary has fired the buffer
+    /// is empty by construction, and an empty fragment is dropped —
+    /// the flush is a no-op there. Every call site runs after any open
+    /// tool slots have closed, so the flushed thinking lane never
+    /// shares its index with a tool call.
     fn flush_reasoning_pending(&mut self) {
         let pending = std::mem::take(&mut self.reasoning_pending);
+        if pending.is_empty() {
+            return;
+        }
+        if let Some((before, after)) = split_reasoning_at_close(&pending) {
+            self.reasoning_boundary = ReasoningBoundary::Crossed;
+            self.emit_thinking_fragment(before);
+            self.emit_text_fragment(after);
+            return;
+        }
         self.emit_thinking_fragment(&pending);
     }
 
@@ -2986,9 +3009,15 @@ impl StreamEmitter {
     /// finish, after tool lanes opened) would re-open the thinking lane at
     /// an index a tool call may already hold, and the accumulator's
     /// index-named [`PartStop`](StreamEvent::PartStop) would close the tool
-    /// slot instead.
+    /// slot instead. When a tool call already holds the thinking index, the
+    /// flush defers: the suffix stays pending until
+    /// [`process_finish`](Self::process_finish) closes the tool slots and
+    /// flushes it behind them, so the flushed lane never shares its index
+    /// with an open tool call.
     fn close_content_lanes(&mut self) {
-        self.flush_reasoning_pending();
+        if !self.seen_tool_indices.contains(&THINKING_PART_INDEX) {
+            self.flush_reasoning_pending();
+        }
         if matches!(self.text, PartLane::Open) {
             self.text = PartLane::Closed;
             self.push(StreamEvent::PartStop {
@@ -3073,6 +3102,15 @@ impl StreamEmitter {
             .collect();
         for index in open_tool_indices {
             self.push(StreamEvent::PartStop { index: Some(index) });
+        }
+        if !self.reasoning_pending.is_empty() {
+            self.flush_reasoning_pending();
+            if matches!(self.thinking, PartLane::Open) {
+                self.thinking = PartLane::Closed;
+                self.push(StreamEvent::PartStop {
+                    index: Some(THINKING_PART_INDEX),
+                });
+            }
         }
 
         let stop_reason = match reason {
@@ -3630,6 +3668,47 @@ mod tests {
             calls,
             vec!["first".to_string(), "second".to_string()],
             "parallel tool calls keep their wire order, unharmed by the flush"
+        );
+    }
+
+    #[test]
+    fn stream_held_reasoning_after_an_open_tool_call_keeps_the_call_intact() {
+        // A held suffix can outlive a tool start: the reasoning fragment
+        // arrives without tool_calls, so no lane closure runs and the tool
+        // slot at the thinking index stays open. The flush must then defer
+        // past that slot — closing it at flush time would end the call
+        // before its remaining arguments arrive and orphan them — and the
+        // finish-time flush behind the tool stops is where it lands. The
+        // call parses from its complete arguments, and the suffix joins the
+        // thinking lane once the slot is gone.
+        let message = message_from_reasoning_chunks(&[
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_a","function":{"name":"run","arguments":"{\"a\""}}]},"finish_reason":null}]}"#,
+            &reasoning_chunk("abc</thi"),
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":": 1}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let calls: Vec<(String, Value)> = message
+            .tool_call_parts()
+            .into_iter()
+            .map(|(_id, tool, input)| (tool.to_string(), input.clone()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![("run".to_string(), serde_json::json!({"a": 1})),],
+            "the deferred flush leaves the open tool call whole — its arguments parse"
+        );
+        let thinking: Vec<String> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec!["abc</thi".to_string()],
+            "the held suffix still reaches the thinking lane once the tool slot is closed"
         );
     }
 

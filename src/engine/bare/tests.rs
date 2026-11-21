@@ -4047,31 +4047,29 @@ async fn a_first_anchor_length_cut_refuses_on_the_measured_figure() {
 #[cfg(feature = "streaming")]
 #[tokio::test]
 async fn a_rejected_non_streaming_completion_books_its_usage() {
-    // The refused completion still spent its tokens: the attempt's
-    // usage is observed exactly as an accepted turn's would be (the
-    // error carries it, so the failed turn's record reports the real
-    // spend), while the success notification and the message commit
-    // stay skipped.
+    // The refused completion still spent its tokens: the attempt's usage is
+    // observed exactly as an accepted turn's would be (the error carries it, so
+    // the failed turn's record reports the real spend), while the success
+    // notification and the message commit stay skipped. The parity is then read
+    // off the engine's own state — the budget gate's tally inspected through
+    // `pre_request` on the same run's numbers (a next run's `begin` would reset
+    // it), the armed anchor, and the folded calibration — against a hard token
+    // line set just under the refused spend, so only the parity this test pins
+    // can produce the 49,600-token crossing.
     let scripted = MockClient::new("test-model");
     scripted.add_events(degenerate_stream_events(5, Some(Usage::new(48_000, 1_600))));
-    scripted.add_text_response("a follow-up that must never be served");
     let ends = Arc::new(Mutex::new(Vec::new()));
     let managers =
         crate::managers::LoopManagers::new().with_observer(Arc::new(FailedTurnRecorder {
             ends: Arc::clone(&ends),
         }));
-    let agent = BareLoop::new_with_managers(
+    let mut agent = BareLoop::new_with_managers(
         Arc::new(scripted),
         ToolRegistry::new(),
         make_config(),
         managers,
-    );
-    // The hard token line sits under the refused attempt's spend, so
-    // the tally the rejection books decides the next run: if the
-    // 48,000 input and 1,600 output tokens reached the gate, the
-    // follow-up refuses with exactly their sum — a figure only the
-    // parity this test pins can produce.
-    let mut agent = agent.with_budget_gate(crate::budget::BudgetGate::new(
+    )
+    .with_budget_gate(crate::budget::BudgetGate::new(
         crate::budget::BudgetLimits {
             tokens: Some(49_000),
             ..crate::budget::BudgetLimits::new()
@@ -4106,10 +4104,6 @@ async fn a_rejected_non_streaming_completion_books_its_usage() {
             .any(|message| message.text_content().contains("<tool_call>")),
         "the degenerate message is still never committed"
     );
-    // The accounting parity, read off the engine's own state: the
-    // budget gate's tally, the armed anchor, and the folded
-    // calibration all carry the refused attempt's figures — the same
-    // observation an accepted turn's success recording performs.
     let gate = agent
         .budget_gate
         .as_ref()
@@ -4131,6 +4125,50 @@ async fn a_rejected_non_streaming_completion_books_its_usage() {
         agent.calibration.calibrated,
         "the rejected attempt's input folded into the calibration ratio"
     );
+}
+
+#[tokio::test]
+async fn budget_pricing_names_the_model_the_request_serves() {
+    // Budget pricing reads the model the request actually carries: the host's
+    // `request_options` override must win over the client default, or a
+    // breaker-routed or overridden request is priced at another model's rate.
+    // The staged (10, 20) report costs 225µ at `test-model`'s rates and 2,250µ
+    // at `pricier-model`'s, so a 1,000µ line sits between them — only the
+    // override's rate can cross it.
+    let client = MockClient::new("test-model");
+    client.add_text_response("a plain answer");
+    let table_json = r#"{ "table_version": "test-table", "pricing_updated": "2999-01-01",
+        "models": { "test-model": { "input_per_mtok": 2.5, "output_per_mtok": 10.0 },
+                    "pricier-model": { "input_per_mtok": 25.0, "output_per_mtok": 100.0 } } }"#;
+    let gate = crate::budget::BudgetGate::new(crate::budget::BudgetLimits {
+        usd: Some(0.001),
+        ..crate::budget::BudgetLimits::new()
+    })
+    .with_price_table(Arc::new(
+        crate::pricing::PriceTable::from_json(table_json).expect("valid test table"),
+    ));
+    let mut agent =
+        BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config()).with_budget_gate(gate);
+    agent.set_request_options(crate::structured::RequestOptions::new().with_model("pricier-model"));
+    let run = agent
+        .run("drive it", &RunConfig::default())
+        .await
+        .expect("a single turn inside its budget completes: {run:?}");
+    assert_eq!(run.turns.len(), 1, "one served turn");
+    let gate = agent
+        .budget_gate
+        .as_ref()
+        .expect("the gate the test installed is still there");
+    let (_warns, hard) = gate.pre_request(std::time::Duration::ZERO);
+    let crossing = hard.expect(
+        "the override model's rate crosses the line — pricing at the client \
+         default would stay under it",
+    );
+    assert_eq!(
+        crossing.spent, 2_250,
+        "the cost is computed at pricier-model's rates, the model the request sent"
+    );
+    assert_eq!(crossing.limit, 1_000);
 }
 
 #[cfg(feature = "streaming")]
@@ -4304,6 +4342,226 @@ async fn a_second_length_cut_completion_ends_the_run() {
     assert!(
         *crate::error::recover_guard(compactions.lock()) >= 1,
         "one salvage ran before the failure"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_second_length_cut_after_a_compacted_retry_reports_the_measured_room() {
+    // The measurement outranks the retry count: the first truncation
+    // measures 3,600 tokens in a 4,000 window — over the line, so its
+    // salvage compacts and re-issues the turn — and the retried attempt
+    // measures 1,500 and truncates again. The retry limit applies only
+    // to attempts that still need compaction, so the run ends with the
+    // real measured figures instead of a fabricated over-full claim
+    // (which finalization would read as unfit and discard the
+    // conversation over).
+    let scripted = MockClient::new("test-model");
+    scripted.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_test".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::Thinking {
+                text: "a first truncated thought ".to_string(),
+                signature: None,
+                redacted: None,
+            }),
+        }),
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("max_tokens".to_string()),
+            },
+            usage: Some(Usage::new(3_600, 100)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    scripted.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_test".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::Thinking {
+                text: "a second truncated thought ".to_string(),
+                signature: None,
+                redacted: None,
+            }),
+        }),
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("max_tokens".to_string()),
+            },
+            usage: Some(Usage::new(1_500, 100)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new(),
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        managers,
+    );
+    let result = agent
+        .run("rewrite your prior response", &RunConfig::default())
+        .await;
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the first truncation's measured figure drove a real compaction"
+    );
+    match result {
+        Err(crate::error::LoopError::LengthCutNoOutput { used, limit }) => {
+            assert_eq!(limit, 4_000, "the failure names the resolved window");
+            assert_eq!(
+                used, 1_500,
+                "the retried attempt's own measurement reports the room it has, \
+                 never the floored over-full figure"
+            );
+        }
+        other => panic!("expected the honest length-cut failure, got: {other:?}"),
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_single_message_length_cut_with_measured_room_fails_honestly() {
+    // The unshrinkable-history gate cannot outrank a measurement either:
+    // a one-message conversation cannot compact, but its measured figure
+    // (300 of 4,000) shows the window is nowhere near full, so the
+    // honest length-cut failure reports the real figures instead of a
+    // floored over-full claim.
+    let scripted = MockClient::new("test-model");
+    scripted.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_test".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::Thinking {
+                text: "a truncated thought ".to_string(),
+                signature: None,
+                redacted: None,
+            }),
+        }),
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("max_tokens".to_string()),
+            },
+            usage: Some(Usage::new(300, 50)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(vec![Message::user("only".to_string())]),
+        make_config().with_context_window(4_000),
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        crate::managers::LoopManagers::new(),
+    );
+    let result = agent.run("go", &RunConfig::default()).await;
+    match result {
+        Err(crate::error::LoopError::LengthCutNoOutput { used, limit }) => {
+            assert_eq!(limit, 4_000, "the failure names the resolved window");
+            assert_eq!(
+                used, 300,
+                "the refusal carries this attempt's own measurement"
+            );
+        }
+        other => panic!("expected the honest length-cut failure, got: {other:?}"),
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_length_cut_with_a_disabled_window_keeps_the_output_limit_reading() {
+    // A context_window of 0 is the disabled-policy sentinel, not a
+    // measured limit: no fit claim exists to make, so the anchored
+    // measured-room reading is out of the question and the salvage
+    // keeps its legacy output-limit failure — a utilization figure
+    // against a zero window would claim room that no policy measures.
+    let scripted = MockClient::new("test-model");
+    scripted.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_test".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::Thinking {
+                text: "a truncated thought ".to_string(),
+                signature: None,
+                redacted: None,
+            }),
+        }),
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("max_tokens".to_string()),
+            },
+            usage: Some(Usage::new(1_500, 100)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        make_config().with_context_window(0),
+        Arc::new(scripted),
+        ToolRegistry::new(),
+        crate::managers::LoopManagers::new(),
+    );
+    let result = agent.run("go", &RunConfig::default()).await;
+    assert!(
+        matches!(
+            result,
+            Err(crate::error::LoopError::ContextExceeded { limit: 0, .. })
+        ),
+        "a disabled window reports the output-limit failure with no fit \
+         claim, got: {result:?}"
     );
 }
 
@@ -4739,8 +4997,11 @@ async fn a_single_message_length_cut_fails_at_once_and_floors_the_reported_figur
     // deliberate floor: `used` above `limit` with no pretence of a
     // measurement, the same reading both salvages share (the wire
     // cannot distinguish the two causes, so the salvage names the
-    // reading its remedy would have acted on).
-    let scripted = MockClient::new("test-model");
+    // reading its remedy would have acted on). The usage-less mock
+    // pins the wire-only arm — a reported measurement outranks this
+    // shape and fails honestly instead
+    // (a_single_message_length_cut_with_measured_room_fails_honestly).
+    let scripted = MockClient::new("test-model").without_usage();
     scripted.add_truncated_thinking("a thought that runs past the cap ");
     let starts = Arc::new(Mutex::new(Vec::new()));
     let ends = Arc::new(Mutex::new(Vec::new()));
@@ -5242,13 +5503,15 @@ async fn a_length_cut_without_a_context_manager_ends_the_run() {
     // compactor to consult. What the configuration *does* produce is
     // the seeded default driving the same honest termination: with an
     // unshrinkable history the forced pass declines and the run ends
-    // with the floored figure, once, paired.
+    // with the floored figure, once, paired. The usage-less mock pins
+    // the wire-only arm — a reported measurement outranks this shape
+    // and fails honestly instead.
     let managers = crate::managers::LoopManagers::new();
     assert!(
         managers.context_manager().is_none(),
         "the bare manager set carries no context manager before construction"
     );
-    let scripted = MockClient::new("test-model");
+    let scripted = MockClient::new("test-model").without_usage();
     scripted.add_truncated_thinking("a thought past the cap ");
     let starts = Arc::new(Mutex::new(Vec::new()));
     let ends = Arc::new(Mutex::new(Vec::new()));

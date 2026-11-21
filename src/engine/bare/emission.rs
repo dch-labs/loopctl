@@ -619,10 +619,10 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         usage: Option<&Usage>,
+        served: &str,
     ) -> Result<(), LoopError> {
-        let served = self.routed_or_client_model()?;
         self.managers.fallback().record_success()?;
-        self.observe_attempt_usage(usage)?;
+        self.observe_attempt_usage(usage, served);
         let usage = TurnUsage::from_report(usage);
         let TurnUsage {
             input_tokens: in_tok,
@@ -647,23 +647,19 @@ impl<C: ApiClient> BareLoop<C> {
     /// Everything a reported usage feeds, independent of whether the
     /// attempt's message is accepted: the usage anchor arms (the
     /// provider's input figure becomes the calibrated figure's ground
-    /// truth), the calibration ratio folds the sample, the context
-    /// manager's window re-syncs when the ratio moved, and the budget
-    /// gate observes both the token pair and the cost against the
-    /// served model. Called by
+    /// truth, recorded against `served` — the model the request
+    /// actually carried — so another routed model never reads it), the
+    /// calibration ratio folds the sample, the context manager's
+    /// window re-syncs when the ratio moved, and the budget gate
+    /// observes both the token pair and the cost at `served`'s rate.
+    /// Called by
     /// [`record_turn_success`](Self::record_turn_success) for accepted
     /// turns and by the repetition guard's rejection arms for refused
     /// completions — a rejected response still spent its tokens, and
     /// its real cost must reach the same accounting an accepted one's
     /// would. A `None` usage reports nothing, exactly as an accepted
     /// turn without a report does.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
-    /// when the routed-model lookup cannot read the fallback state.
-    pub(super) fn observe_attempt_usage(&mut self, usage: Option<&Usage>) -> Result<(), LoopError> {
-        let served = self.routed_or_client_model()?;
+    pub(super) fn observe_attempt_usage(&mut self, usage: Option<&Usage>, served: &str) {
         let raw_usage = usage;
         let usage = TurnUsage::from_report(usage);
         let TurnUsage {
@@ -680,6 +676,7 @@ impl<C: ApiClient> BareLoop<C> {
                 input_tokens: in_tok,
                 raw_payload,
                 anchored_at_turn: self.session.total_turns().saturating_add(1),
+                model: served.to_string(),
             });
         }
         let ratio_before = self.calibration.ratio_bp;
@@ -689,9 +686,8 @@ impl<C: ApiClient> BareLoop<C> {
         }
         if let Some(gate) = &self.budget_gate {
             gate.observe_usage(in_tok, out_tok);
-            gate.observe_cost(&served, raw_usage);
+            gate.observe_cost(served, raw_usage);
         }
-        Ok(())
     }
 
     /// Record an LLM-turn failure and return the error to propagate.

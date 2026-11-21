@@ -695,7 +695,9 @@ struct TurnAccounting {
 /// usable input figure and an armed prediction; cleared by the
 /// invalidation events that make the pairing stale — a compaction
 /// pass, a model switch, and a change in the advertised tool surface,
-/// each a wholesale wire-prefix change the report never described.
+/// each a wholesale wire-prefix change the report never described. The
+/// pairing is also model-scoped: an anchor left by one served model is
+/// dropped before a run for another model reads it.
 #[derive(Debug)]
 struct UsageAnchor {
     /// The report's input figure, in the provider's window scale.
@@ -723,6 +725,16 @@ struct UsageAnchor {
     /// itself survives across runs: a later run that reports no usage
     /// must read as an aging anchor, not a fresh one.
     anchored_at_turn: usize,
+
+    /// The served model whose report armed the anchor.
+    ///
+    /// A usage anchor pairs one provider report with the wire prefix
+    /// it described, and the pairing is model-scoped — another routed
+    /// model counts its window on a different denominator. Read by
+    /// [`drop_anchor_from_another_model`](BareLoop::drop_anchor_from_another_model),
+    /// which drops the anchor before a run for another model consumes
+    /// it.
+    model: String,
 }
 
 /// The measured components of the per-request overhead.
@@ -1632,6 +1644,32 @@ impl<C: ApiClient> BareLoop<C> {
             self.calibration
                 .apply(raw_payload.saturating_sub(anchor.raw_payload)),
         )
+    }
+
+    /// Drop a usage anchor whose model differs from the served model.
+    ///
+    /// A usage anchor pairs one provider report with the wire prefix it
+    /// described, and the pairing is model-scoped: another routed model
+    /// counts its window on a different denominator, so an anchor left
+    /// by a breaker trip is stale in exactly the sense the anchor's
+    /// invalidation events describe. Runs before any figure can consume
+    /// the anchor — at the run prologue and ahead of each turn's
+    /// pre-request estimate — so a rejected attempt's spend still books
+    /// into pricing (the gate's concern) while its measurement never
+    /// compacts another model's conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
+    /// when the routed-model lookup cannot read the fallback state.
+    fn drop_anchor_from_another_model(&mut self) -> Result<(), LoopError> {
+        let served = self.effective_request_model()?;
+        if let Some(anchor) = &self.anchor
+            && anchor.model != served
+        {
+            self.anchor = None;
+        }
+        Ok(())
     }
 
     /// The measured per-request overhead components, computed once.
@@ -2591,6 +2629,7 @@ impl<C: ApiClient> BareLoop<C> {
         {
             return Err(LoopError::FallbackExhausted);
         }
+        self.drop_anchor_from_another_model()?;
 
         // The steering drain: guidance accepted since the last
         // boundary joins the pending set ahead of this turn's
@@ -3365,6 +3404,11 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     self.finalize(Some(&e)).await?;
                     return Err(e);
                 }
+                if let Err(e) = self.drop_anchor_from_another_model() {
+                    self.set_error_state(&e);
+                    self.finalize(Some(&e)).await?;
+                    return Err(e);
+                }
                 self.arm_first_turn().await;
                 if let Err(e) = self.drive_steps(run_config).await {
                     self.finalize(Some(&e)).await?;
@@ -3555,46 +3599,53 @@ impl<C: ApiClient> BareLoop<C> {
     /// carrying no visible text — what a context with no generation
     /// room looks like from the wire, and indistinguishable on it from
     /// an output cap too small for the answer. Which reading rules
-    /// depends on ground truth: with a usage anchor armed, the
-    /// machine's own context figure decides — re-derived through the
-    /// same [`context_figure`](Self::context_figure) routing that
-    /// fed it before the request, so the freshly armed anchor
-    /// decides rather than the pre-request estimate the attempt just
-    /// outdated — the natural trigger
-    /// compacts and retries exactly when the anchored figure actually
-    /// crossed the threshold or emergency line, and a figure below
-    /// both refutes the over-full reading, failing the run with
+    /// depends on ground truth: when the attempt's own usage arms the
+    /// anchor (a measurement this attempt took — a report-less attempt
+    /// or a run whose window is disabled keeps the legacy shape), the
+    /// machine's context figure is re-derived through the same
+    /// [`context_figure`](Self::context_figure) routing that fed it
+    /// before the request, so the freshly armed anchor decides rather
+    /// than the pre-request estimate the attempt just outdated, and
+    /// the natural trigger decides before any retry limit is
+    /// consulted: a figure that crossed the threshold or emergency
+    /// line compacts and retries exactly as before, while a figure
+    /// below both refutes the over-full reading, failing the run with
     /// [`LoopError::LengthCutNoOutput`] and the real figures (no
     /// compaction, no fabricated window-plus-one). In the engine's
     /// own flow the refuted arm is the one a served turn reaches —
     /// the pre-request deferral compacts before serving whenever the
     /// figure crosses a line — so the compacting arm is the safety
-    /// net, not the expectation. Without an anchor — a backend that
-    /// reports no usage — the wire signal is all there is, and the
-    /// salvage keeps its legacy shape: force the emergency figure,
-    /// compact, retry.
+    /// net, not the expectation. Without this attempt's measurement —
+    /// a backend that reports no usage — the wire signal is all there
+    /// is, and the salvage keeps its legacy shape: force the emergency
+    /// figure, compact, retry.
     ///
     /// The truncated message is never recorded; on the compacting arm
     /// the history is compacted toward the salvage target and the turn
     /// re-issued. The attempt's real usage rides the failed-turn event
     /// that pairs its turn-start — the request succeeded and its spend
     /// was real — while the turn's record and the run's totals stay
-    /// the salvaged retry's figures. A second truncation on the same
-    /// turn, an unshrinkable history, or a declined compaction step
-    /// fails the run with [`LoopError::ContextExceeded`] carrying the
-    /// machine's figure floored just above the window: on those arms
-    /// the over-full reading is either spent or unverifiable, and the
-    /// salvage names the reading its remedy acts on — the same
-    /// deliberate floor as [`Self::overflow_salvage`].
+    /// the salvaged retry's figures. The turn's one-retry limit applies
+    /// only to the compacting arm: a second truncation whose measured
+    /// figure sits below both lines fails the run honestly (the
+    /// measurement outranks the retry count), while a second
+    /// truncation that still measures over-full, an unshrinkable
+    /// history, or a declined compaction step fails with
+    /// [`LoopError::ContextExceeded`] carrying the machine's figure
+    /// floored just above the window — on those arms the over-full
+    /// reading is either measured or unverifiable, and the salvage
+    /// names the reading its remedy acts on — the same deliberate
+    /// floor as [`Self::overflow_salvage`].
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::ContextExceeded`] when the retry was
-    /// already spent on this turn or the history cannot be compacted —
-    /// both mean the conversation does not fit even reduced;
-    /// [`LoopError::LengthCutNoOutput`] when a usage anchor refutes
-    /// the over-full reading; `Ok(())` when the compaction pass was
-    /// armed and the turn will be re-issued by the next machine step.
+    /// Returns [`LoopError::ContextExceeded`] when the compaction
+    /// reading requires the turn's retry and it is already spent, or
+    /// the history cannot be compacted — both mean the conversation
+    /// does not fit even reduced; [`LoopError::LengthCutNoOutput`]
+    /// when this attempt's measurement refutes the over-full reading;
+    /// `Ok(())` when the compaction pass was armed and the turn will
+    /// be re-issued by the next machine step.
     fn truncation_salvage(
         &mut self,
         turn: usize,
@@ -3602,12 +3653,25 @@ impl<C: ApiClient> BareLoop<C> {
         usage: &TurnUsage,
         raw_payload: u64,
     ) -> Result<(), LoopError> {
-        if self.truncation_retry == Some(turn) {
+        let anchored =
+            self.anchor.is_some() && usage.input_tokens > 0 && self.effective_context_window() > 0;
+        if anchored {
+            self.machine
+                .set_context_tokens(self.context_figure(raw_payload));
+            if !matches!(
+                self.machine.next_step(self.machine_policy()),
+                MachineStep::Compact { .. }
+            ) {
+                return Err(self.length_cut_with_room_exhausted(turn, turn_start, usage));
+            }
+            if self.truncation_retry == Some(turn) {
+                return Err(self.length_cut_exhausted(turn, turn_start, usage));
+            }
+        } else if self.truncation_retry == Some(turn) {
             return Err(self.length_cut_exhausted(turn, turn_start, usage));
         }
         self.truncation_retry = Some(turn);
         let shrinkable = self.machine.full_history().len() > 1;
-        let anchored = self.anchor.is_some();
         if shrinkable {
             let truncated_payload = self
                 .count_context(&self.machine.full_history())
@@ -3623,10 +3687,7 @@ impl<C: ApiClient> BareLoop<C> {
                 turn,
                 target,
             );
-            if anchored {
-                self.machine
-                    .set_context_tokens(self.context_figure(raw_payload));
-            } else {
+            if !anchored {
                 self.machine
                     .set_context_tokens(self.effective_context_window().saturating_add(1));
             }
@@ -3647,8 +3708,6 @@ impl<C: ApiClient> BareLoop<C> {
             );
             self.anchor = None;
             Ok(())
-        } else if shrinkable && anchored {
-            Err(self.length_cut_with_room_exhausted(turn, turn_start, usage))
         } else {
             Err(self.length_cut_exhausted(turn, turn_start, usage))
         }

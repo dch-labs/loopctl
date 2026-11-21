@@ -584,6 +584,17 @@ pub enum LoopError {
         /// ([`min_repeats`](crate::stream::repetition::RepetitionGuardConfig::min_repeats)),
         /// not a census of how far the loop ran.
         repeats: u64,
+
+        /// The rejected attempt's reported usage, when it carried one.
+        ///
+        /// A completed response the guard refused still spent its
+        /// tokens: the completed non-streaming fallback carries the
+        /// provider's usage report here, while a stream aborted
+        /// mid-flight usually has none to carry. Booked by the engine
+        /// against the budget gate and the failed turn's record before
+        /// the error propagates, so a rejected attempt's real spend is
+        /// never silently dropped.
+        usage: Option<crate::stream::Usage>,
     },
 
     /// The completion ended at the output limit with no visible text
@@ -736,6 +747,14 @@ impl LoopError {
     ///   re-attempts compaction.
     /// - [`Reflection`](LoopError::Reflection) — a second
     ///   reflection pass may produce a valid correction.
+    /// - [`RepetitionDetected`](LoopError::RepetitionDetected) — the
+    ///   degenerate message was never committed, and a retry
+    ///   re-samples the generation (optionally with sampling
+    ///   penalties or a tighter completion budget set on the client).
+    /// - [`LengthCutNoOutput`](LoopError::LengthCutNoOutput) — the
+    ///   anchored figure proved the conversation fits, so a retry
+    ///   with a larger completion budget (or a compacted context)
+    ///   has a reasonable chance of an answer.
     ///
     /// Returns `false` for all other variants (e.g. invalid input,
     /// cancel, configuration errors,
@@ -752,6 +771,8 @@ impl LoopError {
                 | Self::CompactionFailed { .. }
                 | Self::Reflection(_)
                 | Self::RateLimitEscalation { .. }
+                | Self::RepetitionDetected { .. }
+                | Self::LengthCutNoOutput { .. }
         )
     }
 
@@ -1011,4 +1032,24 @@ mod tests {
         let guard = recover_guard(handle.lock());
         assert_eq!(*guard, 42);
     }
+}
+
+#[test]
+fn repetition_and_length_cut_errors_are_recoverable() {
+    // Both describe an attempt whose remedy is another attempt:
+    // a resample for the loop, a larger budget for the cut. A
+    // measured no-progress stall stays permanent — the counter
+    // example the classifier's contract names.
+    let repetition = LoopError::RepetitionDetected {
+        period_bytes: 84,
+        repeats: 4,
+        usage: None,
+    };
+    let length_cut = LoopError::LengthCutNoOutput {
+        used: 48_000,
+        limit: 262_144,
+    };
+    assert!(repetition.is_recoverable());
+    assert!(length_cut.is_recoverable());
+    assert!(!LoopError::CompactionStalled { used: 120 }.is_recoverable());
 }

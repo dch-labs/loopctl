@@ -390,7 +390,10 @@ impl<C: ApiClient> BareLoop<C> {
         };
         match result {
             Ok(response) => {
-                if let Err(error) = self.guard_completed_response(&response.message) {
+                if let Err(error) =
+                    self.guard_completed_response(&response.message, response.usage.as_ref())
+                {
+                    self.observe_attempt_usage(response.usage.as_ref())?;
                     return Err(self.record_turn_failure(turn, error));
                 }
                 self.record_turn_success(turn, response.usage.as_ref())?;
@@ -429,7 +432,16 @@ impl<C: ApiClient> BareLoop<C> {
                 self.record_turn_success(turn, serving.usage.as_ref())?;
                 Ok(serving)
             }
-            Err(e) => Err(self.record_turn_failure(turn, e)),
+            Err(e) => {
+                if let LoopError::RepetitionDetected {
+                    usage: Some(rejected),
+                    ..
+                } = &e
+                {
+                    self.observe_attempt_usage(Some(rejected))?;
+                }
+                Err(self.record_turn_failure(turn, e))
+            }
         }
     }
 
@@ -471,15 +483,16 @@ impl<C: ApiClient> BareLoop<C> {
                         crate::stream::handler::StreamOutcome::RepetitionDetected {
                             period_bytes,
                             repeats,
+                            usage,
                             ..
                         },
                     ) = &error
                     {
-                        self.notify_repetition_detected(
-                            *period_bytes,
-                            *repeats,
+                        let partial = Self::repetition_event_partial_bytes(
+                            usage.as_ref(),
                             partial_text_bytes,
                         );
+                        self.notify_repetition_detected(*period_bytes, *repeats, partial);
                     }
                     return Err(Self::map_handler_error(error));
                 }
@@ -640,6 +653,29 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// The partial-text figure the repetition event reports for a
+    /// verdict.
+    ///
+    /// A verdict off a live stream describes the generation the
+    /// dispatched tally watched, so the tally reports honestly. A
+    /// verdict whose outcome carries a usage report came off the
+    /// completed non-streaming fallback and describes a different
+    /// generation — the refused completion, whose per-delta observers
+    /// never fired — so the streaming tally belongs to a dead attempt
+    /// and the event reports zero, matching the outcome's own
+    /// `has_partial_data: false`.
+    #[cfg(feature = "streaming")]
+    fn repetition_event_partial_bytes(
+        verdict_usage: Option<&crate::stream::Usage>,
+        dispatched: u64,
+    ) -> u64 {
+        if verdict_usage.is_some() {
+            0
+        } else {
+            dispatched
+        }
+    }
+
     /// Map a [`StreamHandlerError`] to a [`LoopError`].
     ///
     /// Preserves cancellation semantics —
@@ -661,11 +697,13 @@ impl<C: ApiClient> BareLoop<C> {
                 crate::stream::handler::StreamOutcome::RepetitionDetected {
                     period_bytes,
                     repeats,
+                    usage,
                     ..
                 },
             ) => LoopError::RepetitionDetected {
                 period_bytes: u64::try_from(period_bytes).unwrap_or(u64::MAX),
                 repeats: u64::try_from(repeats).unwrap_or(u64::MAX),
+                usage,
             },
             StreamHandlerError::StreamFailed(outcome) => {
                 LoopError::Api(format!("stream failed: {outcome}"))
@@ -708,8 +746,14 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Errors
     ///
     /// Returns [`LoopError::RepetitionDetected`] when the completed
-    /// text carries a verbatim repetition loop.
-    fn guard_completed_response(&self, message: &Message) -> Result<(), LoopError> {
+    /// text carries a verbatim repetition loop. The rejected
+    /// attempt's usage report rides the error, so the failed turn's
+    /// record can carry the real spend.
+    fn guard_completed_response(
+        &self,
+        message: &Message,
+        usage: Option<&Usage>,
+    ) -> Result<(), LoopError> {
         let config = self.managers.repetition_guard();
         if !config.enabled {
             return Ok(());
@@ -724,6 +768,7 @@ impl<C: ApiClient> BareLoop<C> {
             return Err(LoopError::RepetitionDetected {
                 period_bytes: u64::try_from(hit.period_bytes).unwrap_or(u64::MAX),
                 repeats: u64::try_from(hit.repeats).unwrap_or(u64::MAX),
+                usage: usage.copied(),
             });
         }
         Ok(())
@@ -880,6 +925,26 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn repetition_event_partial_bytes_distinguishes_the_verdict_s_origin() {
+        // A fallback verdict reports the refused completion's own
+        // figure — zero dispatched bytes — while a live-abort verdict
+        // reports the bytes the dead stream actually dispatched.
+        let reported = crate::stream::Usage::new(48_000, 1_600);
+        assert_eq!(
+            BareLoop::<StubClient>::repetition_event_partial_bytes(Some(&reported), 3_136),
+            0,
+            "a verdict off the completed fallback speaks for that completion, \
+             not the dead streaming attempt"
+        );
+        assert_eq!(
+            BareLoop::<StubClient>::repetition_event_partial_bytes(None, 3_136),
+            3_136,
+            "a live-abort verdict reports the stream's dispatched bytes"
+        );
     }
 
     #[test]

@@ -1294,7 +1294,13 @@ pub struct RepetitionDetectedContext {
     /// observers has seen — the aborting delta was never dispatched. On
     /// the non-streaming arm no delta observers fire at all, and the
     /// figure is the rejected completion's full text length: what the
-    /// guard examined, not what any observer stream delivered.
+    /// guard examined, not what any observer stream delivered. The
+    /// composite arm — the streaming attempts died on transport and
+    /// the completed non-streaming fallback was refused — reports the
+    /// fallback's own figure, zero: the verdict speaks for the refused
+    /// completion (whose observers never fired), and the dead
+    /// streaming attempt's dispatched tally belongs to a different
+    /// generation.
     pub partial_text_bytes: u64,
 }
 

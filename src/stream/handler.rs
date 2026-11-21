@@ -1238,6 +1238,15 @@ pub enum StreamOutcome {
         /// guard declared the loop — the count includes the
         /// text-bearing events of the loop itself.
         events_processed: u64,
+
+        /// The rejected attempt's reported usage, when it carried one.
+        ///
+        /// Only the completed non-streaming fallback has a usage
+        /// report to carry — the completed response was refused, not
+        /// its spend — while a stream aborted mid-flight reports
+        /// `None`. The engine books what lands here against its budget
+        /// gate and the failed turn's record.
+        usage: Option<Usage>,
     },
 }
 
@@ -1324,6 +1333,7 @@ impl fmt::Display for StreamOutcome {
                 repeats,
                 has_partial_data,
                 events_processed,
+                ..
             } => {
                 let partial = if *has_partial_data {
                     " (partial data)"
@@ -2044,13 +2054,8 @@ impl StreamHandler {
             let mut rate_limit_retries: u32 = 0;
             let mut transport_attempts: u32 = 0;
             let mut first_attempt = true;
-            // Shadow accumulator tracks partial-data presence for diagnostics.
             let mut shadow = StreamAccumulator::new();
-            // The repetition guard's rolling text window, reset per attempt.
             let mut guard_text: Vec<u8> = Vec::new();
-            // Text bytes the consumer actually received before a guard abort —
-            // the partial-data truth the aborting event's own delta is
-            // excluded from, since the guard stops it at the yield.
             let mut guard_dispatched_bytes: usize = 0;
 
             loop {
@@ -2115,6 +2120,7 @@ impl StreamHandler {
                                             repeats: hit.repeats,
                                             has_partial_data: guard_dispatched_bytes > 0,
                                             events_processed,
+                                            usage: None,
                                         },
                                     ),
                                 );
@@ -2718,6 +2724,7 @@ impl StreamHandler {
                             repeats: hit.repeats,
                             has_partial_data: false,
                             events_processed: 0,
+                            usage: response.usage,
                         },
                     ));
                 }
@@ -4501,6 +4508,12 @@ mod tests {
     struct RepetitionStreamMock {
         /// The text deltas the stream yields, in order.
         fragments: Vec<String>,
+
+        /// The usage the completed non-streaming response reports.
+        ///
+        /// The fallback rejection path carries the refused response's
+        /// spend on its verdict, so the fixture stages one to see.
+        fallback_usage: Option<Usage>,
     }
 
     impl RepetitionStreamMock {
@@ -4508,6 +4521,7 @@ mod tests {
         fn stanza_repeats(stanza: &str, copies: usize) -> Self {
             Self {
                 fragments: vec![stanza.to_string(); copies],
+                fallback_usage: None,
             }
         }
 
@@ -4515,7 +4529,14 @@ mod tests {
         fn one_delta(text: &str) -> Self {
             Self {
                 fragments: vec![text.to_string()],
+                fallback_usage: None,
             }
+        }
+
+        /// Stage the usage the completed non-streaming response reports.
+        fn with_fallback_usage(mut self, usage: Usage) -> Self {
+            self.fallback_usage = Some(usage);
+            self
         }
     }
 
@@ -4571,11 +4592,12 @@ mod tests {
             >,
         > {
             let message = crate::message::Message::assistant(self.fragments.concat());
+            let usage = self.fallback_usage;
             Box::pin(async move {
                 Ok(crate::api::NonStreamingResponse {
                     message,
                     stop_reason: StreamStopReason::EndTurn,
-                    usage: None,
+                    usage,
                 })
             })
         }
@@ -4714,6 +4736,40 @@ mod tests {
             ),
             "expected a typed repetition abort, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_non_streaming_rejection_carries_the_response_usage() {
+        // The refused completion still spent its tokens: its usage
+        // report rides the verdict, so the engine can book the real
+        // cost against the budget gate and the failed turn's record.
+        let handler = StreamHandler::new();
+        let client = RepetitionStreamMock::one_delta(&DEGENERATE_STANZA.repeat(10))
+            .with_fallback_usage(Usage::new(48_000, 1_600));
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .fallback_non_streaming(
+                &client,
+                &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
+                &cancel,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the degenerate fallback is still refused");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected {
+                usage, ..
+            }) => {
+                let usage = usage.expect("the refused response's usage rides the verdict");
+                assert_eq!(usage.input_tokens, 48_000);
+                assert_eq!(usage.output_tokens, 1_600);
+            }
+            other => panic!("expected a typed repetition abort, got: {other}"),
+        }
     }
 
     #[tokio::test]

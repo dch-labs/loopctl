@@ -2519,6 +2519,23 @@ impl<C: ApiClient> BareLoop<C> {
             .collect()
     }
 
+    /// The usage a failed attempt's error carries, for its failed
+    /// turn-end event.
+    ///
+    /// Only the repetition guard's rejection of a completed response
+    /// carries a usage report — the refused completion spent real
+    /// tokens, and the failed turn's record says which. Every other
+    /// turn failure reports zeros, as it always did: the wire carried
+    /// nothing to say.
+    fn failed_attempt_usage(error: &LoopError) -> TurnUsage {
+        match error {
+            LoopError::RepetitionDetected {
+                usage: Some(usage), ..
+            } => TurnUsage::from_report(Some(usage)),
+            _ => TurnUsage::zeros(),
+        }
+    }
+
     /// Fire the failure turn-end event for an aborted LLM phase.
     ///
     /// The cancelled, stream-error, and loop-detection arms of
@@ -2639,11 +2656,12 @@ impl<C: ApiClient> BareLoop<C> {
                     return salvage;
                 }
                 let failed = e.to_string();
+                let failed_usage = Self::failed_attempt_usage(&e);
                 self.notify_failed_turn(
                     turn,
                     &failed,
                     turn_start,
-                    &TurnUsage::zeros(),
+                    &failed_usage,
                     StreamStopReason::EndTurn,
                 );
                 return Err(e);
@@ -2668,7 +2686,7 @@ impl<C: ApiClient> BareLoop<C> {
             && text.trim().is_empty()
             && stream_stop == StreamStopReason::MaxTokens
         {
-            return self.truncation_salvage(turn, turn_start, &turn_usage);
+            return self.truncation_salvage(turn, turn_start, &turn_usage, raw_payload);
         }
 
         let pattern = if tool_calls.is_empty()
@@ -3538,7 +3556,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// room looks like from the wire, and indistinguishable on it from
     /// an output cap too small for the answer. Which reading rules
     /// depends on ground truth: with a usage anchor armed, the
-    /// machine's own context figure decides — the natural trigger
+    /// machine's own context figure decides — re-derived through the
+    /// same [`context_figure`](Self::context_figure) routing that
+    /// fed it before the request, so the freshly armed anchor
+    /// decides rather than the pre-request estimate the attempt just
+    /// outdated — the natural trigger
     /// compacts and retries exactly when the anchored figure actually
     /// crossed the threshold or emergency line, and a figure below
     /// both refutes the over-full reading, failing the run with
@@ -3578,6 +3600,7 @@ impl<C: ApiClient> BareLoop<C> {
         turn: usize,
         turn_start: Instant,
         usage: &TurnUsage,
+        raw_payload: u64,
     ) -> Result<(), LoopError> {
         if self.truncation_retry == Some(turn) {
             return Err(self.length_cut_exhausted(turn, turn_start, usage));
@@ -3600,7 +3623,10 @@ impl<C: ApiClient> BareLoop<C> {
                 turn,
                 target,
             );
-            if !anchored {
+            if anchored {
+                self.machine
+                    .set_context_tokens(self.context_figure(raw_payload));
+            } else {
                 self.machine
                     .set_context_tokens(self.effective_context_window().saturating_add(1));
             }

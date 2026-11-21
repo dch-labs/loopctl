@@ -2823,25 +2823,29 @@ impl StreamEmitter {
 
     /// Translate a single delta object into text and/or reasoning events.
     ///
-    /// If the delta carries non-empty `content`, emits a `PartStart` (on the
-    /// first text delta) followed by `IndexedDelta(Text)` events. If it
-    /// carries non-empty `reasoning_content`, the same shape is emitted for
-    /// the reasoning lane. Switching lanes emits a `PartStop` for the previous
-    /// lane first, keeping at most one content lane open — a lane left open
-    /// behind a switch could later share its part index with a tool call and
-    /// make closing ambiguous. If it carries `tool_calls`, delegates each to
+    /// If the delta carries non-empty `reasoning_content`, the reasoning
+    /// lane processes first — a think-close tag inside the same delta
+    /// emits its thinking and the post-boundary suffix before any
+    /// content the delta also carries, so the streamed order matches
+    /// the non-streaming assembly. If it carries non-empty `content`, a
+    /// `PartStart` (on the first text delta) followed by
+    /// `IndexedDelta(Text)` events are emitted. Switching lanes emits a
+    /// `PartStop` for the previous lane first, keeping at most one
+    /// content lane open — a lane left open behind a switch could later
+    /// share its part index with a tool call and make closing
+    /// ambiguous. If it carries `tool_calls`, delegates each to
     /// [`process_tool_call`](Self::process_tool_call).
     fn process_delta(&mut self, delta: &OpenAiDelta) {
-        if let Some(text) = &delta.content
-            && !text.is_empty()
-        {
-            self.emit_text_fragment(text);
-        }
-
         if let Some(reasoning) = &delta.reasoning_content
             && !reasoning.is_empty()
         {
             self.process_reasoning_fragment(reasoning);
+        }
+
+        if let Some(text) = &delta.content
+            && !text.is_empty()
+        {
+            self.emit_text_fragment(text);
         }
 
         if let Some(tool_calls) = &delta.tool_calls {
@@ -2976,8 +2980,15 @@ impl StreamEmitter {
     /// a chunk and at finish: wire tool-call indices and the content-lane
     /// indices overlap (a text lane at part index 0 versus a first tool call
     /// at wire index 0), so an open content lane at tool time would share its
-    /// index with a tool lane. Each stop names the lane it closes.
+    /// index with a tool lane. Each stop names the lane it closes. Any
+    /// held-back reasoning suffix flushes into the thinking lane first,
+    /// while that lane is still legitimately open — flushing later (at
+    /// finish, after tool lanes opened) would re-open the thinking lane at
+    /// an index a tool call may already hold, and the accumulator's
+    /// index-named [`PartStop`](StreamEvent::PartStop) would close the tool
+    /// slot instead.
     fn close_content_lanes(&mut self) {
+        self.flush_reasoning_pending();
         if matches!(self.text, PartLane::Open) {
             self.text = PartLane::Closed;
             self.push(StreamEvent::PartStop {
@@ -3053,7 +3064,6 @@ impl StreamEmitter {
         }
         self.finished = true;
 
-        self.flush_reasoning_pending();
         self.close_content_lanes();
         let open_tool_indices: Vec<usize> = self
             .seen_tool_indices
@@ -3551,6 +3561,76 @@ mod tests {
             r#"{{"id":"c1","model":"gpt-4o","choices":[{{"delta":{{"reasoning_content":{fragment}}},"finish_reason":null}}]}}"#,
             fragment = serde_json::json!(fragment)
         )
+    }
+
+    #[test]
+    fn stream_same_delta_reasoning_close_orders_thinking_before_content() {
+        // One delta carrying both lanes: the reasoning fragment ends
+        // with the close tag and the delta also carries content. The
+        // reasoning boundary processes first, so the pre-boundary
+        // thinking emits before the content — the streamed order the
+        // non-streaming assembly always produced.
+        let both_lanes = format!(
+            r#"{{"id":"c1","model":"gpt-4o","choices":[{{"delta":{{"reasoning_content":{},"content":" world"}},"finish_reason":null}}]}}"#,
+            serde_json::json!("plan</think>Hello")
+        );
+        let message = message_from_reasoning_chunks(&[&both_lanes]);
+        let lanes: Vec<&str> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } | MessagePart::Text { text } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lanes,
+            vec!["plan", "Hello world"],
+            "the thinking lane precedes the content a shared delta carries"
+        );
+    }
+
+    #[test]
+    fn stream_held_reasoning_flushes_before_tool_lanes_keep_wire_order() {
+        // The held-back suffix of an unresolved tag prefix must leave
+        // the thinking lane while that lane is still open — before any
+        // tool PartStart — or the finish-time flush would re-open
+        // thinking at an index a parallel tool call already holds and
+        // the index-named PartStop would close the tool slot instead.
+        // One thinking part carrying the whole reasoning text, and the
+        // tool calls in their wire order, is the assembled shape.
+        let message = message_from_reasoning_chunks(&[
+            &reasoning_chunk("abc"),
+            &reasoning_chunk("</thi"),
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"first","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"second","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let thinking: Vec<String> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec!["abc</thi".to_string()],
+            "the held suffix joins the open thinking part, never a second one"
+        );
+        let calls: Vec<String> = message
+            .tool_call_parts()
+            .into_iter()
+            .map(|(_id, tool, _input)| tool.to_string())
+            .collect();
+        assert_eq!(
+            calls,
+            vec!["first".to_string(), "second".to_string()],
+            "parallel tool calls keep their wire order, unharmed by the flush"
+        );
     }
 
     #[test]
@@ -5876,10 +5956,12 @@ mod tests {
     #[test]
     fn openai_combined_content_and_reasoning_in_one_delta() {
         // A single delta object can carry both content and reasoning_content.
-        // process_delta handles content first (closing thinking if open), then
-        // reasoning (closing text if open). Lock in the expected sequence:
-        // PartStart(text) → TextDelta → PartStop → PartStart(thinking) →
-        // ThinkingDelta.
+        // The reasoning lane processes first — a close tag inside the same
+        // delta must emit its thinking before any content the delta also
+        // carries, matching the non-streaming assembly — then the content
+        // opens the text lane. Lock in the expected sequence:
+        // PartStart(thinking) → ThinkingDelta → PartStop → PartStart(text) →
+        // TextDelta.
         let mut em = StreamEmitter::default();
         let chunk = OpenAiChunk::parse(
             r#"{"id":"c1","model":"o1","choices":[{"delta":{"content":"answer","reasoning_content":"why"},"finish_reason":null}]}"#,
@@ -5903,15 +5985,15 @@ mod tests {
         assert!(has_text, "text delta must fire");
         assert!(has_thinking, "thinking delta must fire");
 
-        // The reasoning lane opens after the text lane, so the text lane must
-        // be closed with exactly one PartStop between them.
+        // The text lane opens after the reasoning lane, so the reasoning
+        // lane must be closed with exactly one PartStop between them.
         let stops = events
             .iter()
             .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
-        assert_eq!(stops, 1, "exactly one PartStop for the text lane");
+        assert_eq!(stops, 1, "exactly one PartStop for the reasoning lane");
 
-        // Ordering: TextDelta → PartStop → ThinkingDelta.
+        // Ordering: ThinkingDelta → PartStop → TextDelta.
         let text_idx = events
             .iter()
             .position(|e| {
@@ -5934,8 +6016,14 @@ mod tests {
                 )
             })
             .expect("thinking delta present");
-        assert!(text_idx < stop_idx, "text delta before PartStop");
-        assert!(stop_idx < thinking_idx, "PartStop before thinking delta");
+        assert!(
+            thinking_idx < stop_idx,
+            "thinking delta before the PartStop that closes its lane"
+        );
+        assert!(
+            stop_idx < text_idx,
+            "PartStop before the text delta of the same shared chunk"
+        );
     }
 
     #[test]

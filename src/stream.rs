@@ -61,6 +61,7 @@ use std::fmt;
 #[cfg(feature = "streaming")]
 pub mod handler;
 pub mod rate_limit;
+pub mod repetition;
 
 #[cfg(feature = "streaming")]
 pub use handler::{DetectedRateLimit, RateLimitConfig, RateLimitKind};

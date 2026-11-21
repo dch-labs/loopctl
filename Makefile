@@ -18,6 +18,7 @@ check-no-default:
 test:
 	cargo test
 	cargo test --all-features
+	cargo test --features testing --lib
 	cargo test --doc --all-features
 	cargo test -p loopctl-derive
 	cargo test -p loopctl-sqlite

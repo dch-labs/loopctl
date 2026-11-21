@@ -695,7 +695,9 @@ struct TurnAccounting {
 /// usable input figure and an armed prediction; cleared by the
 /// invalidation events that make the pairing stale — a compaction
 /// pass, a model switch, and a change in the advertised tool surface,
-/// each a wholesale wire-prefix change the report never described.
+/// each a wholesale wire-prefix change the report never described. The
+/// pairing is also model-scoped: an anchor left by one served model is
+/// dropped before a run for another model reads it.
 #[derive(Debug)]
 struct UsageAnchor {
     /// The report's input figure, in the provider's window scale.
@@ -723,6 +725,16 @@ struct UsageAnchor {
     /// itself survives across runs: a later run that reports no usage
     /// must read as an aging anchor, not a fresh one.
     anchored_at_turn: usize,
+
+    /// The served model whose report armed the anchor.
+    ///
+    /// A usage anchor pairs one provider report with the wire prefix
+    /// it described, and the pairing is model-scoped — another routed
+    /// model counts its window on a different denominator. Read by
+    /// [`reset_foreign_model_estimates`](BareLoop::reset_foreign_model_estimates),
+    /// which drops the anchor before a run for another model consumes
+    /// it.
+    model: String,
 }
 
 /// The measured components of the per-request overhead.
@@ -843,10 +855,11 @@ const CALIBRATION_MAX_BP: u64 = 4000;
 /// The engine predicts each request's input-token count (history plus
 /// overhead plus transients); when the provider reports the actual
 /// `input_tokens`, the prediction error feeds this rolling ratio,
-/// which later estimates multiply in. A model-fallback turn samples a
-/// possibly-different tokenizer than the request the prediction was
-/// armed for — accepted noise, bounded by the clamp and diluted by the
-/// smoothing, since fallback routing is transient by design. The ratio is stored in integer
+/// which later estimates multiply in. The ratio is model-scoped: each
+/// sample folds under the model that reported it, and a routed model
+/// change resets the ratio to identity under the new model's name —
+/// one model's tokenizer correction never estimates another's
+/// figures. The ratio is stored in integer
 /// thousandths — the same exact-integer discipline as the crate's
 /// ratio counters — clamped to
 /// `[CALIBRATION_MIN_BP, CALIBRATION_MAX_BP]` so an absurd report (a
@@ -882,6 +895,15 @@ struct EstimateCalibration {
     /// arrived — the honest signal for a backend that reports no
     /// usage.
     calibrated: bool,
+
+    /// The model whose reports folded the current ratio.
+    ///
+    /// Empty while no sample has arrived. A routed model change
+    /// resets the ratio to identity under the new model's name —
+    /// see [`reset_foreign_model_estimates`](BareLoop::reset_foreign_model_estimates)
+    /// — so one model's tokenizer correction never estimates
+    /// another's figures.
+    model: String,
 }
 
 impl EstimateCalibration {
@@ -895,6 +917,7 @@ impl EstimateCalibration {
             ratio_bp: CALIBRATION_IDENTITY_BP,
             prediction: None,
             calibrated: false,
+            model: String::new(),
         }
     }
 
@@ -997,8 +1020,22 @@ impl<C: ApiClient> BareLoop<C> {
     /// and the first model call needs its prepared tools and a context
     /// estimate before [`next_step`](crate::engine::core::LoopMachine::next_step)
     /// can answer. Runs before each pass of [`drive_steps`](Self::drive_steps).
-    async fn arm_first_turn(&mut self) {
+    /// The fallback recovery check and the model-scoped estimate reset run
+    /// after the asynchronous preparation — a cooldown can elapse while it
+    /// awaits — so the opening figure is computed under the model that will
+    /// actually serve the turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
+    /// when the recovery checks cannot read the fallback state.
+    async fn arm_first_turn(&mut self) -> Result<(), LoopError> {
         let prepared = self.prepare_turn(0).await;
+        let fallback = self.managers.fallback();
+        if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
+            fallback.transition_to_recovering()?;
+        }
+        self.reset_foreign_model_estimates()?;
         let estimate = self.context_figure(
             self.count_context(&self.machine.full_history())
                 .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
@@ -1006,6 +1043,7 @@ impl<C: ApiClient> BareLoop<C> {
         );
         self.machine.set_context_tokens(estimate);
         self.prepared_turn = Some(prepared);
+        Ok(())
     }
 
     /// Arm the continuation turn a follow-up injected, at its true index.
@@ -1632,6 +1670,49 @@ impl<C: ApiClient> BareLoop<C> {
             self.calibration
                 .apply(raw_payload.saturating_sub(anchor.raw_payload)),
         )
+    }
+
+    /// Reset the model-scoped estimates when the served model changed.
+    ///
+    /// Both usage-fed estimates pair one model's reports with the wire
+    /// prefixes they described: the usage anchor pairs a provider input
+    /// figure with its request payload, and the calibration ratio folds
+    /// that model's report samples. Another routed model counts its
+    /// window on a different denominator, so estimates carried across a
+    /// breaker trip are stale in exactly the sense the invalidation
+    /// events describe — the anchor drops, the calibration resets to
+    /// identity under the new model's name, and a ratio that actually
+    /// moved re-syncs the manager's raw window through the same flow a
+    /// ratio move uses. Runs before any figure can consume either
+    /// estimate — at the run prologue and ahead of each turn's
+    /// pre-request estimate — so a rejected attempt's spend still books
+    /// into pricing (the gate's concern) while its measurement never
+    /// shapes another model's figure. Same-model turns reset nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
+    /// when the routed-model lookup cannot read the fallback state.
+    fn reset_foreign_model_estimates(&mut self) -> Result<(), LoopError> {
+        let served = self.effective_request_model()?;
+        let anchor_matches = self
+            .anchor
+            .as_ref()
+            .is_none_or(|anchor| anchor.model == served);
+        if self.calibration.model == served && anchor_matches {
+            return Ok(());
+        }
+        let ratio_before = self.calibration.ratio_bp;
+        self.calibration = {
+            let mut identity = EstimateCalibration::identity();
+            identity.model = served;
+            identity
+        };
+        self.anchor = None;
+        if ratio_before != CALIBRATION_IDENTITY_BP {
+            self.sync_manager_window(self.effective_context_window());
+        }
+        Ok(())
     }
 
     /// The measured per-request overhead components, computed once.
@@ -2519,6 +2600,23 @@ impl<C: ApiClient> BareLoop<C> {
             .collect()
     }
 
+    /// The usage a failed attempt's error carries, for its failed
+    /// turn-end event.
+    ///
+    /// Only the repetition guard's rejection of a completed response
+    /// carries a usage report — the refused completion spent real
+    /// tokens, and the failed turn's record says which. Every other
+    /// turn failure reports zeros, as it always did: the wire carried
+    /// nothing to say.
+    fn failed_attempt_usage(error: &LoopError) -> TurnUsage {
+        match error {
+            LoopError::RepetitionDetected {
+                usage: Some(usage), ..
+            } => TurnUsage::from_report(Some(usage)),
+            _ => TurnUsage::zeros(),
+        }
+    }
+
     /// Fire the failure turn-end event for an aborted LLM phase.
     ///
     /// The cancelled, stream-error, and loop-detection arms of
@@ -2574,6 +2672,7 @@ impl<C: ApiClient> BareLoop<C> {
         {
             return Err(LoopError::FallbackExhausted);
         }
+        self.reset_foreign_model_estimates()?;
 
         // The steering drain: guidance accepted since the last
         // boundary joins the pending set ahead of this turn's
@@ -2639,11 +2738,12 @@ impl<C: ApiClient> BareLoop<C> {
                     return salvage;
                 }
                 let failed = e.to_string();
+                let failed_usage = Self::failed_attempt_usage(&e);
                 self.notify_failed_turn(
                     turn,
                     &failed,
                     turn_start,
-                    &TurnUsage::zeros(),
+                    &failed_usage,
                     StreamStopReason::EndTurn,
                 );
                 return Err(e);
@@ -3081,6 +3181,11 @@ impl<C: ApiClient> BareLoop<C> {
             slots.into_iter().flatten().collect(),
         )]);
         let prepared = self.prepare_turn(turn.saturating_add(1)).await;
+        let fallback = self.managers.fallback();
+        if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
+            fallback.transition_to_recovering()?;
+        }
+        self.reset_foreign_model_estimates()?;
         let estimate = self.context_figure(
             self.count_context(&self.machine.full_history())
                 .saturating_add(self.advertised_overhead_tokens(prepared.tools.as_deref()))
@@ -3347,7 +3452,11 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     self.finalize(Some(&e)).await?;
                     return Err(e);
                 }
-                self.arm_first_turn().await;
+                if let Err(e) = self.arm_first_turn().await {
+                    self.set_error_state(&e);
+                    self.finalize(Some(&e)).await?;
+                    return Err(e);
+                }
                 if let Err(e) = self.drive_steps(run_config).await {
                     self.finalize(Some(&e)).await?;
                     return Err(e);
@@ -3536,34 +3645,71 @@ impl<C: ApiClient> BareLoop<C> {
     /// provider cannot report: the response ended at the output limit
     /// carrying no visible text — what a context with no generation
     /// room looks like from the wire, and indistinguishable on it from
-    /// an output cap too small for the answer. The truncated message is
-    /// never recorded; the history is compacted toward the salvage
-    /// target and the turn re-issued. The attempt's real usage rides
-    /// the failed-turn event that pairs its turn-start — the request
-    /// succeeded and its spend was real — while the turn's record and
-    /// the run's totals stay the salvaged retry's figures. A second
-    /// truncation on the same turn, an unshrinkable history, or a
-    /// declined compaction step fails the run with
+    /// an output cap too small for the answer. Which reading rules
+    /// depends on ground truth: when the attempt reports usable input
+    /// tokens (a measurement this attempt took — a report-less attempt
+    /// or a run whose window is disabled keeps the legacy shape), the
+    /// figure is that report's input count itself — no anchor and no
+    /// projection through the pre-request estimate — and the natural
+    /// trigger decides before any retry limit is consulted: a figure
+    /// that crossed the threshold or emergency
+    /// line compacts and retries exactly as before, while a figure
+    /// below both refutes the over-full reading, failing the run with
+    /// [`LoopError::LengthCutNoOutput`] and the real figures (no
+    /// compaction, no fabricated window-plus-one). In the engine's
+    /// own flow the refuted arm is the one a served turn reaches —
+    /// the pre-request deferral compacts before serving whenever the
+    /// figure crosses a line — so the compacting arm is the safety
+    /// net, not the expectation. Without this attempt's measurement —
+    /// a backend that reports no usage — the wire signal is all there
+    /// is, and the salvage keeps its legacy shape: force the emergency
+    /// figure, compact, retry.
+    ///
+    /// The truncated message is never recorded; on the compacting arm
+    /// the history is compacted toward the salvage target and the turn
+    /// re-issued. The attempt's real usage rides the failed-turn event
+    /// that pairs its turn-start — the request succeeded and its spend
+    /// was real — while the turn's record and the run's totals stay
+    /// the salvaged retry's figures. The turn's one-retry limit applies
+    /// only to the compacting arm: a second truncation whose measured
+    /// figure sits below both lines fails the run honestly (the
+    /// measurement outranks the retry count), while a second
+    /// truncation that still measures over-full, an unshrinkable
+    /// history, or a declined compaction step fails with
     /// [`LoopError::ContextExceeded`] carrying the machine's figure
-    /// floored just above the window rather than measured: the wire
-    /// cannot tell an over-full context from a too-small output cap,
-    /// so the salvage always names the reading its remedy acts on —
-    /// the same deliberate floor as [`Self::overflow_salvage`].
+    /// floored just above the window — on those arms the over-full
+    /// reading is either measured or unverifiable, and the salvage
+    /// names the reading its remedy acts on — the same deliberate
+    /// floor as [`Self::overflow_salvage`].
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::ContextExceeded`] when the retry was
-    /// already spent on this turn or the history cannot be compacted —
-    /// both mean the conversation does not fit even reduced; `Ok(())`
-    /// when the compaction pass was armed and the turn will be
-    /// re-issued by the next machine step.
+    /// Returns [`LoopError::ContextExceeded`] when the compaction
+    /// reading requires the turn's retry and it is already spent, or
+    /// the history cannot be compacted — both mean the conversation
+    /// does not fit even reduced; [`LoopError::LengthCutNoOutput`]
+    /// when this attempt's measurement refutes the over-full reading;
+    /// `Ok(())` when the compaction pass was armed and the turn will
+    /// be re-issued by the next machine step.
     fn truncation_salvage(
         &mut self,
         turn: usize,
         turn_start: Instant,
         usage: &TurnUsage,
     ) -> Result<(), LoopError> {
-        if self.truncation_retry == Some(turn) {
+        let measured = usage.input_tokens > 0 && self.effective_context_window() > 0;
+        if measured {
+            self.machine.set_context_tokens(usage.input_tokens);
+            if !matches!(
+                self.machine.next_step(self.machine_policy()),
+                MachineStep::Compact { .. }
+            ) {
+                return Err(self.length_cut_with_room_exhausted(turn, turn_start, usage));
+            }
+            if self.truncation_retry == Some(turn) {
+                return Err(self.length_cut_exhausted(turn, turn_start, usage));
+            }
+        } else if self.truncation_retry == Some(turn) {
             return Err(self.length_cut_exhausted(turn, turn_start, usage));
         }
         self.truncation_retry = Some(turn);
@@ -3583,8 +3729,10 @@ impl<C: ApiClient> BareLoop<C> {
                 turn,
                 target,
             );
-            self.machine
-                .set_context_tokens(self.effective_context_window().saturating_add(1));
+            if !measured {
+                self.machine
+                    .set_context_tokens(self.effective_context_window().saturating_add(1));
+            }
         }
         let compacted = shrinkable
             && matches!(
@@ -3605,6 +3753,37 @@ impl<C: ApiClient> BareLoop<C> {
         } else {
             Err(self.length_cut_exhausted(turn, turn_start, usage))
         }
+    }
+
+    /// The terminal failure for a length cut the anchored figure
+    /// refutes.
+    ///
+    /// The honest counterpart of [`length_cut_exhausted`](Self::length_cut_exhausted):
+    /// a usage anchor measured the conversation well inside the
+    /// window, so the empty truncated completion was not an over-full
+    /// context and the reported `used` is the real anchored figure —
+    /// never floored. Pairs the turn's start with its failed turn-end,
+    /// carrying the truncated attempt's real usage.
+    fn length_cut_with_room_exhausted(
+        &mut self,
+        turn: usize,
+        turn_start: Instant,
+        usage: &TurnUsage,
+    ) -> LoopError {
+        let limit = self.effective_context_window();
+        let exhausted = LoopError::LengthCutNoOutput {
+            used: self.machine.context_tokens(),
+            limit,
+        };
+        let failed = exhausted.to_string();
+        self.notify_failed_turn(
+            turn,
+            &failed,
+            turn_start,
+            usage,
+            StreamStopReason::MaxTokens,
+        );
+        exhausted
     }
 
     /// The terminal failure and paired turn-end for a length cut the

@@ -1856,7 +1856,17 @@ async fn a_threshold_pass_narrates_itself_as_a_compaction_signal_event() {
     let mut script = Vec::new();
     for step in 0..24 {
         script.push(MockResponse {
-            text: format!("step {step} {}", "w".repeat(300)),
+            text: {
+                let mut filler = format!("step {step} ");
+                for n in 0..3 {
+                    std::fmt::Write::write_fmt(
+                        &mut filler,
+                        format_args!("{}[{step}-{n}]", "w".repeat(90)),
+                    )
+                    .expect("writing to a String cannot fail");
+                }
+                filler
+            },
             tool_call: Some(MockToolCall {
                 id: format!("call_{step}"),
                 name: "echo".to_string(),

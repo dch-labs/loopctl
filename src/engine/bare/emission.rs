@@ -567,6 +567,32 @@ impl<C: ApiClient> BareLoop<C> {
         );
     }
 
+    /// Fire [`on_repetition_detected`](crate::observer::LoopObserver::on_repetition_detected)
+    /// for one repetition-guard verdict.
+    ///
+    /// The observability half of a degenerate-generation abort: the
+    /// turn fails with the paired typed error, and this event carries
+    /// the verdict's numbers — the repeating window's byte length, the
+    /// consecutive-copy threshold, and how many bytes of assistant text
+    /// arrived before the abort — so hosts log the loop without
+    /// pattern-matching error text.
+    pub(super) fn notify_repetition_detected(
+        &self,
+        period_bytes: usize,
+        repeats: usize,
+        partial_text_bytes: u64,
+    ) {
+        let turn = self.session.current_run().map_or(0, Run::turn_count);
+        self.managers.observers().on_repetition_detected(
+            &crate::observer::RepetitionDetectedContext {
+                turn,
+                period_bytes: u64::try_from(period_bytes).unwrap_or(u64::MAX),
+                repeats: u64::try_from(repeats).unwrap_or(u64::MAX),
+                partial_text_bytes,
+            },
+        );
+    }
+
     /// Fire [`on_attempt_reset`](crate::observer::LoopObserver::on_attempt_reset)
     /// for the retried stream attempt the engine is entering.
     ///
@@ -593,10 +619,10 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         usage: Option<&Usage>,
+        served: &str,
     ) -> Result<(), LoopError> {
-        let served = self.routed_or_client_model()?;
         self.managers.fallback().record_success()?;
-        let raw_usage = usage;
+        self.observe_attempt_usage(usage, served);
         let usage = TurnUsage::from_report(usage);
         let TurnUsage {
             input_tokens: in_tok,
@@ -605,15 +631,53 @@ impl<C: ApiClient> BareLoop<C> {
             cache_write_tokens,
             reasoning_tokens,
         } = usage;
+        self.managers.observers().on_stream_success(
+            &StreamContext::new(turn, served, in_tok, out_tok).with_usage_detail(
+                cached_input_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+            ),
+        );
+        Ok(())
+    }
+
+    /// Observe one completed attempt's usage — the shared half of
+    /// turn accounting.
+    ///
+    /// Everything a reported usage feeds, independent of whether the
+    /// attempt's message is accepted: the usage anchor arms (the
+    /// provider's input figure becomes the calibrated figure's ground
+    /// truth, recorded against `served` — the model the request
+    /// actually carried — so another routed model never reads it), the
+    /// calibration ratio folds the sample, the context manager's
+    /// window re-syncs when the ratio moved, and the budget gate
+    /// observes both the token pair and the cost at `served`'s rate.
+    /// Called by
+    /// [`record_turn_success`](Self::record_turn_success) for accepted
+    /// turns and by the repetition guard's rejection arms for refused
+    /// completions — a rejected response still spent its tokens, and
+    /// its real cost must reach the same accounting an accepted one's
+    /// would. A `None` usage reports nothing, exactly as an accepted
+    /// turn without a report does.
+    pub(super) fn observe_attempt_usage(&mut self, usage: Option<&Usage>, served: &str) {
+        let raw_usage = usage;
+        let usage = TurnUsage::from_report(usage);
+        let TurnUsage {
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            ..
+        } = usage;
         let armed_prediction = self.calibration.prediction;
         if in_tok > 0
             && let Some(raw_payload) = armed_prediction
             && raw_payload > 0
         {
+            self.calibration.model = served.to_string();
             self.anchor = Some(UsageAnchor {
                 input_tokens: in_tok,
                 raw_payload,
                 anchored_at_turn: self.session.total_turns().saturating_add(1),
+                model: served.to_string(),
             });
         }
         let ratio_before = self.calibration.ratio_bp;
@@ -623,16 +687,8 @@ impl<C: ApiClient> BareLoop<C> {
         }
         if let Some(gate) = &self.budget_gate {
             gate.observe_usage(in_tok, out_tok);
-            gate.observe_cost(&served, raw_usage);
+            gate.observe_cost(served, raw_usage);
         }
-        self.managers.observers().on_stream_success(
-            &StreamContext::new(turn, served, in_tok, out_tok).with_usage_detail(
-                cached_input_tokens,
-                cache_write_tokens,
-                reasoning_tokens,
-            ),
-        );
-        Ok(())
     }
 
     /// Record an LLM-turn failure and return the error to propagate.
@@ -644,16 +700,23 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`on_fallback`](crate::observer::LoopObserver::on_fallback). Always fires
     /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure)
     /// (except for the cancel short-circuit) and returns the original error.
+    /// The failure events name `served` — the model the failed request
+    /// actually carried — rather than a fresh routing resolution, which
+    /// can disagree with the request a host override names. The breaker's
+    /// own bookkeeping keeps its fallback-routing resolution.
     /// # Errors
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
-    pub(super) fn record_turn_failure(&mut self, turn: usize, e: LoopError) -> LoopError {
+    pub(super) fn record_turn_failure(
+        &mut self,
+        turn: usize,
+        e: LoopError,
+        served: &str,
+    ) -> LoopError {
         if matches!(e, LoopError::Cancelled) {
             return e;
         }
-        // A poisoned breaker while recording a failure is the more
-        // severe condition — surface it instead of the original error.
-        self.record_turn_failure_inner(turn, e)
+        self.record_turn_failure_inner(turn, e, served)
             .unwrap_or_else(|poison| poison)
     }
 
@@ -669,8 +732,8 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         e: LoopError,
+        served: &str,
     ) -> Result<LoopError, LoopError> {
-        let served = self.routed_or_client_model()?;
         let was_in_fallback =
             self.managers.fallback().state()? == crate::fallback::FallbackState::Fallback;
         let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
@@ -686,7 +749,7 @@ impl<C: ApiClient> BareLoop<C> {
         if tripped && let Some(to) = self.managers.fallback().fallback_model()? {
             tracing::warn!(from = %served, to = %to, "fallback manager tripped");
             self.managers.observers().on_fallback(&FallbackContext {
-                from: served.clone(),
+                from: served.to_string(),
                 to,
             });
         }
@@ -699,7 +762,7 @@ impl<C: ApiClient> BareLoop<C> {
             .observers()
             .on_stream_failure(&StreamFailureContext {
                 turn,
-                model: served,
+                model: served.to_string(),
                 error: e.clone(),
             });
 

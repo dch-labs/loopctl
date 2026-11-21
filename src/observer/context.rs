@@ -1254,6 +1254,56 @@ pub struct TransportFallbackContext {
     pub stop_reason: crate::stream::StreamStopReason,
 }
 
+/// Context for
+/// [`LoopObserver::on_repetition_detected`](crate::observer::LoopObserver::on_repetition_detected).
+///
+/// Emitted when the repetition guard aborts a degenerate generation
+/// loop — one byte window of the assistant text repeated verbatim
+/// enough consecutive times. The turn fails with the paired
+/// [`RepetitionDetected`](crate::error::LoopError::RepetitionDetected)
+/// error; this event is the observability half, carrying the verdict's
+/// numbers so hosts can log, alert, or teach without pattern-matching
+/// the error text. The partial text stays available to the host
+/// through the per-delta observers (`on_text_delta`,
+/// `on_thinking_delta`) up to the aborting delta.
+#[derive(Debug, Clone)]
+pub struct RepetitionDetectedContext {
+    /// Turn number.
+    ///
+    /// The turn whose model call degenerated; pairs with the turn's
+    /// [`on_turn_start`](crate::observer::LoopObserver::on_turn_start)
+    /// and the failed-turn [`on_turn_end`](crate::observer::LoopObserver::on_turn_end).
+    pub turn: usize,
+
+    /// The repeating window's length, in bytes.
+    ///
+    /// The smallest qualifying period at detection time — the figure
+    /// [`RepetitionGuardConfig::min_period_bytes`](crate::stream::repetition::RepetitionGuardConfig::min_period_bytes)
+    /// bounds.
+    pub period_bytes: u64,
+
+    /// The consecutive verbatim copies that triggered the abort.
+    ///
+    /// The verdict threshold, not a census of how far the loop ran.
+    pub repeats: u64,
+
+    /// How many bytes of assistant text the abort is reporting.
+    ///
+    /// Both lanes (content and thinking) counted. On the streaming arm
+    /// these are the same bytes a host replaying the per-delta
+    /// observers has seen — the aborting delta was never dispatched. On
+    /// the non-streaming arm no delta observers fire at all, and the
+    /// figure is the rejected completion's full text length: what the
+    /// guard examined, not what any observer stream delivered. The
+    /// composite arm — the streaming attempts died on transport and
+    /// the completed non-streaming fallback was refused — reports the
+    /// fallback's own figure, zero: the verdict speaks for the refused
+    /// completion (whose observers never fired), and the dead
+    /// streaming attempt's dispatched tally belongs to a different
+    /// generation.
+    pub partial_text_bytes: u64,
+}
+
 /// Context for [`LoopObserver::on_model_switched`](crate::observer::LoopObserver::on_model_switched).
 ///
 /// Emitted when the model is hot-swapped via

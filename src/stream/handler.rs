@@ -39,7 +39,10 @@ use crate::cancel::CancelSignal;
 use crate::determinism::{Rng, ThreadLocalRng};
 use crate::message::Message;
 use crate::stream::rate_limit;
-use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
+use crate::stream::repetition::{
+    RepetitionGuardConfig, RepetitionHit, concat_lane_text, detect_repetition,
+};
+use crate::stream::{DeltaPart, StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 use futures::StreamExt;
 use futures::stream::Stream;
 use std::fmt;
@@ -1188,6 +1191,63 @@ pub enum StreamOutcome {
     /// The stream was terminated because the user requested cancellation.
     /// Partial data may be available.
     Cancelled,
+
+    /// The repetition guard aborted a degenerate generation loop.
+    ///
+    /// One byte window of the decoded assistant text repeated verbatim
+    /// for [`min_repeats`](crate::stream::repetition::RepetitionGuardConfig::min_repeats)
+    /// consecutive times — the shape of a model stuck in a repetition
+    /// attractor, decoding cheaply toward the provider's output cap.
+    /// The stream ends here with the partial text delivered so far
+    /// (visible to the consumer through the per-delta observers and
+    /// carried by the paired engine error); a retry is host policy,
+    /// not handler policy — a fresh attempt replays the same
+    /// sampling that produced the loop. Upstream, the engine books
+    /// the abort as a model failure for the fallback breaker — a
+    /// model that loops is an unhealthy model — so a configured
+    /// fallback model takes the next attempt.
+    RepetitionDetected {
+        /// The repeating window's length, in bytes.
+        ///
+        /// The smallest qualifying period at detection time, in the
+        /// same units
+        /// [`min_period_bytes`](crate::stream::repetition::RepetitionGuardConfig::min_period_bytes)
+        /// configures.
+        period_bytes: usize,
+
+        /// The consecutive verbatim copies that triggered the abort.
+        ///
+        /// The verdict threshold
+        /// ([`min_repeats`](crate::stream::repetition::RepetitionGuardConfig::min_repeats)),
+        /// not a census of how far the loop ran.
+        repeats: usize,
+
+        /// Whether partial content was accumulated before the abort.
+        ///
+        /// `true` when at least one content event was dispatched to
+        /// the consumer before the detection — the aborting event is
+        /// never dispatched, so a loop detected on the very first
+        /// delta reports `false`: the consumer's per-delta observers
+        /// received nothing. The partial text stays with the consumer
+        /// via those observers.
+        has_partial_data: bool,
+
+        /// Events processed before the abort fired.
+        ///
+        /// How many SSE events the accumulator accepted before the
+        /// guard declared the loop — the count includes the
+        /// text-bearing events of the loop itself.
+        events_processed: u64,
+
+        /// The rejected attempt's reported usage, when it carried one.
+        ///
+        /// Only the completed non-streaming fallback has a usage
+        /// report to carry — the completed response was refused, not
+        /// its spend — while a stream aborted mid-flight reports
+        /// `None`. The engine books what lands here against its budget
+        /// gate and the failed turn's record.
+        usage: Option<Usage>,
+    },
 }
 
 impl fmt::Display for StreamOutcome {
@@ -1268,8 +1328,47 @@ impl fmt::Display for StreamOutcome {
                 write!(f, "fell back to non-streaming request")
             }
             Self::Cancelled => write!(f, "cancelled"),
+            Self::RepetitionDetected {
+                period_bytes,
+                repeats,
+                has_partial_data,
+                events_processed,
+                ..
+            } => {
+                let partial = if *has_partial_data {
+                    " (partial data)"
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "repetition loop detected: {period_bytes}-byte window repeated {repeats} times \
+                     after {events_processed} events{partial}"
+                )
+            }
         }
     }
+}
+
+/// One repetition-guard scan's verdict over a single accepted event.
+///
+/// Produced by [`scan_repetition`](StreamHandler::scan_repetition): the
+/// text bytes the event contributed (zero for non-text events and a
+/// disarmed guard) beside the detector's hit, so the caller's
+/// dispatched tally and the abort decision read one pass over the
+/// event.
+#[derive(Default)]
+struct ScanVerdict {
+    /// Text and thinking bytes the scanned event contributed.
+    ///
+    /// The caller counts these as dispatched only once the event is
+    /// yielded — the aborting event's own contribution never does.
+    appended_bytes: usize,
+
+    /// The detector's verdict over the rolling window after the append.
+    ///
+    /// `Some` is the abort: the event completed a verbatim loop.
+    hit: Option<RepetitionHit>,
 }
 
 /// Errors produced by [`StreamHandler`].
@@ -1486,6 +1585,18 @@ pub struct StreamHandler {
     /// with [`with_rng`](Self::with_rng) to make retry backoffs
     /// reproducible.
     rng: Arc<dyn Rng>,
+
+    /// The repetition guard's configuration.
+    ///
+    /// Armed with conservative defaults: the guard watches the decoded
+    /// assistant text (content and thinking lanes) for one byte window
+    /// repeating verbatim enough consecutive times, and aborts the
+    /// stream with [`StreamOutcome::RepetitionDetected`] instead of
+    /// decoding a degenerate loop to the provider's output cap. A
+    /// disarmed guard restores byte-identical legacy behavior. Read in
+    /// [`stream_turn`](Self::stream_turn) on every text-bearing event
+    /// and once over a non-streaming fallback's completed message.
+    repetition_config: RepetitionGuardConfig,
 }
 
 impl fmt::Debug for StreamHandler {
@@ -1497,6 +1608,7 @@ impl fmt::Debug for StreamHandler {
             .field("rate_limiter", &self.rate_limiter)
             .field("rate_limit_max_wait", &self.rate_limit_max_wait)
             .field("rng", &self.rng)
+            .field("repetition_config", &self.repetition_config)
             .finish()
     }
 }
@@ -1563,6 +1675,7 @@ impl StreamHandler {
             rate_limiter: None,
             rate_limit_max_wait: Duration::from_secs(30),
             rng: Arc::new(ThreadLocalRng),
+            repetition_config: RepetitionGuardConfig::default(),
         }
     }
 
@@ -1607,6 +1720,7 @@ impl StreamHandler {
             rate_limiter: None,
             rate_limit_max_wait: Duration::from_secs(30),
             rng: Arc::new(ThreadLocalRng),
+            repetition_config: RepetitionGuardConfig::default(),
         }
     }
 
@@ -1642,6 +1756,60 @@ impl StreamHandler {
     #[must_use]
     pub fn rng(&self) -> &Arc<dyn Rng> {
         &self.rng
+    }
+
+    /// Set the repetition guard's configuration, consuming `self`.
+    ///
+    /// Stored as given. The default is armed with conservative bounds
+    /// (a 48-byte window repeated 4 consecutive times); see
+    /// [`RepetitionGuardConfig`] for the knobs and the workloads they
+    /// serve. A config that fails its own
+    /// [`validate`](RepetitionGuardConfig::validate) rules never fires —
+    /// detection disables rather than reports on inconsistent bounds —
+    /// so validate hand-built configs at construction time.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::handler::StreamHandler;
+    /// use loopctl::stream::repetition::RepetitionGuardConfig;
+    ///
+    /// let handler = StreamHandler::new().with_repetition_guard(
+    ///     RepetitionGuardConfig {
+    ///         enabled: false,
+    ///         ..RepetitionGuardConfig::default()
+    ///     },
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_repetition_guard(mut self, config: RepetitionGuardConfig) -> Self {
+        self.repetition_config = config;
+        self
+    }
+
+    /// The repetition guard's configuration.
+    ///
+    /// The armed-by-default runaway-generation policy — see
+    /// [`with_repetition_guard`](Self::with_repetition_guard) for the
+    /// knobs and [`repetition`](crate::stream::repetition) for the
+    /// detection rule.
+    #[must_use]
+    pub fn repetition_config(&self) -> &RepetitionGuardConfig {
+        &self.repetition_config
+    }
+
+    /// Replace the repetition guard's configuration in place.
+    ///
+    /// The write half of [`with_repetition_guard`](Self::with_repetition_guard)
+    /// for owners holding the handler mutably: `LoopManagers` restamps
+    /// an installed handler's copy whenever
+    /// [`LoopManagers::with_repetition_guard`](crate::managers::LoopManagers::with_repetition_guard)
+    /// sets new knobs, so both turn paths keep enforcing one
+    /// configuration whatever the builder order. Crate-internal: hosts
+    /// choose the knobs through the builders, not by rewriting a
+    /// handler they no longer own.
+    pub(crate) fn set_repetition_guard(&mut self, config: RepetitionGuardConfig) {
+        self.repetition_config = config;
     }
 
     /// Set the timeout configuration, consuming `self`.
@@ -1886,12 +2054,15 @@ impl StreamHandler {
             let mut rate_limit_retries: u32 = 0;
             let mut transport_attempts: u32 = 0;
             let mut first_attempt = true;
-            // Shadow accumulator tracks partial-data presence for diagnostics.
             let mut shadow = StreamAccumulator::new();
+            let mut guard_text: Vec<u8> = Vec::new();
+            let mut guard_dispatched_bytes: usize = 0;
 
             loop {
                 if !first_attempt {
                     shadow = StreamAccumulator::new();
+                    guard_text.clear();
+                    guard_dispatched_bytes = 0;
                     yield HandlerEvent::AttemptReset;
                 }
                 first_attempt = false;
@@ -1940,6 +2111,22 @@ impl StreamHandler {
                                     total_deadline,
                                 );
                             }
+                            let verdict = self.scan_repetition(&mut guard_text, &event);
+                            if let Some(hit) = verdict.hit {
+                                break ErrorAction::Fail(
+                                    StreamHandlerError::StreamFailed(
+                                        StreamOutcome::RepetitionDetected {
+                                            period_bytes: hit.period_bytes,
+                                            repeats: hit.repeats,
+                                            has_partial_data: guard_dispatched_bytes > 0,
+                                            events_processed,
+                                            usage: None,
+                                        },
+                                    ),
+                                );
+                            }
+                            guard_dispatched_bytes =
+                                guard_dispatched_bytes.saturating_add(verdict.appended_bytes);
                             yield HandlerEvent::Stream(event);
                         }
                         Ok(None) => {
@@ -2002,6 +2189,44 @@ impl StreamHandler {
                 }
             }
         })
+    }
+
+    /// Fold one accepted event into the guard's rolling window and scan it.
+    ///
+    /// Appends the event's text and thinking delta bytes to `buffer`,
+    /// trims it to the configured capacity, and runs the detector.
+    /// The verdict carries the abort hit (if the event completed a
+    /// loop) and how many text bytes the event contributed — the count
+    /// the caller adds to its dispatched tally only when the event is
+    /// actually yielded, so an aborting event's own bytes never claim
+    /// to have reached the consumer. Non-text events and a disarmed
+    /// guard append nothing and report no hit, so a disarmed guard's
+    /// path is byte-identical to a handler that never knew the guard
+    /// existed.
+    fn scan_repetition(&self, buffer: &mut Vec<u8>, event: &StreamEvent) -> ScanVerdict {
+        if !self.repetition_config.enabled {
+            return ScanVerdict::default();
+        }
+        let appended_bytes = if let StreamEvent::IndexedDelta(delta) = event {
+            match &delta.delta {
+                DeltaPart::Text { text } | DeltaPart::Thinking { text, .. } => {
+                    buffer.extend_from_slice(text.as_bytes());
+                    text.len()
+                }
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        let capacity = self.repetition_config.buffer_capacity();
+        if buffer.len() > capacity {
+            let overflow = buffer.len().saturating_sub(capacity);
+            buffer.drain(..overflow);
+        }
+        ScanVerdict {
+            appended_bytes,
+            hit: detect_repetition(buffer, &self.repetition_config),
+        }
     }
 
     /// Route a failed event poll to the matching retry ladder.
@@ -2488,7 +2713,23 @@ impl StreamHandler {
         };
 
         match result {
-            Ok(response) => Ok((response.message, response.stop_reason, response.usage)),
+            Ok(response) => {
+                if let Some(hit) = detect_repetition(
+                    concat_lane_text(&response.message).as_bytes(),
+                    &self.repetition_config,
+                ) {
+                    return Err(StreamHandlerError::StreamFailed(
+                        StreamOutcome::RepetitionDetected {
+                            period_bytes: hit.period_bytes,
+                            repeats: hit.repeats,
+                            has_partial_data: false,
+                            events_processed: 0,
+                            usage: response.usage,
+                        },
+                    ));
+                }
+                Ok((response.message, response.stop_reason, response.usage))
+            }
             Err(e) => Err(StreamHandlerError::FallbackFailed {
                 stream_outcome: stream_outcome.unwrap_or(StreamOutcome::InitFailed {
                     attempts: 0,
@@ -4261,6 +4502,274 @@ mod tests {
 
         assert!(!result.from_fallback);
         assert_eq!(result.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    /// A mock whose stream carries the configured fragments as text deltas.
+    struct RepetitionStreamMock {
+        /// The text deltas the stream yields, in order.
+        fragments: Vec<String>,
+
+        /// The usage the completed non-streaming response reports.
+        ///
+        /// The fallback rejection path carries the refused response's
+        /// spend on its verdict, so the fixture stages one to see.
+        fallback_usage: Option<Usage>,
+    }
+
+    impl RepetitionStreamMock {
+        /// One delta per stanza copy — the wire shape of a repetition loop.
+        fn stanza_repeats(stanza: &str, copies: usize) -> Self {
+            Self {
+                fragments: vec![stanza.to_string(); copies],
+                fallback_usage: None,
+            }
+        }
+
+        /// A single delta carrying the whole completion.
+        fn one_delta(text: &str) -> Self {
+            Self {
+                fragments: vec![text.to_string()],
+                fallback_usage: None,
+            }
+        }
+
+        /// Stage the usage the completed non-streaming response reports.
+        fn with_fallback_usage(mut self, usage: Usage) -> Self {
+            self.fallback_usage = Some(usage);
+            self
+        }
+    }
+
+    impl ApiClient for RepetitionStreamMock {
+        fn model(&self) -> String {
+            "test-model".to_string()
+        }
+
+        fn stream_messages(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            let mut events = vec![
+                StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "msg_repeat".to_string(),
+                        role: "assistant".to_string(),
+                        model: "test-model".to_string(),
+                    },
+                }),
+                StreamEvent::PartStart(PartStart {
+                    index: 0,
+                    part: Some(crate::message::MessagePart::text("")),
+                }),
+            ];
+            for fragment in &self.fragments {
+                events.push(StreamEvent::IndexedDelta(IndexedDelta {
+                    index: 0,
+                    delta: DeltaPart::Text {
+                        text: fragment.clone(),
+                    },
+                }));
+            }
+            events.push(StreamEvent::PartStop { index: Some(0) });
+            events.push(StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".to_string()),
+                },
+                usage: None,
+            }));
+            events.push(StreamEvent::MessageStop);
+            Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+        }
+
+        fn create_message(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let message = crate::message::Message::assistant(self.fragments.concat());
+            let usage = self.fallback_usage;
+            Box::pin(async move {
+                Ok(crate::api::NonStreamingResponse {
+                    message,
+                    stop_reason: StreamStopReason::EndTurn,
+                    usage,
+                })
+            })
+        }
+    }
+
+    /// The malformed tool-call stanza from the production repetition
+    /// incident, as a fixture constant.
+    const DEGENERATE_STANZA: &str =
+        "<tool_call><function=Bash><parameter=command>true\n</parameter></function></tool_call>";
+
+    #[tokio::test]
+    async fn stream_turn_aborts_a_degenerate_repetition_stream() {
+        let handler = StreamHandler::new();
+        let client = RepetitionStreamMock::stanza_repeats(DEGENERATE_STANZA, 10);
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
+            .await
+            .expect_err("a repetition loop aborts the stream");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected {
+                period_bytes,
+                repeats,
+                has_partial_data,
+                ..
+            }) => {
+                assert_eq!(
+                    period_bytes,
+                    DEGENERATE_STANZA.len(),
+                    "the reported period is the stanza's byte length"
+                );
+                assert_eq!(repeats, 4, "the abort fires at the fourth verbatim copy");
+                assert!(
+                    has_partial_data,
+                    "the loop's own text is partial data the host keeps"
+                );
+            }
+            other => panic!("expected a typed repetition abort, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_turn_aborts_a_single_delta_repetition_stream() {
+        let handler = StreamHandler::new();
+        let client = RepetitionStreamMock::one_delta(&DEGENERATE_STANZA.repeat(10));
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
+            .await
+            .expect_err("one large delta carrying a loop still aborts");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected {
+                has_partial_data,
+                ..
+            }) => assert!(
+                !has_partial_data,
+                "the triggering delta was never dispatched, so no partial data \
+                 reached the consumer's per-delta observers"
+            ),
+            other => panic!("expected a typed repetition abort, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_turn_passes_varied_content_through() {
+        let handler = StreamHandler::new();
+        let mut text = String::new();
+        for row in 0..1_000 {
+            std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("id={row},name=item-{row},value={row}.25,flag=true\n"),
+            )
+            .expect("writing to a String cannot fail");
+        }
+        let client = RepetitionStreamMock::one_delta(&text);
+        let cancel = Arc::new(CancelSignal::new());
+
+        let result = handler
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
+            .await
+            .expect("varied repetitive-looking content is not a loop");
+
+        assert_eq!(result.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_guard_completes_the_degenerate_stream() {
+        let handler = StreamHandler::new().with_repetition_guard(
+            crate::stream::repetition::RepetitionGuardConfig {
+                enabled: false,
+                ..crate::stream::repetition::RepetitionGuardConfig::default()
+            },
+        );
+        let client = RepetitionStreamMock::stanza_repeats(DEGENERATE_STANZA, 10);
+        let cancel = Arc::new(CancelSignal::new());
+
+        let result = handler
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
+            .await
+            .expect("a disarmed guard restores the legacy byte-identical behavior");
+
+        assert_eq!(result.stop_reason, StreamStopReason::EndTurn);
+        assert_eq!(
+            result.message.text_content(),
+            DEGENERATE_STANZA.repeat(10),
+            "the degenerate text completes and accumulates when the guard is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_non_streaming_aborts_a_degenerate_completion() {
+        let handler = StreamHandler::new();
+        let client = RepetitionStreamMock::one_delta(&DEGENERATE_STANZA.repeat(10));
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .fallback_non_streaming(
+                &client,
+                &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
+                &cancel,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the non-streaming fallback runs the same guard");
+
+        assert!(
+            matches!(
+                err,
+                StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected { .. })
+            ),
+            "expected a typed repetition abort, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_non_streaming_rejection_carries_the_response_usage() {
+        // The refused completion still spent its tokens: its usage
+        // report rides the verdict, so the engine can book the real
+        // cost against the budget gate and the failed turn's record.
+        let handler = StreamHandler::new();
+        let client = RepetitionStreamMock::one_delta(&DEGENERATE_STANZA.repeat(10))
+            .with_fallback_usage(Usage::new(48_000, 1_600));
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .fallback_non_streaming(
+                &client,
+                &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
+                &cancel,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the degenerate fallback is still refused");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected {
+                usage, ..
+            }) => {
+                let usage = usage.expect("the refused response's usage rides the verdict");
+                assert_eq!(usage.input_tokens, 48_000);
+                assert_eq!(usage.output_tokens, 1_600);
+            }
+            other => panic!("expected a typed repetition abort, got: {other}"),
+        }
     }
 
     #[tokio::test]

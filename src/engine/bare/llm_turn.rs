@@ -228,13 +228,47 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
     fn turn_request_options(&self) -> Result<crate::structured::RequestOptions, LoopError> {
+        let options = self.effective_request_options()?;
+        crate::tracing_spans::record_turn_model(self.effective_request_model()?.as_str());
+        Ok(options)
+    }
+
+    /// The request options for this turn with the fallback routing applied.
+    ///
+    /// Applies [`routed_model`](Self::routed_model) as the per-request
+    /// model override over whatever the host set on `request_options`;
+    /// this is the exact option set the request carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
+    pub(super) fn effective_request_options(
+        &self,
+    ) -> Result<crate::structured::RequestOptions, LoopError> {
         let mut options = self.request_options.clone();
         if let Some(model) = self.routed_model()? {
             options.model = Some(model);
         }
-        let serving = options.model.clone().unwrap_or_else(|| self.client.model());
-        crate::tracing_spans::record_turn_model(&serving);
         Ok(options)
+    }
+
+    /// The model this turn's request will actually serve.
+    ///
+    /// The host's `request_options` model override when set, otherwise
+    /// the fallback routing's resolution, otherwise the client's own
+    /// model — the value [`turn_request_options`](Self::turn_request_options)
+    /// stamps onto the request and the turn span. Usage accounting,
+    /// pricing, and the usage anchor all read this figure, so they name
+    /// the model the wire carries rather than the client default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
+    pub(super) fn effective_request_model(&self) -> Result<String, LoopError> {
+        Ok(self
+            .effective_request_options()?
+            .model
+            .unwrap_or_else(|| self.client.model()))
     }
 
     /// Fire [`on_model_switched`] when the routed model changed since the
@@ -286,10 +320,13 @@ impl<C: ApiClient> BareLoop<C> {
             return Err(LoopError::Cancelled);
         }
         self.check_budget_before_request(turn)?;
+        let options = self.turn_request_options()?;
         match self.turn_mode {
             #[cfg(feature = "streaming")]
-            super::TurnMode::Streaming => self.do_stream(turn, messages, tools).await,
-            super::TurnMode::NonStreaming => self.do_create_message(turn, messages, tools).await,
+            super::TurnMode::Streaming => self.do_stream(turn, messages, tools, options).await,
+            super::TurnMode::NonStreaming => {
+                self.do_create_message(turn, messages, tools, options).await
+            }
         }
     }
 
@@ -368,11 +405,12 @@ impl<C: ApiClient> BareLoop<C> {
         turn: usize,
         messages: Vec<Message>,
         tools: Option<Vec<crate::tool::ToolSchema>>,
+        options: crate::structured::RequestOptions,
     ) -> Result<TurnServing, LoopError> {
         let request = self.build_turn_request(messages, tools);
         let cancel = std::sync::Arc::clone(&self.cancelled);
         let client = &self.client;
-        let options = self.turn_request_options()?;
+        let served = options.model.clone().unwrap_or_else(|| self.client.model());
         let timeout = self.turn_timeout();
         let result = tokio::select! {
             biased;
@@ -390,7 +428,13 @@ impl<C: ApiClient> BareLoop<C> {
         };
         match result {
             Ok(response) => {
-                self.record_turn_success(turn, response.usage.as_ref())?;
+                if let Err(error) =
+                    self.guard_completed_response(&response.message, response.usage.as_ref())
+                {
+                    self.observe_attempt_usage(response.usage.as_ref(), &served);
+                    return Err(self.record_turn_failure(turn, error, &served));
+                }
+                self.record_turn_success(turn, response.usage.as_ref(), &served)?;
                 Ok(TurnServing {
                     message: response.message,
                     usage: response.usage,
@@ -398,7 +442,7 @@ impl<C: ApiClient> BareLoop<C> {
                     transport_fallback: false,
                 })
             }
-            Err(e) => Err(self.record_turn_failure(turn, e)),
+            Err(e) => Err(self.record_turn_failure(turn, e, &served)),
         }
     }
 
@@ -417,24 +461,36 @@ impl<C: ApiClient> BareLoop<C> {
         turn: usize,
         messages: Vec<Message>,
         tools: Option<Vec<crate::tool::ToolSchema>>,
+        options: crate::structured::RequestOptions,
     ) -> Result<TurnServing, LoopError> {
-        match self.stream_turn(messages, tools).await {
+        let served = options.model.clone().unwrap_or_else(|| self.client.model());
+        match self.stream_turn(messages, tools, options).await {
             Ok(serving) => {
                 if serving.transport_fallback {
                     self.notify_transport_fallback(turn, serving.stop_reason);
                 }
-                self.record_turn_success(turn, serving.usage.as_ref())?;
+                self.record_turn_success(turn, serving.usage.as_ref(), &served)?;
                 Ok(serving)
             }
-            Err(e) => Err(self.record_turn_failure(turn, e)),
+            Err(e) => {
+                if let LoopError::RepetitionDetected {
+                    usage: Some(rejected),
+                    ..
+                } = &e
+                {
+                    self.observe_attempt_usage(Some(rejected), &served);
+                }
+                Err(self.record_turn_failure(turn, e, &served))
+            }
         }
     }
 
     /// Stream one turn from the API, accumulating the response.
     ///
     /// Always routes through a [`StreamHandler`](crate::stream::handler::StreamHandler)
-    /// — when none is configured, [`passthrough_default`](crate::stream::handler::StreamHandler::passthrough_default)
-    /// is used (no retries, no timeouts, no fallback).
+    /// — when none is installed, the managers' own passthrough-shaped
+    /// fallback handler serves, carrying the bundle's repetition-guard
+    /// knobs (no retries, no timeouts, no transport fallback).
     ///
     /// # Errors
     ///
@@ -445,29 +501,50 @@ impl<C: ApiClient> BareLoop<C> {
         &self,
         messages: Vec<Message>,
         tools: Option<Vec<crate::tool::ToolSchema>>,
+        options: crate::structured::RequestOptions,
     ) -> Result<TurnServing, LoopError> {
         let handler = self.managers.stream_handler();
         let request = self.build_turn_request(messages, tools);
-        let mut stream = handler.stream_turn(
-            &*self.client,
-            &request,
-            self.turn_request_options()?,
-            &self.cancelled,
-        );
+        let mut stream = handler.stream_turn(&*self.client, &request, options, &self.cancelled);
 
         let mut accumulator = StreamAccumulator::new();
         let mut stop_reason = StreamStopReason::EndTurn;
         let mut attempt = 1usize;
+        let mut partial_text_bytes: u64 = 0;
 
         while let Some(result) = stream.next().await {
-            match result.map_err(Self::map_handler_error)? {
+            let item = match result {
+                Ok(item) => item,
+                Err(error) => {
+                    if let StreamHandlerError::StreamFailed(
+                        crate::stream::handler::StreamOutcome::RepetitionDetected {
+                            period_bytes,
+                            repeats,
+                            has_partial_data,
+                            ..
+                        },
+                    ) = &error
+                    {
+                        let partial = Self::repetition_event_partial_bytes(
+                            *has_partial_data,
+                            partial_text_bytes,
+                        );
+                        self.notify_repetition_detected(*period_bytes, *repeats, partial);
+                    }
+                    return Err(Self::map_handler_error(error));
+                }
+            };
+            match item {
                 HandlerEvent::Stream(ev) => {
-                    self.dispatch_stream_event(&ev, &mut accumulator, &mut stop_reason)?;
+                    let dispatched =
+                        self.dispatch_stream_event(&ev, &mut accumulator, &mut stop_reason)?;
+                    partial_text_bytes = partial_text_bytes.saturating_add(dispatched);
                 }
                 HandlerEvent::AttemptReset => {
                     accumulator = StreamAccumulator::new();
                     stop_reason = StreamStopReason::EndTurn;
                     attempt = attempt.saturating_add(1);
+                    partial_text_bytes = 0;
                     self.notify_attempt_reset(attempt);
                 }
                 HandlerEvent::Fallback {
@@ -496,7 +573,9 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Dispatch one stream event: fire per-delta observer callbacks
     /// (`on_text_delta`, `on_thinking_delta`) and the `text_streamer`, extract
-    /// the stop reason, then fold the event into the accumulator.
+    /// the stop reason, then fold the event into the accumulator. Returns
+    /// the text and thinking bytes the event carried — the repetition
+    /// guard's partial-text accounting.
     ///
     /// # Errors
     ///
@@ -507,10 +586,12 @@ impl<C: ApiClient> BareLoop<C> {
         event: &StreamEvent,
         accumulator: &mut StreamAccumulator,
         stop_reason: &mut StreamStopReason,
-    ) -> Result<(), LoopError> {
+    ) -> Result<u64, LoopError> {
+        let mut dispatched_bytes: usize = 0;
         if let StreamEvent::IndexedDelta(d) = event
             && let crate::stream::DeltaPart::Text { text } = &d.delta
         {
+            dispatched_bytes = dispatched_bytes.saturating_add(text.len());
             if let Some(streamer) = &self.text_streamer {
                 streamer(text.as_str());
             }
@@ -522,6 +603,7 @@ impl<C: ApiClient> BareLoop<C> {
         if let StreamEvent::IndexedDelta(d) = event
             && let crate::stream::DeltaPart::Thinking { text, .. } = &d.delta
         {
+            dispatched_bytes = dispatched_bytes.saturating_add(text.len());
             self.managers
                 .observers()
                 .on_thinking_delta(&ThinkingDeltaContext {
@@ -536,7 +618,8 @@ impl<C: ApiClient> BareLoop<C> {
         }
         accumulator
             .process(event)
-            .map_err(|e| LoopError::Api(format!("stream accumulation error: {e}")))
+            .map_err(|e| LoopError::Api(format!("stream accumulation error: {e}")))?;
+        Ok(u64::try_from(dispatched_bytes).unwrap_or(u64::MAX))
     }
     /// Consult the detection manager and, if a pattern forced a hard stop,
     /// return the error for the driver loop to act on.
@@ -607,12 +690,28 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// The partial-text figure the repetition event reports for a
+    /// verdict.
+    ///
+    /// The verdict's own `has_partial_data` flag is the honest gate: a
+    /// live abort with dispatched bytes reports the stream tally, and a
+    /// verdict without partial data — the completed non-streaming
+    /// fallback, whose per-delta observers never fired, whether or not
+    /// the refused response carried a usage report — reports zero,
+    /// because the streaming tally belongs to a dead attempt and the
+    /// refused completion is the generation the verdict describes.
+    #[cfg(feature = "streaming")]
+    fn repetition_event_partial_bytes(has_partial_data: bool, dispatched: u64) -> u64 {
+        if has_partial_data { dispatched } else { 0 }
+    }
+
     /// Map a [`StreamHandlerError`] to a [`LoopError`].
     ///
     /// Preserves cancellation semantics —
-    /// [`StreamHandlerError::Cancelled`] maps to [`LoopError::Cancelled`].
-    /// All other variants map to [`LoopError::Api`] with a descriptive
-    /// message.
+    /// [`StreamHandlerError::Cancelled`] maps to [`LoopError::Cancelled`]
+    /// and the repetition guard's verdict maps to the typed
+    /// [`LoopError::RepetitionDetected`]. All other variants map to
+    /// [`LoopError::Api`] with a descriptive message.
     #[cfg(feature = "streaming")]
     pub(super) fn map_handler_error(error: StreamHandlerError) -> LoopError {
         match error {
@@ -623,6 +722,18 @@ impl<C: ApiClient> BareLoop<C> {
             StreamHandlerError::InitFailed(outcome) => {
                 LoopError::Api(format!("stream failed before completing: {outcome}"))
             }
+            StreamHandlerError::StreamFailed(
+                crate::stream::handler::StreamOutcome::RepetitionDetected {
+                    period_bytes,
+                    repeats,
+                    usage,
+                    ..
+                },
+            ) => LoopError::RepetitionDetected {
+                period_bytes: u64::try_from(period_bytes).unwrap_or(u64::MAX),
+                repeats: u64::try_from(repeats).unwrap_or(u64::MAX),
+                usage,
+            },
             StreamHandlerError::StreamFailed(outcome) => {
                 LoopError::Api(format!("stream failed: {outcome}"))
             }
@@ -640,6 +751,56 @@ impl<C: ApiClient> BareLoop<C> {
                 retry_after,
             },
         }
+    }
+
+    /// Run the repetition guard over a completed non-streaming response.
+    ///
+    /// The non-streaming turn's share of the guard, always compiled:
+    /// the completed assistant text (both lanes concatenated) runs
+    /// through the same detector the streaming paths carry in the
+    /// [`StreamHandler`](crate::stream::handler::StreamHandler),
+    /// before the turn is recorded or committed — so a degenerate
+    /// completion fails the turn with the typed
+    /// [`LoopError::RepetitionDetected`] and fires
+    /// [`on_repetition_detected`](crate::observer::LoopObserver::on_repetition_detected)
+    /// exactly like a degenerate stream, in every build including the
+    /// crate's default no-features shape where
+    /// [`TurnMode::NonStreaming`](crate::engine::TurnMode::NonStreaming)
+    /// is the only turn path. The managers' effective configuration
+    /// (an installed handler's knobs adopted at install time, or the
+    /// [`LoopManagers`](crate::managers::LoopManagers) knob) is the
+    /// single source; a disarmed guard returns `Ok` without
+    /// inspecting the message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::RepetitionDetected`] when the completed
+    /// text carries a verbatim repetition loop. The rejected
+    /// attempt's usage report rides the error, so the failed turn's
+    /// record can carry the real spend.
+    fn guard_completed_response(
+        &self,
+        message: &Message,
+        usage: Option<&Usage>,
+    ) -> Result<(), LoopError> {
+        let config = self.managers.repetition_guard();
+        if !config.enabled {
+            return Ok(());
+        }
+        let text = crate::stream::repetition::concat_lane_text(message);
+        if let Some(hit) = crate::stream::repetition::detect_repetition(text.as_bytes(), config) {
+            self.notify_repetition_detected(
+                hit.period_bytes,
+                hit.repeats,
+                u64::try_from(text.len()).unwrap_or(u64::MAX),
+            );
+            return Err(LoopError::RepetitionDetected {
+                period_bytes: u64::try_from(hit.period_bytes).unwrap_or(u64::MAX),
+                repeats: u64::try_from(hit.repeats).unwrap_or(u64::MAX),
+                usage: usage.copied(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -793,6 +954,26 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn repetition_event_partial_bytes_follows_the_verdict_s_partial_flag() {
+        // The verdict's own flag gates the tally: a live abort with
+        // dispatched bytes reports them, and a verdict without partial
+        // data — the completed-fallback rejection, whatever its usage
+        // report — reports zero, never the dead attempt's tally.
+        assert_eq!(
+            BareLoop::<StubClient>::repetition_event_partial_bytes(false, 3_136),
+            0,
+            "a verdict without partial data speaks for the refused completion, \
+             not the dead streaming attempt"
+        );
+        assert_eq!(
+            BareLoop::<StubClient>::repetition_event_partial_bytes(true, 3_136),
+            3_136,
+            "a live-abort verdict reports the stream's dispatched bytes"
+        );
     }
 
     #[test]

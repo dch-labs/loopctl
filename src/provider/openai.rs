@@ -73,6 +73,54 @@ const TEXT_PART_INDEX: usize = 0;
 /// thinking deltas, and the lanes interleave in any order.
 const THINKING_PART_INDEX: usize = 1;
 
+/// The reasoning lane's think-close boundary marker.
+///
+/// The tag pass-through servers of the Qwen/DeepSeek serving family
+/// leave this marker inside `reasoning_content` when their parser
+/// hands the whole generation to the reasoning field: everything
+/// before the first occurrence is reasoning, everything after is
+/// content, and the tag itself is a boundary, never stored text. A
+/// generation with no occurrence is all reasoning; a second occurrence
+/// after the first is inert literal text.
+const THINK_CLOSE_TAG: &str = "</think>";
+
+/// Proper prefixes of [`THINK_CLOSE_TAG`], longest first.
+///
+/// The streaming boundary check holds back a reasoning suffix that
+/// could still grow into the tag across a delta boundary; matching
+/// against this table (never slicing the tag at runtime) keeps the
+/// hold-back arithmetic literal and indexing-free.
+const THINK_CLOSE_PREFIXES: [&str; 7] = ["</think", "</thin", "</thi", "</th", "</t", "</", "<"];
+
+/// The length of the suffix of `text` that could still grow into
+/// [`THINK_CLOSE_TAG`], in bytes.
+///
+/// Zero unless the text ends with a proper prefix of the tag — the
+/// longest such suffix wins, so a fragment ending mid-tag holds back
+/// exactly the ambiguous bytes and emits the rest. Byte comparison of
+/// the ASCII tag against the text's tail is exact; the returned length
+/// never splits the held region at a non-tag position.
+fn held_tag_prefix_len(text: &str) -> usize {
+    THINK_CLOSE_PREFIXES
+        .iter()
+        .find(|prefix| text.ends_with(*prefix))
+        .map_or(0, |prefix| prefix.len())
+}
+
+/// Split reasoning text at its first [`THINK_CLOSE_TAG`] occurrence.
+///
+/// The non-streaming half of the boundary: `Some((before, after))`
+/// names the split with the tag itself removed, while `None` means the
+/// text carries no boundary and is all reasoning. Only the first
+/// occurrence splits — a second tag in the content suffix stays
+/// literal text.
+fn split_reasoning_at_close(text: &str) -> Option<(&str, &str)> {
+    let index = text.find(THINK_CLOSE_TAG)?;
+    let (before, rest) = text.split_at(index);
+    let after = rest.split_at(THINK_CLOSE_TAG.len()).1;
+    Some((before, after))
+}
+
 /// The metadata probes' shared per-request deadline, documented on
 /// [`super::PROBE_TIMEOUT`] alongside the discovery probes that share
 /// it.
@@ -156,6 +204,33 @@ pub struct OpenAiClient {
     /// Set via [`OpenAiClientBuilder::thinking_effort`].
     thinking_effort: Option<crate::structured::ThinkingEffort>,
 
+    /// The completion budget sent as `max_tokens` on every request.
+    ///
+    /// `None` (the default) omits the field entirely, leaving the
+    /// provider's server default as the only bound on generation
+    /// length. When set, every request carries the value verbatim on
+    /// both the streaming and non-streaming bodies — the host's bound
+    /// on worst-case output. Set via
+    /// [`OpenAiClientBuilder::with_max_tokens`].
+    max_tokens: Option<u32>,
+
+    /// The `presence_penalty` sampling knob sent on every request.
+    ///
+    /// `None` (the default) omits the field; when set, the value rides
+    /// every request. Positive values penalize tokens by whether they
+    /// already appeared, pushing the model toward new topics — the
+    /// standard softening knob against repetition attractors. Set via
+    /// [`OpenAiClientBuilder::with_presence_penalty`].
+    presence_penalty: Option<f32>,
+
+    /// The `frequency_penalty` sampling knob sent on every request.
+    ///
+    /// `None` (the default) omits the field; when set, the value rides
+    /// every request. Positive values penalize tokens by how often they
+    /// already appeared, scaling with repetition count. Set via
+    /// [`OpenAiClientBuilder::with_frequency_penalty`].
+    frequency_penalty: Option<f32>,
+
     /// Whether prior-turn reasoning is replayed on outgoing requests.
     ///
     /// Off by default: requests are byte-identical to a client that
@@ -216,6 +291,21 @@ impl OpenAiClient {
     #[must_use]
     pub fn builder() -> OpenAiClientBuilder {
         OpenAiClientBuilder::default()
+    }
+
+    /// Forward the client's completion and sampling knobs onto a body.
+    ///
+    /// The single seam every request-build site threads
+    /// [`max_tokens`](OpenAiClientBuilder::with_max_tokens),
+    /// [`presence_penalty`](OpenAiClientBuilder::with_presence_penalty),
+    /// and [`frequency_penalty`](OpenAiClientBuilder::with_frequency_penalty)
+    /// through — unset knobs stay `None` and omit their wire fields, so
+    /// a client built without them serializes byte-identically to one
+    /// that never knew the knobs existed.
+    fn with_completion_knobs(&self, body: RequestBody) -> RequestBody {
+        body.with_max_tokens(self.max_tokens)
+            .with_presence_penalty(self.presence_penalty)
+            .with_frequency_penalty(self.frequency_penalty)
     }
 
     /// The rate-limit snapshot from the most recent response, if the
@@ -295,10 +385,15 @@ impl OpenAiClient {
     /// Build a typed [`NonStreamingResponse`] from OpenAI's native JSON.
     ///
     /// Reads `choices[0].message` into [`MessagePart`]s: a non-empty
-    /// `reasoning_content` string becomes a [`MessagePart::Thinking`]
-    /// part ahead of the visible text (the non-streaming capture half
-    /// of reasoning replay), the `content` string becomes a
-    /// [`MessagePart::Text`] part (skipped when `null`), and each entry
+    /// `reasoning_content` string splits at its first
+    /// [`THINK_CLOSE_TAG`](self) occurrence — the pre-tag text becomes a
+    /// [`MessagePart::Thinking`] part (absent when the tag leads) and
+    /// the post-tag text joins the visible content ahead of the
+    /// `content` string — or, with no occurrence, becomes one
+    /// [`MessagePart::Thinking`] part ahead of the visible text (the
+    /// non-streaming capture half of reasoning replay); the `content`
+    /// string becomes a [`MessagePart::Text`] part (skipped when
+    /// `null`), and each entry
     /// in `tool_calls` becomes a [`MessagePart::ToolCall`] with its
     /// `function.arguments` JSON-string parsed into a [`Value`].
     /// Maps `choices[0].finish_reason` to a [`StreamStopReason`] using the
@@ -319,16 +414,35 @@ impl OpenAiClient {
         let message = choice.and_then(|c| c.get("message"));
         let mut parts: Vec<MessagePart> = Vec::new();
         if let Some(msg) = message {
+            let mut leading_content = String::new();
             if let Some(reasoning) = msg.get("reasoning_content").and_then(|r| r.as_str())
                 && !reasoning.is_empty()
             {
-                parts.push(MessagePart::Thinking {
-                    text: reasoning.to_string(),
-                    signature: None,
-                    redacted: None,
-                });
+                match split_reasoning_at_close(reasoning) {
+                    Some((before, after)) => {
+                        if !before.is_empty() {
+                            parts.push(MessagePart::Thinking {
+                                text: before.to_string(),
+                                signature: None,
+                                redacted: None,
+                            });
+                        }
+                        leading_content = after.to_string();
+                    }
+                    None => parts.push(MessagePart::Thinking {
+                        text: reasoning.to_string(),
+                        signature: None,
+                        redacted: None,
+                    }),
+                }
             }
-            if let Some(text) = msg.get("content").and_then(|t| t.as_str()) {
+            let content = msg.get("content").and_then(|t| t.as_str());
+            if !leading_content.is_empty() {
+                if let Some(text) = content {
+                    leading_content.push_str(text);
+                }
+                parts.push(MessagePart::text(leading_content));
+            } else if let Some(text) = content {
                 parts.push(MessagePart::text(text));
             }
             if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
@@ -925,17 +1039,19 @@ impl ApiClient for OpenAiClient {
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
-        let body = RequestBody::build(
-            &model,
-            &request.messages,
-            system.as_deref(),
-            tools.as_deref(),
-            None,
-            &ToolConstraint::None,
-            self.replay_reasoning,
-        )
-        .with_stream_usage(self.stream_usage)
-        .with_reasoning_effort(self.thinking_effort);
+        let body = self.with_completion_knobs(
+            RequestBody::build(
+                &model,
+                &request.messages,
+                system.as_deref(),
+                tools.as_deref(),
+                None,
+                &ToolConstraint::None,
+                self.replay_reasoning,
+            )
+            .with_stream_usage(self.stream_usage)
+            .with_reasoning_effort(self.thinking_effort),
+        );
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -992,16 +1108,18 @@ impl ApiClient for OpenAiClient {
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
-        let body = RequestBody::build(
-            &model,
-            &request.messages,
-            system.as_deref(),
-            tools.as_deref(),
-            None,
-            &ToolConstraint::None,
-            self.replay_reasoning,
-        )
-        .with_reasoning_effort(self.thinking_effort);
+        let body = self.with_completion_knobs(
+            RequestBody::build(
+                &model,
+                &request.messages,
+                system.as_deref(),
+                tools.as_deref(),
+                None,
+                &ToolConstraint::None,
+                self.replay_reasoning,
+            )
+            .with_reasoning_effort(self.thinking_effort),
+        );
         let url = self.completions_url();
 
         Box::pin(async move {
@@ -1035,17 +1153,19 @@ impl ApiClient for OpenAiClient {
             .clone()
             .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
         let rf = options.response_format.as_ref();
-        let body = RequestBody::build(
-            &model,
-            &request.messages,
-            system.as_deref(),
-            tools.as_deref(),
-            rf,
-            &options.tool_constraint,
-            self.replay_reasoning,
-        )
-        .with_stream_usage(self.stream_usage)
-        .with_reasoning_effort(options.effort.or(self.thinking_effort));
+        let body = self.with_completion_knobs(
+            RequestBody::build(
+                &model,
+                &request.messages,
+                system.as_deref(),
+                tools.as_deref(),
+                rf,
+                &options.tool_constraint,
+                self.replay_reasoning,
+            )
+            .with_stream_usage(self.stream_usage)
+            .with_reasoning_effort(options.effort.or(self.thinking_effort)),
+        );
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -1107,16 +1227,18 @@ impl ApiClient for OpenAiClient {
             .clone()
             .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
         let rf = options.response_format.as_ref();
-        let body = RequestBody::build(
-            &model,
-            &request.messages,
-            system.as_deref(),
-            tools.as_deref(),
-            rf,
-            &options.tool_constraint,
-            self.replay_reasoning,
-        )
-        .with_reasoning_effort(options.effort.or(self.thinking_effort));
+        let body = self.with_completion_knobs(
+            RequestBody::build(
+                &model,
+                &request.messages,
+                system.as_deref(),
+                tools.as_deref(),
+                rf,
+                &options.tool_constraint,
+                self.replay_reasoning,
+            )
+            .with_reasoning_effort(options.effort.or(self.thinking_effort)),
+        );
         let url = self.completions_url();
 
         Box::pin(async move {
@@ -1186,6 +1308,25 @@ pub struct OpenAiClientBuilder {
     /// [`OpenAiClient`].
     thinking_effort: Option<crate::structured::ThinkingEffort>,
 
+    /// The completion budget forwarded as `max_tokens` on every request.
+    ///
+    /// `None` (the default) sends no `max_tokens` field — the provider's
+    /// server default governs generation length. Read by
+    /// [`build`](Self::build) and stored on [`OpenAiClient`].
+    max_tokens: Option<u32>,
+
+    /// The `presence_penalty` sampling knob forwarded on every request.
+    ///
+    /// `None` (the default) sends no `presence_penalty` field. Read by
+    /// [`build`](Self::build) and stored on [`OpenAiClient`].
+    presence_penalty: Option<f32>,
+
+    /// The `frequency_penalty` sampling knob forwarded on every request.
+    ///
+    /// `None` (the default) sends no `frequency_penalty` field. Read by
+    /// [`build`](Self::build) and stored on [`OpenAiClient`].
+    frequency_penalty: Option<f32>,
+
     /// Whether prior-turn reasoning is replayed on outgoing requests.
     ///
     /// Set via [`OpenAiClientBuilder::replay_reasoning`]; see the
@@ -1210,6 +1351,9 @@ impl Default for OpenAiClientBuilder {
             http: super::HttpClientConfig::default(),
             stream_usage: true,
             thinking_effort: None,
+            max_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
             replay_reasoning: false,
             seed: super::ProfileSeed::default(),
         }
@@ -1256,6 +1400,55 @@ impl OpenAiClientBuilder {
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self.seed.missing_model_error = None;
+        self
+    }
+
+    /// Set the completion budget sent as `max_tokens` on every request.
+    ///
+    /// `None` by default — the field is omitted entirely and the
+    /// provider's server default governs generation length, the
+    /// byte-identical legacy shape. When set, every streaming and
+    /// non-streaming request carries the value, bounding worst-case
+    /// output for hosts that need a tighter cap than the server's. A
+    /// later call wins over an earlier one, matching the family's
+    /// builder convention.
+    #[must_use]
+    pub fn with_max_tokens(mut self, tokens: u32) -> Self {
+        self.max_tokens = Some(tokens);
+        self
+    }
+
+    /// Set the `presence_penalty` sampling knob for every request.
+    ///
+    /// `None` by default — the field is omitted entirely. Positive
+    /// values push the model toward new topics (the standard softening
+    /// knob against repetition attractors); the accepted range is
+    /// provider-defined (OpenAI documents `-2.0` to `2.0`) and is not
+    /// clamped here — an out-of-range value surfaces the provider's
+    /// own rejection. A NaN or infinite value fails
+    /// [`build`](Self::build): it cannot serialize as a JSON number and
+    /// would silently drop the knob from the wire. A later call wins
+    /// over an earlier one.
+    #[must_use]
+    pub fn with_presence_penalty(mut self, penalty: f32) -> Self {
+        self.presence_penalty = Some(penalty);
+        self
+    }
+
+    /// Set the `frequency_penalty` sampling knob for every request.
+    ///
+    /// `None` by default — the field is omitted entirely. Positive
+    /// values penalize tokens in proportion to how often they already
+    /// appeared, scaling with repetition count; the accepted range is
+    /// provider-defined (OpenAI documents `-2.0` to `2.0`) and is not
+    /// clamped here — an out-of-range value surfaces the provider's own
+    /// rejection. A NaN or infinite value fails
+    /// [`build`](Self::build): it cannot serialize as a JSON number and
+    /// would silently drop the knob from the wire. A later call wins
+    /// over an earlier one.
+    #[must_use]
+    pub fn with_frequency_penalty(mut self, penalty: f32) -> Self {
+        self.frequency_penalty = Some(penalty);
         self
     }
 
@@ -1448,6 +1641,18 @@ impl OpenAiClientBuilder {
         if let Some(error) = self.seed.seed_error {
             return Err(error);
         }
+        for (name, value) in [
+            ("presence_penalty", self.presence_penalty),
+            ("frequency_penalty", self.frequency_penalty),
+        ] {
+            if value.is_some_and(|penalty| !penalty.is_finite()) {
+                return Err(ApiError::config_validation(format!(
+                    "{name} must be a finite number — a NaN or infinite value cannot ride \
+                     the wire as a JSON number and would serialize as null, silently \
+                     dropping the knob"
+                )));
+            }
+        }
         let api_key = self.api_key.ok_or_else(|| match self.seed.key_env_name {
             Some(name) => ApiError::auth_invalid_key(format!("{name} not set")),
             None => ApiError::auth_invalid_key("API key not provided"),
@@ -1464,6 +1669,9 @@ impl OpenAiClientBuilder {
             model: std::sync::Mutex::new(self.model),
             stream_usage: self.stream_usage,
             thinking_effort: self.thinking_effort,
+            max_tokens: self.max_tokens,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
             replay_reasoning: self.replay_reasoning,
             context_window_probe: std::sync::Mutex::new(ProbeCache::Unprobed),
             rate_limit: super::RateLimitSlot::default(),
@@ -1522,6 +1730,25 @@ struct RequestBody {
     /// table — `Max` rides as `"max"`, never clamped to a lower
     /// step.
     reasoning_effort: Option<&'static str>,
+
+    /// The `max_tokens` completion budget.
+    ///
+    /// `None` omits the field entirely — the server default governs
+    /// generation length, the byte-identical legacy shape. Set from the
+    /// client's knob via [`with_max_tokens`](Self::with_max_tokens).
+    max_tokens: Option<u32>,
+
+    /// The `presence_penalty` sampling value.
+    ///
+    /// `None` omits the field entirely. Set from the client's knob via
+    /// [`with_presence_penalty`](Self::with_presence_penalty).
+    presence_penalty: Option<f32>,
+
+    /// The `frequency_penalty` sampling value.
+    ///
+    /// `None` omits the field entirely. Set from the client's knob via
+    /// [`with_frequency_penalty`](Self::with_frequency_penalty).
+    frequency_penalty: Option<f32>,
 
     /// Whether to request `stream_options.include_usage` when streaming.
     ///
@@ -1610,6 +1837,9 @@ impl RequestBody {
             guided_json,
             stream_usage: true,
             reasoning_effort: None,
+            max_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
         }
     }
 
@@ -1635,6 +1865,38 @@ impl RequestBody {
     /// carries `stream_options`.
     fn with_stream_usage(mut self, enabled: bool) -> Self {
         self.stream_usage = enabled;
+        self
+    }
+
+    /// Attach the `max_tokens` completion budget.
+    ///
+    /// `None` (the [`RequestBody::build`] default) omits the field from
+    /// [`to_json`](Self::to_json) output entirely; `Some` emits the
+    /// value as a JSON number on both the streaming and non-streaming
+    /// bodies.
+    #[must_use]
+    fn with_max_tokens(mut self, tokens: Option<u32>) -> Self {
+        self.max_tokens = tokens;
+        self
+    }
+
+    /// Attach the `presence_penalty` sampling value.
+    ///
+    /// `None` omits the field; `Some` emits the value as a JSON number
+    /// on both the streaming and non-streaming bodies.
+    #[must_use]
+    fn with_presence_penalty(mut self, penalty: Option<f32>) -> Self {
+        self.presence_penalty = penalty;
+        self
+    }
+
+    /// Attach the `frequency_penalty` sampling value.
+    ///
+    /// `None` omits the field; `Some` emits the value as a JSON number
+    /// on both the streaming and non-streaming bodies.
+    #[must_use]
+    fn with_frequency_penalty(mut self, penalty: Option<f32>) -> Self {
+        self.frequency_penalty = penalty;
         self
     }
 
@@ -1674,6 +1936,21 @@ impl RequestBody {
                 obj.insert(
                     "reasoning_effort".to_string(),
                     Value::String(effort.to_owned()),
+                );
+            }
+            if let Some(max_tokens) = self.max_tokens {
+                obj.insert("max_tokens".to_string(), Value::from(max_tokens));
+            }
+            if let Some(presence) = self.presence_penalty {
+                obj.insert(
+                    "presence_penalty".to_string(),
+                    Value::from(f64::from(presence)),
+                );
+            }
+            if let Some(frequency) = self.frequency_penalty {
+                obj.insert(
+                    "frequency_penalty".to_string(),
+                    Value::from(f64::from(frequency)),
                 );
             }
         }
@@ -2317,6 +2594,30 @@ struct OpenAiToolCallFunction {
     name: Option<String>,
 }
 
+/// The reasoning lane's think-close boundary state.
+///
+/// Tracks whether [`THINK_CLOSE_TAG`](self) has already split the
+/// reasoning stream — see
+/// [`reasoning_boundary`](StreamEmitter::reasoning_boundary) for the
+/// routing each state performs.
+#[derive(Default)]
+enum ReasoningBoundary {
+    /// The boundary has not fired; fragments scan for the tag.
+    ///
+    /// The default state: reasoning bytes append to the pending buffer
+    /// and re-scan for [`THINK_CLOSE_TAG`] on every fragment, emitting
+    /// everything the tag cannot complete as thinking.
+    #[default]
+    Pending,
+
+    /// The boundary fired; every later reasoning fragment is content.
+    ///
+    /// The terminal state, set once and never cleared: post-boundary
+    /// `reasoning_content` bytes route to the text lane, and a second
+    /// close tag in that stream stays literal text.
+    Crossed,
+}
+
 /// Whether a content lane (text or thinking) currently has an open part.
 ///
 /// [`StreamEmitter`] separates assistant text and model reasoning into two
@@ -2380,6 +2681,25 @@ struct StreamEmitter {
     /// first non-empty fragment and closes it in `process_finish`, symmetric
     /// to the text lane.
     thinking: PartLane,
+
+    /// Reasoning-lane bytes withheld pending a think-close tag verdict.
+    ///
+    /// Fragments append here until a [`THINK_CLOSE_TAG`] find (or its
+    /// impossibility) resolves them: a complete find splits the buffer
+    /// at the tag, while a miss emits everything except the suffix that
+    /// could still grow into the tag across the next delta boundary.
+    /// Empty once the boundary has fired or the stream ended cleanly.
+    reasoning_pending: String,
+
+    /// The reasoning lane's think-close boundary state.
+    ///
+    /// [`Pending`](ReasoningBoundary::Pending) until the first
+    /// [`THINK_CLOSE_TAG`] find; [`Crossed`](ReasoningBoundary::Crossed)
+    /// after it, routing every later reasoning fragment to the text
+    /// lane as content — a pass-through server keeps streaming the
+    /// post-thinking generation down the same field. A second close
+    /// tag after the crossing stays literal text.
+    reasoning_boundary: ReasoningBoundary,
 
     /// Tool-call indices that have already had their
     /// [`StreamEvent::PartStart`] emitted.
@@ -2503,61 +2823,29 @@ impl StreamEmitter {
 
     /// Translate a single delta object into text and/or reasoning events.
     ///
-    /// If the delta carries non-empty `content`, emits a `PartStart` (on the
-    /// first text delta) followed by `IndexedDelta(Text)` events. If it
-    /// carries non-empty `reasoning_content`, the same shape is emitted for
-    /// the reasoning lane. Switching lanes emits a `PartStop` for the previous
-    /// lane first, keeping at most one content lane open — a lane left open
-    /// behind a switch could later share its part index with a tool call and
-    /// make closing ambiguous. If it carries `tool_calls`, delegates each to
+    /// If the delta carries non-empty `reasoning_content`, the reasoning
+    /// lane processes first — a think-close tag inside the same delta
+    /// emits its thinking and the post-boundary suffix before any
+    /// content the delta also carries, so the streamed order matches
+    /// the non-streaming assembly. If it carries non-empty `content`, a
+    /// `PartStart` (on the first text delta) followed by
+    /// `IndexedDelta(Text)` events are emitted. Switching lanes emits a
+    /// `PartStop` for the previous lane first, keeping at most one
+    /// content lane open — a lane left open behind a switch could later
+    /// share its part index with a tool call and make closing
+    /// ambiguous. If it carries `tool_calls`, delegates each to
     /// [`process_tool_call`](Self::process_tool_call).
     fn process_delta(&mut self, delta: &OpenAiDelta) {
-        if let Some(text) = &delta.content
-            && !text.is_empty()
-        {
-            if matches!(self.thinking, PartLane::Open) {
-                self.thinking = PartLane::Closed;
-                self.push(StreamEvent::PartStop {
-                    index: Some(THINKING_PART_INDEX),
-                });
-            }
-            if matches!(self.text, PartLane::Closed) {
-                self.text = PartLane::Open;
-                self.push(StreamEvent::PartStart(PartStart {
-                    index: TEXT_PART_INDEX,
-                    part: Some(MessagePart::text("")),
-                }));
-            }
-            self.push(StreamEvent::IndexedDelta(IndexedDelta {
-                index: TEXT_PART_INDEX,
-                delta: DeltaPart::Text { text: text.clone() },
-            }));
-        }
-
         if let Some(reasoning) = &delta.reasoning_content
             && !reasoning.is_empty()
         {
-            if matches!(self.text, PartLane::Open) {
-                self.text = PartLane::Closed;
-                self.push(StreamEvent::PartStop {
-                    index: Some(TEXT_PART_INDEX),
-                });
-            }
-            if matches!(self.thinking, PartLane::Closed) {
-                self.thinking = PartLane::Open;
-                self.push(StreamEvent::PartStart(PartStart {
-                    index: THINKING_PART_INDEX,
-                    part: None,
-                }));
-            }
-            self.push(StreamEvent::IndexedDelta(IndexedDelta {
-                index: THINKING_PART_INDEX,
-                delta: DeltaPart::Thinking {
-                    text: reasoning.clone(),
-                    signature: None,
-                    redacted: None,
-                },
-            }));
+            self.process_reasoning_fragment(reasoning);
+        }
+
+        if let Some(text) = &delta.content
+            && !text.is_empty()
+        {
+            self.emit_text_fragment(text);
         }
 
         if let Some(tool_calls) = &delta.tool_calls {
@@ -2568,14 +2856,168 @@ impl StreamEmitter {
         }
     }
 
+    /// Route one reasoning-lane fragment through the think-close boundary.
+    ///
+    /// The reasoning lane's fragment-first seam: before the boundary has
+    /// fired, bytes append to [`reasoning_pending`](Self::reasoning_pending)
+    /// and re-scan for [`THINK_CLOSE_TAG`] — a complete find splits the
+    /// buffer at the tag (the prefix emits as thinking, the suffix as
+    /// content, the tag itself is a boundary and never stored), while a
+    /// miss emits everything except a held-back suffix that could still
+    /// grow into the tag across a delta boundary. After the boundary has
+    /// fired, every fragment is content — a pass-through server keeps
+    /// streaming the post-thinking generation down the same field, and
+    /// a second close tag in that stream stays literal text. While a
+    /// tool call holds the thinking lane's wire index, the whole
+    /// fragment holds instead: emitting would open the thinking lane at
+    /// an index the accumulator routes to the open tool slot, and the
+    /// lane-closure stop would close that slot. The hold releases at
+    /// finish, after the tool slots have closed and the flush resolves
+    /// the boundary over the held bytes.
+    fn process_reasoning_fragment(&mut self, fragment: &str) {
+        if matches!(self.reasoning_boundary, ReasoningBoundary::Crossed) {
+            self.emit_text_fragment(fragment);
+            return;
+        }
+        self.reasoning_pending.push_str(fragment);
+        if self.seen_tool_indices.contains(&THINKING_PART_INDEX) {
+            return;
+        }
+        let Some(index) = self.reasoning_pending.find(THINK_CLOSE_TAG) else {
+            let held = held_tag_prefix_len(&self.reasoning_pending);
+            let split = self.reasoning_pending.len().saturating_sub(held);
+            let (emit, keep) = self.reasoning_pending.split_at(split);
+            let emit = emit.to_string();
+            self.reasoning_pending = keep.to_string();
+            self.emit_thinking_fragment(&emit);
+            return;
+        };
+        let (prefix, rest) = self.reasoning_pending.split_at(index);
+        let suffix = rest.split_at(THINK_CLOSE_TAG.len()).1;
+        let prefix = prefix.to_string();
+        let suffix = suffix.to_string();
+        self.reasoning_pending.clear();
+        self.reasoning_boundary = ReasoningBoundary::Crossed;
+        self.emit_thinking_fragment(&prefix);
+        self.emit_text_fragment(&suffix);
+    }
+
+    /// Emit one fragment into the thinking lane.
+    ///
+    /// Opens the lane on the first non-empty fragment (closing an open
+    /// text lane first, keeping one content lane open at a time) and
+    /// forwards the bytes as a [`Thinking`](crate::stream::DeltaPart::Thinking)
+    /// delta. Empty fragments are dropped — a lane never opens for
+    /// nothing, so a boundary at the very start of the generation
+    /// leaves the thinking part absent rather than empty.
+    fn emit_thinking_fragment(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if matches!(self.text, PartLane::Open) {
+            self.text = PartLane::Closed;
+            self.push(StreamEvent::PartStop {
+                index: Some(TEXT_PART_INDEX),
+            });
+        }
+        if matches!(self.thinking, PartLane::Closed) {
+            self.thinking = PartLane::Open;
+            self.push(StreamEvent::PartStart(PartStart {
+                index: THINKING_PART_INDEX,
+                part: None,
+            }));
+        }
+        self.push(StreamEvent::IndexedDelta(IndexedDelta {
+            index: THINKING_PART_INDEX,
+            delta: DeltaPart::Thinking {
+                text: text.to_string(),
+                signature: None,
+                redacted: None,
+            },
+        }));
+    }
+
+    /// Emit one fragment into the text lane.
+    ///
+    /// Opens the lane on the first non-empty fragment (closing an open
+    /// thinking lane first, keeping one content lane open at a time) and
+    /// forwards the bytes as a [`Text`](crate::stream::DeltaPart::Text)
+    /// delta. Empty fragments are dropped. Both the `content` field and
+    /// post-boundary reasoning route through here, so the two sources
+    /// share one content lane.
+    fn emit_text_fragment(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if matches!(self.thinking, PartLane::Open) {
+            self.thinking = PartLane::Closed;
+            self.push(StreamEvent::PartStop {
+                index: Some(THINKING_PART_INDEX),
+            });
+        }
+        if matches!(self.text, PartLane::Closed) {
+            self.text = PartLane::Open;
+            self.push(StreamEvent::PartStart(PartStart {
+                index: TEXT_PART_INDEX,
+                part: Some(MessagePart::text("")),
+            }));
+        }
+        self.push(StreamEvent::IndexedDelta(IndexedDelta {
+            index: TEXT_PART_INDEX,
+            delta: DeltaPart::Text {
+                text: text.to_string(),
+            },
+        }));
+    }
+
+    /// Flush unresolved reasoning bytes as thinking.
+    ///
+    /// The stream ended before the pending suffix resolved into (or
+    /// ruled out) a tag: the bytes are reasoning under the
+    /// no-close-tag rule, so they emit into the thinking lane before
+    /// the lanes close. A suffix held past open tool calls may carry a
+    /// complete tag — the boundary resolves here over the held bytes,
+    /// splitting prefix thinking from suffix content exactly as the
+    /// live scan would have. After the boundary has fired the buffer
+    /// is empty by construction, and an empty fragment is dropped —
+    /// the flush is a no-op there. Every call site runs after any open
+    /// tool slots have closed, so the flushed thinking lane never
+    /// shares its index with a tool call.
+    fn flush_reasoning_pending(&mut self) {
+        let pending = std::mem::take(&mut self.reasoning_pending);
+        if pending.is_empty() {
+            return;
+        }
+        if let Some((before, after)) = split_reasoning_at_close(&pending) {
+            self.reasoning_boundary = ReasoningBoundary::Crossed;
+            self.emit_thinking_fragment(before);
+            self.emit_text_fragment(after);
+            return;
+        }
+        self.emit_thinking_fragment(&pending);
+    }
+
     /// Close the open text and thinking lanes, if any.
     ///
     /// Called before the first tool [`PartStart`](StreamEvent::PartStart) of
     /// a chunk and at finish: wire tool-call indices and the content-lane
     /// indices overlap (a text lane at part index 0 versus a first tool call
     /// at wire index 0), so an open content lane at tool time would share its
-    /// index with a tool lane. Each stop names the lane it closes.
+    /// index with a tool lane. Each stop names the lane it closes. Any
+    /// held-back reasoning suffix flushes into the thinking lane first,
+    /// while that lane is still legitimately open — flushing later (at
+    /// finish, after tool lanes opened) would re-open the thinking lane at
+    /// an index a tool call may already hold, and the accumulator's
+    /// index-named [`PartStop`](StreamEvent::PartStop) would close the tool
+    /// slot instead. When a tool call already holds the thinking index, the
+    /// flush defers: the suffix stays pending until
+    /// [`process_finish`](Self::process_finish) closes the tool slots and
+    /// flushes it behind them, so the flushed lane never shares its index
+    /// with an open tool call.
     fn close_content_lanes(&mut self) {
+        if !self.seen_tool_indices.contains(&THINKING_PART_INDEX) {
+            self.flush_reasoning_pending();
+        }
         if matches!(self.text, PartLane::Open) {
             self.text = PartLane::Closed;
             self.push(StreamEvent::PartStop {
@@ -2641,7 +3083,11 @@ impl StreamEmitter {
     /// here — it is deferred until the usage chunk arrives (when
     /// `stream_options.include_usage` is set) or flushed by
     /// [`finish`](Self::finish) at stream end, so the `MessageDelta` carries
-    /// both the stop reason and the usage in one event. Maps `"tool_calls"`
+    /// both the stop reason and the usage in one event. A reasoning suffix
+    /// held past open tool calls flushes after those slots close, and the
+    /// lanes it opened — thinking prefix, text suffix — close with them,
+    /// so no part reaches [`MessageStop`](StreamEvent::MessageStop) still
+    /// open. Maps `"tool_calls"`
     /// → [`ToolCall`](StreamStopReason::ToolCall), `"length"` →
     /// [`MaxTokens`](StreamStopReason::MaxTokens), and anything else via
     /// [`StreamStopReason::from_api_str`]. No-ops if already finished.
@@ -2660,6 +3106,10 @@ impl StreamEmitter {
             .collect();
         for index in open_tool_indices {
             self.push(StreamEvent::PartStop { index: Some(index) });
+        }
+        if !self.reasoning_pending.is_empty() {
+            self.flush_reasoning_pending();
+            self.close_content_lanes();
         }
 
         let stop_reason = match reason {
@@ -2910,6 +3360,128 @@ mod tests {
     }
 
     #[test]
+    fn request_body_completion_knobs_absent_when_unset() {
+        let msgs = vec![Message::user("hi")];
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
+        for stream in [true, false] {
+            let json = body.to_json(stream);
+            assert!(
+                json.get("max_tokens").is_none(),
+                "max_tokens must be omitted when unset (stream={stream})"
+            );
+            assert!(
+                json.get("presence_penalty").is_none(),
+                "presence_penalty must be omitted when unset (stream={stream})"
+            );
+            assert!(
+                json.get("frequency_penalty").is_none(),
+                "frequency_penalty must be omitted when unset (stream={stream})"
+            );
+        }
+    }
+
+    #[test]
+    fn request_body_completion_knobs_round_trip() {
+        let msgs = vec![Message::user("hi")];
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        )
+        .with_max_tokens(Some(8_192))
+        .with_presence_penalty(Some(1.5_f32))
+        .with_frequency_penalty(Some(0.5_f32));
+        for stream in [true, false] {
+            let json = body.to_json(stream);
+            assert_eq!(
+                json["max_tokens"], 8_192,
+                "max_tokens rides the wire with the configured value (stream={stream})"
+            );
+            assert_eq!(
+                json["presence_penalty"], 1.5,
+                "presence_penalty rides the wire with the configured value (stream={stream})"
+            );
+            assert_eq!(
+                json["frequency_penalty"], 0.5,
+                "frequency_penalty rides the wire with the configured value (stream={stream})"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_completion_knobs_default_none_and_later_call_wins() {
+        let unbuilt = OpenAiClientBuilder::default();
+        assert!(
+            unbuilt.max_tokens.is_none()
+                && unbuilt.presence_penalty.is_none()
+                && unbuilt.frequency_penalty.is_none(),
+            "an untouched builder carries no completion or sampling knobs"
+        );
+        let client = OpenAiClientBuilder::default()
+            .with_api_key("sk-test")
+            .with_model("gpt-4o")
+            .with_max_tokens(32_768)
+            .with_max_tokens(8_192)
+            .with_presence_penalty(1.5_f32)
+            .with_frequency_penalty(0.25_f32)
+            .build()
+            .expect("a keyed builder builds");
+        assert_eq!(
+            client.max_tokens,
+            Some(8_192),
+            "the later with_max_tokens call wins, matching the family's builder convention"
+        );
+        assert_eq!(client.presence_penalty, Some(1.5_f32));
+        assert_eq!(client.frequency_penalty, Some(0.25_f32));
+    }
+
+    #[test]
+    fn builder_rejects_non_finite_sampling_knobs() {
+        // A NaN or infinite penalty serializes as JSON null — a silent
+        // omission on the wire — so the builder refuses the value up
+        // front rather than dropping the knob the host asked for.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let presence = OpenAiClientBuilder::default()
+                .with_api_key("sk-test")
+                .with_presence_penalty(bad)
+                .build();
+            assert!(
+                presence.is_err(),
+                "a non-finite presence_penalty ({bad}) must fail the build"
+            );
+            let frequency = OpenAiClientBuilder::default()
+                .with_api_key("sk-test")
+                .with_frequency_penalty(bad)
+                .build();
+            assert!(
+                frequency.is_err(),
+                "a non-finite frequency_penalty ({bad}) must fail the build"
+            );
+        }
+        let finite = OpenAiClientBuilder::default()
+            .with_api_key("sk-test")
+            .with_presence_penalty(-2.0_f32)
+            .with_frequency_penalty(2.0_f32)
+            .build();
+        assert!(
+            finite.is_ok(),
+            "finite values at the documented range edges build fine"
+        );
+    }
+
+    #[test]
     #[cfg(feature = "ollama")]
     fn ollama_constructor_disables_stream_usage() {
         let client = crate::provider::ollama("test-model").unwrap();
@@ -2993,6 +3565,372 @@ mod tests {
         let delta = delta.expect("MessageDelta from finish");
         assert_eq!(delta.delta.stop_reason.as_deref(), Some("end_turn"));
         assert!(delta.usage.is_none());
+    }
+
+    /// Feed raw SSE chunk fixtures through the emitter and build the message.
+    ///
+    /// The think-boundary classification tests replay chunk sequences the
+    /// way the stream loop delivers them — parse, process, drain per chunk
+    /// — and observe exactly the [`Message`] a consumer's accumulator
+    /// would build, so the assertions speak in stored parts, not events.
+    fn message_from_reasoning_chunks(chunks: &[&str]) -> Message {
+        let mut emitter = StreamEmitter::default();
+        let mut events = Vec::new();
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).expect("fixture chunk parses");
+            emitter.process_chunk(&chunk);
+            events.extend(emitter.drain());
+        }
+        emitter.mark_done();
+        events.extend(emitter.finish().expect("a clean fixture finishes"));
+        let mut accumulator = crate::stream::StreamAccumulator::new();
+        for event in events {
+            accumulator
+                .process(&event)
+                .expect("fixture event accumulates");
+        }
+        accumulator.build()
+    }
+
+    /// A reasoning-delta chunk fixture carrying `fragment`.
+    fn reasoning_chunk(fragment: &str) -> String {
+        format!(
+            r#"{{"id":"c1","model":"gpt-4o","choices":[{{"delta":{{"reasoning_content":{fragment}}},"finish_reason":null}}]}}"#,
+            fragment = serde_json::json!(fragment)
+        )
+    }
+
+    #[test]
+    fn stream_same_delta_reasoning_close_orders_thinking_before_content() {
+        // One delta carrying both lanes: the reasoning fragment ends
+        // with the close tag and the delta also carries content. The
+        // reasoning boundary processes first, so the pre-boundary
+        // thinking emits before the content — the streamed order the
+        // non-streaming assembly always produced.
+        let both_lanes = format!(
+            r#"{{"id":"c1","model":"gpt-4o","choices":[{{"delta":{{"reasoning_content":{},"content":" world"}},"finish_reason":null}}]}}"#,
+            serde_json::json!("plan</think>Hello")
+        );
+        let message = message_from_reasoning_chunks(&[&both_lanes]);
+        let lanes: Vec<&str> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } | MessagePart::Text { text } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lanes,
+            vec!["plan", "Hello world"],
+            "the thinking lane precedes the content a shared delta carries"
+        );
+    }
+
+    #[test]
+    fn stream_held_reasoning_flushes_before_tool_lanes_keep_wire_order() {
+        // The held-back suffix of an unresolved tag prefix must leave
+        // the thinking lane while that lane is still open — before any
+        // tool PartStart — or the finish-time flush would re-open
+        // thinking at an index a parallel tool call already holds and
+        // the index-named PartStop would close the tool slot instead.
+        // One thinking part carrying the whole reasoning text, and the
+        // tool calls in their wire order, is the assembled shape.
+        let message = message_from_reasoning_chunks(&[
+            &reasoning_chunk("abc"),
+            &reasoning_chunk("</thi"),
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"first","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"second","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let thinking: Vec<String> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec!["abc</thi".to_string()],
+            "the held suffix joins the open thinking part, never a second one"
+        );
+        let calls: Vec<String> = message
+            .tool_call_parts()
+            .into_iter()
+            .map(|(_id, tool, _input)| tool.to_string())
+            .collect();
+        assert_eq!(
+            calls,
+            vec!["first".to_string(), "second".to_string()],
+            "parallel tool calls keep their wire order, unharmed by the flush"
+        );
+    }
+
+    #[test]
+    fn stream_held_reasoning_after_an_open_tool_call_keeps_the_call_intact() {
+        // A held suffix can outlive a tool start: the reasoning fragment
+        // arrives without tool_calls, so no lane closure runs and the tool
+        // slot at the thinking index stays open. The flush must then defer
+        // past that slot — closing it at flush time would end the call
+        // before its remaining arguments arrive and orphan them — and the
+        // finish-time flush behind the tool stops is where it lands. The
+        // call parses from its complete arguments, and the suffix joins the
+        // thinking lane once the slot is gone.
+        let message = message_from_reasoning_chunks(&[
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_a","function":{"name":"run","arguments":"{\"a\""}}]},"finish_reason":null}]}"#,
+            &reasoning_chunk("abc</thi"),
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":": 1}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let calls: Vec<(String, Value)> = message
+            .tool_call_parts()
+            .into_iter()
+            .map(|(_id, tool, input)| (tool.to_string(), input.clone()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![("run".to_string(), serde_json::json!({"a": 1})),],
+            "the deferred flush leaves the open tool call whole — its arguments parse"
+        );
+        let thinking: Vec<String> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec!["abc</thi".to_string()],
+            "the held suffix still reaches the thinking lane once the tool slot is closed"
+        );
+    }
+
+    #[test]
+    fn stream_held_suffix_with_a_complete_tag_releases_as_content_and_stops() {
+        // A suffix held past an open tool call can carry the COMPLETE
+        // boundary: the finish-time flush resolves it — prefix thinking,
+        // suffix content — and both lanes must close, or the text suffix
+        // never receives a PartStop and the accumulator drops the still-
+        // open part when the message builds.
+        let message = message_from_reasoning_chunks(&[
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_a","function":{"name":"run","arguments":"{\"a\": 1}"}}]},"finish_reason":null}]}"#,
+            &reasoning_chunk("abc</think>visible tail"),
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let calls: Vec<(String, Value)> = message
+            .tool_call_parts()
+            .into_iter()
+            .map(|(_id, tool, input)| (tool.to_string(), input.clone()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![("run".to_string(), serde_json::json!({"a": 1})),],
+            "the deferred flush leaves the open tool call whole"
+        );
+        let thinking: Vec<String> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec!["abc".to_string()],
+            "the pre-tag bytes stay thinking when the held bytes resolve the boundary"
+        );
+        assert_eq!(
+            message.text_content(),
+            "visible tail",
+            "the post-tag suffix keeps its lane open through to a PartStop and lands as content"
+        );
+    }
+
+    #[test]
+    fn stream_leading_think_close_stores_content_not_thinking() {
+        let stanza = "<tool_call><function=Bash><parameter=command>true\n</parameter></function></tool_call>";
+        let message = message_from_reasoning_chunks(&[
+            &reasoning_chunk("</think>"),
+            &reasoning_chunk("here is the real answer. "),
+            &reasoning_chunk(stanza),
+            &reasoning_chunk(stanza),
+        ]);
+        assert!(
+            !message
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Thinking { .. })),
+            "a generation whose first tokens are the close tag stores no thinking part: {:?}",
+            message.parts
+        );
+        let text = message.text_content();
+        assert_eq!(
+            text,
+            format!("here is the real answer. {stanza}{stanza}"),
+            "everything after the leading close tag is content, malformed stanzas included"
+        );
+    }
+
+    #[test]
+    fn stream_think_close_after_thinking_splits_lanes() {
+        let message = message_from_reasoning_chunks(&[
+            &reasoning_chunk("plan the answer first"),
+            &reasoning_chunk("</think>"),
+            &reasoning_chunk("the answer"),
+        ]);
+        let thinking = message
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                MessagePart::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a close tag after thinking text closes a real thinking part");
+        assert_eq!(
+            thinking, "plan the answer first",
+            "the thinking part holds exactly the pre-close text"
+        );
+        assert_eq!(
+            message.text_content(),
+            "the answer",
+            "the post-close text is content"
+        );
+    }
+
+    #[test]
+    fn stream_reasoning_without_close_tag_stays_thinking() {
+        let message =
+            message_from_reasoning_chunks(&[&reasoning_chunk("just musing, no boundary")]);
+        assert_eq!(
+            message.parts.len(),
+            1,
+            "a close-tag-free reasoning stream is one part"
+        );
+        assert!(matches!(
+            message.parts.first(),
+            Some(MessagePart::Thinking { text, .. }) if text == "just musing, no boundary"
+        ));
+    }
+
+    #[test]
+    fn stream_second_close_tag_is_inert_text() {
+        let message = message_from_reasoning_chunks(&[
+            &reasoning_chunk("a"),
+            &reasoning_chunk("</think>"),
+            &reasoning_chunk("b</think>c"),
+        ]);
+        assert!(matches!(
+            message.parts.first(),
+            Some(MessagePart::Thinking { text, .. }) if text == "a"
+        ));
+        assert_eq!(
+            message.text_content(),
+            "b</think>c",
+            "an unmatched second close tag in content stays literal text"
+        );
+    }
+
+    #[test]
+    fn stream_close_tag_split_across_deltas_splits_lanes() {
+        let message = message_from_reasoning_chunks(&[
+            &reasoning_chunk("pre"),
+            &reasoning_chunk("</th"),
+            &reasoning_chunk("ink>"),
+            &reasoning_chunk("post"),
+        ]);
+        assert!(matches!(
+            message.parts.first(),
+            Some(MessagePart::Thinking { text, .. }) if text == "pre"
+        ));
+        assert_eq!(
+            message.text_content(),
+            "post",
+            "a close tag split across deltas still acts as the boundary"
+        );
+    }
+
+    #[test]
+    fn non_stream_leading_think_close_stores_content_not_thinking() {
+        let stanza = "<tool_call><function=Bash><parameter=command>true\n</parameter></function></tool_call>";
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": format!("</think>the real answer.{stanza}"),
+                    "content": null
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).expect("fixture response builds");
+        assert!(
+            !response
+                .message
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Thinking { .. })),
+            "a leading close tag in non-stream reasoning stores no thinking part"
+        );
+        assert_eq!(
+            response.message.text_content(),
+            format!("the real answer.{stanza}"),
+            "the post-tag reasoning text is the visible content"
+        );
+    }
+
+    #[test]
+    fn non_stream_think_close_splits_reasoning_and_merges_content() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "think a bit</think>the answer",
+                    "content": " plus more"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).expect("fixture response builds");
+        assert!(matches!(
+            response.message.parts.first(),
+            Some(MessagePart::Thinking { text, .. }) if text == "think a bit"
+        ));
+        assert_eq!(
+            response.message.text_content(),
+            "the answer plus more",
+            "post-tag reasoning merges ahead of the content field"
+        );
+    }
+
+    #[test]
+    fn non_stream_second_close_tag_is_inert_text() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "a</think>b</think>c",
+                    "content": null
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).expect("fixture response builds");
+        assert!(matches!(
+            response.message.parts.first(),
+            Some(MessagePart::Thinking { text, .. }) if text == "a"
+        ));
+        assert_eq!(
+            response.message.text_content(),
+            "b</think>c",
+            "only the first close tag is a boundary"
+        );
     }
 
     #[test]
@@ -5138,10 +6076,12 @@ mod tests {
     #[test]
     fn openai_combined_content_and_reasoning_in_one_delta() {
         // A single delta object can carry both content and reasoning_content.
-        // process_delta handles content first (closing thinking if open), then
-        // reasoning (closing text if open). Lock in the expected sequence:
-        // PartStart(text) → TextDelta → PartStop → PartStart(thinking) →
-        // ThinkingDelta.
+        // The reasoning lane processes first — a close tag inside the same
+        // delta must emit its thinking before any content the delta also
+        // carries, matching the non-streaming assembly — then the content
+        // opens the text lane. Lock in the expected sequence:
+        // PartStart(thinking) → ThinkingDelta → PartStop → PartStart(text) →
+        // TextDelta.
         let mut em = StreamEmitter::default();
         let chunk = OpenAiChunk::parse(
             r#"{"id":"c1","model":"o1","choices":[{"delta":{"content":"answer","reasoning_content":"why"},"finish_reason":null}]}"#,
@@ -5165,15 +6105,15 @@ mod tests {
         assert!(has_text, "text delta must fire");
         assert!(has_thinking, "thinking delta must fire");
 
-        // The reasoning lane opens after the text lane, so the text lane must
-        // be closed with exactly one PartStop between them.
+        // The text lane opens after the reasoning lane, so the reasoning
+        // lane must be closed with exactly one PartStop between them.
         let stops = events
             .iter()
             .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
-        assert_eq!(stops, 1, "exactly one PartStop for the text lane");
+        assert_eq!(stops, 1, "exactly one PartStop for the reasoning lane");
 
-        // Ordering: TextDelta → PartStop → ThinkingDelta.
+        // Ordering: ThinkingDelta → PartStop → TextDelta.
         let text_idx = events
             .iter()
             .position(|e| {
@@ -5196,8 +6136,14 @@ mod tests {
                 )
             })
             .expect("thinking delta present");
-        assert!(text_idx < stop_idx, "text delta before PartStop");
-        assert!(stop_idx < thinking_idx, "PartStop before thinking delta");
+        assert!(
+            thinking_idx < stop_idx,
+            "thinking delta before the PartStop that closes its lane"
+        );
+        assert!(
+            stop_idx < text_idx,
+            "PartStop before the text delta of the same shared chunk"
+        );
     }
 
     #[test]

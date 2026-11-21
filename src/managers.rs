@@ -82,6 +82,7 @@ use crate::observer::{ConvergenceDetectedContext, LoopDetectedContext};
 use crate::observer::{LoopObserver, ObserverHost};
 #[cfg(feature = "streaming")]
 use crate::stream::handler::StreamHandler;
+use crate::stream::repetition::RepetitionGuardConfig;
 #[cfg(feature = "tool_health")]
 use crate::tool::health::ToolHealthRegistry;
 
@@ -188,6 +189,32 @@ pub struct LoopManagers {
     #[cfg(feature = "streaming")]
     stream_handler: Option<StreamHandler>,
 
+    /// The streaming paths' handler when none was installed.
+    ///
+    /// Manager-owned, so the guard knobs the bundle carries govern
+    /// the fallback too: a host that disarms or retunes
+    /// [`with_repetition_guard`](Self::with_repetition_guard) without
+    /// ever installing a handler still gets its configuration on the
+    /// streaming path, instead of the shared armed default a
+    /// handler-less loop would otherwise borrow. Never handed out
+    /// mutably, and never the shared
+    /// [`passthrough_default`](StreamHandler::passthrough_default) —
+    /// that static stays exactly what it always was.
+    #[cfg(feature = "streaming")]
+    stream_fallback: StreamHandler,
+
+    /// The repetition guard's configuration.
+    ///
+    /// The knobs the engine's non-streaming turn guard reads — armed
+    /// with conservative defaults, adopted from an installed
+    /// [`StreamHandler`] at
+    /// install time, or set directly through
+    /// [`with_repetition_guard`](Self::with_repetition_guard). Always
+    /// compiled: the guard it configures covers the crate's default
+    /// no-features build, where `TurnMode::NonStreaming` is the only
+    /// turn path.
+    repetition_guard: crate::stream::repetition::RepetitionGuardConfig,
+
     /// Optional hook executor for bidirectional lifecycle interception.
     ///
     /// When set, hooks can inspect and approve or reject actions before they
@@ -282,6 +309,9 @@ impl LoopManagers {
             context_manager: None,
             #[cfg(feature = "streaming")]
             stream_handler: None,
+            #[cfg(feature = "streaming")]
+            stream_fallback: StreamHandler::passthrough(),
+            repetition_guard: crate::stream::repetition::RepetitionGuardConfig::default(),
             #[cfg(feature = "hooks")]
             hook_executor: None,
             #[cfg(feature = "tool_health")]
@@ -392,6 +422,12 @@ impl LoopManagers {
 
     /// Set the stream handler for resilient streaming (builder-style).
     ///
+    /// Installing a handler also adopts its repetition-guard
+    /// configuration as the managers' own — the engine's
+    /// non-streaming turn guard reads the same knobs the handler's
+    /// streaming abort enforces, so one configuration governs both
+    /// turn paths of a run.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -402,8 +438,64 @@ impl LoopManagers {
     #[must_use]
     #[cfg(feature = "streaming")]
     pub fn with_stream_handler(mut self, handler: StreamHandler) -> Self {
-        self.stream_handler = Some(handler);
+        self.set_stream_handler(handler);
         self
+    }
+
+    /// Set the repetition guard's configuration (builder-style).
+    ///
+    /// The engine's always-compiled share of the guard: the
+    /// non-streaming turn path runs the detector over a completed
+    /// response before it is recorded, reading these knobs. The
+    /// streaming paths enforce the same guard inside the installed
+    /// [`StreamHandler`], whose
+    /// configuration this managers bundle adopts at install time;
+    /// setting these knobs after a handler is installed restamps the
+    /// handler's copy too, so the last write governs both turn paths
+    /// whatever the builder order. Build without a handler and the
+    /// knobs still govern the streaming path: the bundle's own
+    /// passthrough-shaped fallback handler — the one
+    /// [`stream_handler`](crate::capabilities::StreamCapable::stream_handler)
+    /// serves — is restamped by every call, so a disarmed or retuned
+    /// bundle never streams under the shared armed default.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::managers::LoopManagers;
+    /// use loopctl::stream::repetition::RepetitionGuardConfig;
+    ///
+    /// let managers = LoopManagers::new().with_repetition_guard(
+    ///     RepetitionGuardConfig {
+    ///         enabled: false,
+    ///         ..RepetitionGuardConfig::default()
+    ///     },
+    /// );
+    /// assert!(!managers.repetition_guard().enabled);
+    /// ```
+    #[must_use]
+    pub fn with_repetition_guard(mut self, config: RepetitionGuardConfig) -> Self {
+        #[cfg(feature = "streaming")]
+        {
+            if let Some(handler) = self.stream_handler.as_mut() {
+                handler.set_repetition_guard(config.clone());
+            }
+            self.stream_fallback.set_repetition_guard(config.clone());
+        }
+        self.repetition_guard = config;
+        self
+    }
+
+    /// The repetition guard's configuration.
+    ///
+    /// The effective knobs for the engine's non-streaming turn guard —
+    /// the handler's own configuration when one was installed (adopted
+    /// at install time), otherwise whatever
+    /// [`with_repetition_guard`](Self::with_repetition_guard) set,
+    /// otherwise the armed conservative default.
+    #[must_use]
+    pub fn repetition_guard(&self) -> &RepetitionGuardConfig {
+        &self.repetition_guard
     }
 
     /// Set the hook executor for bidirectional lifecycle interception (builder-style).
@@ -470,8 +562,12 @@ impl LoopManagers {
     /// Set the stream handler for resilient streaming.
     ///
     /// Non-consuming variant of [`with_stream_handler`](Self::with_stream_handler).
+    /// Adopts the handler's repetition guard configuration into the
+    /// bundle, exactly as the consuming variant does, so both
+    /// installation APIs leave the same state behind.
     #[cfg(feature = "streaming")]
     pub fn set_stream_handler(&mut self, handler: StreamHandler) {
+        self.repetition_guard = handler.repetition_config().clone();
         self.stream_handler = Some(handler);
     }
 
@@ -863,7 +959,7 @@ impl crate::capabilities::StreamCapable for LoopManagers {
     fn stream_handler(&self) -> &StreamHandler {
         self.stream_handler
             .as_ref()
-            .unwrap_or(StreamHandler::passthrough_default())
+            .unwrap_or(&self.stream_fallback)
     }
 }
 
@@ -1278,4 +1374,66 @@ mod tests {
         accepts_pipeline(&managers);
         accepts_multi_bound(&managers);
     }
+}
+
+#[cfg(feature = "streaming")]
+#[test]
+fn the_fallback_stream_handler_carries_the_managers_guard() {
+    // A handler-less bundle still serves its streaming turns
+    // through a handler — the manager-owned fallback — and that
+    // fallback reads the knobs the bundle carries, not the shared
+    // armed default a bare passthrough would impose.
+    let disarmed = LoopManagers::new().with_repetition_guard(
+        crate::stream::repetition::RepetitionGuardConfig {
+            enabled: false,
+            ..crate::stream::repetition::RepetitionGuardConfig::default()
+        },
+    );
+    assert!(
+        !disarmed.stream_handler().repetition_config().enabled,
+        "a disarmed manager governs its handler-less streaming path"
+    );
+    let retuned = LoopManagers::new().with_repetition_guard(
+        crate::stream::repetition::RepetitionGuardConfig {
+            min_repeats: 9,
+            ..crate::stream::repetition::RepetitionGuardConfig::default()
+        },
+    );
+    assert_eq!(
+        retuned.stream_handler().repetition_config().min_repeats,
+        9,
+        "a retuned manager governs its handler-less streaming path"
+    );
+    assert!(
+        crate::stream::handler::StreamHandler::passthrough_default()
+            .repetition_config()
+            .enabled,
+        "the shared passthrough default stays armed and untouched"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[test]
+fn set_stream_handler_adopts_the_handler_s_repetition_guard() {
+    // Both installation APIs leave the same state behind: the
+    // handler's own guard configuration becomes the bundle's.
+    let mut managers = LoopManagers::new();
+    managers.set_stream_handler(
+        crate::stream::handler::StreamHandler::new().with_repetition_guard(
+            crate::stream::repetition::RepetitionGuardConfig {
+                enabled: false,
+                ..crate::stream::repetition::RepetitionGuardConfig::default()
+            },
+        ),
+    );
+    assert!(
+        !managers.repetition_guard().enabled,
+        "the non-consuming install adopts the handler's knobs, as the builder does"
+    );
+    assert!(
+        !crate::capabilities::StreamCapable::stream_handler(&managers)
+            .repetition_config()
+            .enabled,
+        "the installed handler itself still carries its configuration"
+    );
 }

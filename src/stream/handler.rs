@@ -412,25 +412,28 @@ pub struct RateLimitConfig {
     /// Whether to honour a 429/503 `Retry-After` value when the server
     /// provides one.
     ///
-    /// When `true` (the default), [`backoff`](Self::backoff) returns the
-    /// server-advised delay (capped at [`max_delay`](Self::max_delay)). When
-    /// `false`, the server's hint is ignored and
-    /// [`default_delay`](Self::default_delay) is always used.
+    /// When `true` (the default), the rate-limit ladder answers the
+    /// server-advised delay, capped at [`max_delay`](Self::max_delay) —
+    /// [`progressive_backoff`](Self::progressive_backoff) honours a hint
+    /// exactly on every attempt. When `false`, the hint is discarded and the
+    /// ladder runs off [`default_delay`](Self::default_delay) instead.
     pub respect_retry_after: bool,
 
-    /// Backoff used when the server gives no `Retry-After`.
+    /// Floor of the backoff when the server gives no `Retry-After`.
     ///
-    /// Also used unconditionally when
-    /// [`respect_retry_after`](Self::respect_retry_after) is `false`. Defaults
-    /// to 5s — long enough to let a transient burst clear, short enough that a
-    /// missing header doesn't stall the agent.
+    /// The first hintless hit sleeps exactly this long and each consecutive one
+    /// doubles it up to [`max_delay`](Self::max_delay); the same ramp runs off
+    /// this floor when [`respect_retry_after`](Self::respect_retry_after)
+    /// discards the server's hint. Defaults to 5s — long enough to let a
+    /// transient burst clear, short enough that a missing header doesn't stall
+    /// the agent.
     pub default_delay: Duration,
 
     /// Upper bound on any single rate-limit backoff.
     ///
-    /// Caps both the server's `Retry-After` (when honoured) and
-    /// [`default_delay`](Self::default_delay) so a misbehaving provider cannot
-    /// stall the agent indefinitely.
+    /// Caps the server's `Retry-After` (when honoured) and every rung of the
+    /// hintless ramp grown from [`default_delay`](Self::default_delay), so a
+    /// misbehaving provider cannot stall the agent indefinitely.
     pub max_delay: Duration,
 
     /// Advisory per-minute request ceiling for proactive throttling (0 = unset).
@@ -473,6 +476,17 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// The largest number of doublings [`RateLimitConfig::progressive_backoff`] applies.
+///
+/// Bounds the shift behind the hintless ramp so an unbounded attempt count
+/// yields a finite delay instead of overflowing the doubling factor: past this
+/// many doublings the ramp stops growing and plateaus at
+/// `default_delay * 2^20`. The plateau is reachable only by a floor/ceiling
+/// span wider than 2^20 — a microsecond floor under an hour ceiling plateaus
+/// near a second, short of its own ceiling — while any span the defaults
+/// describe hits `max_delay` first and never reaches this bound.
+const MAX_RATE_LIMIT_BACKOFF_DOUBLINGS: u32 = 20;
+
 impl RateLimitConfig {
     /// Validate the policy.
     ///
@@ -512,6 +526,12 @@ impl RateLimitConfig {
 
     /// Effective backoff for a detected rate limit given an optional server hint.
     ///
+    /// The flat rule — honour the hint, otherwise sleep the floor. The
+    /// rate-limit ladder does **not** call this: it ramps through
+    /// [`progressive_backoff`](Self::progressive_backoff). This stays the
+    /// answer for a caller outside the ladder that wants one delay for one
+    /// detection.
+    ///
     /// - If `server_hint` is `Some(d)` and `respect_retry_after` is `true`,
     ///   returns `min(d, max_delay)`.
     /// - Otherwise returns `min(default_delay, max_delay)`.
@@ -531,6 +551,54 @@ impl RateLimitConfig {
             _ => self.default_delay.min(self.max_delay),
         }
     }
+
+    /// Progressive backoff for the `attempts`-th consecutive rate-limit hit.
+    ///
+    /// A `Some(hint)` under [`respect_retry_after`](Self::respect_retry_after)
+    /// is honoured exactly — `min(hint, max_delay)` on every attempt, because a
+    /// server that says "wait 12 s" means 12 s however often it repeats itself.
+    /// A `None` hint (no parseable `Retry-After`, the shape of a quota error
+    /// carried in the response body) doubles the floor per attempt:
+    /// `min(default_delay * 2^(attempts - 1), max_delay)`. The ceiling clamps
+    /// the growth, and past the cap of 20 doublings (a factor of 2^20) the ramp
+    /// stops growing outright, so an unbounded attempt count stays finite — a
+    /// floor tiny relative to its ceiling therefore plateaus below the ceiling
+    /// rather than overflowing it.
+    ///
+    /// The ramp exists because a flat floor re-contacts the endpoint on the
+    /// very cadence that was just throttled. Quota windows run minutes, a fixed
+    /// five-second ladder never outlasts one, so every rung draws the same 429
+    /// and the turn escalates long before the window could reset.
+    /// [`backoff`](Self::backoff) stays the flat sibling — the right answer for
+    /// a caller outside the retry ladder, never for the ladder itself.
+    ///
+    /// ```
+    /// use loopctl::stream::handler::RateLimitConfig;
+    /// use std::time::Duration;
+    ///
+    /// let cfg = RateLimitConfig::default(); // 5 s floor, 60 s ceiling
+    /// assert_eq!(cfg.progressive_backoff(1, None), Duration::from_secs(5));
+    /// assert_eq!(cfg.progressive_backoff(2, None), Duration::from_secs(10));
+    /// assert_eq!(cfg.progressive_backoff(3, None), Duration::from_secs(20));
+    /// assert_eq!(cfg.progressive_backoff(10, None), Duration::from_secs(60));
+    /// assert_eq!(
+    ///     cfg.progressive_backoff(3, Some(Duration::from_secs(12))),
+    ///     Duration::from_secs(12)
+    /// );
+    /// ```
+    #[must_use]
+    pub fn progressive_backoff(&self, attempts: u32, server_hint: Option<Duration>) -> Duration {
+        if let Some(hint) = server_hint.filter(|_| self.respect_retry_after) {
+            return hint.min(self.max_delay);
+        }
+        let doublings = attempts
+            .saturating_sub(1)
+            .min(MAX_RATE_LIMIT_BACKOFF_DOUBLINGS);
+        let factor = 1_u32.checked_shl(doublings).unwrap_or(u32::MAX);
+        self.default_delay
+            .saturating_mul(factor)
+            .min(self.max_delay)
+    }
 }
 
 /// Which kind of rate-limit / overload response was detected.
@@ -545,8 +613,9 @@ pub enum RateLimitKind {
     ///
     /// The canonical rate-limit signal: the caller has exceeded a per-account
     /// or per-key quota. The server typically sends a `Retry-After` hint;
-    /// [`backoff`](RateLimitConfig::backoff) honours it when
-    /// [`respect_retry_after`](RateLimitConfig::respect_retry_after) is set.
+    /// [`progressive_backoff`](RateLimitConfig::progressive_backoff) honours it
+    /// when [`respect_retry_after`](RateLimitConfig::respect_retry_after) is
+    /// set.
     RateLimited,
 
     /// HTTP 503 Service Unavailable / 529 Overloaded.
@@ -706,9 +775,9 @@ enum RateLimitRetry {
         /// The raw `Retry-After` from [`DetectedRateLimit`] (`None` if the
         /// header was absent). Carried unmodified — clamping to
         /// [`max_delay`](RateLimitConfig::max_delay) happens in
-        /// [`backoff`](RateLimitConfig::backoff) on the retry path, not here.
-        /// Preserved so the escalation consumer can log or forward the
-        /// provider's hint.
+        /// [`progressive_backoff`](RateLimitConfig::progressive_backoff) on the
+        /// retry path, not here. Preserved so the escalation consumer can log
+        /// or forward the provider's hint.
         retry_after: Option<Duration>,
     },
 
@@ -732,10 +801,11 @@ enum RateLimitRetry {
     /// Returned while the retry count is below both
     /// [`fallback_after_retries`](RateLimitConfig::fallback_after_retries) and
     /// [`max_retries`](RateLimitConfig::max_retries). The delay is the
-    /// [`backoff`](RateLimitConfig::backoff) for the detected response,
-    /// further clamped to the remaining time before the turn's
-    /// `total_stream_timeout` deadline so a large `Retry-After` cannot overrun
-    /// the turn budget.
+    /// [`progressive_backoff`](RateLimitConfig::progressive_backoff) for this
+    /// attempt — a server hint honoured exactly, a hintless hit doubling the
+    /// floor of the one before it — further clamped to the remaining time
+    /// before the turn's `total_stream_timeout` deadline so a large
+    /// `Retry-After` cannot overrun the turn budget.
     Retry(Duration),
 }
 
@@ -2423,6 +2493,10 @@ impl StreamHandler {
     ///   but is still within `max_retries` — the caller escalates to the
     ///   model circuit breaker;
     /// - [`RateLimitRetry::Retry`] with the deadline-clamped backoff otherwise.
+    ///   A hintless retry ramps geometrically from
+    ///   [`default_delay`](RateLimitConfig::default_delay) across the ladder
+    ///   (see [`RateLimitConfig::progressive_backoff`]); a server hint is
+    ///   honoured exactly on every attempt.
     ///
     /// `max_retries` is checked first so it is always enforced as the hard
     /// ceiling, regardless of `fallback_after_retries`.
@@ -2442,8 +2516,11 @@ impl StreamHandler {
                 retry_after: detail.retry_after,
             };
         }
-        let delay =
-            clamp_delay_to_deadline(self.rate_limit_config.backoff(detail.retry_after), deadline);
+        let delay = clamp_delay_to_deadline(
+            self.rate_limit_config
+                .progressive_backoff(*count, detail.retry_after),
+            deadline,
+        );
         RateLimitRetry::Retry(delay)
     }
 
@@ -5275,6 +5352,101 @@ mod tests {
         assert_eq!(
             cfg.backoff(Some(Duration::from_secs(9_999_999))),
             Duration::from_mins(1)
+        );
+    }
+
+    #[test]
+    fn hintless_progressive_backoff_doubles_per_attempt() {
+        let cfg = RateLimitConfig::default();
+        for (attempt, expected_secs) in [(1, 5), (2, 10), (3, 20), (4, 40)] {
+            assert_eq!(
+                cfg.progressive_backoff(attempt, None),
+                Duration::from_secs(expected_secs),
+                "attempt {attempt}: each hintless hit doubles the sleep of the one before it"
+            );
+        }
+    }
+
+    #[test]
+    fn hintless_progressive_backoff_clamps_at_max_delay() {
+        let cfg = RateLimitConfig::default();
+        assert_eq!(cfg.progressive_backoff(5, None), Duration::from_secs(60));
+        assert_eq!(
+            cfg.progressive_backoff(u32::MAX, None),
+            Duration::from_mins(1),
+            "an absurd attempt count saturates at the ceiling instead of overflowing"
+        );
+    }
+
+    #[test]
+    fn hintless_progressive_backoff_plateaus_below_the_ceiling_for_a_tiny_floor() {
+        let cfg = RateLimitConfig {
+            default_delay: Duration::from_micros(1),
+            max_delay: Duration::from_hours(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.progressive_backoff(20, None),
+            Duration::from_micros(524_288),
+            "the twentieth hit still doubles, one step short of the doublings cap"
+        );
+        assert_eq!(
+            cfg.progressive_backoff(u32::MAX, None),
+            Duration::from_micros(1_048_576),
+            "past the doublings cap the ramp holds flat at floor * 2^20 — a floor \
+             too tiny to span its ceiling plateaus below it, finite rather than overflowing"
+        );
+    }
+
+    #[test]
+    fn server_hint_outranks_the_hintless_ramp() {
+        let cfg = RateLimitConfig::default();
+        for attempt in 1..=6 {
+            assert_eq!(
+                cfg.progressive_backoff(attempt, Some(Duration::from_secs(12))),
+                Duration::from_secs(12),
+                "attempt {attempt}: the server's word is the delay, ramped or not"
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_backoff_ramps_when_retry_after_is_not_respected() {
+        let cfg = RateLimitConfig {
+            respect_retry_after: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.progressive_backoff(2, Some(Duration::from_secs(12))),
+            Duration::from_secs(10),
+            "a discarded hint leaves the ramp to run off the floor"
+        );
+    }
+
+    #[test]
+    fn rate_limit_retry_ramps_the_hintless_ladder() {
+        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
+            default_delay: Duration::from_millis(100),
+            max_delay: Duration::from_mins(1),
+            ..Default::default()
+        });
+        let mut count = 0u32;
+        let detail = detected_limit(None);
+        let mut delays = Vec::new();
+        for _ in 0..3 {
+            match handler.rate_limit_retry(&detail, &mut count, None) {
+                RateLimitRetry::Retry(delay) => delays.push(delay),
+                other => panic!("expected Retry, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+            ],
+            "each hintless rung must sleep twice the one before it"
         );
     }
 

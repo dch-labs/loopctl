@@ -755,7 +755,7 @@ impl PriceTable {
             .filter(|(prefix, _)| id.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len());
         match matched {
-            Some((prefix, price)) if falls_past_a_delisted_tier(&id, prefix) => None,
+            Some((prefix, _)) if falls_past_a_delisted_tier(&id, prefix) => None,
             _ => matched.map(|(prefix, price)| (prefix.as_str(), price)),
         }
     }

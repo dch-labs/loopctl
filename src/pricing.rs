@@ -1180,12 +1180,17 @@ const DELISTED_TIERS: [&str; 4] = [
 ///
 /// `true` when `id` extends one of [`DELISTED_TIERS`] but the matched
 /// key is shorter than that tier — the lookup skipped the tier on its
-/// way to an ancestor family. A key at or past the tier prices the tier
-/// itself and resolves normally.
+/// way to an ancestor family. The tier must end the id or sit before a
+/// dated-snapshot `-` or a variant `:`; a longer token that merely opens
+/// with the tier's letters (`mimo-v2.5-prototype`) is not the tier and
+/// inherits its family like any other unlisted variant. A key at or past
+/// the tier prices the tier itself and resolves normally.
 fn falls_past_a_delisted_tier(id: &str, matched: &str) -> bool {
-    DELISTED_TIERS
-        .iter()
-        .any(|tier| id.starts_with(tier) && tier.len() > matched.len())
+    DELISTED_TIERS.iter().any(|tier| {
+        id.strip_prefix(tier)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', ':']))
+            && tier.len() > matched.len()
+    })
 }
 
 /// Normalize a model id for family lookup.
@@ -1735,6 +1740,16 @@ mod tests {
             table.price("xiaomi/mimo-v2.5"),
             Some(base),
             "the vendor-prefixed twin still resolves"
+        );
+        assert_eq!(
+            table.price("mimo-v2.5-prototype"),
+            Some(base),
+            "a token that merely opens with the tier's letters is not the tier"
+        );
+        assert_eq!(
+            table.price("xiaomi/mimo-v2-5-production"),
+            Some(base),
+            "nor under the vendor-qualified dashed spelling"
         );
         let listed_pro = table
             .price("mimo-v2.6-pro")

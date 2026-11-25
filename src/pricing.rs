@@ -733,7 +733,10 @@ impl PriceTable {
     /// (`us.anthropic.`, `meta.`, …), so a dated or regionally spelled
     /// id inherits its family's rates. An id no row matches — a
     /// fine-tune, a private deployment, a model this table predates —
-    /// answers [`None`]: the honest default, never a nearest guess.
+    /// answers [`None`]: the honest default, never a nearest guess. A
+    /// tier the listing has delisted answers the same [`None`] rather
+    /// than inheriting its base family's rate, unless a row prices the
+    /// tier itself — an override's exact key included.
     #[must_use]
     pub fn price(&self, model: &str) -> Option<&ModelPrice> {
         self.row_for(model).map(|(_, price)| price)
@@ -746,11 +749,15 @@ impl PriceTable {
     /// on which row priced the report.
     fn row_for(&self, model: &str) -> Option<(&str, &ModelPrice)> {
         let id = normalize_model_id(model);
-        self.rows
+        let matched = self
+            .rows
             .iter()
             .filter(|(prefix, _)| id.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(prefix, price)| (prefix.as_str(), price))
+            .max_by_key(|(prefix, _)| prefix.len());
+        match matched {
+            Some((prefix, _)) if falls_past_a_delisted_tier(&id, prefix) => None,
+            _ => matched.map(|(prefix, price)| (prefix.as_str(), price)),
+        }
     }
 
     /// Whole days between `pricing_updated` and `as_of`, when both parse.
@@ -1146,6 +1153,44 @@ fn scale_rate(rate: f64, source: &str, field: &str) -> Result<u64, PriceTableErr
 fn rate_apply(tokens: u64, micro_per_mtok: u64) -> u64 {
     let scaled = tokens.saturating_mul(micro_per_mtok);
     scaled / 1_000_000
+}
+
+/// Delisted tiers that never inherit a shorter family's row by prefix.
+///
+/// The curated table is regenerated wholesale from the listing
+/// ([`PriceTable::from_openrouter`]), so when a listing drops a tier that
+/// carried its own row — Xiaomi's `mimo-v2.5-pro`, gone in the 2026-11-24
+/// refresh while `mimo-v2.5` stayed listed — nothing in the new data
+/// remembers the tier was a distinct product, and longest-prefix lookup
+/// would quietly price the Pro at the base model's rate: a wrong price,
+/// not the honest [`None`] an unknown model gets and the `cost_usd` line
+/// refuses on. These keys are that memory — a lookup falling through one
+/// of them to a shorter prefix answers `None`, while a row keyed at or
+/// under the tier (a `prices.d/` override, the documented seam for a
+/// still-served model) prices as before. Lowercase like every row key:
+/// the comparison runs on the [`normalize_model_id`] form.
+const DELISTED_TIERS: [&str; 4] = [
+    "mimo-v2-5-pro",
+    "mimo-v2.5-pro",
+    "xiaomi/mimo-v2-5-pro",
+    "xiaomi/mimo-v2.5-pro",
+];
+
+/// Whether a longest-prefix match fell through a delisted tier.
+///
+/// `true` when `id` extends one of [`DELISTED_TIERS`] but the matched
+/// key is shorter than that tier — the lookup skipped the tier on its
+/// way to an ancestor family. The tier must end the id or sit before a
+/// dated-snapshot `-` or a variant `:`; a longer token that merely opens
+/// with the tier's letters (`mimo-v2.5-prototype`) is not the tier and
+/// inherits its family like any other unlisted variant. A key at or past
+/// the tier prices the tier itself and resolves normally.
+fn falls_past_a_delisted_tier(id: &str, matched: &str) -> bool {
+    DELISTED_TIERS.iter().any(|tier| {
+        id.strip_prefix(tier)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', ':']))
+            && tier.len() > matched.len()
+    })
 }
 
 /// Normalize a model id for family lookup.
@@ -1650,6 +1695,99 @@ mod tests {
             table.cost("my-fine-tune-9000", usage).is_none(),
             "cost answers None rather than a nearest-neighbor guess"
         );
+    }
+
+    #[test]
+    fn a_delisted_tier_never_inherits_its_base_family_rate() {
+        let table = PriceTable::from_json(
+            r#"{ "table_version": "fixture", "pricing_updated": "2026-11-24",
+            "models": {
+              "mimo-v2.5": { "input_per_mtok": 0.4, "output_per_mtok": 2.0 },
+              "mimo-v2-5": { "input_per_mtok": 0.4, "output_per_mtok": 2.0 },
+              "xiaomi/mimo-v2.5": { "input_per_mtok": 0.4, "output_per_mtok": 2.0 },
+              "xiaomi/mimo-v2-5": { "input_per_mtok": 0.4, "output_per_mtok": 2.0 },
+              "mimo-v2.6-pro": { "input_per_mtok": 0.435, "output_per_mtok": 0.87 } } }"#,
+        )
+        .expect("valid fixture");
+        // The 2026-11-24 refresh dropped Xiaomi's mimo-v2.5-pro rows (last listed at
+        // 0.48 / 1.8) while the base family stayed; every spelling that would fall
+        // back to it must price None instead of the base rate.
+        for id in [
+            "mimo-v2.5-pro",
+            "mimo-v2-5-pro",
+            "xiaomi/mimo-v2.5-pro",
+            "xiaomi/mimo-v2-5-pro",
+            "Xiaomi/MiMo-V2.5-Pro",
+            "mimo-v2.5-pro-20261101",
+            "xiaomi/mimo-v2.5-pro:free",
+        ] {
+            assert!(
+                table.price(id).is_none(),
+                "{id} is a delisted tier, not a dated mimo-v2.5"
+            );
+            assert!(
+                table.cost(id, Usage::new(10, 10)).is_none(),
+                "{id} costs nothing rather than the base family's rate"
+            );
+        }
+        let base = table.price("mimo-v2.5").expect("the base family is priced");
+        assert_eq!(
+            table.price("mimo-v2.5-20261101"),
+            Some(base),
+            "a dated snapshot still inherits its family"
+        );
+        assert_eq!(
+            table.price("xiaomi/mimo-v2.5"),
+            Some(base),
+            "the vendor-prefixed twin still resolves"
+        );
+        assert_eq!(
+            table.price("mimo-v2.5-prototype"),
+            Some(base),
+            "a token that merely opens with the tier's letters is not the tier"
+        );
+        assert_eq!(
+            table.price("xiaomi/mimo-v2-5-production"),
+            Some(base),
+            "nor under the vendor-qualified dashed spelling"
+        );
+        let listed_pro = table
+            .price("mimo-v2.6-pro")
+            .expect("a tier the table still lists keeps its own row");
+        assert_eq!(listed_pro.input_micro_per_mtok, 435_000);
+
+        let override_json = r#"{ "table_version": "fix", "pricing_updated": "2026-11-25",
+            "models": { "mimo-v2.5-pro": { "input_per_mtok": 0.48, "output_per_mtok": 1.8 } } }"#;
+        let layered =
+            table.with_overrides(&PriceTable::from_json(override_json).expect("valid override"));
+        let priced = layered
+            .price("mimo-v2.5-pro")
+            .expect("an exact override row prices the delisted tier");
+        assert_eq!(
+            priced.input_micro_per_mtok, 480_000,
+            "the host's rate, never the base family's"
+        );
+        assert_eq!(
+            layered.price("mimo-v2.5-pro-20261101"),
+            Some(priced),
+            "and a snapshot of the tier inherits the host's row"
+        );
+    }
+
+    #[test]
+    fn the_seed_never_prices_the_delisted_mimo_pro_at_the_base_rate() {
+        let table = PriceTable::curated();
+        for id in [
+            "mimo-v2.5-pro",
+            "mimo-v2-5-pro",
+            "xiaomi/mimo-v2.5-pro",
+            "xiaomi/mimo-v2-5-pro",
+        ] {
+            assert!(
+                table.price(id).is_none(),
+                "{id} is gone from the listing — unpriced, not repriced at mimo-v2.5's rate"
+            );
+        }
     }
 
     #[test]

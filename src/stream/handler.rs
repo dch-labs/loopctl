@@ -1266,8 +1266,10 @@ pub enum StreamOutcome {
     ///
     /// One byte window of the decoded assistant text repeated verbatim
     /// for [`min_repeats`](crate::stream::repetition::RepetitionGuardConfig::min_repeats)
-    /// consecutive times — the shape of a model stuck in a repetition
-    /// attractor, decoding cheaply toward the provider's output cap.
+    /// consecutive times, or one character ran past
+    /// [`SINGLE_CHAR_RUNAWAY_BYTES`](crate::stream::repetition::SINGLE_CHAR_RUNAWAY_BYTES)
+    /// — the shape of a model stuck in a repetition attractor, decoding
+    /// cheaply toward the provider's output cap.
     /// The stream ends here with the partial text delivered so far
     /// (visible to the consumer through the per-delta observers and
     /// carried by the paired engine error); a retry is host policy,
@@ -1282,14 +1284,16 @@ pub enum StreamOutcome {
         /// The smallest qualifying period at detection time, in the
         /// same units
         /// [`min_period_bytes`](crate::stream::repetition::RepetitionGuardConfig::min_period_bytes)
-        /// configures.
+        /// configures; for a single-character runaway, the character's
+        /// UTF-8 length instead.
         period_bytes: usize,
 
         /// The consecutive verbatim copies that triggered the abort.
         ///
         /// The verdict threshold
         /// ([`min_repeats`](crate::stream::repetition::RepetitionGuardConfig::min_repeats)),
-        /// not a census of how far the loop ran.
+        /// not a census of how far the loop ran; for a single-character
+        /// runaway, the copies it took to reach the line.
         repeats: usize,
 
         /// Whether partial content was accumulated before the abort.
@@ -1437,7 +1441,8 @@ struct ScanVerdict {
 
     /// The detector's verdict over the rolling window after the append.
     ///
-    /// `Some` is the abort: the event completed a verbatim loop.
+    /// `Some` is the abort: the event completed a verbatim loop or a
+    /// single-character runaway.
     hit: Option<RepetitionHit>,
 }
 
@@ -1831,7 +1836,8 @@ impl StreamHandler {
     /// Set the repetition guard's configuration, consuming `self`.
     ///
     /// Stored as given. The default is armed with conservative bounds
-    /// (a 48-byte window repeated 4 consecutive times); see
+    /// (a 48-byte window repeated 4 consecutive times, or one character
+    /// run `4 KiB` long — a run of one character is never a loop); see
     /// [`RepetitionGuardConfig`] for the knobs and the workloads they
     /// serve. A config that fails its own
     /// [`validate`](RepetitionGuardConfig::validate) rules never fires —
@@ -4765,6 +4771,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_turn_passes_a_box_drawing_border_through() {
+        // A border of three-byte horizontals in eight-glyph deltas: the
+        // eighth delta completes 192 bytes — four minimum windows of
+        // identical text — which the byte rule alone reads as a loop; a
+        // border is a line, so every delta reaches the consumer.
+        let handler = StreamHandler::new();
+        let glyph_run = "\u{2500}".repeat(8);
+        let client = RepetitionStreamMock::stanza_repeats(&glyph_run, 32);
+        let cancel = Arc::new(CancelSignal::new());
+
+        let result = handler
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
+            .await
+            .expect("a box-drawing border is not a repetition loop");
+
+        assert_eq!(result.message.text_content(), "\u{2500}".repeat(256));
+        assert_eq!(result.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn stream_turn_aborts_a_single_character_runaway() {
+        // 200 eight-glyph deltas are 4_800 bytes; the 1_365th glyph —
+        // inside the 171st delta — reaches the 4 KiB line (in whole
+        // copies of a three-byte glyph), so the 170 deltas before it were
+        // dispatched and the one carrying it was not.
+        let handler = StreamHandler::new();
+        let glyph_run = "\u{2500}".repeat(8);
+        let client = RepetitionStreamMock::stanza_repeats(&glyph_run, 200);
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
+            .await
+            .expect_err("a model stuck on one character is still stuck");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected {
+                period_bytes,
+                repeats,
+                has_partial_data,
+                ..
+            }) => {
+                assert_eq!(
+                    period_bytes, 3,
+                    "the runaway's period is the glyph's byte length"
+                );
+                assert_eq!(repeats, 1_365, "the copies it took to reach the line");
+                assert!(
+                    has_partial_data,
+                    "the deltas before the crossing were dispatched"
+                );
+            }
+            other => panic!("expected a typed repetition abort, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_byte_trimmed_buffer_still_aborts_a_runaway_at_the_line() {
+        // A capacity-bound line: max_period_bytes 256 makes the rolling
+        // buffer 1_280 bytes, and the handler trims it to exactly that —
+        // inside a glyph, since 1_280 is not a multiple of three. The
+        // line in whole copies is 426. Fifty-three eight-glyph deltas are
+        // 1_272 bytes, one delta short; the fifty-fourth fills the buffer
+        // and aborts with the count the untrimmed fallback arm refuses —
+        // and one copy fewer passes that arm.
+        let handler = StreamHandler::new().with_repetition_guard(
+            crate::stream::repetition::RepetitionGuardConfig {
+                max_period_bytes: 256,
+                ..crate::stream::repetition::RepetitionGuardConfig::default()
+            },
+        );
+        let glyph_run = "\u{2500}".repeat(8);
+        let client = RepetitionStreamMock::stanza_repeats(&glyph_run, 200);
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
+            .await
+            .expect_err("a three-byte runaway on a byte-trimmed buffer still aborts");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected {
+                period_bytes,
+                repeats,
+                has_partial_data,
+                events_processed,
+                ..
+            }) => {
+                assert_eq!(period_bytes, 3);
+                assert_eq!(repeats, 426, "the whole copies the trimmed buffer holds");
+                assert!(
+                    has_partial_data,
+                    "the fifty-three deltas before the fill were dispatched"
+                );
+                assert_eq!(
+                    events_processed, 56,
+                    "MessageStart, PartStart, then fifty-four deltas — the abort lands on the \
+                     delta that fills the buffer"
+                );
+            }
+            other => panic!("expected a typed repetition abort, got: {other}"),
+        }
+
+        let at_line = RepetitionStreamMock::one_delta(&"\u{2500}".repeat(426));
+        let err = handler
+            .fallback_non_streaming(
+                &at_line,
+                &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
+                &cancel,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the untrimmed arm refuses the same copy count");
+        assert!(
+            matches!(
+                err,
+                StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected {
+                    period_bytes: 3,
+                    repeats: 426,
+                    ..
+                })
+            ),
+            "both turn paths answer at the same copy count, got: {err}"
+        );
+        let under_line = RepetitionStreamMock::one_delta(&"\u{2500}".repeat(425));
+        handler
+            .fallback_non_streaming(
+                &under_line,
+                &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
+                &cancel,
+                None,
+                None,
+            )
+            .await
+            .expect("one copy under the line passes the untrimmed arm");
+    }
+
+    #[tokio::test]
     async fn a_disarmed_guard_completes_the_degenerate_stream() {
         let handler = StreamHandler::new().with_repetition_guard(
             crate::stream::repetition::RepetitionGuardConfig {
@@ -4813,6 +4960,37 @@ mod tests {
             ),
             "expected a typed repetition abort, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_non_streaming_refuses_a_single_character_runaway() {
+        let handler = StreamHandler::new();
+        let client = RepetitionStreamMock::one_delta(&"\u{2500}".repeat(1_365));
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .fallback_non_streaming(
+                &client,
+                &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
+                &cancel,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the non-streaming fallback judges a run by the same line");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RepetitionDetected {
+                period_bytes,
+                repeats,
+                ..
+            }) => {
+                assert_eq!(period_bytes, 3);
+                assert_eq!(repeats, 1_365);
+            }
+            other => panic!("expected a typed repetition abort, got: {other}"),
+        }
     }
 
     #[tokio::test]

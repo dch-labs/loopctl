@@ -414,7 +414,7 @@ pub trait LoopObserver: Send + Sync {
     ///
     /// Fired by the engine when the stream repetition guard aborts a
     /// model call whose assistant text fell into a verbatim repetition
-    /// loop. The turn fails with
+    /// loop or ran away on one character. The turn fails with
     /// [`RepetitionDetected`](crate::error::LoopError::RepetitionDetected);
     /// the event carries the verdict's numbers. Retrying is host
     /// policy, not engine policy.

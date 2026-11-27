@@ -557,10 +557,11 @@ pub enum LoopError {
     /// The repetition guard aborted a degenerate generation loop.
     ///
     /// One byte window of the assistant text repeated verbatim for
-    /// enough consecutive times — the shape of a model stuck in a
-    /// repetition attractor, decoding cheaply toward the provider's
-    /// output cap. The stream ends at the abort with the partial text
-    /// delivered so far visible through the per-delta observers; the
+    /// enough consecutive times, or one character ran past the guard's
+    /// runaway line — the shape of a model stuck in a repetition
+    /// attractor, decoding cheaply toward the provider's output cap.
+    /// The stream ends at the abort with the partial text delivered so
+    /// far visible through the per-delta observers; the
     /// paired [`on_repetition_detected`](crate::observer::LoopObserver::on_repetition_detected)
     /// event carries the same verdict for observability. The abort
     /// counts as a model failure for the fallback breaker — a model
@@ -575,14 +576,19 @@ pub enum LoopError {
         ///
         /// The smallest qualifying period at detection time, bounded by
         /// the guard's
-        /// [`min_period_bytes`](crate::stream::repetition::RepetitionGuardConfig::min_period_bytes).
+        /// [`min_period_bytes`](crate::stream::repetition::RepetitionGuardConfig::min_period_bytes);
+        /// for a single-character runaway, the character's UTF-8 length
+        /// instead — under the default floor of 48, a `period_bytes` of
+        /// one to four names a run; a floor of four or less cannot tell
+        /// the two shapes apart by this field alone.
         period_bytes: u64,
 
         /// The consecutive verbatim copies that triggered the abort.
         ///
         /// The verdict threshold
         /// ([`min_repeats`](crate::stream::repetition::RepetitionGuardConfig::min_repeats)),
-        /// not a census of how far the loop ran.
+        /// not a census of how far the loop ran; for a single-character
+        /// runaway, the copies it took to reach the line.
         repeats: u64,
 
         /// The rejected attempt's reported usage, when it carried one.

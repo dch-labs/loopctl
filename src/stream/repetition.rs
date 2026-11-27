@@ -78,7 +78,9 @@ pub const MAX_BUFFER_CAPACITY_BYTES: usize = 1 << 20;
 /// character, rounded down — three-byte glyphs reach it at the 1,365th
 /// copy (4,095 bytes), ASCII at the 4,096th — and bounded by the
 /// configuration's [`buffer_capacity`](RepetitionGuardConfig::buffer_capacity)
-/// where that is smaller. Counting in whole copies is what makes the
+/// where that is smaller, but never below two copies: a capacity too
+/// small to hold two of a wide glyph still condemns a pair, and a lone
+/// glyph stays exempt. Counting in whole copies is what makes the
 /// trimmed streaming path and the untrimmed completed-text path agree: a
 /// rolling buffer trimmed to the capacity reaches exactly the whole
 /// copies the line holds, whether the trim cut inside a glyph or on one,
@@ -297,7 +299,10 @@ struct TrailingRun {
     /// The runaway line, in copies of the character.
     ///
     /// The line in bytes divided by the character's length, rounded
-    /// down: the whole copies that fit inside it. Rounding down is what
+    /// down: the whole copies that fit inside it — never fewer than
+    /// two. A capacity holding under two whole copies of a wide glyph
+    /// would otherwise leave the rule unreachable, the run unmeasurable
+    /// past the one glyph the exemption spares. Rounding down is what
     /// lets a trimmed rolling buffer answer — one trimmed to a capacity
     /// that is not a multiple of the character's length starts inside a
     /// glyph and holds exactly this many whole copies, so a run that
@@ -314,14 +319,15 @@ struct TrailingRun {
 
 impl TrailingRun {
     /// Measure the run of one character at `buffer`'s end, counting
-    /// copies only up to the line `limit` bytes holds.
+    /// copies only up to the line `limit` bytes holds — two at the
+    /// least, so a line under two whole copies still measures a pair.
     ///
     /// `None` when the buffer ends inside a character or holds only
     /// continuation bytes, so there is no character to repeat.
     fn measure(buffer: &[u8], limit: usize) -> Option<Self> {
         let char_len = trailing_char_len(buffer)?;
         let glyph = buffer.get(buffer.len().checked_sub(char_len)?..)?;
-        let line_copies = limit.checked_div(char_len)?;
+        let line_copies = limit.checked_div(char_len)?.max(2);
         let mut copies = 1_usize;
         while copies < line_copies {
             let run_start = buffer.len().saturating_sub(copies.saturating_mul(char_len));
@@ -356,8 +362,9 @@ impl TrailingRun {
 
     /// The runaway verdict once the run has reached the line.
     ///
-    /// A single copy is a character, not a run, so a line of fewer than
-    /// two copies condemns nothing.
+    /// A single copy is a character, not a run, so it condemns nothing —
+    /// the first clause states the exemption outright; the line never
+    /// falls below two copies, so the second alone would already imply it.
     fn runaway(self) -> Option<RepetitionHit> {
         if self.copies >= 2 && self.copies >= self.line_copies {
             return Some(RepetitionHit {
@@ -403,7 +410,8 @@ fn trailing_char_len(buffer: &[u8]) -> Option<usize> {
 /// answers for what the exemption lets through: a trailing run of one
 /// character [`SINGLE_CHAR_RUNAWAY_BYTES`] long, counted in whole copies
 /// of the character and bounded by the configuration's buffer capacity
-/// where that is smaller — a model stuck on one character, reported with
+/// where that is smaller, never below two copies — a model stuck on one
+/// character, reported with
 /// the character's byte length as the period and the copies it took to
 /// reach the line as the repeat count. Disarmed
 /// ([`enabled`](RepetitionGuardConfig::enabled) = `false`)
@@ -846,6 +854,56 @@ mod tests {
             .expect("426 copies are the whole copies the capacity holds");
         assert_eq!(hit.period_bytes, 3);
         assert_eq!(hit.repeats, 426);
+    }
+
+    #[test]
+    fn a_capacity_under_two_whole_copies_still_condemns_a_pair() {
+        // The smallest capacity a valid configuration implies is three
+        // bytes (a one-byte period cap with two repeats), which holds
+        // one whole copy of a two-to-four-byte glyph and none of the
+        // second. Left at the capacity's whole copies, the line sits
+        // under two and the rule is unreachable: the run never measures
+        // past the lone glyph the exemption spares, and any run of it
+        // passes in silence. Floored at two copies, a pair condemns at
+        // the glyph's own period while a lone glyph stays exempt. A
+        // one-byte glyph's line is already the whole capacity, and the
+        // floor leaves it where it is.
+        let config = RepetitionGuardConfig {
+            min_period_bytes: 1,
+            min_repeats: 2,
+            max_period_bytes: 1,
+            ..RepetitionGuardConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.buffer_capacity(), 3);
+        for (glyph, char_len) in [("é", 2_usize), ("─", 3), ("😀", 4)] {
+            assert_eq!(
+                detect_repetition(glyph.as_bytes(), &config),
+                None,
+                "{glyph:?}: one copy is a character, not a run"
+            );
+            assert_eq!(
+                detect_repetition(glyph.repeat(2).as_bytes(), &config),
+                Some(RepetitionHit {
+                    period_bytes: char_len,
+                    repeats: 2,
+                }),
+                "{glyph:?}: a pair reaches the two-copy floor"
+            );
+        }
+        assert_eq!(
+            detect_repetition("xx".as_bytes(), &config),
+            None,
+            "a one-byte glyph's line is the whole capacity — two copies are under it"
+        );
+        assert_eq!(
+            detect_repetition("xxx".as_bytes(), &config),
+            Some(RepetitionHit {
+                period_bytes: 1,
+                repeats: 3,
+            }),
+            "three one-byte copies fill the capacity and reach the line"
+        );
     }
 
     #[test]

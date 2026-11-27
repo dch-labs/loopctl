@@ -154,8 +154,9 @@ pub enum LoopEvent {
     /// The repetition guard aborted a degenerate generation loop.
     ///
     /// Fired when one byte window of the assistant text repeated
-    /// verbatim enough consecutive times; the turn fails with the
-    /// paired typed error.
+    /// verbatim enough consecutive times, or one character ran past the
+    /// guard's runaway line; the turn fails with the paired typed
+    /// error.
     RepetitionDetected(RepetitionDetectedContext),
 
     /// The active model changed.

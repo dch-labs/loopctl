@@ -1259,7 +1259,8 @@ pub struct TransportFallbackContext {
 ///
 /// Emitted when the repetition guard aborts a degenerate generation
 /// loop — one byte window of the assistant text repeated verbatim
-/// enough consecutive times. The turn fails with the paired
+/// enough consecutive times, or one character run past the guard's
+/// runaway line. The turn fails with the paired
 /// [`RepetitionDetected`](crate::error::LoopError::RepetitionDetected)
 /// error; this event is the observability half, carrying the verdict's
 /// numbers so hosts can log, alert, or teach without pattern-matching
@@ -1279,12 +1280,14 @@ pub struct RepetitionDetectedContext {
     ///
     /// The smallest qualifying period at detection time — the figure
     /// [`RepetitionGuardConfig::min_period_bytes`](crate::stream::repetition::RepetitionGuardConfig::min_period_bytes)
-    /// bounds.
+    /// bounds; for a single-character runaway, the character's UTF-8
+    /// length instead.
     pub period_bytes: u64,
 
     /// The consecutive verbatim copies that triggered the abort.
     ///
-    /// The verdict threshold, not a census of how far the loop ran.
+    /// The verdict threshold, not a census of how far the loop ran; for
+    /// a single-character runaway, the copies it took to reach the line.
     pub repeats: u64,
 
     /// How many bytes of assistant text the abort is reporting.
